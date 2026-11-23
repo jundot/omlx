@@ -55,11 +55,13 @@ The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The reque
 |---|---|
 | `GET /admin/api/models` | Discovered models with load state, size, and settings |
 | `POST /admin/api/models/{model_id}/load`, `.../unload` | Load or unload a model |
+| `POST /admin/api/models/{model_id}/requests/{request_id}/abort` | Stop one waiting, prefilling, or generating request and keep the model loaded |
 | `POST /admin/api/reload` | Rescan the model directories |
 | `PUT /admin/api/models/{model_id}/settings` | Update per-model settings (sampling, context, aliases, acceleration) |
 | `POST /admin/api/models/{model_id}/settings/reset` | Reset per-model settings |
 | `GET`, `POST /admin/api/models/{model_id}/settings/optimal` | List or apply benchmarked optimal settings |
 | `POST /admin/api/models/{model_id}/settings/recipe` | Apply a shared settings recipe |
+| `GET /admin/api/models/{model_id}/lora-adapters` | List LoRA adapters in the model folders, each with why it does not fit this model |
 | `GET`, `POST /admin/api/models/{model_id}/profiles`, `PUT`, `DELETE .../profiles/{name}`, `POST .../profiles/{name}/apply` | Per-model profiles |
 | `GET`, `POST /admin/api/profile-templates`, `PUT`, `DELETE .../{name}` | Global profile templates |
 

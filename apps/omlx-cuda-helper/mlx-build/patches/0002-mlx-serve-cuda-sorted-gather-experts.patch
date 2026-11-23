@@ -1,0 +1,145 @@
+The sorted fp expert gather (qmm_sm80 over sorted rhs indices, from ml-explore/mlx#4554) runs
+CTAs per (N tile, expert): a 64-row tile over sorted rows spanned 2-3 experts at Flash Next's
+~40 rows each, one serial K-loop per expert run. A popular expert's M tiles split over up to 8
+CTAs, and the grid stays near 16k CTAs.
+
+Retires when upstream's sorted-rhs gather schedules per expert. Not reported upstream yet.
+
+diff --git a/mlx/backend/cuda/device/qmm_sm80.cuh b/mlx/backend/cuda/device/qmm_sm80.cuh
+index 476c2339c..6ee6315b3 100644
+--- a/mlx/backend/cuda/device/qmm_sm80.cuh
++++ b/mlx/backend/cuda/device/qmm_sm80.cuh
+@@ -470,4 +470,94 @@ void qmm_sm80_rhs_kernel(
+   }
+ }
+ 
++// CTAs per (N tile, expert) over rows sorted by expert: no CTA mixes experts,
++// and blockIdx.z strides a heavy expert's M tiles over gridDim.z CTAs.
++template <int GroupSize,
++          typename Element,
++          typename Quant,
++          typename Scale,
++          typename CtaTiler>
++__global__
++__launch_bounds__(decltype(size(make_tiled_mma()))::value)
++void qmm_sm80_expert_kernel(
++    const Element* A,
++    const Quant* B,
++    const Scale* S,
++    const Element* Z,
++    const uint32_t* rhs_indices,
++    Element* C,
++    int m,
++    int n,
++    int k,
++    int group_count) {
++  int thread_idx = int(threadIdx.x);
++  int n_coord = int(blockIdx.x);
++  uint32_t expert = blockIdx.y;
++
++  // First row whose index is >= expert, and the first one past it.
++  auto lower = [&](uint32_t e) {
++    int lo = 0, hi = m;
++    while (lo < hi) {
++      int mid = (lo + hi) / 2;
++      if (rhs_indices[mid] < e) {
++        lo = mid + 1;
++      } else {
++        hi = mid;
++      }
++    }
++    return lo;
++  };
++  int begin = lower(expert);
++  int end = lower(expert + 1);
++  if (begin >= end) {
++    return;
++  }
++
++  auto cta_tiler = CtaTiler{};
++  auto dA = make_stride(k, Int<1>{}, m * k);
++  auto dB = make_stride(k, Int<1>{}, n * k);
++  auto dC = make_stride(n, Int<1>{}, m * n);
++  auto S_layout = make_scales_layout<GroupSize>(n, k, group_count);
++
++  Tensor mA = make_tensor(make_gmem_ptr(A), make_shape(m, k, 1), dA)(_,_,0);
++  Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(m, n, 1), dC)(_,_,0);
++  Tensor mB = make_tensor(make_gmem_ptr<Quant>(B), make_shape(n, k, group_count), dB)(_,_,expert);
++  Tensor mS = make_tensor(make_gmem_ptr(S), S_layout)(_,_,expert);
++  Tensor mZ = make_tensor(make_gmem_ptr(Z), S_layout)(_,_,expert);
++
++  constexpr int tile_rows = decltype(size<0>(cta_tiler))::value;
++  for (int row = begin + int(blockIdx.z) * tile_rows; row < end;
++       row += int(gridDim.z) * tile_rows) {
++    int run_rows = end - row < tile_rows ? end - row : tile_rows;
++    Tensor mA_offset = domain_offset(make_coord(row, 0), mA);
++    Tensor mC_offset = domain_offset(make_coord(row, 0), mC);
++    auto run_qmm = [&](auto run_tiler) {
++      Tensor gA = local_tile(mA_offset, run_tiler, make_coord(0, n_coord, _), Step<_1, X,_1>{});
++      Tensor gB = local_tile(mB, run_tiler, make_coord(0, n_coord, _), Step< X,_1,_1>{});
++      Tensor gC = local_tile(mC_offset, run_tiler, make_coord(0, n_coord, _), Step<_1,_1, X>{});
++      Tensor gS = local_tile(mS, run_tiler, make_coord(0, n_coord, _), Step< X,_1,_1>{});
++      Tensor gZ = local_tile(mZ, run_tiler, make_coord(0, n_coord, _), Step< X,_1,_1>{});
++      qmm_sm80_mainloop(run_tiler, gA, gB, gS, gZ, gC, run_rows, thread_idx);
++    };
++    if constexpr (tile_rows > 32) {
++      if (run_rows <= 16) {
++        run_qmm(make_shape(Int<16>{}, size<1>(cta_tiler), size<2>(cta_tiler)));
++      } else if (run_rows <= 32) {
++        run_qmm(make_shape(Int<32>{}, size<1>(cta_tiler), size<2>(cta_tiler)));
++      } else {
++        run_qmm(cta_tiler);
++      }
++    } else if constexpr (tile_rows > 16) {
++      if (run_rows <= 16) {
++        run_qmm(make_shape(Int<16>{}, size<1>(cta_tiler), size<2>(cta_tiler)));
++      } else {
++        run_qmm(cta_tiler);
++      }
++    } else {
++      run_qmm(cta_tiler);
++    }
++    __syncthreads();
++  }
++}
++
+ } // namespace mlx::core::cu
+diff --git a/mlx/backend/cuda/quantized/qmm/qmm_sm80.cu b/mlx/backend/cuda/quantized/qmm/qmm_sm80.cu
+index 4ce2817d3..a18bc3525 100644
+--- a/mlx/backend/cuda/quantized/qmm/qmm_sm80.cu
++++ b/mlx/backend/cuda/quantized/qmm/qmm_sm80.cu
+@@ -171,7 +171,7 @@ void gather_qmm_rhs_sm80(
+   auto cta_tiler = make_cta_tiler(m, group_size);
+ 
+   std::string module_name = fmt::format(
+-      "gather_qmm_rhs_sm80_tn_{}_m{}_b{}_g{}_{}",
++      "gather_qmm_expert_split_sm80_tn_{}_m{}_b{}_g{}_{}",
+       dtype_to_string(x.dtype()),
+       cute::size<0>(cta_tiler),
+       bits,
+@@ -180,7 +180,7 @@ void gather_qmm_rhs_sm80(
+ 
+   auto [ctype_x, ctype_q, ctype_s] = get_qmm_cutlass_types(x, bits, mode);
+   std::string kernel_name = fmt::format(
+-      "mlx::core::cu::qmm_sm80_rhs_kernel<{}, {}, {}, {}, {}>",
++      "mlx::core::cu::qmm_sm80_expert_kernel<{}, {}, {}, {}, {}>",
+       group_size,
+       ctype_x,
+       ctype_q,
+@@ -201,10 +201,13 @@ void gather_qmm_rhs_sm80(
+   encoder.set_input_array(rhs_indices);
+   encoder.set_output_array(out);
+ 
++  // N tiles of one expert are neighbours, so its rows of x stay in L2. A heavy
++  // expert's M tiles split over up to 8 CTAs while the grid stays ~16k CTAs.
++  int n_tiles = cute::ceil_div(n, cute::size<1>(cta_tiler));
++  int splits = std::clamp(16384 / (n_tiles * group_count), 1, 8);
++  splits = std::min(splits, cute::ceil_div(m, cute::size<0>(cta_tiler)));
+   dim3 num_blocks{
+-      uint32_t(cute::ceil_div(m, cute::size<0>(cta_tiler))),
+-      uint32_t(cute::ceil_div(n, cute::size<1>(cta_tiler))),
+-      1};
++      uint32_t(n_tiles), uint32_t(group_count), uint32_t(splits)};
+   dim3 block_dims{uint32_t(cute::size(cu::make_tiled_mma()))};
+ 
+   auto [sA_layout, sB_layout, sC_layout] = cu::make_smem_layouts(cta_tiler);

@@ -643,14 +643,20 @@ def _shard_nemotron_h(
 
 def _glm5_rows(path: str, weight: Any) -> Any:
     # Per-expert NVFP4 tensor scales stay whole: every rank keeps every expert.
-    if path.endswith("global_scale"):
+    # oQh input signs stay whole; its row scales split with the rows.
+    if path.endswith(("global_scale", "oqh_signs")):
         return None
+    if path.endswith("rscale"):
+        return -1
     return -1 if path.endswith("bias") else max(weight.ndim - 2, 0)
 
 
 def _glm5_columns(path: str, weight: Any) -> Any:
-    if path.endswith(("bias", "global_scale")):
+    # An input split keeps every oQh row scale and whole blocks of signs.
+    if path.endswith(("bias", "global_scale", "rscale")):
         return None
+    if path.endswith("oqh_signs"):
+        return 0
     return -1
 
 

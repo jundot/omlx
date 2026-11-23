@@ -1334,6 +1334,10 @@ def install_server_telemetry(
                     )
                 if execution.max_kv_size is not None:
                     kwargs.setdefault("max_kv_size", execution.max_kv_size)
+            model = args[0] if args else kwargs.get("model")
+            if getattr(model, "_omlx_one_prompt_prefill", False):
+                # Prompts prefill one at a time, as on a single Mac.
+                kwargs["prefill_batch_size"] = 1
             super().__init__(*args, **kwargs)
             # Full token sequence per in-flight uid, so a boundary snapshot can
             # be keyed while the batched prefill is still running.

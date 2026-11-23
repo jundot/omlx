@@ -44,6 +44,13 @@ from omlx.server import (
 from omlx.settings import GlobalSettings
 
 
+def _mock_pool() -> MagicMock:
+    # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
+    pool = MagicMock()
+    pool._scheduler_config.paged_ssd_cache_dir = None
+    return pool
+
+
 class TestBoundarySnapshotLifecycle:
     def test_reset_helper_uses_engine_pool_cache_dir(self, tmp_path):
         from types import SimpleNamespace
@@ -1521,7 +1528,7 @@ def test_responses_reasoning_cache_policy(
     )
     engine.start = AsyncMock()
     engine.count_chat_tokens.return_value = 128
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1605,7 +1612,7 @@ def _anthropic_preflight_kwargs(monkeypatch, body, model_type="qwen3_5"):
     )
     engine.start = AsyncMock()
     engine.count_chat_tokens.return_value = 128
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1727,7 +1734,7 @@ def test_chat_completion_returns_token_logprobs(
             )
 
     engine.stream_chat = stream_chat
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1774,6 +1781,62 @@ def test_chat_completion_returns_token_logprobs(
     assert content[0]["top_logprobs"] == [
         {"token": "x", "logprob": -3.0, "bytes": [120]}
     ]
+
+
+@pytest.mark.parametrize(
+    "path", ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/completions"]
+)
+def test_specprefill_values_follow_the_requested_model(
+    monkeypatch, tmp_path, prepared_chat_engine, path
+):
+    """A base model and its exposed profile share the attached draft."""
+    engine = prepared_chat_engine
+    engine.specprefill_draft_path = "/draft"
+    engine.preflight_chat = engine.preflight_completion = AsyncMock()
+    engine.chat = engine.generate = AsyncMock(return_value=GenerationOutput(text="Hi"))
+    manager = ModelSettingsManager(tmp_path)
+    manager.set_settings("test-model", ModelSettings(specprefill_threshold=4096))
+    manager.save_profile(
+        "test-model",
+        name="fast",
+        display_name="Fast",
+        description=None,
+        settings={
+            "specprefill_enabled": True,
+            "specprefill_draft_model": "/draft",
+            "specprefill_keep_pct": 0.4,
+        },
+        expose_as_model=True,
+    )
+    state = ServerState()
+    state.engine_pool = _mock_pool()
+    state.settings_manager = manager
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    body = {
+        "/v1/responses": {"input": "Hi", "store": False},
+        "/v1/completions": {"prompt": "Hi"},
+    }.get(path, {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 16})
+
+    client = TestClient(srv.app, raise_server_exceptions=False)
+    for model, expected in (
+        ("test-model", (False, 0.2, 4096)),
+        ("test-model:fast", (True, 0.4, 4096)),
+    ):
+        response = client.post(path, json={"model": model, **body})
+        assert response.status_code == 200, response.text
+        sent = engine.chat.call_args.kwargs
+        assert (
+            sent["specprefill"],
+            sent["specprefill_keep_pct"],
+            sent["specprefill_threshold"],
+        ) == expected
 
 
 @pytest.mark.parametrize("subclass", [False, True])
@@ -1826,7 +1889,7 @@ def test_chat_routes_reuse_final_prepared_prompt(
         yield output
 
     engine.stream_chat = stream_chat
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -1885,6 +1948,17 @@ def test_prepare_chat_prompt_for_request_prepares_vlm_prompt():
     )
 
 
+@pytest.mark.asyncio
+async def test_text_engine_prepares_prompt_off_the_event_loop():
+    engine = BatchedEngine(model_name="test-model")
+
+    prepare_thread = await srv._prepare_prompt_off_loop(
+        engine, lambda engine: threading.get_ident()
+    )
+
+    assert prepare_thread != threading.get_ident()
+
+
 @pytest.fixture
 def served_vlm_engine(monkeypatch):
     """Serve a real VLMBatchedEngine with a stub tokenizer and scheduler."""
@@ -1930,7 +2004,7 @@ def served_vlm_engine(monkeypatch):
 
     engine.chat = chat
     engine.stream_chat = stream_chat
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -2022,7 +2096,7 @@ def test_ignore_eos_reaches_the_engine(
 
     engine.stream_chat = streamed
     engine.stream_generate = streamed
-    pool = MagicMock()
+    pool = _mock_pool()
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()

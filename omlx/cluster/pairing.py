@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Code-based cluster pairing and enrollment bridge (cluster v2, Module B).
+"""Code-based cluster pairing and enrollment bridge (Module B).
 
 Replaces the 3-step copy-paste relay (shared secret + key-exchange tokens in
 both directions) with an exo-style flow:
@@ -19,10 +19,9 @@ both directions) with an exo-style flow:
 5. The joiner polls ``/api/cluster/pair/status/{node_id}`` and unwraps the
    cluster key locally with the code only it possesses.
 
-``DELETE /api/cluster/devices/{node_id}`` unpairs: the device-store entry and
-the stored cluster key are removed, any legacy ``enrolled-nodes.json`` entry
-is dropped, and the SSH trust installed at approve time is revoked
-best-effort.
+``DELETE /admin/api/cluster/forget`` unpairs: the device-store entry and
+the stored cluster key are removed, and the SSH trust installed at approve
+time is revoked best-effort.
 
 Module A (identity + discovery) is built concurrently on another branch.
 Every interaction with it is feature-detected: a real ``DeviceRegistry`` /
@@ -62,10 +61,13 @@ from .registry import SSH_USER_PATTERN
 
 logger = logging.getLogger(__name__)
 
-# --- Pairing policy (from ops/notes/omlx_cluster_v2_spec.md, Module B) ------
+# --- Pairing policy (Module B) -----------------------------------------------
 
 CODE_DIGITS = 6
 CODE_TTL_SECONDS = 10 * 60
+# How long the status poll hands an approved helper daemon its wrapped key.
+# The daemon polls every few seconds.
+AGENT_KEY_PACKAGE_SECONDS = 60
 MAX_CODE_ATTEMPTS = 3
 LOCKOUT_SECONDS = 10 * 60
 PBKDF2_ITERATIONS = 210_000
@@ -223,7 +225,7 @@ def coordinator_identity_tag(
     ).hexdigest()
 
 
-# --- Small persisted stores (same conventions as registry.py/enrollment.py) -
+# --- Small persisted stores (same conventions as registry.py) ---------------
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -368,8 +370,8 @@ class JsonDeviceStore:
     class is unused (``DeviceRegistryBridge`` adapts it instead).
 
     Pending (``awaiting_approval``) requests are deliberately NOT written
-    here: like enrollment.py join keys, they are memory-only so a restart
-    invalidates half-finished pairings.
+    here: they are memory-only so a restart invalidates half-finished
+    pairings.
     """
 
     def __init__(self, base_path: Path) -> None:
@@ -591,7 +593,7 @@ def load_node_identity(base_path: Path) -> dict[str, Any]:
     }
 
 
-# --- Pending requests (memory-only, like enrollment.py join keys) ------------
+# --- Pending requests (memory-only) -------------------------------------------
 
 
 @dataclass
@@ -801,6 +803,11 @@ def _pairing_caps(caps: dict[str, Any]) -> dict[str, Any]:
     return {**caps, "ssh_user": ssh_user}
 
 
+def _agent_controlled(caps: Any) -> bool:
+    """Whether a peer is driven over its own control channel instead of SSH."""
+    return isinstance(caps, dict) and caps.get("control") == "agent"
+
+
 def _advertised_ssh_user(caps: Any) -> str | None:
     user = caps.get("ssh_user") if isinstance(caps, dict) else None
     if isinstance(user, str) and SSH_USER_PATTERN.fullmatch(user):
@@ -838,9 +845,6 @@ class PairingManager:
       :class:`DeviceRegistryBridge`), an object already speaking the
       device-store protocol, or ``None`` for the schema-compatible
       :class:`JsonDeviceStore` fallback.
-    * ``enrollment_store`` — the legacy ``ClusterEnrollmentStore``; consulted
-      on ``unpair`` so CUDA-enrolled entries with the same node_id are
-      dropped too.  Optional.
     * ``identity`` — dict with ``node_id``/``friendly_name``; default bridges
       to Module A's identity module (or the compatible local file).
     * ``enrollment_driver`` / ``revocation_driver`` — SSH TOFU trust
@@ -854,7 +858,6 @@ class PairingManager:
     def __init__(
         self,
         registry: Any = None,
-        enrollment_store: Any = None,
         *,
         base_path: Path | None = None,
         identity: dict[str, Any] | None = None,
@@ -880,7 +883,6 @@ class PairingManager:
             else load_node_identity(self.base_path)
         )
         self._devices = _coerce_device_store(registry, self.base_path)
-        self._enrollment_store = enrollment_store
         self._key_store = (
             key_store
             if key_store is not None
@@ -945,10 +947,23 @@ class PairingManager:
                 break
         return addresses
 
-    def local_ssh_material(self) -> dict[str, Any]:
-        """Complete local trust material the opposite peer must install."""
+    def local_ssh_material(self, *, ssh: bool = True) -> dict[str, Any]:
+        """Complete local trust material the opposite peer must install.
+
+        ``ssh=False`` describes this node to an agent-controlled peer: no SSH
+        keys and no account name, so nothing is installed on either side.
+        """
 
         addresses = self.local_addrs()
+        if not ssh:
+            return {
+                "node_id": self.node_id,
+                "friendly_name": self.friendly_name,
+                "caps": dict(self._caps_provider() if self._caps_provider else {}),
+                "addrs": addresses,
+                "ssh_public_key": None,
+                "ssh_host_public_key": None,
+            }
         if not addresses:
             raise EnrollmentDriveError(
                 "SSH enrollment requires a verified local address"
@@ -1281,8 +1296,17 @@ class PairingManager:
                 normalized_addrs.append(raw)
         if http_port is not None and not (1 <= int(http_port) <= 65535):
             raise PairingRequestError("join request http_port is out of range")
-        ssh_public_key = normalize_ssh_public_key(ssh_public_key or "")
-        ssh_host_public_key = normalize_ssh_public_key(ssh_host_public_key or "")
+        if _agent_controlled(caps):
+            # The code verifier binds the empty keys, so the request cannot be
+            # turned into an SSH enrollment later.
+            if ssh_public_key or ssh_host_public_key:
+                raise PairingRequestError(
+                    "an agent-controlled peer must not send SSH keys"
+                )
+            ssh_public_key, ssh_host_public_key = None, ""
+        else:
+            ssh_public_key = normalize_ssh_public_key(ssh_public_key or "")
+            ssh_host_public_key = normalize_ssh_public_key(ssh_host_public_key or "")
 
         with self._lock:
             now = self._clock()
@@ -1405,8 +1429,9 @@ class PairingManager:
             # race an enrollment that has already passed code verification.
             pending.approving = True
 
+        agent = _agent_controlled(pending.caps)
         try:
-            coordinator_material = self.local_ssh_material()
+            coordinator_material = self.local_ssh_material(ssh=not agent)
         except Exception as exc:
             self._record_audit(
                 "approve_enrollment_failed",
@@ -1437,7 +1462,7 @@ class PairingManager:
             "ssh_host_public_key": pending.ssh_host_public_key,
         }
         try:
-            enrollment = self._enrollment_driver(peer)
+            enrollment = {} if agent else self._enrollment_driver(peer)
         except Exception as exc:
             self._record_audit(
                 "approve_enrollment_failed", node_id=node_id, detail={"error": str(exc)}
@@ -1476,6 +1501,10 @@ class PairingManager:
             "paired_at": paired_at,
             "role": "peer",
         }
+        if agent:
+            # Written only here; discovery caps never decide who is trusted
+            # with the control channel.
+            key_record["control"] = "agent"
         key_written = False
         try:
             with self._lock:
@@ -1495,12 +1524,13 @@ class PairingManager:
                 except Exception as rollback_exc:
                     rollback_errors.append(f"pairing key: {rollback_exc}")
             try:
-                self._revocation_driver(
-                    {
-                        "peer_public_key": pending.ssh_public_key,
-                        "addrs": list(pending.addrs),
-                    }
-                )
+                if not agent:
+                    self._revocation_driver(
+                        {
+                            "peer_public_key": pending.ssh_public_key,
+                            "addrs": list(pending.addrs),
+                        }
+                    )
             except Exception as rollback_exc:
                 rollback_errors.append(f"SSH enrollment: {rollback_exc}")
             with self._lock:
@@ -1600,7 +1630,14 @@ class PairingManager:
                 "coordinator_identity_tag": key_record.get("coordinator_identity_tag"),
             }
             package = key_record.get("cluster_key_package")
-            if package is not None:
+            # For a helper daemon the key opens its control channel. Once the
+            # daemon has taken the package, only a search of the codes needs it.
+            taken = (
+                key_record.get("control") == "agent"
+                and now - float(key_record.get("paired_at") or 0.0)
+                > AGENT_KEY_PACKAGE_SECONDS
+            )
+            if package is not None and not taken:
                 status["cluster_key_package"] = package
             if device:
                 status["friendly_name"] = device.get("friendly_name")
@@ -1614,8 +1651,6 @@ class PairingManager:
 
         Registry removal is the trust anchor and happens first (fail-closed);
         SSH material retraction is best-effort and reported, never raised.
-        Also drops any legacy ``enrolled-nodes.json`` entry with the same
-        node_id so both trusted-node inventories stay in step.
         """
 
         with self._lock:
@@ -1633,13 +1668,6 @@ class PairingManager:
         if not (removed_device or key_record or was_pending):
             raise PairingStateError("unknown device")
 
-        removed_enrollment = False
-        if self._enrollment_store is not None:
-            remove_node = getattr(self._enrollment_store, "remove_node", None)
-            if callable(remove_node):
-                with suppress(Exception):
-                    removed_enrollment = bool(remove_node(node_id))
-
         revocation: dict[str, Any] = {"authorized_key_removed": False, "errors": []}
         material = {
             "peer_public_key": (key_record or {}).get("peer_public_key"),
@@ -1647,7 +1675,8 @@ class PairingManager:
             or (device or {}).get("last_addrs")
             or [],
         }
-        if material["peer_public_key"] or material["addrs"]:
+        agent = (key_record or {}).get("control") == "agent"
+        if not agent and (material["peer_public_key"] or material["addrs"]):
             try:
                 revocation = self._revocation_driver(material) or revocation
             except Exception as exc:
@@ -1659,7 +1688,6 @@ class PairingManager:
             detail={
                 "removed_device": removed_device,
                 "removed_key": key_record is not None,
-                "removed_enrollment": removed_enrollment,
                 "was_pending": was_pending,
             },
         )
@@ -1668,10 +1696,17 @@ class PairingManager:
             "unpaired": True,
             "removed_device": removed_device,
             "removed_key": key_record is not None,
-            "removed_enrollment": removed_enrollment,
             "was_pending": was_pending,
             "revocation": revocation,
         }
+
+    def control_key(self, node_id: str) -> bytes | None:
+        """The cluster key of an agent-controlled peer, None for SSH peers."""
+
+        record = self._key_store.get(node_id)
+        if record is None or record.get("control") != "agent":
+            return None
+        return bytes.fromhex(record["cluster_key"])
 
     def paired_devices(self) -> list[dict[str, Any]]:
         """Persisted paired devices (discovered-but-unpaired never land here)."""
@@ -1692,7 +1727,7 @@ class PairingManager:
         }
 
 
-# --- Configured singleton (mirrors enrollment.py's configure/get pattern) ----
+# --- Configured singleton ----------------------------------------------------
 
 _manager_lock = threading.Lock()
 _configured_manager: PairingManager | None = None
@@ -1702,7 +1737,6 @@ def configure_pairing_manager(
     base_path: Path,
     *,
     registry: Any = None,
-    enrollment_store: Any = None,
     join_watch_s: float | None = 2.0,
     **kwargs: Any,
 ) -> PairingManager:
@@ -1716,7 +1750,6 @@ def configure_pairing_manager(
     with _manager_lock:
         _configured_manager = PairingManager(
             registry,
-            enrollment_store,
             base_path=base_path,
             join_watch_s=join_watch_s,
             **kwargs,

@@ -1241,10 +1241,14 @@ class TestCacheMaterialization:
         leaf_c = Leaf(mx.array([3], dtype=mx.int32))
         calls = []
 
-        def fake_eval(*arrays):
+        def fake_async_eval(*arrays):
             calls.append(arrays)
 
-        monkeypatch.setattr(dsv4.mx, "eval", fake_eval)
+        def blocking_eval(*arrays):
+            raise AssertionError("cache materialization must not block")
+
+        monkeypatch.setattr(dsv4.mx, "async_eval", fake_async_eval)
+        monkeypatch.setattr(dsv4.mx, "eval", blocking_eval)
 
         dsv4._materialize_cache_arrays([CacheList(leaf_a, leaf_b), leaf_c, None])
 
@@ -1916,6 +1920,38 @@ class TestDeepSeekV4SanitizeHcAliases:
 
         assert out["model.layers.0.attn_hc.base"].shape == (2,)
         assert "model.layers.0.hc_attn.base" not in out
+
+
+@pytest.mark.parametrize("hc_mult, hidden", [(2, 8), (4, 6)])
+def test_hyper_connection_kernel_skips_unsupported_layouts(
+    applied_patch, hc_mult, hidden
+):
+    """The fused kernel serves four streams of four-wide rows; other layouts
+    must give the ops path's result."""
+    mx = pytest.importorskip("mlx.core")
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    hc_mod = sys.modules["mlx_lm.models.hyper_connection"]
+    config = SimpleNamespace(
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=3,
+        hc_eps=1e-6,
+        rms_norm_eps=1e-6,
+        hidden_size=hidden,
+    )
+    hc = hc_mod.HyperConnection(config)
+    mx.random.seed(0)
+    hc.fn = mx.random.normal(hc.fn.shape) * 0.1
+    hc.base = mx.random.normal(hc.base.shape) * 0.1
+    x = (mx.random.normal((1, 3, hc_mult, hidden)) * 2).astype(mx.bfloat16)
+
+    hc.eval()
+    got = hc(x)
+    hc.train()
+    want = hc(x)
+    for g, w in zip(got, want):
+        assert mx.array_equal(g, w).item()
 
 
 class TestMtpSanitizeWoAReshape:

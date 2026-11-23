@@ -29,8 +29,15 @@ bool last_dim_contiguous(const array& arr) {
 
 class BlockMaskAttentionPrimitive : public Primitive {
  public:
-  BlockMaskAttentionPrimitive(Stream stream, float scale, bool causal)
-      : Primitive(stream), scale_(scale), causal_(causal) {}
+  BlockMaskAttentionPrimitive(
+      Stream stream,
+      float scale,
+      bool causal,
+      bool has_sinks)
+      : Primitive(stream),
+        scale_(scale),
+        causal_(causal),
+        has_sinks_(has_sinks) {}
 
   static bool unsupported(
       const array& q,
@@ -133,7 +140,7 @@ class BlockMaskAttentionPrimitive : public Primitive {
     const bool align_Q = (qL % bq) == 0;
     const bool align_K = (kL % bk) == 0;
     const bool has_mask = false;
-    const bool has_sinks = false;
+    const bool has_sinks = has_sinks_;
     const bool has_block_mask = true;
     const bool has_block_token_mask = true;
     const bool has_block_indices = false;
@@ -177,7 +184,9 @@ class BlockMaskAttentionPrimitive : public Primitive {
         (align_K ? 't' : 'n'),
         "_has_mask_n_do_causal_",
         (do_causal ? 't' : 'n'),
-        "_has_sinks_n_has_block_mask_t_has_block_token_mask_t_has_block_indices_n");
+        "_has_sinks_",
+        (has_sinks ? 't' : 'n'),
+        "_has_block_mask_t_has_block_token_mask_t_has_block_indices_n");
 
     int64_t str_oD = 1;
     int64_t str_oH = o.shape(3);
@@ -239,6 +248,9 @@ class BlockMaskAttentionPrimitive : public Primitive {
     compute_encoder.set_input_array(v, 2);
     compute_encoder.set_output_array(o, 3);
     compute_encoder.set_bytes(params, 4);
+    if (has_sinks) {
+      compute_encoder.set_input_array(inputs[5], 7);
+    }
     compute_encoder.set_bytes(block_mask_params, 8);
     compute_encoder.set_input_array(block_mask, 9);
     compute_encoder.set_bytes(block_token_mask_params, 10);
@@ -254,15 +266,17 @@ class BlockMaskAttentionPrimitive : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs =
         static_cast<const BlockMaskAttentionPrimitive&>(other);
-    return scale_ == rhs.scale_ && causal_ == rhs.causal_;
+    return scale_ == rhs.scale_ && causal_ == rhs.causal_ &&
+        has_sinks_ == rhs.has_sinks_;
   }
   auto state() const {
-    return std::make_tuple(nullptr, scale_, causal_);
+    return std::make_tuple(nullptr, scale_, causal_, has_sinks_);
   }
 
  private:
   float scale_;
   bool causal_;
+  bool has_sinks_;
 };
 
 } // namespace
@@ -275,6 +289,7 @@ array block_mask_attention(
     const array& block_token_mask,
     float scale,
     bool causal,
+    const std::optional<array>& sinks,
     StreamOrDevice s) {
   for (const auto& tensor : {q, k, v}) {
     if (tensor.ndim() != 4) {
@@ -304,11 +319,21 @@ array block_mask_attention(
 
   Shape out_shape{q_cast.shape(0), q_cast.shape(1), q_cast.shape(2), v_cast.shape(3)};
   std::vector<array> inputs = {q_cast, k_cast, v_cast, block_mask, block_token_mask};
+  if (sinks.has_value()) {
+    // One logit per query head, read in the activation dtype by the kernel.
+    if (sinks->ndim() != 1 || sinks->shape(0) != q_cast.shape(1)) {
+      std::ostringstream msg;
+      msg << "[attention.block_mask_attention] sinks with shape "
+          << sinks->shape() << " expected [H].";
+      throw std::invalid_argument(msg.str());
+    }
+    inputs.push_back(astype(*sinks, final_type, stream));
+  }
   return array(
       std::move(out_shape),
       final_type,
       std::make_shared<BlockMaskAttentionPrimitive>(
-          stream, scale, causal),
+          stream, scale, causal, sinks.has_value()),
       std::move(inputs));
 }
 

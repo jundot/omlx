@@ -17,6 +17,7 @@ import concurrent.futures
 import gc
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -58,6 +59,13 @@ from .utils.hardware import format_bytes
 from .utils.metal_sync import clear_thread_streams
 
 logger = logging.getLogger(__name__)
+
+# Text that shows a client nothing: whitespace and whole tags such as <think>
+# or <|channel|>. Decided on shape, so no model's tag names live here.
+_BLANK_TEXT = re.compile(r"(?:\s|<[^<>\s]*>)*")
+# Most tokens a request may spend before its first visible text while each
+# chunk still ends the decode burst.
+_FIRST_TEXT_MAX_TOKENS = 16
 
 
 class _EngineTeardown:
@@ -189,7 +197,7 @@ def _raise_request_output_error(output: RequestOutput) -> None:
             ),
             limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
         )
-    if output.error_code == "model_unloading":
+    if output.error_code in ("model_unloading", "admin_abort"):
         raise RequestAbortedError(output.error, request_id=output.request_id)
     raise RuntimeError(output.error)
 
@@ -335,8 +343,8 @@ class EngineConfig:
     # case) there is no concurrent request to stay responsive to, so we burst
     # aggressively (decode_burst_budget_single_s). Once concurrent, we use the
     # tight decode_burst_budget_s to keep admission/abort latency low.
-    # A request's first generated chunk always ends the burst so buffering
-    # later decode steps does not add to its time to first token.
+    # A request's chunks up to its first visible text each end the burst, so
+    # buffering later decode steps does not add to its time to first token.
     # max_steps is a safety cap (bounds the host-side output list), NOT a
     # memory knob. Set both budgets <= 0, or max_steps <= 1, to disable.
     decode_burst_max_steps: int = field(
@@ -499,6 +507,32 @@ class EngineCore:
         else:
             loop.call_soon_threadsafe(event.set)
 
+    @staticmethod
+    def _awaits_first_text(item: RequestOutput, running: Any) -> bool:
+        """Whether this chunk must reach the client before decode continues.
+
+        True for a request's first generated chunk, and for each chunk after
+        it until one carries visible text. A reasoning model opens with a
+        think/channel tag that renders nothing, so ending the burst on token 0
+        alone left its first visible text behind a whole burst budget. Capped
+        so a stream of tags or whitespace cannot disable bursting.
+        """
+        if not item.new_token_ids:
+            return False
+        request = running.get(item.request_id) if running else None
+        if request is None:
+            # Cumulative == new tokens marks the first chunk, multi-token
+            # steps included, without per-request state.
+            return item.completion_tokens == len(item.new_token_ids)
+        if request.first_text_released:
+            return False
+        if (
+            not _BLANK_TEXT.fullmatch(item.new_text)
+            or item.completion_tokens >= _FIRST_TEXT_MAX_TOKENS
+        ):
+            request.first_text_released = True
+        return True
+
     def _step_burst(self) -> list:
         """Run scheduler.step() several times in one executor hand-off.
 
@@ -511,13 +545,15 @@ class EngineCore:
         scheduler.step() services aborts/admission/finish every step, so
         correctness is unchanged; the only cost is event-loop responsiveness,
         bounded by decode_burst_budget_s. Stops early when no work remains, a
-        request produces its first chunk, a prefill eviction needs the (async)
-        callback, or the budget elapses —
-        the budget also ends the burst when a slow prefill-chunk step lands.
+        request has not yet produced visible text, a request finishes while a
+        chunked prefill is in flight, a prefill eviction needs the (async)
+        callback, or the budget elapses — the budget also ends the burst when
+        a slow prefill-chunk step lands, including the first one.
 
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
         """
         max_steps = self.config.decode_burst_max_steps
+        started = time.monotonic()
         outputs = [self.scheduler.step()]
         if max_steps <= 1:
             return outputs
@@ -532,16 +568,24 @@ class EngineCore:
         )
         if budget <= 0:
             return outputs
-        deadline = time.monotonic() + budget
+        now = time.monotonic()
+        if now - started >= budget and getattr(outputs[0], "ran_prefill_chunk", False):
+            # A chunk that spent the whole budget hands control back, so queued
+            # admissions and aborts do not wait for a second chunk (#5148).
+            return outputs
+        deadline = now + budget
         while len(outputs) < max_steps:
             last = outputs[-1]
-            # Also release the first chunk of a request admitted mid-burst.
-            # Comparing cumulative and new tokens covers multi-token steps
-            # without per-request tracking. Later chunks retain normal bursts.
-            if any(
-                item.new_token_ids
-                and item.completion_tokens == len(item.new_token_ids)
-                for item in last.outputs
+            # Release a request's opening chunks one step at a time, including
+            # a request admitted mid-burst. Later chunks retain normal bursts.
+            # No short-circuit: every item must update its request.
+            if any([self._awaits_first_text(item, running) for item in last.outputs]):
+                break
+            # A finished request's last output (finish reason, usage) would
+            # otherwise wait for the rest of the burst, which can be a whole
+            # prefill chunk while a prefill is in flight.
+            if last.finished_request_ids and getattr(
+                self.scheduler, "prefilling", None
             ):
                 break
             if (
@@ -633,6 +677,15 @@ class EngineCore:
                         # request still in scheduler) block the entire event loop,
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
+
+                    if any(
+                        getattr(output, "ran_prefill_chunk", False)
+                        for output in step_outputs
+                    ):
+                        # Work queued behind the chunk (VLM prompt prep) wakes
+                        # its caller before this barrier returns, so the
+                        # caller's add_request gets in before the next chunk.
+                        await loop.run_in_executor(self._mlx_executor, lambda: None)
 
                     if eviction_request is not None:
                         callback = self.config.prefill_eviction_callback
@@ -788,8 +841,7 @@ class EngineCore:
         if specprefill is not None:
             request._specprefill_enabled = specprefill
         elif self.scheduler._specprefill_draft_model is not None:
-            # Draft model is loaded → enable by default
-            request._specprefill_enabled = True
+            request._specprefill_enabled = self.scheduler._specprefill_default_enabled
         if specprefill_keep_pct is not None:
             request._specprefill_keep_pct = specprefill_keep_pct
         if specprefill_threshold is not None:
@@ -848,7 +900,13 @@ class EngineCore:
 
         return request_id
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
         """Abort a request.
 
         Uses deferred abort pattern: scheduler.abort_request() just enqueues
@@ -869,7 +927,7 @@ class EngineCore:
             )
             return False
 
-        # A client cancel keeps the computed prefix for a resend.
+        # A client cancel or an admin stop keeps the computed prefix for a resend.
         result = scheduler.abort_request(request_id, keep_cache=True)
 
         # Signal consumer with abort error so any waiting
@@ -877,14 +935,24 @@ class EngineCore:
         # Matches abort_all_requests() pattern.
         collector = self._output_collectors.get(request_id)
         if collector is not None:
-            collector.put(
-                RequestOutput(
+            if reason is None:
+                output = RequestOutput(
                     request_id=request_id,
                     finished=True,
                     finish_reason="abort",
                     error="Request aborted",
                 )
-            )
+            else:
+                # The client still listens; tell it why, as abort_all_requests does.
+                output = RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="error",
+                    new_text=f"\n\n[Error: {reason}]",
+                    error=reason,
+                    error_code=error_code,
+                )
+            collector.put(output)
         self._mark_request_finished(request_id)
         self._wake_engine_loop()
 
@@ -1534,7 +1602,13 @@ class AsyncEngineCore:
             **kwargs,
         )
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
         """Abort a request."""
         engine = getattr(self, "engine", None)
         if engine is None:
@@ -1543,7 +1617,9 @@ class AsyncEngineCore:
                 request_id,
             )
             return False
-        return await engine.abort_request(request_id)
+        return await engine.abort_request(
+            request_id, reason=reason, error_code=error_code
+        )
 
     async def abort_all_requests(
         self,

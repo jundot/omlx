@@ -8,6 +8,7 @@ final class PerformanceScreenVM {
     var embeddingBatchSizeText: String = "32"
     var chunkedPrefill: Bool = false
     var prefillPriority: String = "context"
+    var concurrentPriority: String = "balanced"
 
     // Memory & Lifecycle
     var prefillMemoryGuard: Bool = false
@@ -30,6 +31,7 @@ final class PerformanceScreenVM {
     private(set) var loadedEmbeddingBatchSize: Int = 32
     private(set) var loadedChunkedPrefill: Bool = false
     private(set) var loadedPrefillPriority: String = "context"
+    private(set) var loadedConcurrentPriority: String = "balanced"
     private(set) var loadedPrefillMemoryGuard: Bool = false
     private(set) var loadedMemoryGuardTier: String = "balanced"
     private(set) var loadedMemoryGuardCustomCeilingGb: Double = 0
@@ -61,6 +63,7 @@ final class PerformanceScreenVM {
             || parsedEmbeddingBatchSize != loadedEmbeddingBatchSize
             || chunkedPrefill != loadedChunkedPrefill
             || prefillPriority != loadedPrefillPriority
+            || concurrentPriority != loadedConcurrentPriority
             || prefillMemoryGuard != loadedPrefillMemoryGuard
             || canonicalMemoryGuardTier(memoryGuardTier) != loadedMemoryGuardTier
             || parsedMemoryGuardCustomCeiling != loadedMemoryGuardCustomCeilingGb
@@ -83,6 +86,7 @@ final class PerformanceScreenVM {
             embeddingBatchSizeText: embeddingBatchSizeText,
             chunkedPrefill: chunkedPrefill,
             prefillPriority: prefillPriority,
+            concurrentPriority: concurrentPriority,
             prefillMemoryGuard: prefillMemoryGuard,
             memoryGuardTier: memoryGuardTier,
             memoryGuardCustomCeilingText: memoryGuardCustomCeilingText,
@@ -103,6 +107,7 @@ final class PerformanceScreenVM {
                 self.embeddingBatchSizeText = previous.embeddingBatchSizeText
                 self.chunkedPrefill = previous.chunkedPrefill
                 self.prefillPriority = previous.prefillPriority
+                self.concurrentPriority = previous.concurrentPriority
                 self.prefillMemoryGuard = previous.prefillMemoryGuard
                 self.memoryGuardTier = previous.memoryGuardTier
                 self.memoryGuardCustomCeilingText = previous.memoryGuardCustomCeilingText
@@ -122,6 +127,7 @@ final class PerformanceScreenVM {
                 self.chunkedPrefill = sched.chunkedPrefill ?? false
                 let priority = sched.prefillPriority == "speed" ? "speed" : "context"
                 self.prefillPriority = priority
+                self.concurrentPriority = canonicalConcurrentPriority(sched.concurrentPriority)
             }
             if let mem = s.memory {
                 self.prefillMemoryGuard = mem.prefillMemoryGuard ?? false
@@ -178,6 +184,9 @@ final class PerformanceScreenVM {
                 let priority = sched.prefillPriority == "speed" ? "speed" : "context"
                 self.prefillPriority = priority
                 self.loadedPrefillPriority = priority
+                let concurrentPriority = canonicalConcurrentPriority(sched.concurrentPriority)
+                self.concurrentPriority = concurrentPriority
+                self.loadedConcurrentPriority = concurrentPriority
             }
             if let mem = s.memory {
                 self.prefillMemoryGuard = mem.prefillMemoryGuard ?? false
@@ -289,6 +298,9 @@ final class PerformanceScreenVM {
         if prefillPriority != loadedPrefillPriority {
             patch.prefillPriority = prefillPriority
         }
+        if concurrentPriority != loadedConcurrentPriority {
+            patch.concurrentPriority = concurrentPriority
+        }
         // Memory & lifecycle
         if prefillMemoryGuard != loadedPrefillMemoryGuard {
             patch.memoryPrefillMemoryGuard = prefillMemoryGuard
@@ -332,6 +344,7 @@ final class PerformanceScreenVM {
             self.loadedEmbeddingBatchSize = embeddingBatchSize
             self.loadedChunkedPrefill = chunkedPrefill
             self.loadedPrefillPriority = prefillPriority
+            self.loadedConcurrentPriority = concurrentPriority
             self.loadedPrefillMemoryGuard = prefillMemoryGuard
             self.loadedMemoryGuardTier = tier
             self.loadedMemoryGuardCustomCeilingGb = customCeiling
@@ -396,6 +409,13 @@ final class PerformanceScreenVM {
         let rounded = (v * 100).rounded() / 100
         if rounded == Double(Int(rounded)) { return String(Int(rounded)) }
         return String(rounded)
+    }
+
+    private func canonicalConcurrentPriority(_ value: String?) -> String {
+        guard let value, value == "prefill" || value == "decode" else {
+            return "balanced"
+        }
+        return value
     }
 
     private func canonicalMemoryGuardTier(_ value: String) -> String {

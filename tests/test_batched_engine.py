@@ -13,6 +13,8 @@ Tests cover:
 Note: mlx_lm.load() is mocked to avoid loading real models.
 """
 
+import threading
+import time
 from abc import ABC
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -20,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from omlx.api.grammar import GRAMMAR_CACHE_LIMIT_BYTES
 from omlx.engine.base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
 
 
@@ -367,6 +370,30 @@ class TestBatchedEngineInitialization:
 
         assert engine._model is None
         assert engine._engine is None
+
+
+class TestBatchedEngineAbortRequest:
+    @pytest.mark.asyncio
+    async def test_abort_request_only_reaches_owned_requests(self):
+        from omlx.engine.batched import BatchedEngine
+
+        core = MagicMock()
+        core._output_collectors = {"req-1": object(), "done": object()}
+        core._finished_at = {"done": 0.0}
+        core.abort_request = AsyncMock(return_value=True)
+        engine = BatchedEngine(model_name="test-model")
+        engine._engine = SimpleNamespace(engine=core)
+
+        assert await engine.abort_request("other") is False
+        assert await engine.abort_request("done") is False
+        core.abort_request.assert_not_awaited()
+
+        assert await engine.abort_request(
+            "req-1", reason="stop", error_code="admin_abort"
+        )
+        core.abort_request.assert_awaited_once_with(
+            "req-1", reason="stop", error_code="admin_abort"
+        )
 
 
 class TestBatchedEngineStreamingCleanup:
@@ -1472,3 +1499,54 @@ class TestBatchedEngineToolParserRepair:
 
         assert engine.tokenizer is tokenizer
         assert tokenizer.tool_parser.__module__ == f"mlx_lm.tool_parsers.{expected}"
+
+
+class TestGrammarCompilerLazyInit:
+    def test_concurrent_first_access_shares_one_compiler(self):
+        """Concurrent first callers all get the compiler, built once."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._model = SimpleNamespace(config={"model_type": "k2_horizon"})
+        engine._tokenizer = object()
+
+        sentinel = object()
+        calls: list[int] = []
+        results: list[Any] = []
+        start = threading.Barrier(8)
+
+        def fake_create(tokenizer, model, cache_limit_bytes=-1):
+            calls.append(1)
+            time.sleep(0.05)
+            return sentinel
+
+        def worker():
+            start.wait(timeout=5)
+            results.append(engine.grammar_compiler)
+
+        with patch("omlx.api.grammar.create_grammar_compiler", side_effect=fake_create):
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert len(results) == 8
+        assert all(result is sentinel for result in results), results
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize(
+        ("model_type", "limit"),
+        [("qwen3", GRAMMAR_CACHE_LIMIT_BYTES), ("k2_horizon", 64 * 1024**2)],
+    )
+    def test_compiler_cache_is_bounded(self, model_type, limit):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._model = SimpleNamespace(config={"model_type": model_type})
+        engine._tokenizer = object()
+
+        with patch("omlx.api.grammar.create_grammar_compiler") as create:
+            assert engine.grammar_compiler is create.return_value
+
+        assert create.call_args.kwargs == {"cache_limit_bytes": limit}

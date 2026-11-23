@@ -99,6 +99,8 @@ class ClaudeCodeIntegration(Integration):
         env["ANTHROPIC_AUTH_TOKEN"] = ctx.auth_token
         env["ANTHROPIC_API_KEY"] = ""
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
+        # Allows automode to work without generating Claude server message.
+        env["CLAUDE_CODE_AUTO_MODE_SERVER"] = "0"
         # Large timeout for local model inference (model loading + generation).
         env["API_TIMEOUT_MS"] = "3000000"
         if ctx.model:
@@ -146,7 +148,9 @@ class ClaudeCodeIntegration(Integration):
             env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent_model
 
         if ctx.context_window:
-            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
+            # Claude Code warns at startup when this is outside [100k, 1M].
+            if 100_000 <= ctx.context_window <= 1_000_000:
+                env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
             # Claude Code (2.1.220+) reads CLAUDE_CODE_MAX_CONTEXT_TOKENS to
             # set the *detected* context window for custom model IDs that
             # don't canonicalize to "claude-*"; auto-compact then fires at

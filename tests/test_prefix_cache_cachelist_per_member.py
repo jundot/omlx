@@ -483,3 +483,35 @@ def test_store_refuses_blanked_member_source(tmp_path):
     _assert_restored(
         cache.reconstruct_cache(table2), expected_seq_len=num_blocks * BLOCK_SIZE
     )
+
+
+def test_all_kv_cachelist_snapshot_is_a_placeholder(tmp_path):
+    """Hy4 Flash's append-only CacheList is stored from the full cache."""
+    from types import SimpleNamespace
+
+    from omlx.scheduler import Scheduler
+
+    seq_len = 3 * BLOCK_SIZE
+    latent, index = KVCache(), KVCache()
+    keys, values = _position_kv(seq_len)
+    latent.update_and_fetch(keys, values)
+    index.update_and_fetch(keys, values)
+    live = [_layer_dict(CacheList(latent, index))]
+    stub = SimpleNamespace(_extract_cache_states=lambda _: ([dict(live[0])], None))
+    boundary, _ = Scheduler._extract_snapshot_cache_states(stub, [])
+    assert boundary[0]["state"] == ()
+    assert Scheduler._is_sliceable_extracted_layer(live[0])
+
+    cache, ssd = _make_cache(tmp_path)
+    try:
+        tokens = list(range(seq_len))
+        assert cache.store_cache("hy4", tokens, live) is not None
+        table, _ = cache.fetch_cache("hy4-prefix", tokens[: 2 * BLOCK_SIZE] + [-1])
+        restored = cache.reconstruct_cache(table)
+        for original, actual in zip((latent, index), restored[0].caches):
+            assert actual.offset == 2 * BLOCK_SIZE
+            n = actual.offset
+            assert mx.array_equal(original.keys[:, :, :n], actual.keys[:, :, :n])
+            assert mx.array_equal(original.values[:, :, :n], actual.values[:, :, :n])
+    finally:
+        ssd.close()

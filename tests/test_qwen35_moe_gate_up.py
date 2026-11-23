@@ -364,7 +364,9 @@ def test_expert_ordered_verify_gather_matches_gather_qmm(bits):
                 group_size=32,
                 bits=bits,
             ).reshape(rows * top_k, n)
-            got = moe_verify_gather.gather_qmv(linear, x, indices.reshape(-1), top_k)
+            pairs = indices.reshape(-1)
+            order = moe_verify_gather.pair_order(pairs)
+            got = moe_verify_gather.gather_qmv(linear, x, pairs, top_k, order)
             assert mx.array_equal(got, expected).item()
 
 

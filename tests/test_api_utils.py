@@ -59,7 +59,7 @@ from omlx.api.utils import (
     uses_native_reasoning_content,
 )
 from omlx.exceptions import InvalidRequestError
-from omlx.model_settings import ModelSettings
+from omlx.model_settings import ModelSettings, merge_chat_template_request_kwargs
 
 
 class TestReasoningEffortChatTemplateKwargs:
@@ -84,6 +84,38 @@ class TestReasoningEffortChatTemplateKwargs:
 
         assert merged == {"reasoning_effort": 0.9}
         assert isinstance(merged["reasoning_effort"], float)
+
+    @pytest.mark.parametrize("effort", ["none", " Off "])
+    def test_off_effort_disables_thinking_and_keeps_effort(self, effort):
+        assert merge_reasoning_effort_chat_template_kwargs(None, effort) == {
+            "enable_thinking": False,
+            "reasoning_effort": effort,
+        }
+
+    def test_explicit_enable_thinking_wins_over_none_effort(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(
+            {"enable_thinking": True}, "none"
+        )
+
+        assert merged == {"enable_thinking": True, "reasoning_effort": "none"}
+
+    def test_explicit_template_effort_wins_over_none_effort(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(
+            {"reasoning_effort": "low"}, "none"
+        )
+
+        assert merged == {"reasoning_effort": "low"}
+
+    def test_forced_enable_thinking_keeps_none_effort(self):
+        settings = ModelSettings(
+            enable_thinking=True, forced_ct_kwargs=["enable_thinking"]
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings, merge_reasoning_effort_chat_template_kwargs(None, "none")
+        )
+
+        assert merged == {"enable_thinking": True, "reasoning_effort": "none"}
 
 
 class TestCleanOutputText:
@@ -3506,6 +3538,26 @@ class TestExtractMultimodalContent:
             "type": "image_url",
             "image_url": {"url": "data:image/png;base64,abc"},
         }
+
+    def test_converts_hf_image_part_with_data_uri(self):
+        """{"type": "image", "image": "<data URI>"} keeps the image (#5471)."""
+        message = Message(
+            role="user",
+            content=[
+                {"type": "text", "text": "What color is this image?"},
+                {"type": "image", "image": "data:image/png;base64,abc"},
+            ],
+        )
+
+        result = extract_multimodal_content([message])
+
+        assert result[0]["content"] == [
+            {"type": "text", "text": "What color is this image?"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+            },
+        ]
 
     def test_image_url_missing_url_dropped(self):
         """image_url item with no extractable URL should be dropped."""

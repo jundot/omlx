@@ -589,4 +589,9 @@ NB_MODULE(_ext, m) {
       "inv_order"_a,
       "scores"_a,
       "stream"_a = nb::none());
+  m.def("moe_weighted_sum_top_ks", []() {
+    return std::vector<int>(
+        std::begin(omlx::quant_matmul::kMoeWeightedSumTopKs),
+        std::end(omlx::quant_matmul::kMoeWeightedSumTopKs));
+  });
 }

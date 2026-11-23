@@ -76,6 +76,10 @@ _HTML_CONTENT_TYPES = {"", "text/html", "application/xhtml+xml"}
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _USER_AGENT = "omlx-web/1.0"
 
+# Fake-IP proxies (Clash, sing-box) resolve every host into this benchmark
+# block. The proxy picks the real address, so the guard cannot check it.
+_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
 
 class WebSearchError(Exception):
     """Tool failure carrying a stable error code the chat model can act on."""
@@ -555,7 +559,7 @@ async def _assert_public_host(host: str) -> None:
         mapped = getattr(ip, "ipv4_mapped", None)
         if mapped is not None:
             ip = mapped
-        if not ip.is_global:
+        if not ip.is_global and ip not in _FAKE_IP_NETWORK:
             raise WebSearchError(
                 "invalid_arguments",
                 "Fetching private or local network addresses is not allowed.",

@@ -3,6 +3,7 @@
 import json
 import os
 import plistlib
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -137,8 +138,8 @@ def codex_probe():
         yield probe
 
 
-def write_fake_codex(path: Path, body: str) -> str:
-    path.write_text(f"#!{sys.executable}\n{body}")
+def write_fake_codex(path: Path, body: str, interpreter: str = sys.executable) -> str:
+    path.write_text(f"#!{interpreter}\n{body}")
     path.chmod(0o755)
     return str(path)
 
@@ -235,13 +236,13 @@ class TestCodexIntegration:
     def test_capture_kills_the_whole_codex_process_group(self, tmp_path):
         pid_file = tmp_path / "child.pid"
         # Like the npm shim: a parent that never posts, with a native child.
+        # A shell script rather than a Python one: the probe's 1 s timeout would
+        # otherwise race the interpreter's start-up on a loaded runner, and the
+        # pid file would never be written.
         codex_bin = write_fake_codex(
             tmp_path / "codex",
-            "import subprocess, sys, time\n"
-            "child = subprocess.Popen([sys.executable, '-c',"
-            " 'import time; time.sleep(60)'])\n"
-            f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
-            "time.sleep(60)\n",
+            f"sleep 60 &\necho $! > {shlex.quote(str(pid_file))}\nsleep 60\n",
+            interpreter="/bin/sh",
         )
 
         with patch("omlx.integrations.codex._PROBE_TIMEOUT_SECONDS", 1.0):
@@ -425,7 +426,11 @@ class TestCodexConfigWriter:
 
 
 def make_app_bundle(
-    root: Path, name: str, bundle_id: str, with_cli: bool = True
+    root: Path,
+    name: str,
+    bundle_id: str,
+    with_cli: bool = True,
+    cli_path: str = "codex",
 ) -> Path:
     """Create a fake macOS app bundle with an Info.plist and optional CLI."""
     contents = root / name / "Contents"
@@ -433,9 +438,8 @@ def make_app_bundle(
     with (contents / "Info.plist").open("wb") as f:
         plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
     if with_cli:
-        resources = contents / "Resources"
-        resources.mkdir()
-        cli = resources / "codex"
+        cli = contents / "Resources" / cli_path
+        cli.parent.mkdir(parents=True)
         cli.write_text("#!/bin/sh\n")
         cli.chmod(0o755)
     return root / name
@@ -557,8 +561,13 @@ class TestCodexAppIntegration:
             assert not CodexAppIntegration().is_installed()
 
     @pytest.mark.usefixtures("codex_probe")
-    def test_launch_falls_back_to_bundled_cli(self, tmp_path):
-        bundle = make_app_bundle(tmp_path, "Codex.app", "com.openai.codex")
+    @pytest.mark.parametrize(
+        "cli_path", ["codex", "codex-cli/CodexCLI.app/Contents/MacOS/codex"]
+    )
+    def test_launch_falls_back_to_bundled_cli(self, tmp_path, cli_path):
+        bundle = make_app_bundle(
+            tmp_path, "Codex.app", "com.openai.codex", cli_path=cli_path
+        )
         config_path = tmp_path / "codex" / "config.toml"
         captured = {}
 
@@ -576,7 +585,7 @@ class TestCodexAppIntegration:
                 ctx(port=8000, api_key="key", model="q", models_status_map=CODEX_STATUS)
             )
 
-        bundled = str(bundle / "Contents" / "Resources" / "codex")
+        bundled = str(bundle / "Contents" / "Resources" / cli_path)
         assert captured["binary"] == bundled
         assert captured["argv"] == [bundled, "app"]
 
@@ -1678,6 +1687,7 @@ class TestClaudeCodeIntegration:
         assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "qwen3.5"
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
+        assert env["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
         # Bundled-python vars must be stripped so claude code subprocess hooks
         # don't inherit our cpython-3.11 stack.
         assert "PYTHONHOME" not in env
@@ -1767,7 +1777,7 @@ class TestClaudeCodeIntegration:
             )
 
         env = captured["env"]
-        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "49152"
+        assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "49152"
 
     def test_launch_sets_max_context_tokens_64k(self):
@@ -1794,7 +1804,7 @@ class TestClaudeCodeIntegration:
             )
 
         env = captured["env"]
-        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "65536"
+        assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
 
     def test_launch_sets_max_context_tokens_for_canonical_claude_alias(self):

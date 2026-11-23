@@ -13,6 +13,10 @@ import SwiftUI
 struct AppView: View {
     @State private var selection: AppSection? = .status
     @State private var presentedUpdate: AvailableUpdate?
+    @State private var settingsQuery = ""
+    @State private var highlightedSettingID: String?
+    @FocusState private var settingsSearchFocused: Bool
+    @FocusState private var settingsResultsFocused: Bool
 
     @AppStorage(EnhancedReadability.enabledKey) private var enhancedReadability = false
 
@@ -24,13 +28,23 @@ struct AppView: View {
             for: scheme, enhancedReadability: enhancedReadability
         )
         let section = selectedSection
+        let searchResults = SettingsSearch.results(for: settingsQuery)
 
         // The sidebar is the only way to switch screens, so it must never
         // collapse: pin visibility to `.all` and remove the toolbar toggle,
         // matching System Settings.
         NavigationSplitView(columnVisibility: .constant(.all)) {
-            SettingsSidebar(selection: bindingForSelection())
-                .toolbar(removing: .sidebarToggle)
+            Group {
+                if settingsQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    SettingsSidebar(selection: bindingForSelection())
+                } else {
+                    SettingsSearchResults(results: searchResults, selection: $highlightedSettingID,
+                                          activate: openSetting)
+                        .focused($settingsResultsFocused)
+                }
+            }
+            .toolbar(removing: .sidebarToggle)
+            .navigationSplitViewColumnWidth(min: 180, ideal: 195, max: 215)
         } detail: {
             ContentScaffold(
                 section: section,
@@ -40,6 +54,22 @@ struct AppView: View {
             ) {
                 screen(for: section)
             }
+        }
+        .searchable(text: $settingsQuery, placement: .sidebar,
+                    prompt: Text(String(localized: "settings.search.prompt", defaultValue: "Search Settings",
+                                        comment: "Placeholder for the global settings search field")))
+        .searchFocused($settingsSearchFocused)
+        .onSubmit(of: .search) {
+            openHighlightedSetting()
+        }
+        // Sidebar search can consume Return before onSubmit; scope key handling to search and its results.
+        .onKeyPress(.return) {
+            guard settingsSearchFocused || settingsResultsFocused else { return .ignored }
+            openHighlightedSetting()
+            return .handled
+        }
+        .onChange(of: settingsQuery) { _, _ in
+            highlightedSettingID = nil
         }
         .navigationSplitViewStyle(.balanced)
         // Fixed width, like System Settings: the sidebar plus the 720 pt
@@ -89,6 +119,20 @@ struct AppView: View {
             )
                 .environment(\.omlxTheme, theme)
         }
+    }
+
+    private func openHighlightedSetting() {
+        let results = SettingsSearch.results(for: settingsQuery)
+        if let entry = results.first(where: { $0.id == highlightedSettingID }) ?? results.first {
+            openSetting(entry)
+        }
+    }
+
+    private func openSetting(_ entry: SettingsSearchEntry) {
+        highlightedSettingID = entry.id
+        services.requestedServerAnchor = nil
+        bindingForSelection().wrappedValue = entry.section
+        services.askAIPage = entry.askAIPage
     }
 
     /// Drilling out of ModelSettingsScreen via the sidebar (changing section)
@@ -539,7 +583,49 @@ private struct SettingsSidebar: View {
             }
         }
         .listStyle(.sidebar)
-        .navigationSplitViewColumnWidth(min: 180, ideal: 195, max: 215)
+    }
+}
+
+private struct SettingsSearchResults: View {
+    let results: [SettingsSearchEntry]
+    @Binding var selection: String?
+    let activate: (SettingsSearchEntry) -> Void
+
+    var body: some View {
+        List(selection: $selection) {
+            ForEach(results) { entry in
+                Button {
+                    activate(entry)
+                } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(entry.title())
+                            .font(.body)
+                        Text(entry.breadcrumb())
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .tag(entry.id)
+                .help("\(entry.title()) — \(entry.breadcrumb())")
+                .accessibilityLabel("\(entry.title()), \(entry.breadcrumb())")
+                .accessibilityIdentifier("settings-search-result-\(entry.id)")
+            }
+        }
+        .listStyle(.sidebar)
+        .overlay {
+            if results.isEmpty {
+                Text(String(localized: "settings.search.empty", defaultValue: "No settings found",
+                            comment: "Empty state for global settings search results"))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding()
+            }
+        }
     }
 }
 

@@ -50,7 +50,7 @@ def test_network_auth_ui_behavior():
         "[::1]",
     ]
     result = subprocess.run(
-        [node, str(ROOT / "tests/network_auth_ui.test.cjs")],
+        [node, str(ROOT / "tests/network_auth_ui_runner.cjs")],
         input=json.dumps([(host, is_loopback_bind(host)) for host in hosts]),
         capture_output=True,
         text=True,

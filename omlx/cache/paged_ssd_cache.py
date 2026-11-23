@@ -367,6 +367,8 @@ _NUMERICS_REVISIONS = {
     "mlx_vlm.models.deepseekocr.vision": "mlx-vlm-138d761",
     "mlx_vlm.models.minicpmv4_6.vision": "mlx-vlm-138d761",
     "mlx_vlm.quantization.nvfp4": "mlx-vlm-138d761",
+    # Hy4 Flash blocks stored after a restore before #5534 hold wrong ranges.
+    "omlx.patches.hy_v4.flash": "hy4-flash-ranges-1",
 }
 
 
@@ -409,6 +411,12 @@ def numerics_revision_for_model(model: Any) -> str | None:
     # Set by cast_bf16_params_to_fp16: KV computed before the recast is bf16.
     if any(getattr(module, "_omlx_fp16_recast", False) for module in modules):
         revisions.add("fp16-recast")
+    # Set by apply_adapter: KV depends on the LoRA weights.
+    revisions.update(
+        f"lora-{signature}"
+        for module in modules
+        if (signature := getattr(module, "_omlx_lora_signature", None))
+    )
     # DeepSeek V4.1 CED prefill stores approximate decoder states.
     if any(
         type(module).__module__ == _DEEPSEEK_V41_LANGUAGE_MODULE
@@ -416,6 +424,20 @@ def numerics_revision_for_model(model: Any) -> str | None:
         for module in modules
     ):
         revisions.add("ced-prefill-1")
+    # A8 prefill computes KV from INT8 activations. apply_qwen35_oq_a8_patch
+    # tags the modules of a model; DeepSeek V4.1 keeps the flag in its config.
+    # MiniMax M3 tags its projections and expert banks (minimax_m3_compat.a8).
+    if any(
+        getattr(module, "_omlx_oq_a8_config", None) is not None
+        or hasattr(module, "_omlx_a8_plan")
+        or hasattr(module, "_omlx_minimax_a8_min_tokens")
+        or (
+            type(module).__module__ == _DEEPSEEK_V41_LANGUAGE_MODULE
+            and getattr(getattr(module, "_config", None), "a8_prefill", False)
+        )
+        for module in modules
+    ):
+        revisions.add("a8-prefill-1")
     return ",".join(sorted(revisions)) or None
 
 
@@ -5402,6 +5424,22 @@ class PagedSSDCacheManager(CacheManager):
         """Number of reduced-namespace lookups resolved by legacy FP32."""
         with self._lock:
             return self._gdn_legacy_fp32_fallbacks
+
+    def get_tracked_files(self) -> dict[Path, int]:
+        """Return the size of each tracked SSD file, keyed by path.
+
+        Includes other models' blocks and sidecars, the same files that
+        ``_tracked_ssd_size()`` charges to the shared SSD budget.
+        """
+        with self._lock:
+            return {
+                metadata.file_path: metadata.file_size
+                for metadata in (
+                    *self._index.get_all_metadata(),
+                    *self._incompatible_index.get_all_metadata(),
+                    *self._gdn_sidecar_index.get_all_metadata(),
+                )
+            }
 
     def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
         """Get model-scoped SSD cache statistics.

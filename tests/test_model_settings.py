@@ -14,6 +14,7 @@ from omlx.model_settings import (
     ModelSettingsManager,
     a8_prefill_on,
     ced_prefill_on,
+    resolve_lora_conflicts,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
 )
@@ -893,47 +894,19 @@ class TestVlmMtpProcessorExclusivity:
 # --------------------------------------------------------------------------
 
 
-def test_a8_and_ced_are_on_until_saved_off():
-    """Unset means on; only a saved False turns them off. Unset A8 yields to
-    ANE prefill, which takes the same projections."""
+def test_ced_is_on_until_saved_off_and_a8_off_until_saved_on():
+    """CED stays on unless saved off. A8 changes numerics, so it runs only
+    when saved on."""
     settings = ModelSettings()
-    assert settings.a8_prefill_enabled is None and a8_prefill_on(settings)
+    assert settings.a8_prefill_enabled is None and not a8_prefill_on(settings)
     assert settings.deepseek_v41_ced_prefill_enabled is None
     assert ced_prefill_on(settings) and ced_prefill_on(None)
     assert settings.a8_prefill_min_tokens == 128
-    assert not a8_prefill_on(ModelSettings(qwen35_ane_prefill_enabled=True))
+    assert a8_prefill_on({"a8_prefill_enabled": True})
     assert not a8_prefill_on({"a8_prefill_enabled": False})
     assert not ced_prefill_on({"deepseek_v41_ced_prefill_enabled": False})
     # Unset values are not written, so they stay distinguishable.
     assert "a8_prefill_enabled" not in settings.to_dict()
-
-
-@pytest.mark.parametrize("kernels", [False, True])
-def test_old_files_unset_a8_only_where_it_could_not_be_turned_on(
-    tmp_path, monkeypatch, kernels
-):
-    """Before version 2 every save stored A8 False. Without the kernels the
-    toggle was hidden and saving it on was refused, so that False is a
-    default; with them it may be a choice. CED False is kept either way."""
-    monkeypatch.setattr(
-        "omlx.model_settings.quant_fast.oq_a8_available", lambda: kernels
-    )
-    (tmp_path / "model_settings.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "models": {
-                    "m": {
-                        "qwen35_oq_a8_enabled": False,
-                        "deepseek_v41_ced_prefill_enabled": False,
-                    }
-                },
-            }
-        )
-    )
-    settings = ModelSettingsManager(tmp_path).get_settings("m")
-    assert settings.a8_prefill_enabled is (False if kernels else None)
-    assert settings.deepseek_v41_ced_prefill_enabled is False
 
 
 def test_oq_a8_and_ane_prefill_cannot_both_be_enabled():
@@ -981,6 +954,37 @@ def test_prefill_conflict_resolution_leaves_clean_dicts_alone():
         assert conflicts == []
         # Unchanged dicts are returned as-is, not copied.
         assert resolved is data
+
+
+def test_lora_adapter_conflicts_raise_and_profile_merges_drop_them(tmp_path):
+    """Paths that skip the wrapped projections cannot run with an adapter; a
+    profile merged over such a base keeps the adapter and drops the others."""
+    with pytest.raises(ValueError, match="DFlash"):
+        ModelSettings(lora_adapter="/a", dflash_enabled=True)
+    resolved, names = resolve_lora_conflicts(
+        {
+            "lora_adapter": "/a",
+            "dflash_enabled": True,
+            "prefill_helper_node_id": "m5",
+            "max_tokens": 4,
+        }
+    )
+    assert names == ["dflash_enabled", "prefill_helper_node_id"]
+    settings = ModelSettings.from_dict(resolved)
+    assert (settings.dflash_enabled, settings.prefill_helper_node_id) == (False, None)
+    assert (settings.lora_adapter, settings.max_tokens) == ("/a", 4)
+
+    # A hand-edited file keeps the model's other settings.
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps(
+            {
+                "version": SETTINGS_VERSION,
+                "models": {"m": {"lora_adapter": "/a", "dflash_enabled": True}},
+            }
+        )
+    )
+    loaded = ModelSettingsManager(tmp_path).get_settings("m")
+    assert (loaded.lora_adapter, loaded.dflash_enabled) == ("/a", False)
 
 
 def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
@@ -1037,6 +1041,39 @@ def test_old_a8_setting_names_still_load(tmp_path):
     # A record holding both names keeps the current one.
     both = {"qwen35_oq_a8_enabled": True, "a8_prefill_enabled": False}
     assert rename_legacy_fields(both) == {"a8_prefill_enabled": False}
+
+
+@pytest.mark.parametrize(("version", "expected"), [(2, None), (SETTINGS_VERSION, 3)])
+def test_ui_default_mtp_depth_loads_as_the_model_default(tmp_path, version, expected):
+    """UIs before settings v3 saved depth 3 for "Default"; it loads unset so the
+    model's own ceiling applies, while a 3 saved since then is a real choice."""
+    depth = {"mtp_enabled": True, "mtp_adaptive_max_depth": 3}
+    models = {"m": depth, "deep": {**depth, "mtp_adaptive_max_depth": 5}}
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps({"version": version, "models": models})
+    )
+    record = {
+        "name": "p",
+        "display_name": "P",
+        "created_at": "2026-06-01T00:00:00+00:00",
+        "updated_at": "2026-06-01T00:00:00+00:00",
+        "settings": dict(depth),
+    }
+    store_version = 1 if version < SETTINGS_VERSION else 2
+    (tmp_path / "model_profiles.json").write_text(
+        json.dumps({"version": store_version, "profiles": {"m": {"p": record}}})
+    )
+    (tmp_path / "global_templates.json").write_text(
+        json.dumps({"version": store_version, "templates": {"t": record}})
+    )
+
+    manager = ModelSettingsManager(tmp_path)
+    assert manager.get_settings("m").mtp_adaptive_max_depth == expected
+    assert manager.get_settings("deep").mtp_adaptive_max_depth == 5
+    profile = manager.get_profile("m", "p")["settings"]
+    assert profile.get("mtp_adaptive_max_depth") == expected
+    template = manager.get_template("t")["settings"]
+    assert template.get("mtp_adaptive_max_depth") == expected
 
 
 def test_oq_a8_exposes_no_kernel_choice():

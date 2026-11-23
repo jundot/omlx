@@ -550,7 +550,7 @@ class TestConvertToolsForTemplate:
 
     @pytest.mark.parametrize("render_properties", [False, True])
     def test_schema_key_order_does_not_change_rendered_tools(self, render_properties):
-        """Equivalent JSON object orders must produce the same prompt prefix."""
+        """Reordered schema keywords must produce the same prompt prefix."""
         from jinja2 import Environment, StrictUndefined
 
         schema = {
@@ -572,11 +572,17 @@ class TestConvertToolsForTemplate:
             "anyOf": [{"type": "string"}, {"type": "number"}],
         }
 
-        def reverse_object_keys(value):
+        def reverse_object_keys(value, in_properties=False):
+            # Property names keep their order: it is part of the tool definition.
             if isinstance(value, dict):
+                items = list(value.items())
+                if not in_properties:
+                    items.reverse()
                 return {
-                    key: reverse_object_keys(child)
-                    for key, child in reversed(list(value.items()))
+                    key: reverse_object_keys(
+                        child, in_properties=key == "properties" and not in_properties
+                    )
+                    for key, child in items
                 }
             if isinstance(value, list):
                 return [reverse_object_keys(child) for child in value]
@@ -606,6 +612,9 @@ class TestConvertToolsForTemplate:
         assert template.render(tools=converted) == template.render(tools=reordered)
         assert [json.dumps(tools), json.dumps(reordered_tools)] == originals
         parameters = converted[0]["function"]["parameters"]
+        assert list(parameters) == ["type", "properties", "required", "anyOf"]
+        assert list(parameters["properties"]) == ["query", "filters"]
+        assert list(parameters["properties"]["query"]) == ["type", "description"]
         assert parameters["required"] == ["query", "filters"]
         assert [item["type"] for item in parameters["anyOf"]] == ["string", "number"]
 
@@ -1692,6 +1701,31 @@ def test_recovery_candidate_unclosed_envelope_3153_is_payload():
     assert "<tool_call>" not in visible
     assert f.recovery_candidate_is_payload() is True
     assert f.take_recovery_candidate().startswith("<tool_call>")
+
+
+@pytest.mark.parametrize(
+    "text,is_payload",
+    [
+        # Coding-agent tool names are common words: in prose they are not a call.
+        ("<tool_call>`, which the parser will read first. END", False),
+        ("<tool_call> opens the call; the model must write the name next. END", False),
+        ("<tool_call> then write to save. END", False),
+        # In call position, right after the opener, they still are.
+        ('<tool_call>write(content="hel', True),
+        ("<tool_call>\nread\n<arg_key>path</arg_key>", True),
+        ("<tool_call>  edit", True),
+        # MiniCPM5's opener ends at "name=", so the name follows a quote.
+        ('<function name="write"><param name="content">hel', True),
+    ],
+)
+def test_declared_tool_name_is_call_evidence_only_in_call_position(text, is_payload):
+    tokenizer = _make_tokenizer_with_end("<function name=", "</function>")
+    f = ToolCallStreamFilter(tokenizer, tools=["read", "write", "edit", "bash"])
+    f.feed(text)
+    f.finish()
+
+    assert f.recovery_candidate_is_payload() is is_payload
+    assert f.take_recovery_candidate()
 
 
 def test_close_marker_fallback_rescans_the_recovered_tail():
@@ -6003,6 +6037,33 @@ def test_native_union_parameter_keeps_correct_python_literal_values(
     assert json.loads(calls[0].function.arguments)["v"] == expected
 
 
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '["a"]\n["b"]',
+        '"[\\"a\\"]\\n[\\"b\\"]"',
+        '"[\\"a\\"]\\n[\\"b\\"]',
+    ],
+)
+def test_native_array_parameter_merges_string_fragments(raw):
+    tools = [
+        {
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "properties": {"v": {"type": "array", "items": {"type": "string"}}}
+                },
+            }
+        }
+    ]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer("mlx_lm.tool_parsers.qwen3_coder"),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == ["a", "b"]
+
 def test_stream_filter_suppresses_envelope_with_long_tool_name():
     name = "t" * 120
     f = ToolCallStreamFilter(_make_tokenizer(), tools={name})
@@ -6051,3 +6112,4 @@ def test_think_tags_in_the_answer_survive_for_leading_thinking_models(
     cleaned, calls = parse_tool_calls("Strip ``<think>...</think>`` spans.", tok, None)
     assert calls is None
     assert cleaned == expected
+

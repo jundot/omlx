@@ -353,6 +353,15 @@ def moe_weighted_sum(
     raise RuntimeError("moe_weighted_sum native kernel is unavailable")
 
 
+def moe_weighted_sum_top_ks() -> tuple[int, ...]:
+    """Top-k values ``moe_weighted_sum`` is built for; empty without the kernel."""
+    if not has_symbol("moe_weighted_sum"):
+        return ()
+    top_ks = getattr(_ext, "moe_weighted_sum_top_ks", None)
+    # Builds that predate the query have these three.
+    return tuple(top_ks()) if top_ks is not None else (6, 8, 10)
+
+
 def oq_a8_available() -> bool:
     """True when the INT8 NAX GEMM can actually run on this machine.
 

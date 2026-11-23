@@ -108,6 +108,7 @@ def _append_sparse(i: int, item: Any, state: Arrays) -> None:
 
 class Glm5NextAdapter(StageAdapter):
     model_types = ("glm5_next",)
+    contract = 1
     captures_layers = True
 
     def layer_count(self, lm: Any) -> int:
@@ -119,6 +120,9 @@ class Glm5NextAdapter(StageAdapter):
 
     def keep_first(self, lm: Any, k: int) -> None:
         lm.model.layers = _layers(lm)[:k]
+        # The MTP head never runs here and is attached even without its files.
+        if "mtp" in lm:
+            del lm["mtp"]
 
     @contextmanager
     def use_first(self, lm: Any, k: int):

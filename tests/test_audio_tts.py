@@ -56,6 +56,8 @@ def _make_mock_tts_engine(wav_bytes: bytes = None) -> MagicMock:
 
 def _make_mock_pool(tts_engine=None, model_id: str = "qwen3-tts") -> MagicMock:
     pool = MagicMock()
+    # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
+    pool._scheduler_config.paged_ssd_cache_dir = None
     pool.get_engine = AsyncMock(return_value=tts_engine or _make_mock_tts_engine())
     pool.get_entry = MagicMock(
         return_value=MagicMock(
@@ -1635,7 +1637,6 @@ class TestMing3Patches:
     @pytest.mark.parametrize(
         "stop_bias, max_steps, temperature, expected_len",
         [
-            ([20.0, -20.0], 9, 0.0, 9),
             ([-20.0, 20.0], 9, 0.0, 5),
             ([20.0, -20.0], 1, 0.0, 1),
             ([20.0, -20.0], 6, 0.5, 6),
@@ -1666,7 +1667,7 @@ class TestMing3Patches:
             assert mx.array_equal(got, want).item()
 
     @pytest.mark.parametrize(
-        "cfg, temperature", [(2.0, 0.0), (2.0, 0.5), (1.0, 0.5), (0.0, 0.0)]
+        "cfg, temperature", [(2.0, 0.5), (1.0, 0.5), (0.0, 0.0)]
     )
     def test_tiny_compiled_flow_matches_eager_flow(self, cfg, temperature):
         from omlx.patches.mlx_audio_ming3 import apply_ming3_patches

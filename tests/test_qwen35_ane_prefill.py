@@ -3471,6 +3471,15 @@ def test_min_viable_gdn_fraction_tracks_the_alignment():
     assert ane_patch._min_viable_gdn_fraction(_floor_gdn(2050, 10), 128) is None
 
 
+def test_min_viable_gdn_fraction_survives_six_decimal_storage():
+    """A 1/3 floor stored as 0.333333 lands one channel short of z."""
+    floor = ane_patch._min_viable_gdn_fraction(_floor_gdn(4096, 8192), 128)
+    stored = float(f"{floor:.6f}")
+
+    assert stored == floor
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(4096, 8192, stored, 128) == 4096
+
+
 def test_warn_gdn_below_floor_names_the_floor(monkeypatch, caplog):
     model = SimpleNamespace(modules=lambda: [_floor_gdn(512, 1536)])
     monkeypatch.setattr(ane_patch, "_eligible_gdn", lambda module: True)

@@ -17,6 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from omlx.patches import row_exact_qmv
+from omlx.patches.mlx_vlm_minimax_m3_compat import a8
 
 from . import decode_kernels
 from omlx.patches.deepseek_v4.verify_qmv import (
@@ -131,4 +132,5 @@ def rows_linear(proj, x: mx.array) -> mx.array:
             return out[0]
     elif type(proj) is nn.Linear and dense_eligible(proj, x, max_rows=MAX_ROWS):
         return exact_verify_gemv(proj, x)
-    return proj(x)
+    y = a8.dense(proj, x)
+    return proj(x) if y is None else y

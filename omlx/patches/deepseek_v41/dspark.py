@@ -192,6 +192,14 @@ def forward_spec(model, input_ids, main_hidden, cache, *, temperature=0.0):
 
 def proposal_forward(model, input_ids, cache, draft_length=None):
     """Compute parallel draft logits; the shared loop applies Markov biases."""
+    h = proposal_hidden(model, input_ids, cache, draft_length)
+    final = model.mtp[-1]
+    return project_logits(final.norm(h), model.head.weight), h
+
+
+def proposal_hidden(model, input_ids, cache, draft_length=None):
+    """The last stage's output of proposal_forward, before its norm and vocabulary head
+    (several requests' blocks can share one head projection)."""
     c = model._config
     width = max(1, min(draft_length or c.dspark_block_size, c.dspark_block_size))
     input_ids = input_ids.reshape(input_ids.shape[0], -1)[:, -1:]
@@ -210,7 +218,4 @@ def proposal_forward(model, input_ids, cache, draft_length=None):
     pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
     for stage, item in zip(model.mtp, cache):
         h, pre = stage(h, pre, item)
-    final = model.mtp[-1]
-    h = hc_pre(h, pre)
-    logits = project_logits(final.norm(h), model.head.weight)
-    return logits, h
+    return hc_pre(h, pre)

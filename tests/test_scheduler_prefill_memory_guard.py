@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from omlx import memory_monitor as mm
 from omlx.cache.paged_cache import PagedCacheManager
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
@@ -22,6 +23,12 @@ from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import MemoryMonitor
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig
+
+
+@pytest.fixture(autouse=True)
+def _no_bounded_sdpa_routes(monkeypatch):
+    # A route installed earlier in the worker would replace the unpriced fallback.
+    monkeypatch.setattr(mm, "_SDPA_TILED_PREFILL_HEAD_DIMS", {})
 
 
 class _ModelConfig:

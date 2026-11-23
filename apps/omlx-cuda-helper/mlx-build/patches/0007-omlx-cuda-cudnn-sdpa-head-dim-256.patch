@@ -1,0 +1,25 @@
+MLX's CUDA backend sends attention past head dim 128 to its unfused fallback, which materializes
+the whole score matrix in the output type. cuDNN 9.10 runs the fused forward pass at head dim 256
+on Ampere too (RTX A6000: 8192 queries over 40K keys, 24 query and 4 KV heads, in 172 ms instead
+of 637 ms on the float32 sheets the helper used before). Allow 256 for more than one query row;
+a single decode row keeps the path it had.
+
+diff --git a/mlx/backend/cuda/scaled_dot_product_attention.cpp b/mlx/backend/cuda/scaled_dot_product_attention.cpp
+index 2257609fb..8b8ed7a15 100644
+--- a/mlx/backend/cuda/scaled_dot_product_attention.cpp
++++ b/mlx/backend/cuda/scaled_dot_product_attention.cpp
+@@ -343,9 +343,11 @@ bool supports_sdpa_cudnn(
+     return false;
+   }
+ 
+-  // D_qk and D_v must be a multiple of 8 with maximum value 128.
+-  if ((q.shape(-1) % 8 != 0) || (q.shape(-1) > 128) || (v.shape(-1) % 8 != 0) ||
+-      (v.shape(-1) > 128)) {
++  // D_qk and D_v must be a multiple of 8 with maximum value 128, or 256 for
++  // a forward pass over more than one query row.
++  int max_head_dim = q.shape(2) > 1 ? 256 : 128;
++  if ((q.shape(-1) % 8 != 0) || (q.shape(-1) > max_head_dim) ||
++      (v.shape(-1) % 8 != 0) || (v.shape(-1) > max_head_dim)) {
+     return false;
+   }
+ 

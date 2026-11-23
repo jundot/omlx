@@ -14,6 +14,8 @@ It suits a large model that fits on one Mac with fast memory (good for decoding)
 | GLM-5.3 Flash | `glm5_next` | Works with a DFlash drafter |
 | Qwen3.8 Flash-Next | `qwen4_exp` | PLE rows are read on this Mac and sent with each chunk |
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | Works with the DSpark drafter |
+| Qwen3.8 27B (Qwen3.5 architecture) | `qwen3_5` | Checkpoints served by the VLM engine. With a context window above the native one, prompts stay on this Mac when the helper holds an attention layer |
+| Inkling 2 Small | `inkling2` | Checkpoints served by the VLM engine; prompts with images stay on this Mac. Works with the DSpark drafter |
 
 Measured on an M3 Ultra (512 GB) with an M5 Max over Thunderbolt 5, for a 64K-token prompt:
 
@@ -23,10 +25,11 @@ Measured on an M3 Ultra (512 GB) with an M5 Max over Thunderbolt 5, for a 64K-to
 | GLM-5.3 Flash oQ4e | 540 tok/s | 1,390 tok/s | 740 tok/s |
 | Qwen3.8 Flash-Next oQ4e | 1,310 tok/s | 3,670 tok/s | 2,860 tok/s |
 | MiniMax M3.1 Flash oQ4e | 300 tok/s | 570 tok/s | 390 tok/s |
+| Inkling 2 Small (NVFP4) | 410 tok/s | 580 tok/s | not measured |
 
-The 64 GB column keeps the helper to the layers a 64 GB M5 Max can hold, on the same GPU. A helper holding fewer layers takes a smaller share of each chunk, so models with large layers gain less from a smaller Mac.
+Inkling 2 Small used its published checkpoint and the Code (Python) benchmark context; an M5 Max 128 GB holds 15 of its 48 layers. The 64 GB column keeps the helper to the layers a 64 GB M5 Max can hold, on the same GPU. A helper holding fewer layers takes a smaller share of each chunk, so models with large layers gain less from a smaller Mac.
 
-DeepSeek V4.1 and Qwen3.8 ran the helper's layers with INT8 Activation Prefill, which is on by default. It changes numerics as it does on a single M5-series Mac. Greedy output matched the helper-off output on the tested prompts for DeepSeek V4.1 (INT8), GLM-5.3, and Qwen3.8 with 16-bit activations on the helper. MiniMax split and whole-model caches were identical on a partial checkpoint.
+DeepSeek V4.1 and Qwen3.8 ran the helper's layers with INT8 Activation Prefill turned on. It changes numerics as it does on a single M5-series Mac. Greedy output matched the helper-off output on the tested prompts for DeepSeek V4.1 (INT8), GLM-5.3, and Qwen3.8 with 16-bit activations on the helper. MiniMax split and whole-model caches were identical on a partial checkpoint with 16-bit activations; MiniMax helper layers use INT8 Activation Prefill too when it is turned on.
 
 ## Requirements
 
@@ -62,9 +65,71 @@ The Cluster tab's Prefill Accelerator checks report which of these the Macs use.
 4. If the helper Mac lacks the model files, they are copied to `~/.omlx/prefill-helper/models` there. The copy starts on its own when at least 50 GB stays free. When deleting older copies there would keep 50 GB free, the row names them and **Delete and copy** removes them first. Otherwise the row shows the space left after copying and **Copy anyway** fills the disk past 50 GB. A model that does not fit at all is refused.
 5. When the model is loaded the helper starts, loads its layers and reports **Ready**. Long prompts then show "via <Mac>" in the prefill progress.
 
-**Layers on the helper** is **Auto** by default: each prompt is split by the measured speed of both Macs, and the measurements are kept per model and Mac so a restarted helper splits its first prompt the same way. A fixed number is available for testing.
+**Layers on the helper** is **Auto** by default. The helper loads every layer that fits, and each prompt is split by the measured speed of both Macs and the link, so a prompt can use fewer layers than the helper holds. The measurements are kept per model and Mac so a restarted helper splits its first prompt the same way. A fixed number asks for that many layers on every prompt instead of splitting by speed. More layers on the helper is not always faster, because the slower side of the split sets the pace: a fixed number above the one Auto picks can be slower than Auto.
 
-**INT8 Activation Prefill** and DeepSeek V4.1 **CED prefill** are on unless turned off in the model's settings. On a Mac without INT8 tensor units (M4 and earlier), INT8 Activation Prefill applies only to the helper's layers, and changing it restarts the helper without reloading the model.
+DeepSeek V4.1 **CED prefill** is on unless turned off in the model's settings. **INT8 Activation Prefill** is off unless turned on there. On a Mac without INT8 tensor units (M4 and earlier), INT8 Activation Prefill applies only to the helper's layers, and changing it restarts the helper without reloading the model.
+
+## Linux helper with NVIDIA GPUs
+
+`omlx-cuda-helper` (`apps/omlx-cuda-helper/`) turns a Linux machine with NVIDIA GPUs into a helper. This Mac uses it like a helper Mac: choose it under **Prefill Accelerator** in the model's settings. Its README covers the build and the options. What differs from a helper Mac:
+
+- **No SSH and no oMLX on the helper.** The helper is a small daemon without a UI. Pair it in the Cluster tab with the 6-digit code it prints in its log; this Mac then drives it over a control channel that the pairing key protects. In the Cluster tab it has no Join button, because it can only be a prefill helper.
+- **Compatibility is per model family**, not per oMLX version. The checks list the families the helper serves and name the side to update when they disagree. A helper older than the one this oMLX comes with gets a warning with the update command.
+- **Two GPUs run as a pipeline.** Each GPU holds a range of layers. GPU memory decides how many layers the helper takes, and with it the speedup.
+- **Long prompts drop layers.** When the next chunk's cache would not fit in the helper's GPU memory, the helper drops the layers the prompt does not use first, then its last layers one at a time, and this Mac runs them from that chunk on. The helper loads them again while no prompt waits.
+- **INT8 Activation Prefill** does not apply to the helper's layers.
+- **The link matters more.** The checks warn below 5 GbE. **Auto** measures the link and what each layer sends, uses fewer layers on a slow link, and keeps a prompt on this Mac when the transfer alone would take longer than prefilling here.
+- **A direct Ethernet cable** to the helper is used when it is faster than the network both machines share. It needs no addresses (the helper is reached at its IPv6 link-local address), but discovery and pairing run on the shared network, so the helper stays on it too.
+
+Setup:
+
+1. On the machine with the NVIDIA GPU, start the helper with Docker. The Cluster tab shows the commands for Linux, Windows and DGX Spark under **Add a PC with an NVIDIA GPU**; building from source is described in the helper's README.
+2. In the Cluster tab, press **Pair** on the helper and type the code from its log (`docker logs omlx-helper`). On Windows the helper asks this Mac to pair instead, because Docker Desktop does not pass discovery through.
+3. Run the Prefill Accelerator checks (control channel, link, model families, GPU memory, free disk).
+4. Choose the helper in the model's settings. Missing model files are copied over the control channel to the helper's models folder.
+
+Measured on an M3 Ultra (512 GB) with two RTX A6000 (48 GB each) over a direct 2.5 GbE cable, for a 32K-token prompt with **Auto**. 1 GbE is an estimate from Auto's speed model, calibrated on measured runs.
+
+| Model | Layers that fit | Layers Auto used | This Mac alone | 2.5 GbE | 1 GbE (estimate, approx.) | Sent per token |
+|---|---|---|---|---|---|---|
+| Qwen3.8 27B oQ4e | 58 of 64 | 56 | 405 tok/s | 2,079 tok/s (+413%) | 1,025 tok/s (+153%) | 109 KB |
+| Qwen3.8 Flash-Next oQ4e | 42 of 48 | 35 | 1,388 tok/s | 3,574 tok/s (+157%) | 1,950 tok/s (+40%) | 65 KB |
+| DeepSeek V4.1 Flash oQ3e | 12 of 40 | 12 | 1,119 tok/s | 1,971 tok/s (+76%) | 1,820 tok/s (+63%) | 45 KB |
+| DeepSeek V4.1 Flash oQ4e | 10 of 40 | 10 | 1,148 tok/s | 1,761 tok/s (+53%) | 1,740 tok/s (+52%) | 45 KB |
+| GLM-5.3 Flash oQ4e | 21 of 45 | 21 | 561 tok/s | 947 tok/s (+69%) | 920 tok/s (+64%) | 60 KB |
+| MiniMax M3.1 Flash oQ4e | 22 of 60 | 22 | 327 tok/s | 485 tok/s (+48%) | 475 tok/s (+45%) | 66 KB |
+
+Inkling 2 Small (published NVFP4 checkpoint, Code (Python) benchmark context, Lightning MTP on, **Auto**) on the same M3 Ultra over the shared 2.5 GbE network:
+
+| Helper | Layers that fit | This Mac alone (16K / 64K) | With the helper (16K / 64K) | Sent per token |
+|---|---|---|---|---|
+| 2x RTX A6000 | 10 of 48 | 458 / 412 tok/s | 549 / 506 tok/s (+20% / +23%) | 69 KB |
+| DGX Spark | 14 of 48 | 458 / 412 tok/s | 594 / 563 tok/s (+30% / +37%) | 95 KB |
+
+Each Inkling 2 layer takes 6.6 GiB, so the layers that stay on this Mac set the speed: per 2,048-token chunk the helper took 0.24 s (A6000) or 1.2 s (Spark) and this Mac 3.0 to 3.4 s.
+
+At 2.5 GbE the link was busy for about two thirds of each Qwen3.8 run and peaked at 308 MB/s. For DeepSeek V4.1, GLM-5.3 and MiniMax the layers that stay on this Mac set the speed, because only 10 to 22 of their layers fit in the two GPUs. On a slower link Auto uses fewer layers. It can keep DeepSeek V4.1 on this Mac there: most of the 45 KB each token sends is the boundary between layers (about 42 KB), which does not shrink when the helper takes fewer layers. Auto times a prompt on this Mac alone before it trusts a close call.
+
+### Numerics
+
+A helper Mac runs the same Metal kernels as this Mac. The Linux helper computes in the same 16-bit float type, but CUDA and Metal do not add up every sum in the same order, so each layer matches this Mac's result to rounding noise, not bit for bit. Models with discrete steps (expert routing, sparse attention block selection) can turn that noise into a different continuation.
+
+Measured with greedy decoding on 8 prompts per model (a generated log with an open question, the same log with 20 values to look up, documentation and source code to summarize, each at 8K and 32K tokens), with the helper holding as many layers as fit:
+
+| Model | Helper layers | First-token KL, median (max) | Top token changed | Same 64-token continuation | Lookups right of 40, off / on |
+|---|---|---|---|---|---|
+| Qwen3.8 27B oQ4e | 63 of 64 | 0.0009 (0.003) | 0 of 8 | 6 of 8 | 40 / 40 |
+| GLM-5.3 Flash oQ4e | 21 of 45 | 0.006 (0.03) | 0 of 8 | 0 of 8 | 39 / 40 |
+| Qwen3.8 Flash-Next oQ4e | 47 of 48 | 0.010 (0.02) | 0 of 8 | 7 of 8 | 40 / 40 |
+| MiniMax M3.1 Flash oQ4e | 21 of 60 | 0.006 (0.14) | 2 of 8 | 3 of 8 | 40 / 40 |
+| DeepSeek V4.1 Flash oQ3e | 12 of 40 | 0.035 (0.47) | 2 of 8 | 1 of 8 | 40 / 40 |
+| DeepSeek V4.1 Flash oQ4e | 10 of 40 | 0.042 (0.14) | 2 of 8 | 2 of 8 | 40 / 40 |
+
+KL is taken over the first token's 20 most likely tokens. With the helper off, two runs of a prompt are identical. GLM-5.3 answered with reasoning text, which diverges early. The answers to the lookup questions did not get worse in any run.
+
+For Inkling 2 Small the KL of each of the first 48 generated tokens (as long as the runs chose the same tokens) averaged 0.001 to 0.005 against the helper-off run on 4 prompts of 7K to 35K tokens, with an M5 Max, two RTX A6000 or a DGX Spark as the helper. Per layer, a Linux helper differs from this Mac by about as much as this Mac's own two prefill attention paths differ from each other.
+
+The same kind of difference appears on this Mac alone when a kernel path changes: with MiniMax M3.1, switching this Mac's prefill attention to its other implementation in the same 21 layers gave a first-token KL of up to 0.11, a different top token in 2 of 8 prompts and the same continuation in 2 of 8. DeepSeek V4.1 moves the most; its expert layers quantize their inputs, which amplifies small differences. Use a helper Mac when the output has to match this Mac's own.
 
 ## How it works
 
@@ -73,6 +138,13 @@ Each prompt is cut into a fixed chunk grid when it is admitted. For every chunk 
 Large lookup tables (DeepSeek V4.1 Engram, Qwen3.8 PLE) stay on this Mac. It reads each chunk's rows and sends them ahead, so the helper holds no table and reads nothing from its SSD.
 
 A benchmark waits up to 10 minutes for the helper to be ready, and an uploaded result names the helper's chip, memory, layers and link (never its name). Prompts shorter than 2,048 tokens and prompts with images prefill here. Other prompts queue for the helper in arrival order. If the helper disconnects or is stopped, the prompt continues here from the last finished chunk.
+
+## Measuring prefill speed
+
+- Prompts that go to the helper always prefill in chunks. The model's chunked prefill setting does not decide whether the helper runs.
+- The speed in the prefill progress is measured per chunk and moves from chunk to chunk. For a whole prompt, read the helper row in the model's settings ("last prompt N tokens in S s", `last_prompt` in `GET /admin/api/prefill-helper/models/{id}`) or run the built-in benchmark.
+- A repeated prompt hits the prefix cache and prefills only its new tokens. Check `usage.prompt_tokens_details.cached_tokens` in the response, or change the prompt between runs.
+- When the helper fails a prompt, this Mac logs `Prefill helper <name> left request <id> to this Mac: <reason>` and prefills the rest itself.
 
 ## On the helper Mac
 

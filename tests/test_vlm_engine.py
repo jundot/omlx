@@ -2141,6 +2141,30 @@ class TestFormatMessagesForVLMTemplate:
         assert self._count_image_placeholders([formatted[-1]]) == 1
         assert image_ranges == [(2, 1)]
 
+    def test_prompt_only_format_returns_rendered_strings(self):
+        """PROMPT_ONLY / prompt-with-image formats render messages to strings."""
+        engine = _make_loaded_engine(model_type="paligemma")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,a"},
+                    },
+                    {"type": "text", "text": "describe"},
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert all(isinstance(message, str) for message in formatted)
+        assert "<image>" in formatted[-1]
+        assert image_ranges == [(0, 1)]
+
     def test_caps_placeholders_by_loaded_image_count(self):
         """Do not add more placeholders than successfully loaded images."""
         engine = _make_loaded_engine(model_type="qwen3_5")

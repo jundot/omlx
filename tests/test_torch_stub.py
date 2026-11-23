@@ -54,9 +54,13 @@ def _restore_sys_modules():
 
 
 @pytest.fixture
-def stub_module():
+def stub_module(monkeypatch):
     """Import a fresh copy of the stub module so its module-level state
     doesn't leak between tests."""
+    # install() sets this variable. setenv records the start value, also when
+    # it is unset, so teardown restores it exactly.
+    monkeypatch.setenv("TVM_FFI_DISABLE_TORCH_C_DLPACK", "")
+    monkeypatch.delenv("TVM_FFI_DISABLE_TORCH_C_DLPACK")
     if "omlx._torch_stub" in sys.modules:
         importlib.reload(sys.modules["omlx._torch_stub"])
         return sys.modules["omlx._torch_stub"]
@@ -251,15 +255,9 @@ def test_install_sets_tvm_ffi_dlpack_env_var(stub_module):
     """
     for k in _TOUCHED:
         sys.modules.pop(k, None)
-    os.environ.pop("TVM_FFI_DISABLE_TORCH_C_DLPACK", None)
-    try:
-        with mock.patch(
-            "importlib.util.find_spec", side_effect=lambda name: None
-        ):
-            stub_module.install()
-        assert os.environ.get("TVM_FFI_DISABLE_TORCH_C_DLPACK") == "1"
-    finally:
-        os.environ.pop("TVM_FFI_DISABLE_TORCH_C_DLPACK", None)
+    with mock.patch("importlib.util.find_spec", side_effect=lambda name: None):
+        stub_module.install()
+    assert os.environ.get("TVM_FFI_DISABLE_TORCH_C_DLPACK") == "1"
 
 
 def test_install_does_not_touch_env_var_when_real_torch_present(stub_module):
@@ -270,20 +268,16 @@ def test_install_does_not_touch_env_var_when_real_torch_present(stub_module):
     """
     for k in _TOUCHED:
         sys.modules.pop(k, None)
-    os.environ.pop("TVM_FFI_DISABLE_TORCH_C_DLPACK", None)
-    try:
-        fake_spec = importlib.util.spec_from_loader("torch", loader=None)
-        with mock.patch(
-            "importlib.util.find_spec",
-            side_effect=lambda name: fake_spec if name == "torch" else None,
-        ):
-            result = stub_module.install()
-        assert result is False
-        assert "TVM_FFI_DISABLE_TORCH_C_DLPACK" not in os.environ, (
-            "real-torch path must leave the env var alone"
-        )
-    finally:
-        os.environ.pop("TVM_FFI_DISABLE_TORCH_C_DLPACK", None)
+    fake_spec = importlib.util.spec_from_loader("torch", loader=None)
+    with mock.patch(
+        "importlib.util.find_spec",
+        side_effect=lambda name: fake_spec if name == "torch" else None,
+    ):
+        result = stub_module.install()
+    assert result is False
+    assert "TVM_FFI_DISABLE_TORCH_C_DLPACK" not in os.environ, (
+        "real-torch path must leave the env var alone"
+    )
 
 
 def test_missing_top_level_attribute_raises_attributeerror_and_logs(
@@ -575,10 +569,9 @@ def _load_pyproject():
 
 
 def _pyproject_dev_pins(package):
-    """Collect pins from the [dev] extra and PEP 735 dependency group."""
+    """Collect pins from the PEP 735 dev dependency group."""
     data = _load_pyproject()
-    specs = list(data["project"]["optional-dependencies"]["dev"])
-    specs += [s for s in data["dependency-groups"]["dev"] if isinstance(s, str)]
+    specs = [s for s in data["dependency-groups"]["dev"] if isinstance(s, str)]
     return _package_pins(specs, package)
 
 
@@ -602,8 +595,8 @@ def test_pyproject_dev_pins_match_stub_targets(stub_module):
     ):
         pins = _pyproject_dev_pins(package)
         assert len(pins) == 1, (
-            f"{package}: expected one identical pin across both pyproject "
-            f"dev lists, got {sorted(pins) or 'none'}"
+            f"{package}: expected one pin in the pyproject dev group, "
+            f"got {sorted(pins) or 'none'}"
         )
         assert pins == {targets[0]}, (
             f"{package}: pyproject dev pin {sorted(pins)} != stub target "

@@ -366,7 +366,12 @@ def test_prep_matches_norms_and_mrope(rows, pos_ndim, config, dtype):
     q_proj = (mx.random.normal((rows, 24 * 512)) * 4).astype(dtype)
     k_proj = (mx.random.normal((rows, 2 * 256)) * 4).astype(dtype)
     start = 40000 + rows
-    positions = _positions(start, rows) if pos_ndim == 3 else _positions(start, rows)[0]
+    if pos_ndim == 3:
+        # Vision-token planes: one t position and an h/w grid.
+        index = mx.arange(rows, dtype=mx.int32)
+        positions = (start + mx.stack([0 * index, index // 4, index % 4]))[:, None]
+    else:
+        positions = _positions(start, rows)[0]
     rotary = attn.rotary_emb
 
     queries = attn.q_norm(q_proj.reshape(1, rows, 24, 2, 256)[:, :, :, 0]).transpose(0, 2, 1, 3)
@@ -396,6 +401,8 @@ def test_prep_matches_norms_and_mrope(rows, pos_ndim, config, dtype):
 def test_gathered_prefill_prep_matches_mlx_path(monkeypatch, config):
     """Prefill chunks before, across and past the QSA budget take the q/k
     norms and MRoPE from ``prep_qk``: outputs and cache equal the MLX ops'."""
+    # A 256-token budget keeps the same three chunk routes at an eighth of the length.
+    config = dataclasses.replace(config, indexer_budget=256)
     attn = _attention(seed=5, config=config)
     rows = []
     prep = attn._prep_qk
@@ -410,7 +417,7 @@ def test_gathered_prefill_prep_matches_mlx_path(monkeypatch, config):
         cache = language.QSAKVCache()
         mx.random.seed(21)
         outs, done = [], 0
-        for size in (1500, 1500, 700):
+        for size in (192, 192, 96):
             x = (mx.random.normal((1, size, config.hidden_size)) * 0.5).astype(
                 mx.bfloat16
             )
@@ -423,7 +430,7 @@ def test_gathered_prefill_prep_matches_mlx_path(monkeypatch, config):
         return outs, _state(cache)
 
     got, got_state = prefill()
-    assert rows == [1500, 1500, 700]
+    assert rows == [192, 192, 96]
     monkeypatch.setattr(attn_fused, "_DISABLED", True)
     want, want_state = prefill()
     assert all(_bit_equal(g, w) for g, w in zip(got, want))

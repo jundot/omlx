@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cluster v2 pairing endpoints (Module B).
+"""Cluster pairing endpoints (Module B).
 
-Two routers, both under ``/api/cluster`` (the v2 surface; the legacy 3-step
-copy-paste endpoints stay untouched under ``/admin/api/cluster`` as
-"Advanced (legacy)"):
+Two routers, both under ``/api/cluster``:
 
 * ``pair_router`` — unauthenticated joiner-facing endpoints. The pair request
   carries a salted PBKDF2 verifier binding the node and both SSH identities,
   and the coordinator binds enrollment to the HTTP source address. The served
   cluster key is separately encrypted under a code-derived key, so the admin's
   approve step remains the sole trust decision.
-* ``pair_admin_router`` — admin-facing approve/deny/unpair.  Mounted with
+* ``pair_admin_router`` — admin-facing approve/deny.  Mounted with
   ``Depends(require_admin)`` exactly like the existing cluster router.
 
 An invite only asks the other Mac's user to show a code; it never starts a
@@ -41,8 +39,8 @@ from .pairing import (
     get_pairing_manager,
 )
 
-pair_router = APIRouter(prefix="/api/cluster", tags=["cluster-v2-pairing"])
-pair_admin_router = APIRouter(prefix="/api/cluster", tags=["cluster-v2-pairing-admin"])
+pair_router = APIRouter(prefix="/api/cluster", tags=["cluster-pairing"])
+pair_admin_router = APIRouter(prefix="/api/cluster", tags=["cluster-pairing-admin"])
 
 _get_pairing_manager: Any = get_pairing_manager
 pair_request_rate_limiter = ProbeRateLimiter(rate_per_second=0.5, burst=8)
@@ -75,8 +73,11 @@ class PairRequestBody(BaseModel):
     code_salt: str = Field(min_length=24, max_length=64)
     http_port: int | None = Field(default=None, ge=1, le=65535)
     addrs: list[str] = Field(default_factory=list, max_length=8)
-    ssh_public_key: str = Field(min_length=32, max_length=8192)
-    ssh_host_public_key: str = Field(min_length=32, max_length=8192)
+    # Absent for an agent-controlled peer (caps.control == "agent").
+    ssh_public_key: str | None = Field(default=None, min_length=32, max_length=8192)
+    ssh_host_public_key: str | None = Field(
+        default=None, min_length=32, max_length=8192
+    )
 
 
 class PairApproveBody(BaseModel):
@@ -206,13 +207,17 @@ def _send_invite(manager: PairingManager, node_id: str) -> bool:
         # A scope-less link-local or this Mac's own loopback cannot reach it.
         if ip.version == 4 and not ip.is_loopback:
             usable.append(str(ip))
+    invite: dict[str, Any] = {"node_id": manager.node_id}
+    if peer.caps.control == "agent":
+        # A helper daemon joins at the invite's source address and this port.
+        invite["http_port"] = manager.http_port
     for addr in sorted(
         usable, key=lambda ip: health.get(ip, {}).get("state") != "verified"
     ):
         try:
             manager._http_post(
                 f"http://{addr}:{peer.http_port}/api/cluster/pair/invited",
-                {"node_id": manager.node_id},
+                invite,
                 3.0,
             )
         except Exception:
@@ -316,14 +321,3 @@ async def cluster_pair_deny(body: PairDenyBody):
     return {"ok": True, "node_id": body.node_id, "state": "denied"}
 
 
-@pair_admin_router.delete("/devices/{node_id}")
-async def cluster_unpair_device(node_id: str):
-    """Unpair: drop the registry entry, the cluster key, and SSH trust."""
-
-    manager = _manager()
-    if not node_id or len(node_id) > 255:
-        raise HTTPException(status_code=400, detail="invalid node_id")
-    try:
-        return await asyncio.to_thread(manager.unpair, node_id)
-    except PairingError as exc:
-        raise _pairing_http_error(exc) from exc

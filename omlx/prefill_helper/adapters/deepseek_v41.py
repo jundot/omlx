@@ -83,6 +83,7 @@ def _stage_from(lm: Any, k: int):
 
 class DeepseekV41Adapter(StageAdapter):
     model_types = ("deepseek_v41",)
+    contract = 1
 
     def layer_count(self, lm: Any) -> int:
         return lm._config.n_layers

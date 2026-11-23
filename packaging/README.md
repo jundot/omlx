@@ -7,7 +7,7 @@ This directory builds the venvstacks Python layers that the Swift app embeds. Th
 - macOS 15.0+ (Sequoia), required by MLX >= 0.29.2
 - Apple Silicon (M1 to M5)
 - Xcode 26.5+ with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`) for the custom kernels
-- Python 3.11+ on the host, plus venvstacks from `make dev`, `uvx`, or `pipx run`
+- Python 3.11+ on the host, plus venvstacks from `make dev` (requires pip 25.1+), `uv sync`, `uvx`, or `pipx run`
 
 ## Build
 

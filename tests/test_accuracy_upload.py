@@ -208,6 +208,7 @@ def _result_data(**overrides) -> dict:
         "total": 120,
         "time_s": 12.3,
         "thinking_used": False,
+        "max_tokens": 128,
         "dataset_total": 14042,
         "sampling_profile": "deterministic",
         "category_scores": {"anatomy": 0.75},
@@ -253,6 +254,7 @@ class TestUploadIntelligenceResult:
         assert payload["correct_count"] == 90
         assert payload["total_questions"] == 120
         assert payload["dataset_total"] == 14042
+        assert payload["question_max_tokens"] == 128
         assert payload["model_repo"] == "mlx-community/Qwen3-4bit"
         assert payload["category_counts"] == {"anatomy": [4, 4]}
         assert payload["owner_hash"] == "h" * 64 + "a"
@@ -344,6 +346,18 @@ class TestUploadIntelligenceResult:
             )
 
         assert outcome == {"skipped": "min_questions"}
+        mock_to_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lora_adapter_runs_are_not_uploaded(self):
+        mock_to_thread = AsyncMock()
+
+        with patch("asyncio.to_thread", mock_to_thread):
+            outcome = await upload_intelligence_result(
+                MagicMock(), {**_ctx(), "lora_adapter": "/a"}, _result_data()
+            )
+
+        assert outcome == {"skipped": "lora_adapter"}
         mock_to_thread.assert_not_awaited()
 
     def test_category_counts_derivation(self):

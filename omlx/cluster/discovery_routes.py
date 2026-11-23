@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cluster v2 discovery/identity HTTP endpoints.
+"""Cluster discovery/identity HTTP endpoints.
 
 ``discovery_router`` is mounted WITHOUT ``require_admin`` in
 ``omlx/server.py`` so peers can probe ``/api/cluster/node_id`` before any
 trust exists; it is still gated by the distributed-inference exposure flag
-(``require_distributed_inference_enabled``) like the enrollment router. The
+(``require_distributed_inference_enabled``). The
 probe endpoint is rate-limited per source IP. ``/api/cluster/devices``
 carries the trusted inventory and requires admin like the rest of the
 cluster surface.
@@ -116,7 +116,7 @@ async def cluster_discovery_health(is_admin: bool = Depends(require_admin)):
     last five seconds — on macOS that is how a denied Local Network
     permission presents, so the UI pairs it with actionable guidance instead
     of a silently empty device list. Shape is pinned by the wizard fixture
-    (tests/ui/fixtures/cluster_v2/discovery_health_ok.json).
+    (tests/ui/fixtures/cluster/discovery_health_ok.json).
     """
 
     service = discovery_service_or_none()
@@ -335,21 +335,6 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
     for row in paired:
         row["paired"] = True
 
-    # Seam with Module B's enrollment: a paired device that completed SSH
-    # TOFU enrollment carries its enrolled ssh_target, so the UI probes and
-    # plans against the enrolled target instead of guessing from probe IPs.
-    try:
-        from .enrollment import get_cluster_enrollment
-
-        enrollment = get_cluster_enrollment()
-    except RuntimeError:
-        enrollment = None
-    if enrollment is not None:
-        enrolled = {node.node_id: node for node in enrollment.list_nodes()}
-        for row in paired:
-            node = enrolled.get(row.get("node_id"))
-            if node is not None:
-                row["ssh_target"] = node.ssh
     observed_records: dict[str, dict[str, Any]] = {}
     if registry:
         for entry in registry.discovered():

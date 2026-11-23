@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Offline unit tests for cluster v2 pairing (Module B).
+"""Offline unit tests for cluster pairing (Module B).
 
 No network, no SSH, no Module A code: enrollment/revocation drivers, SSH key
 provider, caps, clocks, and HTTP transport are all fakes.  The loopback
@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omlx.cluster import pairing, pairing_routes
+from omlx.cluster.discovery import PeerCaps
 from omlx.cluster.pairing import (
     CODE_TTL_SECONDS,
     LOCKOUT_SECONDS,
@@ -62,17 +63,6 @@ class _Audit:
         return [event for event, _, _ in self.events]
 
 
-class _FakeEnrollmentStore:
-    """Duck-type of the legacy ClusterEnrollmentStore bits pairing uses."""
-
-    def __init__(self):
-        self.removed = []
-
-    def remove_node(self, node_id):
-        self.removed.append(node_id)
-        return True
-
-
 class _FakeModuleARegistry:
     """Mimics Module A DeviceRegistry method names (upsert/get/remove/list)."""
 
@@ -105,7 +95,6 @@ def _manager(
     clock=None,
     audit=None,
     registry=None,
-    enrollment_store=None,
     driver_calls=None,
     revocation_calls=None,
     enrollment_driver=None,
@@ -125,7 +114,6 @@ def _manager(
 
     return PairingManager(
         registry,
-        enrollment_store,
         base_path=tmp_path / node_id,
         identity={
             "node_id": node_id,
@@ -148,14 +136,12 @@ def _loopback_pair(tmp_path):
     """Coordinator + joiner managers joined by an in-process transport."""
 
     coordinator_clock, joiner_clock = _Clock(), _Clock()
-    enrollment_store = _FakeEnrollmentStore()
     driver_calls, revocation_calls = [], []
     coordinator = _manager(
         tmp_path,
         node_id="coord-node",
         name="Coordinator",
         clock=coordinator_clock,
-        enrollment_store=enrollment_store,
         driver_calls=driver_calls,
         revocation_calls=revocation_calls,
     )
@@ -179,7 +165,7 @@ def _loopback_pair(tmp_path):
 
     joiner._http_post = http_post
     joiner._http_get = http_get
-    return coordinator, joiner, enrollment_store, driver_calls, revocation_calls
+    return coordinator, joiner, driver_calls, revocation_calls
 
 
 # --- Code + wrap crypto -------------------------------------------------------
@@ -241,7 +227,7 @@ def test_wrap_rejects_oversized_iteration_counts():
 
 
 def test_two_manager_loopback_happy_path(tmp_path):
-    coordinator, joiner, enrollment_store, driver_calls, _ = _loopback_pair(tmp_path)
+    coordinator, joiner, driver_calls, _ = _loopback_pair(tmp_path)
 
     shown = joiner.start_join()
     code = shown["code"]
@@ -405,9 +391,7 @@ def test_deny_removes_pending_and_is_audited(tmp_path):
 
 
 def test_unpair_revokes_everything(tmp_path):
-    coordinator, joiner, enrollment_store, _, revocation_calls = _loopback_pair(
-        tmp_path
-    )
+    coordinator, joiner, _, revocation_calls = _loopback_pair(tmp_path)
     code = joiner.start_join()["code"]
     joiner.request_join("coordinator.local:8080")
     coordinator.approve("join-node", code)
@@ -417,10 +401,8 @@ def test_unpair_revokes_everything(tmp_path):
     assert result["unpaired"] is True
     assert result["removed_device"] is True
     assert result["removed_key"] is True
-    assert result["removed_enrollment"] is True
     assert coordinator.paired_devices() == []
     assert coordinator._key_store.get("join-node") is None
-    assert enrollment_store.removed == ["join-node"]
     assert revocation_calls == [
         {
             "peer_public_key": _test_public_key("join-node"),
@@ -439,7 +421,7 @@ def test_unpair_revokes_everything(tmp_path):
 def test_forget_route_unpairs_through_the_real_manager(tmp_path, monkeypatch):
     from omlx.cluster import routes
 
-    coordinator, joiner, _, _, _ = _loopback_pair(tmp_path)
+    coordinator, joiner, _, _ = _loopback_pair(tmp_path)
     code = joiner.start_join()["code"]
     joiner.request_join("coordinator.local:8080")
     coordinator.approve("join-node", code)
@@ -685,6 +667,82 @@ def test_missing_ssh_host_key_asks_for_remote_login(tmp_path):
     with pytest.raises(EnrollmentDriveError, match="Remote Login"):
         coordinator.approve("join-node", code)
     assert coordinator.paired_devices() == []
+
+
+def _agent_request(node_id="helper-node", code="048213", **extra):
+    """A join request as a helper daemon builds it: no SSH identities."""
+    salt = bytes(range(16))
+    return {
+        "node_id": node_id,
+        "friendly_name": "nvidia1",
+        "caps": {"chip": "2x NVIDIA RTX A6000", "ram_gb": 96.0, "control": "agent"},
+        "code_hash": pairing_code_hash(code, node_id, "", "", salt),
+        "code_salt": base64.b64encode(salt).decode(),
+        "addrs": ["192.168.1.230"],
+        "http_port": 8765,
+        **extra,
+    }
+
+
+def test_agent_controlled_peer_pairs_without_ssh_enrollment(tmp_path):
+    driver_calls, revocation_calls = [], []
+    coordinator = _manager(
+        tmp_path,
+        node_id="coord-node",
+        name="Coordinator",
+        driver_calls=driver_calls,
+        revocation_calls=revocation_calls,
+    )
+    # Remote Login is off on the host: an SSH peer could not pair here.
+    coordinator._ssh_host_key_provider = lambda: None
+    coordinator.handle_join_request(_agent_request())
+
+    approved = coordinator.approve("helper-node", "048213")
+
+    assert driver_calls == [] and approved["enrollment"] == {}
+    material = coordinator.join_status("helper-node")["coordinator"]
+    assert material["ssh_public_key"] is None
+    assert material["ssh_host_public_key"] is None
+    assert "ssh_user" not in material["caps"]
+    key = unwrap_cluster_key(approved["cluster_key_package"], "048213")
+    assert coordinator.control_key("helper-node") == key
+    assert approved["coordinator_identity_tag"] == pairing.coordinator_identity_tag(
+        key, material
+    )
+    assert coordinator.paired_devices()[0]["caps"]["control"] == "agent"
+
+    # The daemon takes its wrapped key right after the approval. Later the
+    # open status route no longer hands it out.
+    assert "cluster_key_package" in coordinator.join_status("helper-node")
+    coordinator._clock.now += pairing.AGENT_KEY_PACKAGE_SECONDS + 1
+    late = coordinator.join_status("helper-node")
+    assert late["state"] == "approved" and "cluster_key_package" not in late
+
+    assert coordinator.unpair("helper-node")["removed_key"] is True
+    assert revocation_calls == []
+    assert coordinator.control_key("helper-node") is None
+
+
+def test_ssh_keys_must_match_the_control_mode(tmp_path):
+    coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator")
+    with pytest.raises(PairingRequestError, match="must not send SSH keys"):
+        coordinator.handle_join_request(
+            _agent_request(ssh_public_key=_test_public_key("helper-node"))
+        )
+    mac = _agent_request(node_id="mac-node")
+    mac["caps"] = {"chip": "M4 Max"}
+    with pytest.raises(PairingRequestError, match="invalid SSH public key"):
+        coordinator.handle_join_request(mac)
+
+    # An SSH-paired peer never hands out its cluster key as a control key.
+    coordinator2, joiner, *_ = _loopback_pair(tmp_path / "ssh")
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator2.approve("join-node", code)
+    assert coordinator2.control_key("join-node") is None
+    # Its wrapped key stays on the status route for a joiner that polls late.
+    coordinator2._clock.now += CODE_TTL_SECONDS
+    assert "cluster_key_package" in coordinator2.join_status("join-node")
 
 
 def test_default_enrollment_requires_key_and_verified_address(monkeypatch):
@@ -989,6 +1047,7 @@ def test_an_invite_only_asks_the_other_mac_to_show_its_code(tmp_path, monkeypatc
         paired=False,
         http_port=8000,
         addrs=[{"ip": "127.0.0.1"}, {"ip": "fe80::1"}, {"ip": "10.0.0.2"}],
+        caps=PeerCaps(),
     )
     service = SimpleNamespace(peers=lambda: [host], address_health=lambda node: {})
     monkeypatch.setattr(pairing_routes, "discovery_service_or_none", lambda: service)
@@ -999,6 +1058,11 @@ def test_an_invite_only_asks_the_other_mac_to_show_its_code(tmp_path, monkeypatc
     assert sent == [
         ("http://10.0.0.2:8000/api/cluster/pair/invited", {"node_id": "coord-node"})
     ]
+    # A helper daemon has no browser: the invite tells it where to join.
+    host.caps = PeerCaps(control="agent")
+    client.post("/api/cluster/pair/invite", json={"node_id": "host-node"})
+    assert sent[-1][1] == {"node_id": "coord-node", "http_port": manager.http_port}
+    host.caps = PeerCaps()
 
     invited = "/api/cluster/pair/invited"
     assert client.post(invited, json={"node_id": "stranger"}).status_code == 404
@@ -1056,11 +1120,6 @@ def test_endpoints_full_flow(tmp_path, monkeypatch):
     assert status["coordinator"]["node_id"] == "coord-node"
     joined = joiner.complete_join(status, code)
     assert joined["node_id"] == "coord-node"
-
-    response = client.delete("/api/cluster/devices/join-node")
-    assert response.status_code == 200
-    assert response.json()["unpaired"] is True
-    assert client.get("/api/cluster/pair/status/join-node").json()["state"] == "unknown"
 
 
 def test_public_pairing_endpoints_are_rate_limited(tmp_path, monkeypatch):
@@ -1143,7 +1202,6 @@ def test_endpoint_error_mapping(tmp_path):
         client.post("/api/cluster/pair/deny", json={"node_id": "ghost"}).status_code
         == 404
     )
-    assert client.delete("/api/cluster/devices/ghost").status_code == 404
 
 
 def test_endpoint_deny_flow(tmp_path):
@@ -1196,43 +1254,9 @@ def test_unconfigured_manager_returns_503(tmp_path):
     app.include_router(pairing_routes.pair_admin_router)
     client = TestClient(app)
     assert client.get("/api/cluster/pair/status/x").status_code == 503
-    assert client.delete("/api/cluster/devices/x").status_code == 503
 
 
 # --- Legacy non-regression ----------------------------------------------------------
-
-
-def test_legacy_pairing_endpoints_still_registered():
-    from omlx.cluster import routes
-
-    paths = {
-        (route.path, tuple(sorted(route.methods)))
-        for route in routes.router.routes
-        for methods in [getattr(route, "methods", set())]
-        if methods
-    }
-    expected = {
-        "/admin/api/cluster/pairing-token",
-        "/admin/api/cluster/verify-pairing-token",
-        "/admin/api/cluster/ssh-key",
-        "/admin/api/cluster/ssh-key/generate",
-        "/admin/api/cluster/ssh-key/exchange-token",
-        "/admin/api/cluster/ssh-key/exchange",
-        "/admin/api/cluster/ssh-key/store-keychain",
-        "/admin/api/cluster/join-keys",
-        "/admin/api/cluster/join-status",
-    }
-    present = {path for path, _ in paths}
-    assert expected <= present
-
-
-def test_legacy_pairing_token_flow_still_works():
-    from omlx.cluster.discovery import generate_pairing_token, verify_pairing_token
-
-    secret = "x" * 32
-    token = generate_pairing_token(shared_secret=secret)
-    assert verify_pairing_token(token, shared_secret=secret) is True
-    assert verify_pairing_token(token, shared_secret="y" * 32) is False
 
 
 def _run_as(monkeypatch, user):
@@ -1246,7 +1270,7 @@ def test_join_status_carries_coordinator_caps_and_key(tmp_path, monkeypatch):
     whatever join_status returns, so the coordinator block must carry the
     same caps/ssh key that approve() returns synchronously."""
 
-    coordinator, joiner, _, _, _ = _loopback_pair(tmp_path)
+    coordinator, joiner, _, _ = _loopback_pair(tmp_path)
     _run_as(monkeypatch, "joiner.user")
     shown = joiner.start_join()
     joiner.request_join("coord:8000")

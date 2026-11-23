@@ -233,3 +233,11 @@ def test_ced_and_full_prefill_blocks_share_one_ssd_budget(tmp_path):
     manager = open_manager(ced, 1 << 30)
     assert not manager.has_block(b"\x02" * 32)
     manager.close()
+
+
+def test_a8_prefill_blocks_get_their_own_numerics_revision():
+    def revision(**config):
+        return numerics_revision_for_model(VLMModelAdapter(Model(tiny_ced(**config))))
+
+    assert revision(ced_prefill=False, a8_prefill=True) == "a8-prefill-1"
+    assert revision(a8_prefill=True) == "a8-prefill-1,ced-prefill-1"

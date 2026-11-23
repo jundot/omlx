@@ -129,7 +129,7 @@ private struct Header: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Squircle(systemSymbol: "cpu", size: 44, gradient: SquircleGradient.models)
+            ModelIconTile(modelType: model?.modelType, size: 44)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(model?.displayTitle ?? "—")
@@ -142,8 +142,10 @@ private struct Header: View {
                     }
                 }
                 if let m = model {
-                    Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
-                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
+                    Text([m.idNotInTitle, m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize)]
+                        .compactMap { $0 }
+                        .joined(separator: " · "))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -1359,6 +1361,30 @@ private struct AdvancedPage: View {
             ChatTemplateKwargsEditor(vm: vm, client: client)
         }
 
+        if showsLLMRows {
+            SectionHeader(
+                String(localized: "settings.advanced.lora_adapter.section",
+                       defaultValue: "LoRA Adapter",
+                       comment: "Section header above the LoRA adapter picker"),
+                subtitle: String(localized: "settings.advanced.lora_adapter.subtitle",
+                                 defaultValue: "Apply a LoRA adapter from the model folders on top of these weights.",
+                                 comment: "Subtitle for the LoRA adapter section")
+            )
+            ListGroup {
+                Row(label: String(localized: "settings.advanced.lora_adapter.label",
+                                  defaultValue: "Adapter",
+                                  comment: "Row label for the LoRA adapter picker"),
+                    sublabel: vm.loraAdapterDetail,
+                    isLast: true) {
+                    Popup(
+                        selection: vm.bindProfile($vm.loraAdapter),
+                        width: .controlWide,
+                        options: vm.loraAdapterOptions()
+                    )
+                }
+            }
+        }
+
         if vm.embeddingAudioSupported {
             SectionHeader(String(localized: "settings.advanced.embedding_audio.section",
                                  defaultValue: "Audio",
@@ -1563,8 +1589,8 @@ private struct PrefillAcceleratorGroup: View {
                                 comment: "Picker suffix for a paired Mac that does not answer"))
         } else if device.versionOk != true {
             parts.append(String(localized: "settings.acceleration.prefill_helper.update",
-                                defaultValue: "needs the same oMLX version",
-                                comment: "Picker suffix for a paired Mac on another oMLX version"))
+                                defaultValue: "needs an update",
+                                comment: "Picker suffix for a paired helper that needs an update"))
         } else if let fit = device.layersFit, fit > 0 {
             parts.append(String(localized: "settings.acceleration.prefill_helper.fits",
                                 defaultValue: "\(fit) layers fit",
@@ -1675,6 +1701,11 @@ private struct PrefillAcceleratorGroup: View {
                 text += " · " + String(localized: "settings.acceleration.prefill_helper.state.last_prompt",
                                        defaultValue: "last prompt \(last.tokens) tokens in \(seconds)s",
                                        comment: "Prefill Accelerator status suffix with the last prompt timing")
+            }
+            if status.outOfMemory == true {
+                text += " · " + String(localized: "settings.acceleration.prefill_helper.state.out_of_memory",
+                                       defaultValue: "ran out of GPU memory for a prompt",
+                                       comment: "Prefill Accelerator status suffix after a prompt went past the helper's GPU memory and ran on this Mac")
             }
             return text
         case "offline":
@@ -2383,13 +2414,15 @@ private struct AccelerationSection: View {
                     }))
                 }
             }
-            // The A8 rows do not depend on an ANE backend: Qwen3.8 Flash-Next
-            // and DeepSeek V4.1 have none, but still support A8.
+            // The A8 rows do not depend on an ANE backend, which several A8 families lack.
             if vm.showsA8Prefill {
                 Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
                                   defaultValue: "INT8 Activation Prefill",
                                   comment: "Row label for the oQ INT8-activation prefill kernels"),
                     sublabel: a8PrefillSublabel,
+                    warning: String(localized: "settings.experimental.qwen_oq_a8.quality_warning",
+                                    defaultValue: "May reduce quality",
+                                    comment: "Warning on the INT8 prefill row: INT8 activations can lower output quality"),
                     isLast: !vm.a8PrefillEnabled) {
                     RowSwitch(isOn: vm.bindProfile($vm.a8PrefillEnabled))
                         .disabled(vm.a8PrefillConflictReason != nil)
@@ -2420,7 +2453,7 @@ private struct AccelerationSection: View {
     private var a8PrefillSublabel: String {
         if let reason = vm.a8PrefillConflictReason { return reason }
         let text = String(localized: "settings.experimental.qwen_oq_a8.sub",
-                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, routed expert gate/up projections on Qwen3.8 Flash-Next, and the expert and attention projections of DeepSeek V4.1. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, routed expert gate/up projections on Qwen3.8 Flash-Next, and the expert and attention projections of DeepSeek V4.1 and MiniMax M3. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
         guard vm.model?.a8PrefillSupported != true, !vm.prefillHelperNodeID.isEmpty else {
             return text

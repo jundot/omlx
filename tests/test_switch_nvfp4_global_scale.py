@@ -123,6 +123,9 @@ def test_sorted_prefill_keeps_global_scale_on_the_reroute(monkeypatch):
     x = mx.random.normal((64, 1, K), key=mx.random.key(3))
     y = proj(x, indices, sorted_indices=True)
     assert _rel(y, _reference(x, indices, dense)) < 5e-3
+    args = (proj.weight, proj.scales, None, None, indices, True, 16, 4, "nvfp4")
+    positional = mx.gather_qmm(x, *args, proj.global_scale, sorted_indices=True)
+    assert mx.array_equal(positional, y).item()
 
 
 def _nvfp4_switch_glu():

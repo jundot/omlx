@@ -16,7 +16,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .accuracy_upload import build_upload_context, upload_intelligence_result
 from .external_api import (
@@ -70,6 +70,9 @@ class AccuracyBenchmarkRequest(BaseModel):
     batch_size: int = 1
     enable_thinking: bool = False
     sampling_profile: SamplingProfile = "deterministic"
+    # Floor for each question's max_tokens, applied after the thinking clamp.
+    # External runs may also set it as external.max_tokens_override.
+    max_tokens_override: Optional[int] = Field(default=None, ge=1, le=1_000_000)
     # When set, the benchmark runs against a remote OpenAI-compatible
     # endpoint instead of a local engine and model_id is the remote
     # model name (not validated against the local catalog).
@@ -81,6 +84,12 @@ class AccuracyBenchmarkRequest(BaseModel):
         # never send it, so keep the stored flag honest.
         if self.external is not None:
             self.enable_thinking = False
+        return self
+
+    @model_validator(mode="after")
+    def _use_external_max_tokens_override(self) -> "AccuracyBenchmarkRequest":
+        if self.external is not None and self.max_tokens_override is None:
+            self.max_tokens_override = self.external.max_tokens_override
         return self
 
     @field_validator("batch_size")
@@ -557,6 +566,7 @@ async def run_accuracy_benchmark(
                     batch_size=request.batch_size,
                     sampling_kwargs=sampling_kwargs,
                     enable_thinking=request.enable_thinking,
+                    max_tokens_override=request.max_tokens_override,
                 )
             except asyncio.CancelledError:
                 run.status = "cancelled"
@@ -616,6 +626,7 @@ async def run_accuracy_benchmark(
                 "time_s": round(result.time_seconds, 1),
                 "dataset_total": evaluator.dataset_total,
                 "sampling_profile": request.sampling_profile,
+                "max_tokens": result.max_tokens,
                 "question_results": question_results,
             }
             if request.external is not None:

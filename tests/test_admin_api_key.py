@@ -1021,8 +1021,9 @@ class TestRuntimeCacheObservability:
     """Tests for runtime cache observability robustness."""
 
     def test_runtime_cache_uses_model_scoped_ssd_stats(self):
-        """Per-model rows should not repeat the shared SSD cache total."""
+        """Rows stay model-scoped; the header counts each shared file once."""
         cache_dir = Path("/tmp/omlx-cache")
+        unloaded_block = {cache_dir / "f" / "unloaded.safetensors": 100_000}
 
         mock_settings = MagicMock()
         mock_settings.base_path = Path("/tmp/omlx-base")
@@ -1046,6 +1047,10 @@ class TestRuntimeCacheObservability:
             "hot_cache_size_bytes": 0,
             "hot_cache_entries": 0,
         }
+        manager_a.get_tracked_files.return_value = {
+            cache_dir / "a" / "a.safetensors": 4096,
+            **unloaded_block,
+        }
         scheduler_a = MagicMock()
         scheduler_a.config.model_name = "/models/model-a"
         scheduler_a.paged_ssd_cache_manager = manager_a
@@ -1062,6 +1067,10 @@ class TestRuntimeCacheObservability:
             "hot_cache_max_bytes": 0,
             "hot_cache_size_bytes": 0,
             "hot_cache_entries": 0,
+        }
+        manager_b.get_tracked_files.return_value = {
+            cache_dir / "b" / "b.safetensors": 8192,
+            **unloaded_block,
         }
         scheduler_b = MagicMock()
         scheduler_b.config.model_name = "/models/model-b"
@@ -1103,8 +1112,8 @@ class TestRuntimeCacheObservability:
             payload = admin_routes._build_runtime_cache_observability(mock_settings)
 
         mock_settings.cache.get_ssd_cache_max_size_bytes.assert_not_called()
-        assert payload["total_num_files"] == 10
-        assert payload["total_size_bytes"] == 12288
+        assert payload["total_num_files"] == 3
+        assert payload["total_size_bytes"] == 4096 + 8192 + 100_000
         assert payload["effective_block_sizes"] == [1024, 2048]
         rows = {row["id"]: row for row in payload["models"]}
         assert rows["model-a"]["block_size"] == 1024
@@ -1204,6 +1213,7 @@ class TestRuntimeCacheObservability:
         bad_scheduler = MagicMock()
         bad_scheduler.get_ssd_cache_stats.side_effect = RuntimeError("boom")
         good_scheduler = MagicMock()
+        good_scheduler.paged_ssd_cache_manager = None
         good_scheduler.get_ssd_cache_stats.return_value = {
             "block_size": 1024,
             "indexed_blocks": 12,

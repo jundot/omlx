@@ -1,0 +1,26 @@
+# conda-forge packages for the MLX CUDA build (CUDA 12.9; MLX refuses 13.1).
+python=3.12
+cuda-version=12.9
+cuda-nvcc
+cuda-cudart-dev
+cuda-nvrtc-dev
+cuda-driver-dev
+cuda-cccl
+libcublas-dev
+libcufft-dev
+libcusolver-dev
+libcusparse-dev
+libnvjitlink-dev
+cudnn
+libcudnn-dev
+gxx_linux-64=13
+sysroot_linux-64=2.28
+cmake<4
+ninja
+make
+git
+ccache
+openblas
+liblapacke
+numpy
+pip

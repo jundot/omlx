@@ -86,6 +86,8 @@ venv.bak/
 *.safetensors
 *.gguf
 *.ggml
+# Tiny checkpoints of the Prefill Accelerator contract fixtures.
+!tests/fixtures/prefill_contract/*/model/model.safetensors
 
 # Logs
 *.log

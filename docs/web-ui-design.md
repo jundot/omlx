@@ -29,7 +29,18 @@ Families outside Tailwind's palette:
 
 ## Custom theme
 
-`ui.custom_theme` stores per-theme token overrides (`{"light": {"bg-primary": "#..."}, "dark": {...}}`), and `static/js/custom_theme.js` paints them before first paint. That file owns the token list and the contrast rules: the Theme Settings editor disables Apply when primary/secondary text, links or button text fall below 4.5:1. The server only checks that each value is `#rrggbb`.
+`ui.custom_theme` stores per-theme token overrides (`{"light": {"bg-primary": "#..."}, "dark": {...}}`), and `static/js/custom_theme.js` paints them before first paint. That file owns the token list and the contrast rules (`CONTRAST_RULES`, 4.5:1 for text and 3:1 for controls and accents): the Theme Settings editor disables Apply, names the failing pairs and outlines the fields to change. The server only checks that each value is `#rrggbb`.
+
+### How the dark draft is generated
+
+**Generate dark from light** fills the dark column from the light one in OKLCH (`darkFromLight` in `custom_theme.js`). It only edits the draft, so Apply still runs the contrast check. The constants are calibrated so the stock light palette lands close to the stock dark one.
+
+1. Neutrals invert their lightness (`1 - L`) through `NEUTRAL_CURVE`, keep their hue and cap chroma at 0.012. The switch ON track stops at L 0.72 because its knob stays white.
+2. Status fills keep their color unless darker than L 0.62; links, the accent and danger text are lifted to at least L 0.71.
+3. A color outside sRGB loses chroma until it fits.
+4. A foreground below its contrast floor steps its lightness away from its backgrounds until it passes.
+
+The Preview header's Save as image button writes both modes, every token's English name and exact hex, and the same palette as JSON in an `omlx-theme` `tEXt` chunk. The image is English-only so it can be handed to an agent or shared outside the dashboard. `theme_preview.js` draws the preview card for both: the Preview canvases in the UI language, the image with its fixed English labels, so the two never drift apart.
 
 ## Type
 

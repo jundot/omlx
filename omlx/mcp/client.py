@@ -182,7 +182,7 @@ class MCPClient:
             )
 
         # Create SSE client context
-        self._sse_client = sse_client(self.config.url)
+        self._sse_client = sse_client(self.config.url, headers=self.config.headers)
         self._read, self._write = await self._sse_client.__aenter__()
 
         try:

@@ -87,6 +87,10 @@ final class OMLXClient: ObservableObject {
         try await post("/admin/api/global-settings", body: patch)
     }
 
+    func testWebSearch(_ settings: WebSearchTestRequest) async throws -> WebSearchTestResponse {
+        try await post("/admin/api/web-search/test", body: settings, timeout: 60)
+    }
+
     func getServerInfo() async throws -> ServerInfoDTO {
         try await get("/admin/api/server-info")
     }
@@ -171,6 +175,10 @@ final class OMLXClient: ObservableObject {
 
     func getGenerationConfig(id: String) async throws -> GenerationConfigDTO {
         try await get(AdminAPI.modelGenerationConfig(id))
+    }
+
+    func listLoRAAdapters(id: String) async throws -> LoRAAdapterListResponse {
+        try await get(AdminAPI.modelLoRAAdapters(id))
     }
 
     /// Server-side lookup of the best omlx.ai benchmarks for this device

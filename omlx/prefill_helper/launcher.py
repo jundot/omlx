@@ -12,6 +12,7 @@ from __future__ import annotations
 import getpass
 import ipaddress
 import json
+import logging
 import queue
 import re
 import secrets
@@ -26,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .. import __version__
 from ..cluster.registry import get_device_registry
 from ..cluster.ssh_policy import cluster_ssh_options
 from ..cluster.staging import scp_push, sidecar_files
@@ -39,11 +41,15 @@ from ..cluster.transport import (
 from .adapter import StageAdapter
 from .worker import READY_PREFIX
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_PYTHON = "~/.omlx/bin/omlx-cluster-python"
 COPY_DIR = "~/.omlx/prefill-helper/models"
 _READY_TIMEOUT_S = 900.0
 _PARALLEL_COPIES = 4
 _FAST_LINKS = ("thunderbolt", "rdma")
+# The row name of the first accelerator check, and what it shows.
+VIA = "ssh"
 # Reaching sshd on a link-local address tells which local interface the cable is.
 _SSH_PORT = 22
 
@@ -54,6 +60,12 @@ _PYTHON_PATH = re.compile(r"[~\w./-]+")
 
 class LaunchError(RuntimeError):
     """The helper cannot start; the message is shown to the user."""
+
+
+class UnreachableError(LaunchError):
+    """The helper cannot be reached right now: asleep, unplugged, or off the
+    network. Worth retrying with backoff, unlike a version, memory, disk, or
+    pairing problem."""
 
 
 @dataclass(frozen=True)
@@ -76,6 +88,10 @@ class HelperTarget:
     def __post_init__(self) -> None:
         if not _PYTHON_PATH.fullmatch(self.python):
             raise ValueError(f"unsupported helper interpreter path: {self.python!r}")
+
+    @property
+    def endpoint(self) -> str:
+        return self.ssh_target
 
 
 def _ssh(target: str, command: str, *, runner: Runner = subprocess.run, timeout=30):
@@ -111,7 +127,7 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
         except (OSError, subprocess.SubprocessError):
             continue
     if target is None:
-        raise LaunchError(f"{device['friendly_name']} does not answer over SSH.")
+        raise UnreachableError(f"{device['friendly_name']} does not answer over SSH.")
     local, peer = probe_host_interfaces("localhost"), probe_host_interfaces(target)
     link = shared_link_addresses(local, peer)
     cable = None if link.kind in _FAST_LINKS else thunderbolt_link_local(local, peer)
@@ -125,7 +141,7 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
             bind_address=cable[1],
         )
     if not link.ok:
-        raise LaunchError(link.reason or "No network link to the helper Mac.")
+        raise UnreachableError(link.reason or "No network link to the helper Mac.")
     wifi = (
         link.source.interface in local.wifi_interfaces
         or link.peer.interface in peer.wifi_interfaces
@@ -226,6 +242,16 @@ def remote_info(
         raise LaunchError(f"oMLX is not installed on {target.name}.") from None
 
 
+def incompatible(
+    info: dict, adapter: StageAdapter | None, name: str, oqh: int | None = None
+) -> str | None:
+    """Why this Mac cannot help, or None: it runs the helper from its own
+    oMLX, so the versions must be equal."""
+    if info.get("version") != __version__:
+        return f"{name} runs oMLX {info.get('version')}; update it to {__version__}."
+    return None
+
+
 def required_files(
     model_path: str | Path, layers: int, adapter: StageAdapter
 ) -> dict[str, int]:
@@ -235,7 +261,7 @@ def required_files(
     return {name: (root / name).stat().st_size for name in dict.fromkeys(names)}
 
 
-# Runs on the helper with /usr/bin/python3 -I: finds a complete copy of the
+# Runs on the helper with its oMLX Python and -P (no cwd on sys.path): finds a complete copy of the
 # model in its model folders, else reports what the copy folder still lacks
 # and the other copies there (the running helper's is never offered).
 _PROBE = r"""
@@ -329,9 +355,12 @@ def locate_files(
 ) -> dict[str, Any]:
     """Where the helper already has the model, or what it is missing."""
     request = json.dumps({"name": model_name, "files": files, "copy_dir": COPY_DIR})
-    command = f"/usr/bin/python3 -I -c {shlex.quote(_PROBE)} {shlex.quote(request)}"
+    command = f"{target.python} -P -c {shlex.quote(_PROBE)} {shlex.quote(request)}"
     result = _ssh(target.ssh_target, command, runner=runner, timeout=120)
     if result.returncode != 0:
+        logger.warning(
+            "File check on %s failed: %s", target.name, result.stderr.strip()
+        )
         raise LaunchError(f"Could not check the model files on {target.name}.")
     return json.loads(result.stdout.strip().splitlines()[-1])
 
@@ -347,9 +376,12 @@ def delete_copies(
 ) -> int:
     """Remove other models' copies on the helper; returns its free bytes."""
     request = json.dumps({"names": names, "copy_dir": COPY_DIR})
-    command = f"/usr/bin/python3 -I -c {shlex.quote(_DELETE)} {shlex.quote(request)}"
+    command = f"{target.python} -P -c {shlex.quote(_DELETE)} {shlex.quote(request)}"
     result = _ssh(target.ssh_target, command, runner=runner, timeout=300)
     if result.returncode != 0:
+        logger.warning(
+            "Copy removal on %s failed: %s", target.name, result.stderr.strip()
+        )
         raise LaunchError(f"Could not remove model copies on {target.name}.")
     return int(json.loads(result.stdout.strip().splitlines()[-1])["free"])
 
@@ -463,7 +495,8 @@ def launch(
         lines.put(None)
 
     threading.Thread(target=read_stdout, daemon=True).start()
-    threading.Thread(target=lambda: errors.extend(process.stderr), daemon=True).start()
+    stderr = threading.Thread(target=lambda: errors.extend(process.stderr), daemon=True)
+    stderr.start()
     deadline = time.monotonic() + _READY_TIMEOUT_S
     while True:
         try:
@@ -476,6 +509,8 @@ def launch(
             hello = json.loads(line[len(READY_PREFIX) :])
             return HelperProcess(process, int(hello["port"]), hello, token)
     process.terminate()
+    # Its last lines can still be in flight when stdout closes.
+    stderr.join(timeout=5)
     detail = "".join(errors[-5:]).strip()
     raise LaunchError(
         f"The helper on {target.name} did not start"

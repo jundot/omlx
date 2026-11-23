@@ -134,6 +134,9 @@ private struct ActiveModelsSection: View {
                                 .foregroundStyle(theme.text)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
+                            if let alias = m.displayAlias {
+                                ModelAliasText(alias: alias)
+                            }
                             Spacer(minLength: 8)
                             ActiveBadge(model: m)
                             Text(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))
@@ -252,136 +255,193 @@ private struct LibrarySection: View {
                 }
             } else {
                 ForEach(Array(models.enumerated()), id: \.element.id) { idx, m in
-                    FreeRow(isLast: idx == models.count - 1) {
-                        HStack(spacing: 10) {
-                            Button {
-                                onToggleFavorite(m.id, !(m.isFavorite ?? false))
-                            } label: {
-                                Image(systemName: (m.isFavorite ?? false) ? "star.fill" : "star")
-                                    .font(.system(size: 12))
-                                    .foregroundStyle((m.isFavorite ?? false) ? Color.yellow : theme.textTertiary)
-                            }
-                            .buttonStyle(.plain)
-                            .help((m.isFavorite ?? false)
-                                ? String(localized: "models.library.favorite_on.help",
-                                         defaultValue: "Favorite — click to remove",
-                                         comment: "Tooltip on the filled star that removes a model from favorites")
-                                : String(localized: "models.library.favorite_off.help",
-                                         defaultValue: "Add to favorites",
-                                         comment: "Tooltip on the outlined star that adds a model to favorites"))
-                            Squircle(systemSymbol: iconName(for: m),
-                                     size: 26,
-                                     gradient: gradient(for: m))
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack(spacing: 4) {
-                                    Text(m.displayTitle)
-                                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
-                                        .foregroundStyle(theme.text)
-                                        .lineLimit(1)
-                                        .truncationMode(.tail)
-                                    CopyIconButton(value: m.id)
-                                    if m.isInHFCache {
-                                        StatusPill(status: .custom(
-                                            color: theme.textTertiary,
-                                            label: String(localized: "models.library.hf_cache.badge",
-                                                          defaultValue: "HF cache",
-                                                          comment: "Badge on a library model found in the shared Hugging Face cache"),
-                                            fillBg: true))
-                                            .help(String(localized: "models.library.hf_cache.help",
-                                                         defaultValue: "Found in the Hugging Face cache. Other apps that use this cache will need to download it again after you delete it.",
-                                                         comment: "Tooltip on the HF cache badge in the model library"))
-                                    }
-                                    ForEach((m.externalEngines ?? []).filter(\.compatible)) { engine in
-                                        StatusPill(status: .custom(
-                                            color: theme.accent,
-                                            label: engine.label,
-                                            fillBg: true))
-                                            .help(String(localized: "models.library.external_engine.help",
-                                                         defaultValue: "\(engine.label) can serve this model. Turn it on in the model's Advanced settings.",
-                                                         comment: "Tooltip on the external engine badge in the model library; placeholder is the engine name"))
-                                    }
-                                    if m.isGGUF {
-                                        StatusPill(status: .custom(
-                                            color: theme.textTertiary,
-                                            label: "GGUF",
-                                            fillBg: true))
-                                            .help(String(localized: "models.library.gguf.help",
-                                                         defaultValue: "A GGUF file, served by an external engine",
-                                                         comment: "Tooltip on the GGUF badge in the model library"))
-                                    }
-                                }
-                                updateBadge(for: m)
-                                Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
-                                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
-                                    .foregroundStyle(theme.textSecondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                            Spacer(minLength: 8)
-                            HStack(spacing: 10) {
-                                if isModelLoaded(m.id) {
-                                    Button {
-                                        onUnload(m.id)
-                                    } label: {
-                                        Text(String(localized: "models.library.unload",
-                                                    defaultValue: "Unload",
-                                                    comment: "Button label that unloads a library model from memory"))
-                                            .lineLimit(1)
-                                            .frame(minWidth: 48)
-                                    }
-                                    .buttonStyle(.omlx(.plain, size: .small))
-                                } else {
-                                    Button {
-                                        onLoad(m.id)
-                                    } label: {
-                                        Text(String(localized: "models.library.load",
-                                                    defaultValue: "Load",
-                                                    comment: "Button label that loads a library model into memory"))
-                                            .lineLimit(1)
-                                            .frame(minWidth: 48)
-                                    }
-                                    .buttonStyle(.omlx(.normal, size: .small))
-                                    .disabled(m.isLoading)
-                                }
-                                Button {
-                                    onOpenSettings(m.id)
-                                } label: {
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 11))
-                                }
-                                .buttonStyle(.omlx(.plain, size: .small))
-                                .help(String(localized: "models.library.settings.help",
-                                             defaultValue: "Settings",
-                                             comment: "Tooltip on the chevron that opens a model's settings screen"))
-                                Button {
-                                    onRequestRemove(m.id)
-                                } label: {
-                                    if deletingID == m.id {
-                                        ProgressView()
-                                            .controlSize(.mini)
-                                    } else {
-                                        Image(systemName: "trash")
-                                            .font(.system(size: 11))
-                                            .foregroundStyle(theme.redDot)
-                                    }
-                                }
-                                .buttonStyle(.omlx(.plain, size: .small))
-                                .disabled(deletingID != nil)
-                                .help(String(localized: "models.library.remove.help",
-                                             defaultValue: "Remove from disk",
-                                             comment: "Tooltip on the trash button that deletes a model from local storage"))
-                            }
-                            .fixedSize(horizontal: true, vertical: false)
-                            .layoutPriority(1)
-                        }
-                    }
+                    LibraryRow(
+                        model: m,
+                        isLast: idx == models.count - 1,
+                        isLoaded: isModelLoaded(m.id),
+                        deletingID: deletingID,
+                        updates: updates,
+                        onLoad: onLoad,
+                        onUnload: onUnload,
+                        onOpenSettings: onOpenSettings,
+                        onRequestRemove: onRequestRemove,
+                        onToggleFavorite: onToggleFavorite
+                    )
                 }
             }
         }
     }
+}
+
+/// Clicking the row opens model settings. Copy and remove show only while the pointer is over the row.
+private struct LibraryRow: View {
+    let model: ModelDTO
+    let isLast: Bool
+    let isLoaded: Bool
+    let deletingID: String?
+    let updates: ModelsScreenVM
+    let onLoad: (String) -> Void
+    let onUnload: (String) -> Void
+    let onOpenSettings: (String) -> Void
+    let onRequestRemove: (String) -> Void
+    let onToggleFavorite: (String, Bool) -> Void
+
+    @Environment(\.omlxTheme) private var theme
+    @State private var isHovered = false
+
+    private var isFavorite: Bool { model.isFavorite ?? false }
+    private var showsHoverActions: Bool { isHovered || deletingID == model.id }
+
+    var body: some View {
+        FreeRow(isLast: isLast, verticalPadding: 8) {
+            content
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
+        .onTapGesture { onOpenSettings(model.id) }
+        .accessibilityAction(named: Text(Self.settingsLabel)) { onOpenSettings(model.id) }
+        .contextMenu {
+            Button(Self.copyIDLabel) { copy(model.id) }
+            if let alias = model.displayAlias {
+                Button(Self.copyAliasLabel) { copy(alias) }
+            }
+            Button(Self.settingsLabel) { onOpenSettings(model.id) }
+            Divider()
+            Button(Self.removeLabel, role: .destructive) { onRequestRemove(model.id) }
+                .disabled(deletingID != nil)
+        }
+    }
+
+    private var content: some View {
+        HStack(spacing: 10) {
+            favoriteButton
+            ModelIconTile(modelType: model.modelType)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(model.displayTitle)
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                        .foregroundStyle(theme.text)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    updateBadge
+                }
+                details
+            }
+            Spacer(minLength: 8)
+            HStack(spacing: 10) {
+                HStack(spacing: 2) {
+                    CopyIconButton(value: model.apiModelName,
+                                   helpText: model.displayAlias == nil ? Self.copyIDLabel : Self.copyAliasLabel)
+                    removeButton
+                }
+                .opacity(showsHoverActions ? 1 : 0)
+                .allowsHitTesting(showsHoverActions)
+                LoadToggle(
+                    isLoaded: isLoaded,
+                    isLoading: model.isLoading,
+                    onLoad: { onLoad(model.id) },
+                    onUnload: { onUnload(model.id) }
+                )
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(theme.textTertiary)
+                    .accessibilityHidden(true)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(1)
+        }
+    }
+
+    private var favoriteButton: some View {
+        Button {
+            onToggleFavorite(model.id, !isFavorite)
+        } label: {
+            Image(systemName: isFavorite ? "star.fill" : "star")
+                .font(.system(size: 12))
+                .foregroundStyle(isFavorite ? Color.yellow : theme.textTertiary)
+        }
+        .buttonStyle(.plain)
+        .help(isFavorite
+            ? String(localized: "models.library.favorite_on.help",
+                     defaultValue: "Favorite — click to remove",
+                     comment: "Tooltip on the filled star that removes a model from favorites")
+            : String(localized: "models.library.favorite_off.help",
+                     defaultValue: "Add to favorites",
+                     comment: "Tooltip on the outlined star that adds a model to favorites"))
+    }
+
+    private var details: some View {
+        HStack(spacing: 0) {
+            if let alias = model.displayAlias {
+                ModelAliasText(alias: alias)
+                Text(" · ").fixedSize()
+            }
+            if let id = model.idNotInTitle {
+                Text("\(id) · ")
+                    .truncationMode(.middle)
+            }
+            ForEach(Array(detailTags.enumerated()), id: \.offset) { idx, tag in
+                let label = idx == 0 ? tag.label : " · \(tag.label)"
+                if let help = tag.help {
+                    Text(label).fixedSize().help(help)
+                } else {
+                    Text(label).fixedSize()
+                }
+            }
+        }
+        .font(.omlxText(DesignTokens.FontSize.subheadline))
+        .foregroundStyle(theme.textSecondary)
+        .lineLimit(1)
+    }
+
+    private var detailTags: [(label: String, help: String?)] {
+        var tags: [(label: String, help: String?)] = []
+        if let type = ModelSettingsScreenVM.modelTypeOptions.first(where: { $0.0 == model.modelType && !$0.0.isEmpty }) {
+            tags.append((type.1, nil))
+        }
+        tags.append((model.estimatedSizeFormatted ?? formatBytes(model.estimatedSize), nil))
+        if model.isInHFCache {
+            tags.append((String(localized: "models.library.hf_cache.badge",
+                                defaultValue: "HF cache",
+                                comment: "Badge on a library model found in the shared Hugging Face cache"),
+                         String(localized: "models.library.hf_cache.help",
+                                defaultValue: "Found in the Hugging Face cache. Other apps that use this cache will need to download it again after you delete it.",
+                                comment: "Tooltip on the HF cache badge in the model library")))
+        }
+        for engine in (model.externalEngines ?? []).filter(\.compatible) {
+            tags.append((engine.label,
+                         String(localized: "models.library.external_engine.help",
+                                defaultValue: "\(engine.label) can serve this model. Turn it on in the model's Advanced settings.",
+                                comment: "Tooltip on the external engine badge in the model library; placeholder is the engine name")))
+        }
+        if model.isGGUF {
+            tags.append(("GGUF",
+                         String(localized: "models.library.gguf.help",
+                                defaultValue: "A GGUF file, served by an external engine",
+                                comment: "Tooltip on the GGUF badge in the model library")))
+        }
+        return tags
+    }
+
+    private var removeButton: some View {
+        Button {
+            onRequestRemove(model.id)
+        } label: {
+            if deletingID == model.id {
+                ProgressView()
+                    .controlSize(.mini)
+            } else {
+                Image(systemName: "trash")
+                    .font(.system(size: 11))
+            }
+        }
+        .buttonStyle(.omlx(.plain, size: .small))
+        .disabled(deletingID != nil)
+        .help(Self.removeLabel)
+    }
 
     @ViewBuilder
-    private func updateBadge(for model: ModelDTO) -> some View {
+    private var updateBadge: some View {
         if let update = updates.update(for: model.id) {
             Button { updates.showUpdate(for: model.id) } label: {
                 StatusPill(status: .custom(
@@ -397,28 +457,144 @@ private struct LibrarySection: View {
         }
     }
 
-    private func gradient(for m: ModelDTO) -> [Color] {
-        switch m.modelType {
-        case "embedding", "reranker", "decision": return SquircleGradient.downloads
-        case "audio_stt", "audio_tts", "audio_sts": return SquircleGradient.integrations
-        case "vlm":             return SquircleGradient.update
-        default:                return SquircleGradient.models
-        }
+    private func copy(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 
-    private func iconName(for m: ModelDTO) -> String {
-        switch m.modelType {
-        case "embedding": return "cube.transparent"
-        case "reranker":  return "arrow.up.arrow.down"
-        case "decision":  return "checklist"
-        case "audio_stt", "audio_tts", "audio_sts": return "waveform"
-        case "vlm":     return "eye"
-        default:        return "cpu"
+    private static var copyAliasLabel: String {
+        String(localized: "models.library.copy_alias",
+               defaultValue: "Copy alias",
+               comment: "Tooltip and context menu item that copies a model's alias")
+    }
+
+    private static var copyIDLabel: String {
+        String(localized: "common.copy_model_id",
+               defaultValue: "Copy model ID",
+               comment: "Tooltip and accessibility label for a button that copies a model identifier")
+    }
+
+    private static var settingsLabel: String {
+        String(localized: "models.library.settings.help",
+               defaultValue: "Settings",
+               comment: "Tooltip on the chevron that opens a model's settings screen")
+    }
+
+    private static var removeLabel: String {
+        String(localized: "models.library.remove.help",
+               defaultValue: "Remove from disk",
+               comment: "Tooltip on the trash button that deletes a model from local storage")
+    }
+}
+
+/// Load control: load when idle, a loaded mark that turns into unload under the pointer.
+private struct LoadToggle: View {
+    let isLoaded: Bool
+    let isLoading: Bool
+    let onLoad: () -> Void
+    let onUnload: () -> Void
+
+    @Environment(\.omlxTheme) private var theme
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: isLoaded ? onUnload : onLoad) {
+            Group {
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: symbol)
+                        .foregroundStyle(isLoaded || isHovered ? theme.text : theme.textSecondary)
+                }
+            }
+            .font(.system(size: 17))
+            .frame(width: 24, height: 24)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .disabled(isLoading)
+        .onHover { isHovered = $0 }
+        .help(label)
+        .accessibilityLabel(Text(label))
+    }
+
+    private var symbol: String {
+        if isLoaded {
+            return isHovered ? "eject.circle.fill" : "checkmark.circle.fill"
+        }
+        return isHovered ? "arrow.up.circle.fill" : "arrow.up.circle"
+    }
+
+    private var label: String {
+        isLoaded
+            ? String(localized: "models.library.unload",
+                     defaultValue: "Unload",
+                     comment: "Button label that unloads a library model from memory")
+            : String(localized: "models.library.load",
+                     defaultValue: "Load",
+                     comment: "Button label that loads a library model into memory")
     }
 }
 
 // MARK: - Helpers
+
+private struct ModelAliasText: View {
+    let alias: String
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        Text(alias)
+            .font(.omlxText(DesignTokens.FontSize.subheadline))
+            .foregroundStyle(theme.text)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .help(alias)
+            .accessibilityLabel(Text(String(localized: "settings.basic.alias.label",
+                                            defaultValue: "Model Alias")))
+            .accessibilityValue(Text(alias))
+    }
+}
+
+/// Neutral rounded tile used for model icons in lists and headers.
+struct ModelIconTile: View {
+    let systemSymbol: String
+    let size: CGFloat
+
+    @Environment(\.omlxTheme) private var theme
+
+    init(systemSymbol: String, size: CGFloat = 26) {
+        self.systemSymbol = systemSymbol
+        self.size = size
+    }
+
+    init(modelType: String?, size: CGFloat = 26) {
+        self.init(systemSymbol: Self.symbol(for: modelType), size: size)
+    }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
+        Image(systemName: systemSymbol)
+            .font(.system(size: size * 0.5, weight: .medium))
+            .foregroundStyle(theme.textSecondary)
+            .frame(width: size, height: size)
+            .background(shape.fill(theme.controlBg))
+            .overlay(shape.strokeBorder(theme.groupBorder, lineWidth: 0.5))
+    }
+
+    static func symbol(for modelType: String?) -> String {
+        switch modelType {
+        case "vlm": return "text.below.photo"
+        case "embedding": return "square.stack.3d.up"
+        case "reranker": return "text.line.first.and.arrowtriangle.forward"
+        case "decision": return "arrow.triangle.branch"
+        case "audio_stt": return "waveform.and.mic"
+        case "audio_tts": return "waveform"
+        case "audio_sts": return "person.wave.2"
+        default: return "text.alignleft"
+        }
+    }
+}
 
 func sortModelsByName(_ models: [ModelDTO]) -> [ModelDTO] {
     models.enumerated().sorted { lhs, rhs in
@@ -442,6 +618,19 @@ func sortModelsByName(_ models: [ModelDTO]) -> [ModelDTO] {
 extension ModelDTO {
     var displayTitle: String {
         displayName ?? settings?.displayName ?? id
+    }
+
+    var displayAlias: String? {
+        guard let alias = settings?.modelAlias, !alias.isEmpty else { return nil }
+        return alias
+    }
+
+    var apiModelName: String { displayAlias ?? id }
+
+    /// The API id, or nil when `displayTitle` already ends with it.
+    var idNotInTitle: String? {
+        let title = displayTitle
+        return title == id || title.hasSuffix("/\(id)") ? nil : id
     }
 }
 

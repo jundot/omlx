@@ -93,6 +93,47 @@ class TestSupportsRealtimeStt:
 
 class TestRealtimeSessionLifecycle:
     @pytest.mark.asyncio
+    async def test_voxtral_startup_reserves_session_and_activity(self):
+        engine = STTEngine("m")
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        finish = threading.Event()
+
+        def start():
+            loop.call_soon_threadsafe(started.set)
+            assert finish.wait(5)
+            return _FakeVoxtralSession()
+
+        engine._model = SimpleNamespace(create_streaming_session=start)
+        task = asyncio.create_task(engine.create_realtime_session())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            with pytest.raises(RuntimeError, match="already active"):
+                await asyncio.wait_for(engine.create_realtime_session(), timeout=0.1)
+            assert engine.has_active_requests()
+        finally:
+            finish.set()
+            session = await task
+            await session.release()
+        assert not engine.has_active_requests()
+
+    @pytest.mark.asyncio
+    async def test_failed_voxtral_startup_releases_session_and_activity(self):
+        engine = STTEngine("m")
+        start = MagicMock(
+            side_effect=[ValueError("startup failed"), _FakeVoxtralSession()]
+        )
+        engine._model = SimpleNamespace(create_streaming_session=start)
+
+        with pytest.raises(ValueError, match="startup failed"):
+            await engine.create_realtime_session()
+        assert not engine.has_active_requests()
+
+        session = await engine.create_realtime_session()
+        await session.release()
+        assert not engine.has_active_requests()
+
+    @pytest.mark.asyncio
     async def test_second_session_rejected_until_release(self):
         engine = STTEngine("m")
         engine._model = SimpleNamespace(generate_streaming=lambda: None)
@@ -220,6 +261,8 @@ class _FakeWholeBufferModel:
         self.seconds: list[float] = []
 
     def generate(self, audio, **kwargs):
+        # Parakeet casts the waveform like this; NumPy input raises TypeError.
+        audio = audio.astype(mx.bfloat16)
         self.seconds.append(len(audio) / 16000)
         return SimpleNamespace(text=f" part{len(self.seconds)} ")
 

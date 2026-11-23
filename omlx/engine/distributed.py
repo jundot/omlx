@@ -34,6 +34,7 @@ from ..cluster.liveness import (
     read_marker,
 )
 from ..exceptions import InvalidRequestError
+from ..model_settings import a8_prefill_on, ced_prefill_on
 from ..patches.deepseek_v41.processing import (
     install_tokenizer_protocol as install_deepseek_v41_tokenizer_protocol,
 )
@@ -171,6 +172,30 @@ def _with_model_mtp(
     )
 
 
+def _with_model_prefill(
+    deployment: ClusterDeployment,
+    model_settings: Any | None,
+    model_type: str | None,
+) -> ClusterDeployment:
+    """The deployment with the model's CED and A8 prefill settings applied.
+
+    Only DeepSeek V4.1 tensor-parallel ranks read them.
+    """
+
+    if model_type != "deepseek_v41" or deployment.tensor_parallel_size < 2:
+        return deployment
+    a8 = a8_prefill_on(model_settings)
+    # Model settings check the threshold only while A8 is on.
+    min_tokens = getattr(model_settings, "a8_prefill_min_tokens", None) if a8 else None
+    execution = replace(
+        deployment.execution,
+        ced_prefill=ced_prefill_on(model_settings),
+        a8_prefill=a8,
+        a8_prefill_min_tokens=int(min_tokens or 128),
+    )
+    return replace(deployment, execution=execution)
+
+
 class DistributedInferenceError(RuntimeError):
     """A bounded error surfaced when the private rank-zero backend fails."""
 
@@ -226,6 +251,7 @@ class DistributedBatchedEngine(BatchedEngine):
         abort_drain_timeout: float = 15.0,
         orphan_reap_grace: float = 5.0,
         vision_checkpoint: bool = False,
+        config_model_type: str | None = None,
     ) -> None:
         if request_read_timeout is None:
             raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
@@ -244,6 +270,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if abort_drain_timeout < 0 or orphan_reap_grace < 0:
             raise ValueError("distributed abort timeouts must be non-negative")
         deployment = _with_model_mtp(deployment, model_settings)
+        deployment = _with_model_prefill(deployment, model_settings, config_model_type)
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,
@@ -882,14 +909,19 @@ raise SystemExit(2)
         return normalized or None
 
     @staticmethod
-    def _join_reasoning_and_content(reasoning: Any, content: Any) -> str:
+    def _join_reasoning_and_content(
+        reasoning: Any, content: Any, tool_calls: Any = None
+    ) -> str:
         """Carry private structured reasoning through GenerationOutput safely."""
 
         reasoning_text = reasoning if isinstance(reasoning, str) else ""
         content_text = content if isinstance(content, str) else ""
-        if reasoning_text:
+        if not reasoning_text:
+            return content_text
+        # A reasoning-only reply stays open so extract_thinking recovers it as content.
+        if content_text or tool_calls:
             return f"<think>{reasoning_text}</think>{content_text}"
-        return content_text
+        return f"<think>{reasoning_text}"
 
     async def _enter_request(self, request_id: str | None = None) -> str:
         async with self._active_lock:
@@ -1287,6 +1319,7 @@ raise SystemExit(2)
             text = self._join_reasoning_and_content(
                 message.get("reasoning") or message.get("reasoning_content"),
                 message.get("content"),
+                tool_calls=tool_calls,
             )
             return GenerationOutput(
                 text=text,
@@ -1541,10 +1574,7 @@ raise SystemExit(2)
             self._mark_backend_finished(request_id)
             await self._leave_request(request_id)
 
-        pending_final_text = ""
-        if reasoning_open:
-            pending_final_text = "</think>"
-            full_text += pending_final_text
+        # Keep an open think block open; the thinking parser recovers it as content.
         tool_calls = self._normalize_backend_tool_calls(
             [backend_tool_calls[index] for index in sorted(backend_tool_calls)]
         )
@@ -1559,7 +1589,7 @@ raise SystemExit(2)
         )
         yield GenerationOutput(
             text=full_text,
-            new_text=pending_final_text,
+            new_text="",
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             finish_reason=("tool_calls" if tool_calls else (finish_reason or "stop")),
@@ -2025,6 +2055,11 @@ raise SystemExit(2)
         self._validate_request_features(kwargs)
         await self._require_healthy_cluster()
         return None
+
+    def active_request_count(self) -> int:
+        if self.runtime_failed_reason is not None:
+            return 0
+        return self._active_requests
 
     def has_active_requests(self) -> bool:
         if self.runtime_failed_reason is not None:

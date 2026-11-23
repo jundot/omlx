@@ -324,6 +324,21 @@ def test_batch_uid_cancellation_closes_request_on_every_rank():
     assert snapshot["last_request"]["status"] == "cancelled"
 
 
+def test_a_one_prompt_model_prefills_prompts_one_at_a_time(monkeypatch):
+    class FakeBatchGenerator:
+        def __init__(self, model, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(mlx_server, "BatchGenerator", FakeBatchGenerator)
+    with install_server_telemetry(_Marker()):
+        ced = SimpleNamespace(_omlx_one_prompt_prefill=True)
+        one = mlx_server.BatchGenerator(ced, prefill_batch_size=4)
+        other = mlx_server.BatchGenerator(SimpleNamespace(), prefill_batch_size=4)
+
+    assert one.kwargs["prefill_batch_size"] == 1
+    assert other.kwargs["prefill_batch_size"] == 4
+
+
 def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
     import mlx_lm.server as mlx_server
 

@@ -33,7 +33,8 @@
   <b>English</b> ·
   <a href="README.zh.md">中文</a> ·
   <a href="README.ko.md">한국어</a> ·
-  <a href="README.ja.md">日本語</a>
+  <a href="README.ja.md">日本語</a> ·
+  <a href="README.it.md">Italiano</a>
 </p>
 
 ---
@@ -174,8 +175,9 @@ checklist.
 A paired Mac can also speed up prefill without splitting the model: the
 [Prefill Accelerator](docs/experimental/prefill-accelerator.md) runs the first
 layers of long prompts on the other Mac while the model, its cache and
-decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next and
-MiniMax M3).
+decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next,
+Qwen3.8 27B, MiniMax M3 and Inkling 2). The helper can also be a Linux machine with
+NVIDIA GPUs running [omlx-cuda-helper](apps/omlx-cuda-helper/README.md).
 
 ### Vision-Language Models
 
@@ -287,9 +289,27 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/rerank` | Document reranking |
 | `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
-| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
+| `POST /v1/audio/transcriptions` | Speech-to-text, including speaker labels when supported |
+| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`); embedding models take `prompt` only |
 
 The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
+
+#### Transcription with speaker labels
+
+Select an installed speech model that supports timed speaker attribution, such as VibeVoice-ASR or Nemotron 3.5 Transcribe. Send a multipart request with the model ID from `GET /v1/models`:
+
+```sh
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer $OMLX_API_KEY" \
+  -F "file=@meeting.wav" \
+  -F "model=$MODEL_ID" \
+  -F "response_format=diarized_json" \
+  -F "chunking_strategy=auto"
+```
+
+The response includes text, the audio duration, and one segment per speaker turn with `speaker`, `start`, `end`, and `text`. Speaker labels are local to the recording.
+
+Streaming is not supported, and `chunking_strategy` must be `auto` or omitted; the whole file goes to the model. Models without timed speaker labels, including Nemotron checkpoints without the CTC alignment files, return HTTP 400.
 
 ### Tool Calling & Structured Output
 
@@ -479,8 +499,10 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
-- [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`, and a GGUF's tokenizer is derived from its header as Splash's Apache-2.0 `install/gguf.py` derives it; Splash itself can also serve supported models as an external engine
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - Qwen GDN and QSA kernels (one via its mlxfast-challenge port) and the Linux helper's expert kernels and MLX CUDA patches are adapted from its MIT-licensed code
+- [TensorFold](https://github.com/ashhart/TensorFold) - The Linux helper's sparse-attention and Gated DeltaNet CUDA kernels for MiniMax M3, GLM-5.3 and Qwen3.8 Flash-Next are adapted from its Apache-2.0 kernels
+- [Splash](https://github.com/incoai/splash) - The verify-shape linear and attention kernels and GGUF tokenizer loading are adapted from its Apache-2.0 code, and it can serve models as an external engine
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
 - [m5gpu](https://github.com/beamivalice/m5gpu) - The GPU power limit writes the AGX GPU power target that m5gpu by beamivalice documented (`SetMaxGPUAbsolutePower` with `AbsoluteTarget`, and `-1000` to remove it)
 - [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Ming-3.0-tts's pipelined decode loop follows Stéphane Busso's ming-tts-serve, and its fused DiT kernels are adapted from ming-tts-serve's MIT-licensed `ming_fused.zig`
+- [Wikipedia](https://www.wikipedia.org) - Parts of the built-in oQ and oQe calibration text are truncated excerpts of Wikipedia articles, licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)

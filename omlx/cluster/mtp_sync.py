@@ -58,6 +58,18 @@ class ClusterMtpSync:
         )
         return list(main_ids), list(draft_ids), reason
 
+    def share_batch_plan(self, standard: bool, depth: int) -> tuple[bool, int]:
+        """Rank zero's choice for a batch step: ordinary decode, or MTP at this depth."""
+
+        standard, depth = self._broadcast("plan", bool(standard), int(depth))
+        return bool(standard), int(depth)
+
+    def share_batch_park(self, park: bool) -> bool:
+        """Whether rank zero parks batched MTP after this cycle."""
+
+        (park,) = self._broadcast("park", bool(park))
+        return bool(park)
+
     def share_cycle_result(self, accepted: int, emit_id: int) -> tuple[int, int, int]:
         """Rank zero's accepted draft count and final token, plus a seed."""
 

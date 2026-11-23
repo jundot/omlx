@@ -14,7 +14,10 @@ Note: Uses pytest-asyncio for async tests.
 
 import asyncio
 import concurrent.futures
+import threading
+import time
 import weakref
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -29,9 +32,13 @@ from omlx.engine_core import (
     EngineCore,
     _raise_request_output_error,
 )
-from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
+from omlx.exceptions import (
+    PrefillMemoryAbortedError,
+    PrefillMemoryExceededError,
+    RequestAbortedError,
+)
 from omlx.output_collector import RequestOutputCollector
-from omlx.request import RequestOutput, SamplingParams
+from omlx.request import Request, RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
 
 
@@ -586,6 +593,35 @@ class TestEngineCoreAbortRequest:
 
                 # stream_outputs' finally block should have cleaned up
                 assert request_id not in engine._output_collectors
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_admin_abort_ends_stream_with_request_aborted_error(
+        self, mock_model, mock_tokenizer
+    ):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+
+                request_id = await engine.add_request(prompt="Hello")
+                await engine.abort_request(
+                    request_id, reason="Stopped by admin", error_code="admin_abort"
+                )
+
+                outputs = []
+                with pytest.raises(RequestAbortedError, match="Stopped by admin"):
+                    async for output in engine.stream_outputs(request_id):
+                        outputs.append(output)
+                assert outputs[-1].finish_reason == "error"
+                assert outputs[-1].new_text == "\n\n[Error: Stopped by admin]"
+                assert request_id in engine.scheduler._pending_abort_ids
             finally:
                 await engine.stop()
                 engine.close()
@@ -1712,6 +1748,41 @@ class TestGlobalMLXExecutor:
             f"Per-engine executors should allow parallel step() calls."
         )
 
+    @pytest.mark.asyncio
+    async def test_two_hop_admission_lands_before_next_prefill_chunk(
+        self, mock_model, mock_tokenizer
+    ):
+        """VLM prompt prep queued behind a chunk gets its add in before the next one."""
+        started = threading.Event()
+        chunks = 0
+        added_after: list[int] = []
+
+        def chunk_step():
+            nonlocal chunks
+            started.set()
+            time.sleep(0.1)
+            chunks += 1
+            return SchedulerOutput(has_work=True, ran_prefill_chunk=True)
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine.scheduler.step = chunk_step
+            engine.scheduler.has_requests = lambda: True
+            engine.scheduler.add_request = lambda request: added_after.append(chunks)
+            try:
+                await engine.start()
+                while not started.is_set():
+                    await asyncio.sleep(0.005)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(engine._mlx_executor, lambda: None)
+                await engine.add_request("hello")
+            finally:
+                await engine.stop()
+                engine.close()
+
+        assert added_after == [1]
+
 
 class TestEngineCoreCloseReleasesSSDManager:
     """close() must release the SSD cache manager even if shutdown() fails.
@@ -1899,7 +1970,10 @@ class TestStepBurst:
             RequestOutput(request_id="b", new_token_ids=[22], completion_tokens=2)
         )
         try:
-            engine.scheduler.running = {"a": object(), "b": object()}
+            engine.scheduler.running = {
+                "a": Request("a", "p", SamplingParams(), first_text_released=True),
+                "b": Request("b", "p", SamplingParams()),
+            }
             engine.scheduler.step = MagicMock(side_effect=steps + [steps[-1]])
             engine.scheduler.has_requests = MagicMock(return_value=True)
 
@@ -1907,6 +1981,52 @@ class TestStepBurst:
             assert engine.scheduler.step.call_count == 2
             engine.scheduler.has_requests.return_value = False
             assert engine._step_burst() == steps[2:]
+        finally:
+            engine.close()
+
+    @pytest.mark.parametrize(
+        ("texts", "expected_bursts"),
+        [
+            # Visible token 0: one release, then normal bursting.
+            (["Hi", " a", " b", " c", " d", " e"], [1, 4, 1]),
+            # Reasoning openers show nothing, so the burst keeps ending until
+            # the first visible text has been released too.
+            (["<think>", "\n", "The", " a", " b", " c"], [1, 1, 1, 3]),
+            (["<|channel|>", "", "ok", " a", " b", " c"], [1, 1, 1, 3]),
+            # Tags and whitespace only: the cap restores bursting.
+            (["<think>"] + ["\n"] * 23, [1] * 16 + [4, 4]),
+        ],
+        ids=["visible_first", "think_opener", "channel_opener", "blank_capped"],
+    )
+    def test_burst_ends_until_first_visible_text(
+        self, mock_model, mock_tokenizer, texts, expected_bursts
+    ):
+        """Each chunk up to a request's first visible text ends the burst."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        steps = [
+            SchedulerOutput(
+                has_work=True,
+                outputs=[
+                    RequestOutput(
+                        request_id="a",
+                        new_token_ids=[index],
+                        new_text=text,
+                        completion_tokens=index + 1,
+                    )
+                ],
+            )
+            for index, text in enumerate(texts)
+        ]
+        try:
+            engine.scheduler.running = {"a": Request("a", "p", SamplingParams())}
+            engine.scheduler.step = MagicMock(side_effect=list(steps))
+            engine.scheduler.has_requests = lambda: (
+                engine.scheduler.step.call_count < len(steps)
+            )
+            bursts = []
+            while engine.scheduler.step.call_count < len(steps):
+                bursts.append(len(engine._step_burst()))
+            assert bursts == expected_bursts
         finally:
             engine.close()
 
@@ -2024,15 +2144,77 @@ class TestStepBurst:
         """Elapsed budget ends the burst (also caps slow prefill-chunk steps)."""
         engine = self._make_engine(mock_model, mock_tokenizer, max_steps=8, budget=0.05)
         try:
-            engine.scheduler.step = MagicMock(
-                return_value=SchedulerOutput(has_work=True)
+            # deadline = 100.01 + 0.05: steps end at 100.01, 100.04, 100.07.
+            outs = self._run_timed_burst(engine, [0.01] + [0.03] * 7)
+            assert len(outs) == 3
+            assert engine.scheduler.step.call_count == 3
+        finally:
+            engine.close()
+
+    def _run_timed_burst(
+        self, engine, durations, outputs=None, chunk_steps=(), prefilling=False
+    ):
+        """Run one burst where step i takes durations[i] seconds."""
+        clock = [100.0]
+        calls = iter(range(len(durations)))
+
+        def step():
+            index = next(calls)
+            clock[0] += durations[index]
+            if outputs and outputs[index] is not None:
+                return outputs[index]
+            output = SchedulerOutput(has_work=True)
+            output.ran_prefill_chunk = index in chunk_steps
+            return output
+
+        engine.scheduler.step = MagicMock(side_effect=step)
+        engine.scheduler.has_requests = MagicMock(return_value=True)
+        engine.scheduler.prefilling = deque([object()] if prefilling else [])
+        with patch("omlx.engine_core.time.monotonic", side_effect=lambda: clock[0]):
+            return engine._step_burst()
+
+    @pytest.mark.parametrize(
+        ("durations", "chunk_steps", "expected_steps"),
+        [
+            ([3.0, 3.0, 3.0], {0, 1, 2}, 1),
+            ([0.12, 0.12, 0.12, 0.12], (), 2),
+            ([0.05, 0.05, 0.05, 0.05], {0, 1, 2, 3}, 3),
+        ],
+        ids=["slow_chunk", "slow_decode", "fast_chunks"],
+    )
+    def test_prefill_chunk_over_budget_ends_burst(
+        self, mock_model, mock_tokenizer, durations, chunk_steps, expected_steps
+    ):
+        """Only a chunk that alone spends the budget ends the burst (#5148)."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4, budget=0.1)
+        try:
+            outs = self._run_timed_burst(
+                engine, durations, chunk_steps=chunk_steps, prefilling=True
             )
-            engine.scheduler.has_requests = MagicMock(return_value=True)
-            # deadline = monotonic()(=100.0) + 0.05; next check (=200.0) exceeds it.
-            with patch("omlx.engine_core.time.monotonic", side_effect=[100.0, 200.0]):
-                outs = engine._step_burst()
-            assert len(outs) == 1
-            assert engine.scheduler.step.call_count == 1
+            assert len(outs) == expected_steps
+        finally:
+            engine.close()
+
+    @pytest.mark.parametrize(
+        ("prefilling", "expected_steps"),
+        [(True, 1), (False, 4)],
+        ids=["prefill_in_flight", "no_prefill"],
+    )
+    def test_finished_request_ends_burst_while_prefilling(
+        self, mock_model, mock_tokenizer, prefilling, expected_steps
+    ):
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4, budget=0.1)
+        finished = SchedulerOutput(
+            has_work=True,
+            outputs=[RequestOutput(request_id="a", finished=True)],
+            finished_request_ids={"a"},
+        )
+        try:
+            outs = self._run_timed_burst(
+                engine, [0.01] * 4, [finished, None, None, None], prefilling=prefilling
+            )
+            assert outs[0] is finished
+            assert len(outs) == expected_steps
         finally:
             engine.close()
 

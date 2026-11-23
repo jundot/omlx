@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Offline tests for the v2 discovery/identity endpoints."""
+"""Offline tests for the cluster discovery/identity endpoints."""
 
 import pytest
 from fastapi import FastAPI
@@ -227,22 +227,6 @@ def test_devices_merges_pending_pairing_requests(_configured_stores, monkeypatch
     assert len(pending) == 1
     assert pending[0]["state"] == "awaiting_approval"
     assert pending[0]["friendly_name"] == "studio-2"
-
-
-def test_devices_paired_rows_carry_enrolled_ssh_target(_configured_stores, monkeypatch):
-    from types import SimpleNamespace
-
-    from omlx.cluster import enrollment
-
-    _, registry, client = _configured_stores
-    registry.mark_paired("peer-1", friendly_name="studio-b")
-    enrolled = SimpleNamespace(node_id="peer-1", ssh="omlx@studio-b.local")
-    fake_store = SimpleNamespace(list_nodes=lambda: (enrolled,))
-    monkeypatch.setattr(enrollment, "get_cluster_enrollment", lambda: fake_store)
-
-    payload = client.get("/api/cluster/devices").json()
-
-    assert payload["paired"][0]["ssh_target"] == "omlx@studio-b.local"
 
 
 def test_cluster_name_persisted_config(tmp_path, monkeypatch):
@@ -548,13 +532,7 @@ def test_devices_enriches_paired_row_from_discovery_record(_configured_stores):
     configure_discovery_service(None)
 
 
-def test_devices_paired_row_normalizes_last_addrs_and_keeps_ssh_target(
-    _configured_stores, monkeypatch
-):
-    from types import SimpleNamespace
-
-    from omlx.cluster import enrollment
-
+def test_devices_paired_row_normalizes_last_addrs(_configured_stores):
     _, registry, client = _configured_stores
     registry.mark_paired(
         "peer-1",
@@ -562,9 +540,6 @@ def test_devices_paired_row_normalizes_last_addrs_and_keeps_ssh_target(
         caps={"chip": "M4", "ram_gb": 64},
         addrs=["192.168.1.20", "192.168.1.21"],
     )
-    enrolled = SimpleNamespace(node_id="peer-1", ssh="omlx@studio-b.local")
-    fake_store = SimpleNamespace(list_nodes=lambda: (enrolled,))
-    monkeypatch.setattr(enrollment, "get_cluster_enrollment", lambda: fake_store)
 
     payload = client.get("/api/cluster/devices").json()
 
@@ -579,8 +554,6 @@ def test_devices_paired_row_normalizes_last_addrs_and_keeps_ssh_target(
     assert row["state"] == "suspect"
     assert row["last_seen"] is None
     assert row["http_port"] == 0
-    # The enrollment seam still applies on top of the normalization.
-    assert row["ssh_target"] == "omlx@studio-b.local"
 
 
 def test_manual_paired_endpoint_persists_and_rehydrates_on_reboot(
@@ -630,13 +603,7 @@ def test_manual_paired_endpoint_persists_and_rehydrates_on_reboot(
     service.stop()
 
 
-def test_devices_expose_address_health_for_ordinary_paired_peer(
-    _configured_stores, monkeypatch
-):
-    from types import SimpleNamespace
-
-    from omlx.cluster import enrollment
-
+def test_devices_expose_address_health_for_ordinary_paired_peer(_configured_stores):
     identity, registry, client = _configured_stores
     registry.mark_paired("peer", friendly_name="Worker", addrs=["192.0.2.1"])
     online = {"192.0.2.1"}
@@ -648,13 +615,6 @@ def test_devices_expose_address_health_for_ordinary_paired_peer(
         zeroconf_module=None,
     )
     configure_discovery_service(service)
-    monkeypatch.setattr(
-        enrollment,
-        "get_cluster_enrollment",
-        lambda: SimpleNamespace(
-            list_nodes=lambda: [SimpleNamespace(node_id="peer", ssh="192.0.2.1")]
-        ),
-    )
     for ip in ("192.0.2.1", "192.0.2.2"):
         service._add_candidate(ip, 8000, node_id="peer", if_type="manual")
     service._probe_candidate("192.0.2.1", 8000)
@@ -670,7 +630,6 @@ def test_devices_expose_address_health_for_ordinary_paired_peer(
     assert row["address_health"]["192.0.2.1"]["state"] == "stale"
     assert row["address_health"]["192.0.2.2"]["state"] == "verified"
     assert not row.get("ssh_user")
-    assert row["ssh_target"] == "192.0.2.1"
     assert "preferred_ssh_target" not in registry.paired()[0]
 
 

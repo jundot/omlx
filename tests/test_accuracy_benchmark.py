@@ -412,6 +412,14 @@ class TestExternalAccuracyRequest:
         )
         assert req.enable_thinking is False
 
+    def test_external_max_tokens_override_uses_the_shared_floor(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="remote-model",
+            benchmarks={"mmlu": 100},
+            external={**_external_dict(), "max_tokens_override": 8192},
+        )
+        assert req.max_tokens_override == 8192
+
     def test_local_keeps_thinking(self):
         req = AccuracyBenchmarkRequest(
             model_id="local-model",
@@ -639,7 +647,7 @@ class TestLocalTruncation:
             error_message="",
         )
 
-    async def _run_local(self, questions):
+    async def _run_local(self, questions, **request_kwargs):
         correct = sum(q.correct for q in questions)
         mock_result = MagicMock(
             benchmark_name="mmlu",
@@ -649,9 +657,11 @@ class TestLocalTruncation:
             time_seconds=0.4,
             category_scores=None,
             thinking_used=True,
+            max_tokens=8192,
             question_results=questions,
         )
         mock_evaluator = MagicMock()
+        self.evaluator = mock_evaluator
         mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])
         mock_evaluator.run = AsyncMock(return_value=mock_result)
         pool = MagicMock()
@@ -661,7 +671,9 @@ class TestLocalTruncation:
         pool.release_engine = AsyncMock()
         pool._settings_manager = None
         run = create_run(
-            AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 4})
+            AccuracyBenchmarkRequest(
+                model_id="test-model", benchmarks={"mmlu": 4}, **request_kwargs
+            )
         )
         with (
             patch.dict(
@@ -723,6 +735,15 @@ class TestLocalTruncation:
         assert result["finished_count"] == 0
         assert result["finished_accuracy"] is None
 
+    @pytest.mark.asyncio
+    async def test_override_reaches_evaluator_and_limit_is_recorded(self):
+        result = await self._run_local(
+            [self._question(0, True, "stop", 900)], max_tokens_override=4096
+        )
+        assert self.evaluator.run.call_args.kwargs["max_tokens_override"] == 4096
+        # The evaluator's effective limit (thinking floor 8192), not the request.
+        assert result["max_tokens"] == 8192
+
 
 class _StubResult:
     """Minimal stand-in for an eval BenchmarkResult."""
@@ -736,6 +757,7 @@ class _StubResult:
         self.question_results = []
         self.category_scores = None
         self.thinking_used = False
+        self.max_tokens = 128
 
 
 class _StubEnginePool:
@@ -818,7 +840,8 @@ class TestQueueChainOwnership:
                 return [{"id": "1"}]
 
             async def run(self, engine, items, on_progress, batch_size=1,
-                          sampling_kwargs=None, enable_thinking=False):
+                          sampling_kwargs=None, enable_thinking=False,
+                          max_tokens_override=None):
                 nonlocal b_finished_normally
                 if engine.model_id == "model-b":
                     b_entered.set()
@@ -894,7 +917,8 @@ class TestQueueChainOwnership:
                 return [{"id": "1"}]
 
             async def run(self, engine, items, on_progress, batch_size=1,
-                          sampling_kwargs=None, enable_thinking=False):
+                          sampling_kwargs=None, enable_thinking=False,
+                          max_tokens_override=None):
                 run_log.append(("enter", engine.model_id))
                 try:
                     if engine.model_id == "model-b":

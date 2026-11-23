@@ -372,6 +372,17 @@ class TestMCPClientConnect:
         http_client.__aexit__.assert_awaited_once_with(None, None, None)
 
     @pytest.mark.asyncio
+    async def test_connect_sse_passes_headers(self, sse_client: MCPClient):
+        sse_client.config.headers = {"Authorization": "Bearer token"}
+        with patch("mcp.client.sse.sse_client") as mock_sse, patch("mcp.ClientSession"):
+            mock_sse.return_value.__aenter__.return_value = (None, None)
+            await sse_client._connect_sse()
+
+        mock_sse.assert_called_once_with(
+            sse_client.config.url, headers={"Authorization": "Bearer token"}
+        )
+
+    @pytest.mark.asyncio
     async def test_connect_stdio_passes_cwd_to_sdk(self):
         """cwd from the server config reaches StdioServerParameters (#1111).
 

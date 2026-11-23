@@ -433,15 +433,20 @@ class TestCompatibility:
         assert "Qwen3.8-Flash-Next needs a GGUF" in reason
         assert splash_mod.splash_draft_to_download(model, None, []) is None
 
-    def test_supported_checkpoint_resolves_with_its_draft(self, tmp_path, launchers):
+    def test_supported_checkpoint_resolves_with_its_draft(
+        self, tmp_path, launchers, monkeypatch
+    ):
         launchers("splash")
+        monkeypatch.setenv("HOME", str(tmp_path))
         model = _write_model(tmp_path / "Qwen3.8-27B-4bit")
         other = _write_draft(
             tmp_path / "other-draft", text={**QWEN38_TEXT, "hidden_size": 1}
         )
         draft = _write_draft(tmp_path / "z-lab" / "Qwen3.8-27B-DFlash2")
 
-        target, reason = resolve_splash_target(model, None, [str(other), str(draft)])
+        target, reason = resolve_splash_target(
+            model, None, [str(other), "~/z-lab/Qwen3.8-27B-DFlash2"]
+        )
 
         assert reason == ""
         assert target.family == "Qwen3.8-27B"
@@ -474,6 +479,12 @@ class TestCompatibility:
         assert resolve_splash_target(model, None, [str(draft)])[0] is None
         launchers("splash", version="1.3.1")
         assert resolve_splash_target(model, None, [str(draft)])[0] is not None
+        # The oQh variant of the same level keeps its rotated tensors out of Splash.
+        config = json.loads((model / "config.json").read_text())
+        config["omlx_oqh"] = {"version": 1, "tensors": {}}
+        (model / "config.json").write_text(json.dumps(config))
+        target, reason = resolve_splash_target(model, None, [str(draft)])
+        assert target is None and "oQh" in reason
 
     @pytest.mark.parametrize(
         "quantization_config",
@@ -1061,16 +1072,46 @@ class TestRequestTranslation:
         assert value("--max-cache-disk") == str(5 * GIB)
         assert value("--cache-dir") == str(tmp_path / "ssd")
 
+    def test_serve_command_sends_activations_when_supported(self, tmp_path):
+        engine = _engine(tmp_path, version="1.6.1", activations="bf16")
+
+        command = engine._serve_command(9000)
+
+        assert command[command.index("--activations") + 1] == "bf16"
+
+    def test_serve_command_skips_activations_for_older_launchers(self, tmp_path):
+        # Splash < 1.6.1 rejects --activations, so it must not be passed there.
+        engine = _engine(tmp_path, version="1.6.0", activations="bf16")
+
+        assert "--activations" not in engine._serve_command(9000)
+
+    def test_serve_command_leaves_auto_activations_to_splash(self, tmp_path):
+        engine = _engine(tmp_path, version="1.6.1", activations="auto")
+
+        assert "--activations" not in engine._serve_command(9000)
+
+    def test_default_activation_precision_keeps_bf16(self):
+        assert SplashOptions().activations == "bf16"
+
     def test_serve_command_leaves_unset_limits_to_splash(self, tmp_path):
         command = _engine(tmp_path)._serve_command(9000)
 
         for flag in (
             "--max-context",
             "--max-memory",
-            "--max-cache-disk",
             "--disable-ane",
         ):
             assert flag not in command
+
+    def test_serve_command_turns_ssd_cache_off_without_omlx_ssd_cache(self, tmp_path):
+        # Cache disabled, hot cache only and a Splash SSD size of 0 all reach
+        # Splash as cache_disk_bytes == 0.
+        command = _engine(tmp_path)._serve_command(9000)
+
+        assert command[command.index("--max-cache-disk") + 1] == "0"
+        # Splash rejects --persistent-cache next to --max-cache-disk 0.
+        assert "--persistent-cache" not in command
+        assert "--cache-dir" not in command
 
     def test_request_body_passes_sampling_through(self, tmp_path):
         body = _engine(tmp_path)._request_body(
@@ -1200,6 +1241,24 @@ class TestStreaming:
         assert body["stream"] is True and body["return_progress"] is True
         assert engine.has_active_requests() is False
 
+    async def test_active_request_count_follows_streaming_request(self, tmp_path):
+        seen = {}
+
+        def handler(request):
+            seen["active"] = engine.active_request_count()
+            return httpx.Response(
+                200, content=_sse({"choices": [{"delta": {"content": "x"}}]})
+            )
+
+        engine = _engine_with_transport(tmp_path, handler)
+        assert engine.active_request_count() == 0
+
+        async for _ in engine.stream_chat([{"role": "user", "content": "hi"}]):
+            pass
+
+        assert seen["active"] == 1
+        assert engine.active_request_count() == 0
+
     @pytest.mark.parametrize(
         "kwargs, expected",
         [
@@ -1319,7 +1378,8 @@ class TestStreaming:
 # that carry the key from SPLASH_API_KEY.
 FAKE_SERVER = textwrap.dedent("""\
     import json, os, sys
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from http.server import BaseHTTPRequestHandler
+    from socketserver import TCPServer
     args = sys.argv[1:]
     model, port = args[args.index("--model") + 1], int(args[args.index("--port") + 1])
     assert os.environ["HF_HUB_OFFLINE"] == "1"
@@ -1340,7 +1400,8 @@ FAKE_SERVER = textwrap.dedent("""\
             self.wfile.write(json.dumps(data).encode())
         def log_message(self, *a):
             pass
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # HTTPServer resolves the host name, which a broken resolver holds for 35 s.
+    TCPServer(("127.0.0.1", port), Handler).serve_forever()
     """)
 
 
@@ -1849,6 +1910,7 @@ class TestAdminAPI:
             splash_max_memory_gb=24,
             splash_ssd_cache_gb=0,
             splash_ane_prefill=False,
+            splash_activations="auto",
         )
 
         assert "integrations" in result["runtime_applied"]
@@ -1858,8 +1920,10 @@ class TestAdminAPI:
             24,
         )
         assert (restored.splash_ssd_cache_gb, restored.splash_ane_prefill) == (0, False)
+        assert restored.splash_activations == "auto"
         for fields in (
             {"splash_kv_format": "fp8"},
+            {"splash_activations": "fp8"},
             {"splash_max_memory_gb": 0},
             {"splash_ssd_cache_gb": -1},
         ):
@@ -1882,6 +1946,7 @@ class TestAdminAPI:
         assert status["path"] == str(launcher)
         assert (status["version"], status["auto_detected"]) == ("1.3.1", True)
         assert response["integrations"]["splash_kv_format"] == "int8"
+        assert response["integrations"]["splash_activations"] == "bf16"
 
     async def test_model_external_engine_is_validated(
         self, tmp_path, launchers, global_settings
@@ -1943,6 +2008,42 @@ class TestAdminAPI:
         (row,) = admin_routes._external_engines_for_model(pool, info, None)
         assert row["draft_repo"] is None
 
+    @pytest.mark.parametrize("engine, expected", [("splash", False), (None, True)])
+    def test_model_list_marks_mtp_unused_on_an_external_engine(
+        self, tmp_path, engine, expected
+    ):
+        model = _write_model(tmp_path / "models" / "Qwen3.8-27B-4bit-mtp")
+        config = json.loads((model / "config.json").read_text())
+        config["text_config"]["mtp_num_hidden_layers"] = 1
+        (model / "config.json").write_text(json.dumps(config))
+        (model / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"mtp.fc.weight": "model.safetensors"}})
+        )
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [{"id": "Qwen3.8-27B-4bit-mtp", "model_path": str(model)}]
+        }
+        manager = MagicMock()
+        manager.get_all_settings.return_value = {
+            "Qwen3.8-27B-4bit-mtp": ModelSettings(external_engine=engine)
+        }
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            patch.object(
+                admin_routes,
+                "_get_server_state",
+                return_value=MagicMock(default_model=None),
+            ),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+        ):
+            row = asyncio.run(admin_routes.list_models(is_admin=True))["models"][0]
+
+        assert row["mtp_compatible"] is expected
+        if not expected:
+            assert "external engine" in row["mtp_compatibility_reason"]
+
 
 # -- native response_format ---------------------------------------------------
 
@@ -1985,6 +2086,8 @@ class TestNativeResponseFormat:
             engine.start = AsyncMock()
             engine.count_chat_tokens.return_value = 10
             pool = MagicMock()
+            # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
+            pool._scheduler_config.paged_ssd_cache_dir = None
             pool.preload_pinned_models = AsyncMock()
             pool.check_ttl_expirations = AsyncMock()
             pool.shutdown = AsyncMock()
@@ -2163,7 +2266,7 @@ class TestProcessMemory:
             "base_url": "http://127.0.0.1:8123/v1",
             "api_key": "secret",
             "model": REPO_ID,
-            "extra_body": {"reasoning_effort": "none"},
+            "extra_body": {"reasoning_effort": "none", "ignore_eos": True},
         }
 
 
@@ -2199,7 +2302,13 @@ class TestSplashBenchmark:
         assert bench.overhead == 0
         assert bench.prompt(100) == "tokens:100"
 
-    async def test_run_benchmark_against_splash_endpoint(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("saved_window", "launch_window"),
+        [(None, None), (1024, 1024 + 128), (131072, None)],
+    )
+    async def test_run_benchmark_against_splash_endpoint(
+        self, monkeypatch, saved_window, launch_window
+    ):
         stats = StreamStats(
             prompt_tokens=1000,
             completion_tokens=100,
@@ -2224,6 +2333,11 @@ class TestSplashBenchmark:
         pool.get_entry.return_value = SimpleNamespace(
             model_type="qwen3_5", model_settings=None, model_path=Path("/tmp/model")
         )
+        settings = ModelSettings(
+            external_engine="splash", max_context_window=saved_window
+        )
+        pool._settings_manager.get_settings.return_value = settings
+        pool.external_engine_id.return_value = "splash"
         run = BenchmarkRun(
             bench_id="splash-run-1",
             request=BenchmarkRequest(
@@ -2234,6 +2348,10 @@ class TestSplashBenchmark:
         await run_benchmark(run, pool)
 
         client.aclose.assert_awaited_once()
+        # Only a saved window shorter than the run grows, and only for this launch.
+        runtime_settings = pool.get_engine.await_args.kwargs["runtime_settings"]
+        assert getattr(runtime_settings, "max_context_window", None) == launch_window
+        assert settings.max_context_window == saved_window
         results = {r["test_type"]: r for r in run.results}
         assert (results["single"]["requested_pp"], results["single"]["pp"]) == (
             1024,
@@ -2270,6 +2388,25 @@ class TestSplashRuntimeCache:
         assert engine._status == payload
         await engine.stop()
         assert engine._status_task is None
+
+    async def test_status_refresh_keeps_a_cancel_raised_as_timeout(self, tmp_path):
+        # Older anyio raises the request timeout in place of a cancel that
+        # lands with the deadline.
+        fetching = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            fetching.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise httpx.ReadTimeout("timed out", request=request) from None
+
+        engine = _engine_with_transport(tmp_path, handler)
+        task = asyncio.create_task(engine._refresh_status())
+        await fetching.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
     def test_cache_dashboard_lists_splash_next_to_mlx(self, tmp_path):
         settings = SimpleNamespace(

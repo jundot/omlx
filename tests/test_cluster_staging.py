@@ -2,6 +2,7 @@
 """Staging must send each Mac its layers' shards and nothing else."""
 
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from omlx.cluster.staging import (
     _REMOTE_INSTALL_SNIPPET,
     ShardInfo,
     fabric_transfer_address,
+    home_relative_model_path,
     index_shards,
     plan_cluster_staging,
     plan_staging,
@@ -392,7 +394,7 @@ def test_manifest_reads_the_exact_model_path_on_local_and_remote(tmp_path, monke
 
     assert manifest["ready"] is True
     assert all(node["missing_files"] == 0 for node in manifest["nodes"])
-    assert remote_calls == [("Studio.local", str(root))]
+    assert remote_calls == [("Studio.local", home_relative_model_path(str(root)))]
 
 
 def test_manifest_is_not_ready_when_a_remote_sidecar_is_missing(
@@ -743,12 +745,10 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
         {"node_id": "local", "capacity_bytes": 1024**3},
         {"node_id": "studio", "capacity_bytes": 1024**3},
     ]
+    preview = routes._create_cluster_plan(
+        routes.ClusterPlanRequest(model_path=str(root), nodes=nodes)
+    )
     with TestClient(app) as client:
-        preview = client.post(
-            "/admin/api/cluster/plan",
-            json={"model_path": str(root), "nodes": nodes},
-        )
-        assert preview.status_code == 200, preview.text
         activation = {
             "model_path": str(root),
             "backend": "ring",
@@ -766,7 +766,7 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
                 },
             ],
             "preflight": True,
-            "approved_placement": preview.json()["placement_signature"],
+            "approved_placement": routes._placement_signature(preview.to_dict()),
         }
         response = client.post(
             "/admin/api/cluster/stage",
@@ -869,6 +869,26 @@ def test_free_space_is_readable_for_a_path_that_does_not_exist_yet(tmp_path):
     from omlx.cluster.staging import free_disk_bytes
 
     assert free_disk_bytes(tmp_path / "not" / "created" / "yet") > 0
+
+
+def test_remote_free_space_reads_a_destination_that_does_not_exist_yet(
+    tmp_path, monkeypatch
+):
+    from omlx.cluster.staging import free_disk_bytes
+
+    real_run = subprocess.run
+
+    def run_on_this_mac(argv, **kwargs):
+        # The peer's shell, with tmp_path as its home directory.
+        return real_run(
+            ["/bin/sh", "-c", argv[-1]],
+            env={**os.environ, "HOME": str(tmp_path)},
+            **kwargs,
+        )
+
+    monkeypatch.setattr(subprocess, "run", run_on_this_mac)
+
+    assert free_disk_bytes("~/Models/not staged yet", ssh_target="studio") > 0
 
 
 def test_remote_default_uses_published_worker_shim(monkeypatch):

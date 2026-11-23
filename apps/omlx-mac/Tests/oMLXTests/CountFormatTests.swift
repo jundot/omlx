@@ -36,4 +36,22 @@ final class CountFormatTests: XCTestCase {
         XCTAssertEqual(CountFormat.compact(12_345, locale: Locale(identifier: "ja-JP")), "1.2万")
         XCTAssertEqual(CountFormat.compact(12_345, locale: Locale(identifier: "ko-KR")), "1.2만")
     }
+
+    func testNumberScaleSwitchesBetweenExactDigitsAndCompactUnits() {
+        let key = NumberScale.storageKey
+        let previous = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let previous {
+                UserDefaults.standard.set(previous, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+
+        UserDefaults.standard.removeObject(forKey: key)
+        XCTAssertEqual(CountFormat.count(104_166_321, locale: zh), "1.0亿")
+
+        UserDefaults.standard.set(NumberScale.exact.rawValue, forKey: key)
+        XCTAssertEqual(CountFormat.count(104_166_321, locale: zh), "104,166,321")
+    }
 }

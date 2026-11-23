@@ -81,9 +81,10 @@ inline void fp8_decode4(uint p, thread float* v) {
 // ROWS rows of an MXFP8 matrix ([*, K] bytes as uint32, one e8m0 scale per 32) dotted with an
 // fp32 vector; each lane covers 8 contiguous values per step (MLX qmv_fast layout), x is
 // loaded once per step and reused for all ROWS rows. fp32 accumulation order is free.
+// The last step may cover fewer lanes (a tensor-parallel 1152-wide down projection).
 template <int K, int ROWS, typename W, typename S, typename X>
 inline void fp8_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % 32 == 0, "K must be a multiple of the 32-wide scale groups");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float xv[8];
@@ -108,7 +109,7 @@ inline void fp8_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
 // from NB = 4 up (wo_b at NB = 8: 35 GB/s).
 template <int K, int ROWS, int NB, typename W, typename S, typename X>
 inline void fp8_rows_nb(W w, S s, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % 32 == 0, "K must be a multiple of the 32-wide scale groups");
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
         float wv[ROWS][8], sc[ROWS];
@@ -193,7 +194,7 @@ inline void fp8_mma8(W w, S s, uint r0, X x, uint XS, uint lane, uint ks,
 template <int K, int ROWS, typename W, typename S, typename X>
 inline void fp4_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
     constexpr int NW = (K % 512 == 0) ? 2 : 1;      // uint32 words per lane per step
-    static_assert(K % (256 * NW) == 0, "K must be a multiple of 32 lanes x 8 values");
+    static_assert(K % 32 == 0, "K must be a multiple of the 32-wide scale groups");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 8 * NW; k < uint(K); k += 256 * NW) {
         float xv[8 * NW];
@@ -211,6 +212,15 @@ inline void fp4_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
     }
     for (int r = 0; r < ROWS; ++r) acc[r] = simd_sum(acc[r]);
 }
+// oQh rows (w = rscale * (q - center), MLX code packing) read as affine rows of one group: the
+// row scale, and bias -center * scale.
+template <int BITS, typename S>
+struct oqh_bias {
+    S s;
+    float operator[](size_t g) const { return -0.5f * float((1 << BITS) - 1) * float(s[g]); }
+};
+template <int BITS, typename S>
+inline oqh_bias<BITS, S> oqh_biases(S s) { return {s}; }
 // Affine weights (MLX layout, as oQ exports store them) at 3 or 5 bits, read like MLX's qdot: x is
 // pre-scaled per term so each code is multiplied masked in place; a code that straddles a byte
 // gives two terms. A lane covers 16 contiguous values: aff_x16 gives their terms' x and their sum,
@@ -218,7 +228,7 @@ inline void fp4_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
 // multi-vector helpers give a vector the same value.
 template <int BITS>
 constexpr int aff_terms16() {
-    static_assert(BITS == 3 || BITS == 5, "other widths are read with shifts (aff8_rows)");
+    static_assert(BITS == 3 || BITS == 5, "other widths are read by aff8_rows");
     return BITS == 3 ? 20 : 24;
 }
 template <int BITS, typename X>
@@ -264,7 +274,7 @@ inline void aff_w16(const device uchar* p, thread float* m) {
 // bias per GS values) dotted with an fp32 vector: scale * sum(q x) + bias * sum(x) per lane slice.
 template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff16_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 16 == 0, "K must be a multiple of 16 lanes x 16 values");
+    static_assert(K % GS == 0 && GS % 16 == 0, "K must be a multiple of whole 16-value groups");
     constexpr int NT = aff_terms16<BITS>();
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     for (uint k = lane * 16; k < uint(K); k += 512) {
@@ -284,7 +294,7 @@ inline void aff16_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* a
 // aff16_rows for NB vectors (x + v * XS) sharing each row's masked codes.
 template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff16_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 16 == 0, "K must be a multiple of 16 lanes x 16 values");
+    static_assert(K % GS == 0 && GS % 16 == 0, "K must be a multiple of whole 16-value groups");
     constexpr int NT = aff_terms16<BITS>();
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 16; k < uint(K); k += 512) {
@@ -307,8 +317,8 @@ inline void aff16_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thr
     }
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
 }
-// Affine weights read with shifts, 8 contiguous values per lane per step (rows at 2, 4, 6 or 8
-// bits, matrix tiles at every width). q[j] = code of value j of the 8 values starting at byte p.
+// Affine weights read with shifts, 8 contiguous values per lane per step (rows at 6 or 8 bits,
+// matrix tiles at every width). q[j] = code of value j of the 8 values starting at byte p.
 template <int BITS>
 inline void affine_codes8(const device uchar* p, thread float* q) {
     constexpr uint MASK = (1u << BITS) - 1u;
@@ -339,19 +349,38 @@ inline void affine_codes8(const device uchar* p, thread float* q) {
         }
     }
 }
+// The codes one lane reads per step in aff8_rows / aff8_rows_nb: 16 at 2 bits (one uint32), else 8.
+template <int BITS>
+constexpr int aff_lane_codes() { return BITS == 2 ? 16 : 8; }
+// 2- and 4-bit codes are masked in place, as MLX's qdot does: q[j] = code j * 2^(BITS * j), against x
+// pre-scaled by aff_unit<BITS>(j) = 2^-(BITS * j). Power-of-two scaling is exact, so q[j] * x[j] = code * x.
+template <int BITS>
+inline float aff_unit(int j) { return (BITS == 2 || BITS == 4) ? as_type<float>(uint(127 - BITS * j) << 23) : 1.0f; }
+template <int BITS>
+inline void affine_codes_lane(const device uchar* p, thread float* q) {
+    constexpr uint MASK = (1u << BITS) - 1u;
+    if (BITS == 2 || BITS == 4) {
+        const uint v = *reinterpret_cast<const device uint*>(p);
+        for (int j = 0; j < aff_lane_codes<BITS>(); ++j) q[j] = float(v & (MASK << (BITS * j)));
+    } else {
+        affine_codes8<BITS>(p, q);
+    }
+}
 template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 8 == 0, "K must be a multiple of 32 lanes x 8 values");
+    constexpr int N = aff_lane_codes<BITS>();
+    static_assert(K % GS == 0 && GS % N == 0, "K must be a multiple of whole lane steps");
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
-    for (uint k = lane * 8; k < uint(K); k += 256) {
-        float xv[8], xs = 0.0f;
-        for (int i = 0; i < 8; ++i) { xv[i] = x[k + i]; xs += xv[i]; }
+    for (uint k = lane * N; k < uint(K); k += 32 * N) {
+        float xv[N], xs = 0.0f;
+        for (int i = 0; i < N; ++i) { xv[i] = float(x[k + i]); xs += xv[i]; }
+        for (int i = 0; i < N; ++i) xv[i] *= aff_unit<BITS>(i);
         for (int r = 0; r < ROWS; ++r) {
             const auto wr = reinterpret_cast<const device uchar*>(w + size_t(row0 + r) * (K * BITS / 32)) + k * BITS / 8;
-            float q[8];
-            affine_codes8<BITS>(wr, q);
+            float q[N];
+            affine_codes_lane<BITS>(wr, q);
             float a = 0.0f;
-            for (int j = 0; j < 8; ++j) a = fma(q[j], xv[j], a);
+            for (int j = 0; j < N; ++j) a = fma(q[j], xv[j], a);
             const size_t g = size_t(row0 + r) * (K / GS) + k / GS;
             acc[r] = fma(float(s[g]), a, fma(float(b[g]), xs, acc[r]));
         }
@@ -361,24 +390,26 @@ inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* ac
 // aff8_rows for NB vectors sharing each weight decode; per vector the arithmetic is aff8_rows'.
 template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff8_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
-    static_assert(K % 256 == 0 && GS % 8 == 0, "K must be a multiple of 32 lanes x 8 values");
+    constexpr int N = aff_lane_codes<BITS>();
+    static_assert(K % GS == 0 && GS % N == 0, "K must be a multiple of whole lane steps");
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
-    for (uint k = lane * 8; k < uint(K); k += 256) {
-        float q[ROWS][8], sc[ROWS], bi[ROWS];
+    for (uint k = lane * N; k < uint(K); k += 32 * N) {
+        float q[ROWS][N], sc[ROWS], bi[ROWS];
         for (int r = 0; r < ROWS; ++r) {
             const auto wr = reinterpret_cast<const device uchar*>(w + size_t(row0 + r) * (K * BITS / 32)) + k * BITS / 8;
-            affine_codes8<BITS>(wr, q[r]);
+            affine_codes_lane<BITS>(wr, q[r]);
             const size_t g = size_t(row0 + r) * (K / GS) + k / GS;
             sc[r] = float(s[g]);
             bi[r] = float(b[g]);
         }
         for (int v = 0; v < NB; ++v) {
             const auto xb = x + size_t(v) * XS + k;
-            float xv[8], xs = 0.0f;
-            for (int i = 0; i < 8; ++i) { xv[i] = float(xb[i]); xs += xv[i]; }
+            float xv[N], xs = 0.0f;
+            for (int i = 0; i < N; ++i) { xv[i] = float(xb[i]); xs += xv[i]; }
+            for (int i = 0; i < N; ++i) xv[i] *= aff_unit<BITS>(i);
             for (int r = 0; r < ROWS; ++r) {
                 float a = 0.0f;
-                for (int j = 0; j < 8; ++j) a = fma(q[r][j], xv[j], a);
+                for (int j = 0; j < N; ++j) a = fma(q[r][j], xv[j], a);
                 acc[r * NB + v] = fma(sc[r], a, fma(bi[r], xs, acc[r * NB + v]));
             }
         }
@@ -438,6 +469,125 @@ inline void aff_mma8(W w, S s, B b, uint r0, X x, uint XS, uint lane, uint ks,
             float t = 0.0f;
             for (int q = 0; q < KS; ++q) t += red[q * 64 + fm * 8 + fn + e];
             tile[fm * 8 + fn + e] = t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// fp8_mma8 / aff_mma8 for 9..16 vectors: each weight fragment is decoded once and multiplied
+// into two column tiles (vectors 0..7 -> tile0, 8..15 -> tile1). Each tile keeps the 8-vector
+// helper's per-vector arithmetic, so a vector gets the same value as from fp8_mma8 / aff_mma8.
+// red holds 2 * KS * 64 floats. Every simdgroup of the threadgroup must call it.
+template <int K, int KS, int NB, typename W, typename S, typename X>
+inline void fp8_mma16(W w, S s, uint r0, X x, uint XS, uint lane, uint ks,
+                      threadgroup float* red, threadgroup float* tile0, threadgroup float* tile1) {
+    constexpr int G = K / 32;
+    static_assert(K % 32 == 0 && G % KS == 0 && NB > 8 && NB <= 16, "K split must cover whole scale groups");
+    constexpr int GPS = G / KS;
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    simdgroup_matrix<float, 8, 8> part0, part1, a, b0, b1;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const device uchar* wrow = reinterpret_cast<const device uchar*>(w + size_t(r0 + fm) * (K / 4));
+    const auto srow = s + size_t(r0 + fm) * G;
+    const bool v2 = int(fn + 8) < NB, v3 = int(fn + 9) < NB;
+    const auto x0 = x + size_t(fn) * XS, x1 = x + size_t(fn + 1) * XS;
+    const auto x2 = x + size_t(v2 ? fn + 8 : 0) * XS, x3 = x + size_t(v3 ? fn + 9 : 0) * XS;
+    for (int g = int(ks) * GPS; g < int(ks + 1) * GPS; ++g) {
+        const uint base = uint(g) * 32;
+        const uint2 wb = *reinterpret_cast<const device uint2*>(wrow + base + 4 * fn);
+        const uint xo = base + 4 * fm;
+        const float4 xa = float4(x0[xo], x0[xo + 1], x0[xo + 2], x0[xo + 3]);
+        const float4 xb = float4(x1[xo], x1[xo + 1], x1[xo + 2], x1[xo + 3]);
+        const float4 xc = v2 ? float4(x2[xo], x2[xo + 1], x2[xo + 2], x2[xo + 3]) : float4(0.0f);
+        const float4 xd = v3 ? float4(x3[xo], x3[xo + 1], x3[xo + 2], x3[xo + 3]) : float4(0.0f);
+        part0.thread_elements()[0] = 0.0f; part0.thread_elements()[1] = 0.0f;
+        part1.thread_elements()[0] = 0.0f; part1.thread_elements()[1] = 0.0f;
+        float wx[4], wy[4];
+        fp8_decode4(wb.x, wx); fp8_decode4(wb.y, wy);
+        for (int j = 0; j < 4; ++j) {
+            a.thread_elements()[0] = wx[j];
+            a.thread_elements()[1] = wy[j];
+            b0.thread_elements()[0] = xa[j];
+            b0.thread_elements()[1] = xb[j];
+            b1.thread_elements()[0] = xc[j];
+            b1.thread_elements()[1] = xd[j];
+            simdgroup_multiply_accumulate(part0, a, b0, part0);
+            simdgroup_multiply_accumulate(part1, a, b1, part1);
+        }
+        const float sc = e8m0(srow[g]) * 256.0f;
+        acc[0] += part0.thread_elements()[0] * sc;
+        acc[1] += part0.thread_elements()[1] * sc;
+        acc[2] += part1.thread_elements()[0] * sc;
+        acc[3] += part1.thread_elements()[1] * sc;
+    }
+    for (int e = 0; e < 4; ++e) red[(e / 2) * (KS * 64) + ks * 64 + fm * 8 + fn + e % 2] = acc[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) {
+        for (int e = 0; e < 4; ++e) {
+            float t = 0.0f;
+            for (int q = 0; q < KS; ++q) t += red[(e / 2) * (KS * 64) + q * 64 + fm * 8 + fn + e % 2];
+            (e < 2 ? tile0 : tile1)[fm * 8 + fn + e % 2] = t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+template <int K, int KS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
+inline void aff_mma16(W w, S s, B b, uint r0, X x, uint XS, uint lane, uint ks,
+                      threadgroup float* red, threadgroup float* tile0, threadgroup float* tile1) {
+    constexpr int G = K / GS;
+    static_assert(GS % 32 == 0 && G % KS == 0 && NB > 8 && NB <= 16, "K split must cover whole groups");
+    constexpr int GPS = G / KS;
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    simdgroup_matrix<float, 8, 8> part0, part1, a, b0, b1;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const device uchar* wrow = reinterpret_cast<const device uchar*>(w + size_t(r0 + fm) * (K * BITS / 32));
+    const bool v2 = int(fn + 8) < NB, v3 = int(fn + 9) < NB;
+    const auto x0 = x + size_t(fn) * XS, x1 = x + size_t(fn + 1) * XS;
+    const auto x2 = x + size_t(v2 ? fn + 8 : 0) * XS, x3 = x + size_t(v3 ? fn + 9 : 0) * XS;
+    for (int g = int(ks) * GPS; g < int(ks + 1) * GPS; ++g) {
+        part0.thread_elements()[0] = 0.0f; part0.thread_elements()[1] = 0.0f;
+        part1.thread_elements()[0] = 0.0f; part1.thread_elements()[1] = 0.0f;
+        float xs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int sb = 0; sb < GS / 32; ++sb) {
+            const uint base = uint(g) * GS + uint(sb) * 32;
+            float q[8], xa[4], xb[4], xc[4], xd[4];
+            affine_codes8<BITS>(wrow + (base + 4 * fn) * BITS / 8, q);
+            for (int j = 0; j < 4; ++j) {
+                xa[j] = float(x0[base + 4 * fm + j]);
+                xb[j] = float(x1[base + 4 * fm + j]);
+                xc[j] = v2 ? float(x2[base + 4 * fm + j]) : 0.0f;
+                xd[j] = v3 ? float(x3[base + 4 * fm + j]) : 0.0f;
+                xs[0] += xa[j]; xs[1] += xb[j]; xs[2] += xc[j]; xs[3] += xd[j];
+            }
+            for (int j = 0; j < 4; ++j) {
+                a.thread_elements()[0] = q[j];
+                a.thread_elements()[1] = q[j + 4];
+                b0.thread_elements()[0] = xa[j];
+                b0.thread_elements()[1] = xb[j];
+                b1.thread_elements()[0] = xc[j];
+                b1.thread_elements()[1] = xd[j];
+                simdgroup_multiply_accumulate(part0, a, b0, part0);
+                simdgroup_multiply_accumulate(part1, a, b1, part1);
+            }
+        }
+        for (int e = 0; e < 4; ++e) {
+            xs[e] += simd_shuffle_xor(xs[e], 2u); xs[e] += simd_shuffle_xor(xs[e], 4u); xs[e] += simd_shuffle_xor(xs[e], 16u);
+        }
+        const size_t gi = size_t(r0 + fm) * G + g;
+        const float sc = float(s[gi]), bi = float(b[gi]);
+        acc[0] = fma(sc, part0.thread_elements()[0], fma(bi, xs[0], acc[0]));
+        acc[1] = fma(sc, part0.thread_elements()[1], fma(bi, xs[1], acc[1]));
+        acc[2] = fma(sc, part1.thread_elements()[0], fma(bi, xs[2], acc[2]));
+        acc[3] = fma(sc, part1.thread_elements()[1], fma(bi, xs[3], acc[3]));
+    }
+    for (int e = 0; e < 4; ++e) red[(e / 2) * (KS * 64) + ks * 64 + fm * 8 + fn + e % 2] = acc[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) {
+        for (int e = 0; e < 4; ++e) {
+            float t = 0.0f;
+            for (int q = 0; q < KS; ++q) t += red[(e / 2) * (KS * 64) + q * 64 + fm * 8 + fn + e % 2];
+            (e < 2 ? tile0 : tile1)[fm * 8 + fn + e % 2] = t;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -544,8 +694,8 @@ _UP = r"""
     const uint row0 = threadgroup_position_in_grid.x * 32 + sg * 4;
     if (slot < uint(TOPK)) {
         const uint e = uint(chosen[slot]);
-        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, xq, lane, g4);
-        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, xq, lane, u4);
+        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, R1_X, lane, g4);
+        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, R1_X, lane, u4);
     } else {
         S1_ROWS(DIM, 4, sw1, ss1, sb1, row0, xq, lane, g4);
         S3_ROWS(DIM, 4, sw3, ss3, sb3, row0, xq, lane, u4);
@@ -560,8 +710,12 @@ _UP = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {   // act_quant over this 32-row block (the w2 input's quantization group)
         const float v = hblock[lane];
-        const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-        hq[slot * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+        const uint at = slot * INTER + threadgroup_position_in_grid.x * 32 + lane;
+#if R2_OQH
+        if (slot < uint(TOPK)) hb[at] = bfloat16_t(v);   // oQh w2 reads it rotated, unquantized
+        else
+#endif
+        hq[at] = act_quant_value(v, act_scale(max(simd_max(abs(v)), 1e-4f)));
     }
 """
 
@@ -577,7 +731,7 @@ _DOWN = r"""
         const device float* hrow = hq + slot * INTER;
         if (slot < uint(TOPK)) {
             const uint e = uint(idx[slot]);
-            R2_ROWS(INTER, 4, w2 + size_t(e) * DIM * R2_WPR(INTER), s2p + size_t(e) * DIM * R2_SPR(INTER), b2p + size_t(e) * DIM * R2_SPR(INTER), row0, hrow, lane, acc);
+            R2_ROWS(INTER, 4, w2 + size_t(e) * DIM * R2_WPR(INTER), s2p + size_t(e) * DIM * R2_SPR(INTER), b2p + size_t(e) * DIM * R2_SPR(INTER), row0, R2_H + slot * INTER, lane, acc);
         } else {
             S2_ROWS(INTER, 4, sw2, ss2, sb2, row0, hrow, lane, acc);
         }
@@ -620,8 +774,8 @@ _UP_NB = r"""
             }
         const uint e = uint(chosen[slot]);
         float g4[4], u4[4];
-        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, xq + b * DIM, lane, g4);
-        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, xq + b * DIM, lane, u4);
+        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, R1_X + b * DIM, lane, g4);
+        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, R1_X + b * DIM, lane, u4);
         if (lane < 4) {
             float gate = float(bfloat16_t(g4[lane])), up = float(bfloat16_t(u4[lane]));
             if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
@@ -632,8 +786,12 @@ _UP_NB = r"""
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
             const float v = hblock[0][lane];
-            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = act_quant_value(v, s);
+            const uint at = (b * TOPK + slot) * INTER + rb * 32 + lane;
+#if R2_OQH
+            hb[at] = bfloat16_t(v);
+#else
+            hq[at] = act_quant_value(v, act_scale(max(simd_max(abs(v)), 1e-4f)));
+#endif
         }
     } else {
         float g4[4 * NB], u4[4 * NB];
@@ -646,10 +804,10 @@ _UP_NB = r"""
                 hblock[b][sg * 4 + lane] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
             }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg < uint(NB)) {
-            const float v = hblock[sg][lane];
-            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hqs[sg * INTER + rb * 32 + lane] = act_quant_value(v, s);
+        for (uint v = sg; v < uint(NB); v += 8) {
+            const float y = hblock[v][lane];
+            const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
+            hqs[v * INTER + rb * 32 + lane] = act_quant_value(y, s);
         }
     }
 """
@@ -675,8 +833,8 @@ _UP_NB_MMA = r"""
             }
         const uint e = uint(chosen[slot]);
         float g4[4], u4[4];
-        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, xq + b * DIM, lane, g4);
-        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, xq + b * DIM, lane, u4);
+        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, R1_X + b * DIM, lane, g4);
+        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, R1_X + b * DIM, lane, u4);
         if (lane < 4) {
             float gate = float(bfloat16_t(g4[lane])), up = float(bfloat16_t(u4[lane]));
             if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
@@ -687,26 +845,38 @@ _UP_NB_MMA = r"""
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
             const float v = hblock[0][lane];
-            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = act_quant_value(v, s);
+            const uint at = (b * TOPK + slot) * INTER + rb * 32 + lane;
+#if R2_OQH
+            hb[at] = bfloat16_t(v);
+#else
+            hq[at] = act_quant_value(v, act_scale(max(simd_max(abs(v)), 1e-4f)));
+#endif
         }
     } else {
-        // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups
-        threadgroup float red[4][2 * 64], tg_g[4][64], tg_u[4][64];
+        // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups,
+        // one column tile per 8 tokens
+        constexpr int CT = (NB + 7) / 8, NB0 = NB < 8 ? NB : 8, NB16 = NB > 8 ? NB : 9;
+        threadgroup float red[4][CT * 2 * 64], tg_g[CT][4][64], tg_u[CT][4][64];
         const uint t = sg / 2, ks = sg % 2, r0 = rb * 32 + t * 8;
-        S1_MMA8(DIM, 2, NB, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[t]);
-        S3_MMA8(DIM, 2, NB, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[t]);
+        if (CT > 1) {
+            S1_MMA16(DIM, 2, NB16, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[0][t], tg_g[CT - 1][t]);
+            S3_MMA16(DIM, 2, NB16, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[0][t], tg_u[CT - 1][t]);
+        } else {
+            S1_MMA8(DIM, 2, NB0, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[0][t]);
+            S3_MMA8(DIM, 2, NB0, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[0][t]);
+        }
         for (uint i = tid; i < uint(32 * NB); i += 256) {
             const uint r = i % 32, b = i / 32;
-            float gate = float(bfloat16_t(tg_g[r / 8][(r % 8) * 8 + b])), up = float(bfloat16_t(tg_u[r / 8][(r % 8) * 8 + b]));
+            const uint e = (r % 8) * 8 + b % 8;
+            float gate = float(bfloat16_t(tg_g[b / 8][r / 8][e])), up = float(bfloat16_t(tg_u[b / 8][r / 8][e]));
             if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
             hblock[b][r] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg < uint(NB)) {
-            const float v = hblock[sg][lane];
-            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hqs[sg * INTER + rb * 32 + lane] = act_quant_value(v, s);
+        for (uint v = sg; v < uint(NB); v += 8) {
+            const float y = hblock[v][lane];
+            const float s = act_scale(max(simd_max(abs(y)), 1e-4f));
+            hqs[v * INTER + rb * 32 + lane] = act_quant_value(y, s);
         }
     }
 """
@@ -721,7 +891,7 @@ _DOWN_R_NB = r"""
     float acc[4];
     const uint e = uint(idx[b * TOPK + slot]);
     R2_ROWS(INTER, 4, w2 + size_t(e) * DIM * R2_WPR(INTER), s2p + size_t(e) * DIM * R2_SPR(INTER),
-            b2p + size_t(e) * DIM * R2_SPR(INTER), row0, hq + (b * TOPK + slot) * INTER, lane, acc);
+            b2p + size_t(e) * DIM * R2_SPR(INTER), row0, R2_H + (b * TOPK + slot) * INTER, lane, acc);
     if (lane < 4) part[slot * 4 + lane] = float(bfloat16_t(acc[lane]));
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (slot == 0 && lane < 4) {
@@ -744,13 +914,15 @@ _DOWN_S_NB = r"""
 
 # _DOWN_S_NB on simdgroup matrices: one 8-row tile per threadgroup, K split over 2 simdgroups.
 _DOWN_S_NB_MMA = r"""
-    threadgroup float red[2 * 64], tile[64];
+    constexpr int CT = (NB + 7) / 8, NB0 = NB < 8 ? NB : 8, NB16 = NB > 8 ? NB : 9;
+    threadgroup float red[CT * 2 * 64], tile[CT][64];
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
     const uint r0 = threadgroup_position_in_grid.x * 8;
-    S2_MMA8(INTER, 2, NB, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile);
+    if (CT > 1) S2_MMA16(INTER, 2, NB16, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile[0], tile[CT - 1]);
+    else S2_MMA8(INTER, 2, NB0, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile[0]);
     for (uint i = tid; i < uint(8 * NB); i += 64) {
         const uint r = i % 8, b = i / 8;
-        out[b * DIM + r0 + r] = bfloat16_t(partial[b * DIM + r0 + r] + float(bfloat16_t(tile[r * 8 + b])));
+        out[b * DIM + r0 + r] = bfloat16_t(partial[b * DIM + r0 + r] + float(bfloat16_t(tile[b / 8][r * 8 + b % 8])));
     }
 """
 
@@ -777,6 +949,9 @@ def weight_format(p):
     mode = getattr(p, "mode", None)
     if p is None or not getattr(p, "quantize_input", True):
         return None
+    if "rscale" in p and "oqh_signs" in p:
+        ok = p.bits in (2, 3, 4, 5, 6, 8) and p.rscale.dtype in (mx.bfloat16, mx.float16)
+        return ("oqh", p.bits, 0) if ok else None   # one group per row
     if mode in ("mxfp8", "mxfp4"):
         fmt = MXFP8 if mode == "mxfp8" else MXFP4
         return fmt if p.group_size == 32 and "biases" not in p else None
@@ -796,7 +971,7 @@ def format_macros(roles):
     """Per-role weight access for the kernel sources: <role>_WPR(K) uint32 words and
     <role>_SPR(K) scales per row, <role>_ROWS / <role>_ROWS_NB / <role>_MMA8 the row dot
     products (one vector, NB vectors, NB vectors on simdgroup matrices)."""
-    lines = []
+    roles, lines = list(roles), []
     for role, (mode, bits, gs) in roles:
         if mode == "affine":
             # Masked terms for 3 and 5 bits (codes straddle bytes), shifts otherwise.
@@ -805,23 +980,40 @@ def format_macros(roles):
             rows = f"{helper}_rows<K_, R_, {bits}, {gs}>(w_, s_, b_, r0_, x_, l_, acc_)"
             nb = f"{helper}_rows_nb<K_, R_, NB_, {bits}, {gs}>(w_, s_, b_, r0_, x_, xs_, l_, acc_)"
             mma = f"aff_mma8<K_, KS_, NB_, {bits}, {gs}>(w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, tile_)"
+            mma16 = f"aff_mma16<K_, KS_, NB_, {bits}, {gs}>(w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_)"
         elif mode == "mxfp8":
             wpr, spr = "((K_) / 4)", "((K_) / 32)"
             rows = "fp8_rows<K_, R_>(w_, s_, r0_, x_, l_, acc_)"
             nb = "fp8_rows_nb<K_, R_, NB_>(w_, s_, r0_, x_, xs_, l_, acc_)"
             mma = "fp8_mma8<K_, KS_, NB_>(w_, s_, r0_, x_, xs_, l_, ks_, red_, tile_)"
+            mma16 = "fp8_mma16<K_, KS_, NB_>(w_, s_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_)"
+        elif mode == "oqh":
+            helper = "aff16" if bits in (3, 5) else "aff8"
+            wpr, spr = f"((K_) * {bits} / 32)", "1"
+            rows = f"{helper}_rows<K_, R_, {bits}, K_>(w_, s_, oqh_biases<{bits}>(s_), r0_, x_, l_, acc_)"
+            nb = "static_assert(false, \"oQh only as routed experts\")"
+            mma = mma16 = nb
         else:
             wpr, spr = "((K_) / 8)", "((K_) / 32)"
             rows = "fp4_rows<K_, R_>(w_, s_, r0_, x_, l_, acc_)"
             nb = "static_assert(false, \"no MXFP4 multi-vector rows\")"
             mma = "static_assert(false, \"no MXFP4 matrix rows\")"
+            mma16 = mma
         lines += [
             f"#define {role}_WPR(K_) {wpr}",
             f"#define {role}_SPR(K_) {spr}",
             f"#define {role}_ROWS(K_, R_, w_, s_, b_, r0_, x_, l_, acc_) {rows}",
             f"#define {role}_ROWS_NB(K_, R_, NB_, w_, s_, b_, r0_, x_, xs_, l_, acc_) {nb}",
             f"#define {role}_MMA8(K_, KS_, NB_, w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, tile_) {mma}",
+            f"#define {role}_MMA16(K_, KS_, NB_, w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_) {mma16}",
+            f"#define {role}_OQH {int(mode == 'oqh')}",
         ]
+    # oQh routed experts read their inputs rotated: xr for w1 / w3, hr for w2.
+    oqh = {role: mode == "oqh" for role, (mode, _, _) in roles}
+    lines += [
+        f"#define R1_X {'xr' if oqh.get('R1') else 'xq'}",
+        f"#define R2_H {'hr' if oqh.get('R2') else 'hq'}",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -833,12 +1025,22 @@ def _biases(p):
     return p.biases if "biases" in p else _const((0,) * 8)
 
 
+def _parts(p):
+    """(weight, scales, biases) kernel inputs of a projection; oQh passes its row scales."""
+    return p.weight, p.rscale if "rscale" in p else p.scales, _biases(p)
+
+
 def _formats(moe):
     e, s = moe.experts, moe.shared_experts
     return tuple(weight_format(getattr(m, n, None)) for m in (e, s) for n in ("w1", "w3", "w2"))
 
 
 _ROLES = ("R1", "R3", "R2", "S1", "S3", "S2")
+
+
+def _oqh_io(formats):
+    """(rotated x, rotated h) flags: oQh routed experts read both in their basis."""
+    return formats[0][0] == "oqh", formats[2][0] == "oqh"
 
 
 @cache
@@ -866,13 +1068,15 @@ def _gate(moe, x, config):
 def _kernels_nb(mma, formats):
     header = format_macros(zip(_ROLES, formats)) + _HEADER
     tag = format_tag(formats)
+    rot_x, rot_h = _oqh_io(formats)
     up_inputs = ["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "b1p", "w3", "s3p", "b3p",
-                 "sw1", "ss1", "sb1", "sw3", "ss3", "sb3"]
+                 "sw1", "ss1", "sb1", "sw3", "ss3", "sb3"] + ["xr"] * rot_x
+    up_outputs = ["hq", "hqs", "out_idx", "out_w"] + ["hb"] * rot_h
     up = mx.fast.metal_kernel(
         name=f"v41_decode_moe_up_nb_{tag}", input_names=up_inputs,
-        output_names=["hq", "hqs", "out_idx", "out_w"], source=_UP_NB, header=header)
+        output_names=up_outputs, source=_UP_NB, header=header)
     down_r = mx.fast.metal_kernel(name=f"v41_decode_moe_down_routed_nb_{tag}",
-                                  input_names=["hq", "idx", "w2", "s2p", "b2p"],
+                                  input_names=["hq", "idx", "w2", "s2p", "b2p"] + ["hr"] * rot_h,
                                   output_names=["partial"], source=_DOWN_R_NB, header=header)
     down_s = mx.fast.metal_kernel(name=f"v41_decode_moe_down_shared_nb_{tag}",
                                   input_names=["hqs", "partial", "sw2", "ss2", "sb2"],
@@ -880,7 +1084,7 @@ def _kernels_nb(mma, formats):
     if mma:
         up = mx.fast.metal_kernel(
             name=f"v41_decode_moe_up_nb_mma_{tag}", input_names=up_inputs,
-            output_names=["hq", "hqs", "out_idx", "out_w"], source=_UP_NB_MMA, header=header)
+            output_names=up_outputs, source=_UP_NB_MMA, header=header)
         down_s = mx.fast.metal_kernel(name=f"v41_decode_moe_down_shared_nb_mma_{tag}",
                                       input_names=["hqs", "partial", "sw2", "ss2", "sb2"],
                                       output_names=["out"], source=_DOWN_S_NB_MMA, header=header)
@@ -899,21 +1103,22 @@ def fused_decode_moe_nb(moe, x, config, mma=None):
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
     scores, xq = _gate(moe, x, config)
     e, s = moe.experts, moe.shared_experts
-    hq, hqs, idx, w = up_k(
+    rot_x, rot_h = _oqh_io(formats)
+    hq, hqs, idx, w, *hb = up_k(
         inputs=[scores, moe.gate.bias, _const((config.route_scale,)), _const((config.swiglu_limit,)), xq,
-                e.w1.weight, e.w1.scales, _biases(e.w1), e.w3.weight, e.w3.scales, _biases(e.w3),
-                s.w1.weight, s.w1.scales, _biases(s.w1), s.w3.weight, s.w3.scales, _biases(s.w3)],
+                *_parts(e.w1), *_parts(e.w3), *_parts(s.w1), *_parts(s.w3)] + ([e.w1.rotate(x)] if rot_x else []),
         template=[("NE", ne), ("TOPK", topk), ("DIM", dim), ("INTER", inter), ("NB", nb)],
         grid=((nb * topk + 1) * 256, inter // 32, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(nb * topk * inter,), (nb * inter,), (nb * topk,), (nb * topk,)],
-        output_dtypes=[mx.float32, mx.float32, mx.int32, mx.float32])
+        output_shapes=[(nb * topk * inter,), (nb * inter,), (nb * topk,), (nb * topk,)]
+        + [(nb * topk * inter,)] * rot_h,
+        output_dtypes=[mx.float32, mx.float32, mx.int32, mx.float32] + [mx.bfloat16] * rot_h)
     partial = down_r(
-        inputs=[hq, idx, e.w2.weight, e.w2.scales, _biases(e.w2)],
+        inputs=[hq, idx, *_parts(e.w2)] + [e.w2.rotate(h.reshape(nb * topk, inter)) for h in hb],
         template=[("TOPK", topk), ("DIM", dim), ("INTER", inter)],
         grid=(nb * topk * 32, dim // 4, 1), threadgroup=(topk * 32, 1, 1),
         output_shapes=[(nb * dim,)], output_dtypes=[mx.float32])[0]
     out = down_s(
-        inputs=[hqs, partial, s.w2.weight, s.w2.scales, _biases(s.w2)],
+        inputs=[hqs, partial, *_parts(s.w2)],
         template=[("DIM", dim), ("INTER", inter), ("NB", nb)],
         grid=(dim // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(nb * dim,)], output_dtypes=[mx.bfloat16])[0]
@@ -932,14 +1137,15 @@ def _const(values):
 def _kernels(formats):
     header = format_macros(zip(_ROLES, formats)) + _HEADER
     tag = format_tag(formats)
+    rot_x, rot_h = _oqh_io(formats)
     up = mx.fast.metal_kernel(
         name=f"v41_decode_moe_up_{tag}",
         input_names=["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "b1p", "w3", "s3p", "b3p",
-                     "sw1", "ss1", "sb1", "sw3", "ss3", "sb3"],
-        output_names=["hq", "out_idx", "out_w"], source=_UP, header=header)
+                     "sw1", "ss1", "sb1", "sw3", "ss3", "sb3"] + ["xr"] * rot_x,
+        output_names=["hq", "out_idx", "out_w"] + ["hb"] * rot_h, source=_UP, header=header)
     down = mx.fast.metal_kernel(
         name=f"v41_decode_moe_down_{tag}",
-        input_names=["hq", "idx", "w2", "s2p", "b2p", "sw2", "ss2", "sb2"],
+        input_names=["hq", "idx", "w2", "s2p", "b2p", "sw2", "ss2", "sb2"] + ["hr"] * rot_h,
         output_names=["out"], source=_DOWN, header=header)
     return up, down
 
@@ -953,28 +1159,35 @@ def supported(moe, x, config):
         and getattr(config, "score_func", "sqrtsoftplus") == "sqrtsoftplus"
         and all(f is not None for f in formats)
         and formats[3] != MXFP4 and formats[4] != MXFP4 and formats[5] != MXFP4
+        # w1 and w3 read one input; shared experts are never oQh.
+        and (formats[0][0] == "oqh") == (formats[1][0] == "oqh")
+        and all(f[0] != "oqh" for f in formats[3:])
         and config.n_activated_experts <= 31
-        and config.dim % 256 == 0 and config.moe_inter_dim % 256 == 0
+        and config.dim % 256 == 0
+        # The shared down projection splits its groups over two simdgroups.
+        and config.moe_inter_dim % (2 * formats[5][2]) == 0
     )
 
 
 def fused_decode_moe(moe, x, config):
     """x: [1, 1, dim] bf16 (ffn_norm output). Returns ([1, 1, dim] bf16, idx, weights)."""
-    up_k, down_k = _kernels(_formats(moe))
+    formats = _formats(moe)
+    up_k, down_k = _kernels(formats)
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
     scores, xq = _gate(moe, x.reshape(1, -1), config)
     e, s = moe.experts, moe.shared_experts
-    hq, idx, w = up_k(
+    rot_x, rot_h = _oqh_io(formats)
+    hq, idx, w, *hb = up_k(
         inputs=[scores, moe.gate.bias, _const((config.route_scale,)),
                 _const((config.swiglu_limit,)), xq,
-                e.w1.weight, e.w1.scales, _biases(e.w1), e.w3.weight, e.w3.scales, _biases(e.w3),
-                s.w1.weight, s.w1.scales, _biases(s.w1), s.w3.weight, s.w3.scales, _biases(s.w3)],
+                *_parts(e.w1), *_parts(e.w3), *_parts(s.w1), *_parts(s.w3)]
+        + ([e.w1.rotate(x.reshape(1, -1))] if rot_x else []),
         template=[("NE", ne), ("TOPK", topk), ("DIM", dim), ("INTER", inter)],
         grid=(inter // 32 * 256, topk + 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[((topk + 1) * inter,), (topk,), (topk,)],
-        output_dtypes=[mx.float32, mx.int32, mx.float32])
+        output_shapes=[((topk + 1) * inter,), (topk,), (topk,)] + [(topk * inter,)] * rot_h,
+        output_dtypes=[mx.float32, mx.int32, mx.float32] + [mx.bfloat16] * rot_h)
     out = down_k(
-        inputs=[hq, idx, e.w2.weight, e.w2.scales, _biases(e.w2), s.w2.weight, s.w2.scales, _biases(s.w2)],
+        inputs=[hq, idx, *_parts(e.w2), *_parts(s.w2)] + [e.w2.rotate(h.reshape(topk, inter)) for h in hb],
         template=[("TOPK", topk), ("DIM", dim), ("INTER", inter)],
         grid=(dim // 4 * (topk + 1) * 32, 1, 1), threadgroup=((topk + 1) * 32, 1, 1),
         output_shapes=[(dim,)], output_dtypes=[mx.bfloat16])[0]

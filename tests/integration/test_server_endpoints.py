@@ -7,6 +7,7 @@ to verify request/response formats without loading actual models.
 """
 
 import json
+import threading
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fastapi.testclient import TestClient
+from mlx_embeddings.tokenizer_utils import TokenizerWrapper
 
 from omlx.api.responses_utils import ResponseStore
 from omlx.engine.base import BaseEngine
@@ -2498,6 +2500,135 @@ class TestTokenizeEndpoints:
         if param is not None:
             assert response.json()["error"]["param"] == param
             assert mock_engine_pool.release_calls == ["test-model"]
+
+
+class CharTokenizer:
+    """id = ord(char) + 3, with <pad>=0, <bos>=1 and <eos>=2.
+
+    Counts differ from the whitespace estimate of count_tokens().
+    """
+
+    SPECIALS = {0: "<pad>", 1: "<bos>", 2: "<eos>"}
+
+    def __init__(self):
+        self.threads: set[str] = set()
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        self.threads.add(threading.current_thread().name)
+        ids = [ord(char) + 3 for char in text]
+        return [1, *ids, 2] if add_special_tokens else ids
+
+    def decode(self, token_ids: list[int]) -> str:
+        self.threads.add(threading.current_thread().name)
+        return "".join(self.SPECIALS.get(i) or chr(i - 3) for i in token_ids)
+
+    def __len__(self) -> int:
+        return 259
+
+
+class TestEmbeddingTokenizeEndpoints:
+    """/tokenize and /detokenize on embedding models use the model's tokenizer."""
+
+    MODEL = "test-embed-model"
+
+    @staticmethod
+    def _load(engine, processor):
+        engine._model = SimpleNamespace(
+            processor=processor,
+            # EmbeddingGemma 2 declares a 262144 RoPE limit but embeds 8192 tokens.
+            effective_max_length=lambda max_length: min(max_length, 8192),
+        )
+
+    @pytest.mark.parametrize(
+        "wrap",
+        [
+            pytest.param(lambda tokenizer: tokenizer, id="tokenizer"),
+            pytest.param(
+                lambda tokenizer: SimpleNamespace(tokenizer=tokenizer), id="processor"
+            ),
+            pytest.param(TokenizerWrapper, id="mlx-embeddings"),
+        ],
+    )
+    def test_tokenize(self, client, mock_engine_pool, mock_embedding_engine, wrap):
+        tokenizer = CharTokenizer()
+        self._load(mock_embedding_engine, wrap(tokenizer))
+        tokenizer.threads.clear()
+        mock_engine_pool._entries[self.MODEL] = SimpleNamespace(
+            model_context_length=262144
+        )
+
+        response = client.post(
+            "/tokenize",
+            json={"model": self.MODEL, "prompt": "hi", "return_token_strs": True},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "count": 4,
+            "max_model_len": 8192,
+            "tokens": [1, 107, 108, 2],
+            "token_strs": ["<bos>", "h", "i", "<eos>"],
+        }
+        # embed() uses the same tokenizer on the MLX executor, and HF fast
+        # tokenizers switch shared truncation state on every call.
+        assert tokenizer.threads == {"mlx-global_0"}
+        assert mock_engine_pool.release_calls == [self.MODEL]
+
+    def test_detokenize(self, client, mock_engine_pool, mock_embedding_engine):
+        tokenizer = CharTokenizer()
+        self._load(mock_embedding_engine, TokenizerWrapper(tokenizer))
+        tokenizer.threads.clear()
+
+        response = client.post(
+            "/detokenize", json={"model": self.MODEL, "tokens": [1, 107, 108, 2]}
+        )
+        assert response.status_code == 200
+        assert response.json() == {"prompt": "<bos>hi<eos>"}
+        assert tokenizer.threads == {"mlx-global_0"}
+
+        response = client.post(
+            "/detokenize", json={"model": self.MODEL, "tokens": [107, 259]}
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["param"] == "tokens[1]"
+        assert mock_engine_pool.release_calls == [self.MODEL, self.MODEL]
+
+    def test_chat_is_rejected(self, client, mock_engine_pool, mock_embedding_engine):
+        self._load(mock_embedding_engine, CharTokenizer())
+
+        response = client.post(
+            "/tokenize",
+            json={
+                "model": self.MODEL,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["param"] == "messages"
+        assert mock_engine_pool.release_calls == [self.MODEL]
+
+    @pytest.mark.parametrize(
+        ("path", "body"),
+        [
+            ("/tokenize", {"model": "test-rerank-model", "prompt": "hello"}),
+            (
+                "/v1/chat/completions",
+                {
+                    "model": "test-embed-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            ),
+        ],
+    )
+    def test_other_engines_and_routes_stay_rejected(
+        self, client, mock_engine_pool, path, body
+    ):
+        response = client.post(path, json=body)
+
+        assert response.status_code == 400
+        assert "not an LLM" in response.json()["error"]["message"]
+        assert mock_engine_pool.release_calls == [body["model"]]
 
 
 class TestMCPEndpoints:

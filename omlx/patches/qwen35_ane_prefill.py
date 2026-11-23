@@ -1272,7 +1272,7 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
 
 
 def _min_viable_gdn_fraction(gdn: Any, alignment: int) -> float | None:
-    """Smallest fraction whose aligned slice covers exactly z on ``gdn``.
+    """Smallest 6-decimal fraction whose aligned slice covers exactly z on ``gdn``.
 
     Wider requests are capped at z so approximate ANE rows never enter the
     recurrent qkv projection. ``None`` means z cannot be represented exactly
@@ -1286,9 +1286,12 @@ def _min_viable_gdn_fraction(gdn: Any, alignment: int) -> float | None:
     if total_outputs <= 0 or z_outputs <= 0 or z_outputs % alignment:
         return None
     ane_min = z_outputs
-    fraction = ane_min / total_outputs
+    # Round up to 6 decimals: the Mac app stores fractions at that precision,
+    # and an exact non-terminating floor such as 1/3 falls one channel short.
+    units = -(-ane_min * 1_000_000 // total_outputs)
+    fraction = units / 1_000_000
     if (int(total_outputs * fraction) // alignment) * alignment < ane_min:
-        fraction = (ane_min + 1) / total_outputs
+        fraction = (units + 1) / 1_000_000
     return fraction
 
 
@@ -1354,7 +1357,7 @@ def _warn_gdn_below_floor(
     if floor is None or gdn_fraction >= floor:
         return
     logger.warning(
-        "ANE GDN prefill fraction %.3f is below this model's %.3f floor, so "
+        "ANE GDN prefill fraction %.6f is below this model's %.6f floor, so "
         "no GDN procedure could be compiled and GDN prefill stays on GPU",
         gdn_fraction,
         floor,

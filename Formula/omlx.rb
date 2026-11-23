@@ -1,8 +1,8 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.3.tar.gz"
-  sha256 "ff0d649ba4e550c031a5d27bb7a4a89b30b35607483fd42010bda2164c0547ad"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.8.3.tar.gz"
+  sha256 "ccc4939f6ee9ec57a56b8b26333d1e5c0f5b4723d8165ba33cb87832ddac01ac"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -116,8 +116,10 @@ class Omlx < Formula
     end
 
     # [audio] is the only source of mlx-audio and of the Kokoro G2P stack
-    # (misaki, spaCy) that the spaCy model check below needs.
-    install_spec = build.with?("grammar") ? "#{buildpath}[audio,grammar]" : "#{buildpath}[audio]"
+    # (misaki, spaCy) that the spaCy model check below needs. [cluster] adds
+    # zeroconf, the only way the Cluster tab finds NVIDIA prefill helpers.
+    extras = build.with?("grammar") ? "audio,cluster,grammar" : "audio,cluster"
+    install_spec = "#{buildpath}[#{extras}]"
     system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")

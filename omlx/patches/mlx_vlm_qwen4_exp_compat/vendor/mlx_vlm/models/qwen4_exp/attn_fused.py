@@ -125,12 +125,9 @@ _PREP_SOURCE = r"""
         int freq_idx = slot;
         int d = freq_idx;
         int pair_d = d + half_dim;
-#if POS_NDIM == 3
-        int axis = int(position_selector[freq_idx]);
+        // POS_NDIM is a template argument, not a macro, so #if cannot test it.
+        const int axis = POS_NDIM == 3 ? int(position_selector[freq_idx]) : 0;
         float pos = static_cast<float>(position_ids[axis * q_len + t]);
-#else
-        float pos = static_cast<float>(position_ids[t]);
-#endif
         float angle = pos * static_cast<float>(inv_freq[freq_idx]);
         if (rope_scale[0] != 1.0f) {
             // YaRN runs mlx-vlm's eager MRoPE instead: precise cos/sin times
@@ -495,10 +492,22 @@ def _gpu_class() -> str:
         return ""
 
 
+@functools.lru_cache(maxsize=None)
+def _thread_limited_gpu() -> bool:
+    """g13/g14 GPUs cap threadgroups at 896 threads, below the 1024 threads
+    the combine kernels launch; they must keep the MLX path rather than
+    fail each warm-up probe."""
+    try:
+        architecture = str(mx.device_info().get("architecture", ""))
+    except Exception:
+        return False
+    return architecture.startswith(("applegpu_g13", "applegpu_g14"))
+
+
 def rows_available() -> bool:
     """Whether the fused decode/verify attention rows can run on this GPU at
     all (layers still check their own shapes): off after a kernel failure."""
-    return not _DISABLED and _gpu_class() == "d"
+    return not _DISABLED and _gpu_class() == "d" and not _thread_limited_gpu()
 
 
 def row_plan(first_keys: int, last_keys: int) -> int | None:
@@ -688,7 +697,7 @@ def ready(dtype, heads: int, kv_heads: int, head_dim: int, rotary_dim: int, pos_
     transcribed plans 12+ of them on a 'd' GPU. Each specialization runs once
     on tiny inputs first; a compile or launch failure turns the kernels off."""
     global _DISABLED
-    if _gpu_class() != "d" or not prep_ready(
+    if _gpu_class() != "d" or _thread_limited_gpu() or not prep_ready(
         dtype, heads, kv_heads, head_dim, rotary_dim, pos_ndim
     ):
         return False

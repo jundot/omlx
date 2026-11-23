@@ -394,6 +394,8 @@ class TestResponsesEndpointReaches400:
             from unittest.mock import AsyncMock
 
             fake_pool = MagicMock()
+            # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
+            fake_pool._scheduler_config.paged_ssd_cache_dir = None
             fake_pool.get_entry = MagicMock(return_value=None)
             fake_pool.preload_pinned_models = AsyncMock()
             fake_pool.check_ttl_expirations = AsyncMock()

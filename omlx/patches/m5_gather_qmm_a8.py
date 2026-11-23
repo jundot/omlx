@@ -92,8 +92,8 @@ _FMT_AFFINE = 0
 _FMT_MXFP4 = 1
 _FMT_INT8 = 2
 _MX_GROUP = 32
-# 64 rows x 256 E8M0 bytes = 16 KiB of staged scales (K = 8192).
-_STAGE_MAX_MX_GROUPS = 256
+# 64 rows x 384 E8M0 bytes = 24 KiB of staged scales (K = 12288).
+_STAGE_MAX_MX_GROUPS = 384
 # Largest G (= K / 64) whose tile metadata is staged in threadgroup memory:
 # 2 x 64 rows x 80 groups x 2 bytes = 20 KiB. Staging G = 80 (K = 5120) beat
 # the scalar loads by about 5% on M5 Max.
@@ -152,6 +152,9 @@ constant constexpr ushort kE2M1x2[256] = {__E2M1_LUT__};
 // staged as [group][local row]) and no bias. Step t covers codes
 // 32 (t >> 1) + 8 cx + 4 (t & 1) + j in checkpoint K order, so each step pair
 // is one scale group with its own accumulator.
+// EPI 3: the MiniMax SwiGLU-OAI in float -- gate and up times the expert's
+// gsc / usc, gate clamped above and up to +-limit, then
+// gate * sigmoid(alpha * gate) * (up + beta).
 template <
     typename T,
     typename S,
@@ -176,6 +179,8 @@ METAL_FUNC void omlx_a8_gather_nax(
     const device S* su_in,
     const device S* bu_in,
     const device float* rw,
+    const device float* gsc,
+    const device float* usc,
     const device uint32_t* rmap,
     const device uint32_t* tiles,
     const uint32_t tile_count,
@@ -183,6 +188,8 @@ METAL_FUNC void omlx_a8_gather_nax(
     const int K,
     const int n_tok,
     const float limit,
+    const float alpha,
+    const float beta,
     device T* out,
     threadgroup T* meta_s,
     threadgroup T* meta_b,
@@ -641,7 +648,21 @@ METAL_FUNC void omlx_a8_gather_nax(
           const int n = col_base + int(coord.x) + (e & 3);
           const int m = row_start + ms;
           const float sc = (ACT ? 1.0f : sa[mt_row[i][r]]) * kWScale;
-          if (EPI == 2) {
+          if (EPI == 3) {
+            float g = sc * Cf[i][e] * gsc[expert];
+            float u = sc * Cf[i][e + kA8Elems] * usc[expert];
+            if (limit != 0.0f) {
+              g = metal::min(g, limit);
+              u = metal::clamp(u, -limit, limit);
+            }
+            const float z = alpha * g;
+            const float neg = 1.0f / (1.0f + metal::precise::exp(metal::abs(z)));
+            float v = g * (z < 0.0f ? neg : 1.0f - neg) * (u + beta);
+            if (RW) {
+              v *= rw[m];
+            }
+            out[size_t(m) * size_t(half_n) + size_t(n)] = static_cast<T>(v);
+          } else if (EPI == 2) {
             float g = sc * Cf[i][e];
             float u = sc * Cf[i][e + kA8Elems];
             if (limit != 0.0f) {
@@ -704,9 +725,9 @@ _A8_SOURCE = """
     // uint storage keeps the uchar4 scale reads aligned.
     threadgroup uint meta_e[(STAGED && FMT != 0) ? SG * 16 : 1];
     omlx_a8_gather_nax<T, S, FMT, BITS, WM, WN, EPI, STAGED, SG, ACT, SPLIT, RW>(
-        qa, sa, ra, w, scales, biases, wu, su, bu, rw, rmap, tiles,
-        tile_count[0], params[0], params[1], params[2], limit[0], out, meta_s,
-        meta_b, reinterpret_cast<threadgroup uchar*>(meta_e),
+        qa, sa, ra, w, scales, biases, wu, su, bu, rw, gsc, usc, rmap, tiles,
+        tile_count[0], params[0], params[1], params[2], limit[0], limit[1],
+        limit[2], out, meta_s, meta_b, reinterpret_cast<threadgroup uchar*>(meta_e),
         threadgroup_position_in_grid,
         simdgroup_index_in_threadgroup, thread_index_in_threadgroup);
 """
@@ -741,6 +762,8 @@ def _get_kernel():
                     "su",
                     "bu",
                     "rw",
+                    "gsc",
+                    "usc",
                     "rmap",
                     "tiles",
                     "tile_count",
@@ -836,10 +859,14 @@ def _launch(
     route_weights=None,
     act=_ACT_ROW,
     fmt=_FMT_AFFINE,
+    oai=None,
+    expert_scales=None,
 ):
     """Stage A, the tile scan and the gather kernel; None when unavailable.
 
     MX formats (``fmt`` != 0) pass ``biases=None`` and E8M0 ``scales``.
+    ``oai`` = ``(alpha, beta)`` selects the SwiGLU-OAI epilogue, with
+    ``expert_scales`` = ``(gate, up)`` per-expert float multipliers.
     """
     from omlx.custom_kernels.quant_matmul import fast
 
@@ -857,7 +884,9 @@ def _launch(
     wm, wn = bm // 32, _WN
     # The DeepSeek V4.1 epilogue for split, clamped or weighted SwiGLU.
     epi = 0
-    if swiglu:
+    if swiglu and oai is not None:
+        epi = 3
+    elif swiglu:
         plain = up is None and limit is None and route_weights is None
         epi = 1 if plain else 2
     wu, su, bu = up if up is not None else (w, scales, biases)
@@ -871,6 +900,17 @@ def _launch(
     # Without route weights rw is unread; Sa stands in because a one-element
     # array would be bound in the constant address space.
     rw = route_weights.astype(mx.float32) if route_weights is not None else sa
+    if epi != 3:
+        gsc = usc = sa
+    else:
+        if expert_scales is None:
+            expert_scales = (mx.ones((E,), dtype=mx.float32),) * 2
+        gsc, usc = (s.astype(mx.float32) for s in expert_scales)
+        if E < 8:
+            # Arrays of fewer than 8 elements bind in the constant address space.
+            pad = mx.zeros((8 - E,), dtype=mx.float32)
+            gsc, usc = mx.concatenate([gsc, pad]), mx.concatenate([usc, pad])
+    alpha, beta = oai if oai is not None else (0.0, 0.0)
 
     # The grid is sized by the *upper bound* on tiles and the kernel returns
     # early for tile indices past tile_count, so nothing is read back to the
@@ -906,11 +946,13 @@ def _launch(
             su,
             bu,
             rw,
+            gsc,
+            usc,
             row_map,
             tiles,
             tile_count,
             mx.array([N, K, T], dtype=mx.int32),
-            mx.array([float(limit or 0.0)], dtype=mx.float32),
+            mx.array([float(limit or 0.0), alpha, beta], dtype=mx.float32),
         ],
         template=[
             ("T", x.dtype),
@@ -951,6 +993,9 @@ def sorted_gather_qmm_a8(
     swiglu_limit=None,
     route_weights=None,
     group_scales=False,
+    swiglu_alpha=None,
+    swiglu_beta=0.0,
+    expert_scales=None,
 ):
     """``activation(x[row_map]) @ w[indices].T`` with an INT8 activation.
 
@@ -972,6 +1017,11 @@ def sorted_gather_qmm_a8(
     ``group_scales=True`` scales activations per GS64 group instead of per
     row, so an outlier sets the scale of its own group only.
 
+    ``swiglu_alpha`` selects the MiniMax SwiGLU-OAI instead:
+    ``g * sigmoid(alpha * g) * (u + swiglu_beta)`` in float, where gate and up
+    are first multiplied by ``expert_scales`` (``(gate, up)``, ``[E]`` float)
+    and clamped by ``swiglu_limit``.
+
     ``init_value`` pre-fills the output, so tests can detect unwritten
     elements.
     """
@@ -979,16 +1029,20 @@ def sorted_gather_qmm_a8(
         return None
     if up is not None and not _supports_up(w, scales, biases, up, swiglu):
         return None
-    if route_weights is not None and route_weights.shape != indices.shape:
+    if not _supports_epilogue(
+        w, indices, swiglu, route_weights, swiglu_alpha, expert_scales
+    ):
         return None
     act = _ACT_G64 if group_scales else _ACT_ROW
     groups = int(x.shape[2]) // _GROUP
+    oai = swiglu_alpha is not None
     extended = (
         bits != 4
         or act != _ACT_ROW
         or up is not None
         or swiglu_limit is not None
         or route_weights is not None
+        or oai
     )
     # One canary verdict per kernel instantiation.
     if extended:
@@ -1002,6 +1056,7 @@ def sorted_gather_qmm_a8(
             swiglu_limit is not None,
             route_weights is not None,
             act,
+            oai,
         )
         if not _nax._checked(key, _self_test_extended):
             return None
@@ -1022,6 +1077,22 @@ def sorted_gather_qmm_a8(
         limit=swiglu_limit,
         route_weights=route_weights,
         act=act,
+        oai=(float(swiglu_alpha), float(swiglu_beta)) if oai else None,
+        expert_scales=expert_scales,
+    )
+
+
+def _supports_epilogue(w, indices, swiglu, route_weights, alpha, expert_scales):
+    """Route weights per sorted row, and SwiGLU-OAI scales per expert."""
+    if route_weights is not None and route_weights.shape != indices.shape:
+        return False
+    if alpha is None:
+        return expert_scales is None
+    if not swiglu:
+        return False
+    experts = (int(w.shape[0]),)
+    return expert_scales is None or (
+        len(expert_scales) == 2 and all(s.shape == experts for s in expert_scales)
     )
 
 
@@ -1085,6 +1156,9 @@ def sorted_gather_qmm_a8_mx(
     group_scales=False,
     init_value=None,
     bm=None,
+    swiglu_alpha=None,
+    swiglu_beta=0.0,
+    expert_scales=None,
 ):
     """:func:`sorted_gather_qmm_a8` for MXFP4 codes (``fmt=_FMT_MXFP4``) or
     the INT8 codes of :func:`mxfp8_to_int8` (``fmt=_FMT_INT8``), with E8M0
@@ -1094,10 +1168,13 @@ def sorted_gather_qmm_a8_mx(
         return None
     if not swiglu and (route_weights is not None or swiglu_limit is not None):
         return None
-    if route_weights is not None and route_weights.shape != indices.shape:
+    if not _supports_epilogue(
+        w, indices, swiglu, route_weights, swiglu_alpha, expert_scales
+    ):
         return None
     act = _ACT_G64 if group_scales else _ACT_ROW
     bm = bm or (_BM_SPLIT_SWIGLU if up is not None else _BM)
+    oai = swiglu_alpha is not None
     key = (
         "a8mx",
         x.dtype,
@@ -1109,6 +1186,7 @@ def sorted_gather_qmm_a8_mx(
         route_weights is not None,
         act,
         bm,
+        oai,
     )
     if not _nax._checked(key, _self_test_extended):
         return None
@@ -1127,6 +1205,8 @@ def sorted_gather_qmm_a8_mx(
         route_weights=route_weights,
         act=act,
         fmt=fmt,
+        oai=(float(swiglu_alpha), float(swiglu_beta)) if oai else None,
+        expert_scales=expert_scales,
     )
 
 
@@ -1280,17 +1360,19 @@ def _self_test(key: tuple):
 
 
 _CANARY_LIMIT = 1.0  # small enough that the canary's gate and up hit the clamp
+# SwiGLU-OAI constants of MiniMax M3; the kernel takes them at run time.
+_CANARY_OAI = (1.702, 1.0)
 
 
 def _self_test_extended(key: tuple):
     """The canary of :func:`_self_test` for the Q2/Q3, group-scaled, split,
-    clamped and weighted instantiations, and for the MX formats (``"a8mx"``
-    keys), against a float reference on the dequantized weights."""
+    clamped, weighted and SwiGLU-OAI instantiations, and for the MX formats
+    (``"a8mx"`` keys), against a float reference on the dequantized weights."""
     if key[0] == "a8mx":
-        _, dtype, groups, fmt, swiglu, split, clamp, weighted, act, bm = key
+        _, dtype, groups, fmt, swiglu, split, clamp, weighted, act, bm, oai = key
         bits = 4 if fmt == _FMT_MXFP4 else 8
     else:
-        _, dtype, groups, bits, swiglu, split, clamp, weighted, act = key
+        _, dtype, groups, bits, swiglu, split, clamp, weighted, act, oai = key
         fmt, bm = _FMT_AFFINE, _BM_SPLIT_SWIGLU if split else _BM
     k_dim = groups * _GROUP
     try:
@@ -1328,6 +1410,11 @@ def _self_test_extended(key: tuple):
             mx.random.uniform(0.2, 1.5, (rows,), key=keys[3]) if weighted else None
         )
         limit = _CANARY_LIMIT if clamp else None
+        expert_scales = (
+            tuple(mx.random.uniform(0.5, 2.0, (2, experts), key=mx.random.key(0xA81)))
+            if oai
+            else None
+        )
         if swiglu and split:
             (w, w_ref), (up, up_ref) = quant((experts, n, k_dim), keys[1]), quant(
                 (experts, n, k_dim), keys[2]
@@ -1347,6 +1434,8 @@ def _self_test_extended(key: tuple):
             route_weights=weights,
             act=act,
             fmt=fmt,
+            oai=_CANARY_OAI if oai else None,
+            expert_scales=expert_scales,
         )
         if out is None:
             return False
@@ -1362,10 +1451,17 @@ def _self_test_extended(key: tuple):
                 gate, upv = gather(w_ref), gather(up_ref)
             else:
                 gate, upv = mx.split(gather(w_ref), 2, axis=-1)
+            if oai:
+                gate = gate * expert_scales[0][idx][:, None, None]
+                upv = upv * expert_scales[1][idx][:, None, None]
             if limit is not None:
                 gate = mx.minimum(gate, limit)
                 upv = mx.clip(upv, -limit, limit)
-            ref = nn.silu(gate) * upv
+            if oai:
+                alpha, beta = _CANARY_OAI
+                ref = gate * mx.sigmoid(alpha * gate) * (upv + beta)
+            else:
+                ref = nn.silu(gate) * upv
             if weights is not None:
                 ref = ref * weights[:, None, None]
         err = mx.abs(out.astype(mx.float32) - ref).max().item()

@@ -139,6 +139,13 @@ def test_fused_prework_l2_bit_exact(seq, batch):
 
 
 def test_verify_gate_routes_qwen4_l2_norm(monkeypatch):
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    # Match runtime registration before importing Qwen4. Importing the stock
+    # package first pins it in sys.modules and breaks later vendor cache tests.
+    apply_mlx_vlm_qwen4_exp_compat_patch()
     q4 = pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
     from mlx_vlm.models.cache import ArraysCache
     from mlx_vlm.models.qwen3_5 import language as q35
@@ -233,7 +240,6 @@ def test_verify_gate_resolves_compat_vendor_verifier(
 
     from mlx_vlm.models.cache import ArraysCache
 
-    pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
     if not vendor_registered_first:
         monkeypatch.setattr(prework_mod, "_PATCHED", False)
         assert prework_mod.apply_qwen35_gdn_prework_patch()
@@ -254,10 +260,16 @@ def test_verify_gate_resolves_compat_vendor_verifier(
     fake = ModuleType("mlx_vlm.models.qwen4_exp.language")
     fake._Qwen4Verifier = VendorVerifier
     fake.Qwen4ExpGatedDeltaNet = VendorGDN
-    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen4_exp.language", fake)
-    import mlx_vlm.models.qwen4_exp as q4_pkg
+    # Provide the whole temporary namespace without importing the stock
+    # package. Restore both sys.modules and the parent attribute together.
+    import mlx_vlm.models
 
-    monkeypatch.setattr(q4_pkg, "language", fake, raising=False)
+    q4_pkg = ModuleType("mlx_vlm.models.qwen4_exp")
+    q4_pkg.__path__ = []
+    q4_pkg.language = fake
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen4_exp", q4_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen4_exp.language", fake)
+    monkeypatch.setattr(mlx_vlm.models, "qwen4_exp", q4_pkg, raising=False)
 
     if vendor_registered_first:
         monkeypatch.setattr(prework_mod, "_PATCHED", False)
@@ -1092,6 +1104,11 @@ def test_qwen4_verify_records_replay_rows_instead_of_states(
     committed states stay bit-exact to the stock recording across two blocks."""
     import copy
 
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
     q4 = pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
     from mlx_vlm.models.cache import ArraysCache
     from mlx_vlm.models.qwen3_5 import language as q35
@@ -1099,6 +1116,7 @@ def test_qwen4_verify_records_replay_rows_instead_of_states(
     ver_cls = getattr(q4, "_Qwen4Verifier", None) or getattr(
         q4, "Qwen4ExpBatchInvariantForward", None
     )
+    assert ver_cls is not None
     args = SimpleNamespace(
         hidden_size=64,
         linear_num_value_heads=4,
@@ -1500,10 +1518,11 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8, 12, 16])
-@pytest.mark.parametrize("seed", [5, 23])
+# One block per in-projection geometry: the two-row tile, then two, one and
+# three rows per threadgroup.
+@pytest.mark.parametrize("rows", [2, 4, 5, 9])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
-    monkeypatch, qwen4_verify, dtype, rows, seed
+    monkeypatch, qwen4_verify, dtype, rows
 ):
     """Row t, the state after it and the conv window equal the t-th planned
     one-token decode step; a partial accept restores that step's states."""
@@ -1519,8 +1538,8 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
         return decode_step(*args)
 
     monkeypatch.setattr(prework_mod, "qwen4_decode_step_fused", counted)
-    module = _real_qwen4_decode_module(((6, 64),) * 4, seed, dtype)
-    inputs, conv_state, recurrent_state = _verify_inputs(rows, seed, dtype)
+    module = _real_qwen4_decode_module(((6, 64),) * 4, 5, dtype)
+    inputs, conv_state, recurrent_state = _verify_inputs(rows, 5, dtype)
     serial = ArraysCache(size=2)
     serial[0], serial[1] = conv_state, recurrent_state
     outputs, convs, states = [], [conv_state], [recurrent_state]

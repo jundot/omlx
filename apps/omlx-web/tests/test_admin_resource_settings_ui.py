@@ -1,9 +1,11 @@
-import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from omlx.settings import CONCURRENT_PRIORITIES
 
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS = (
@@ -11,26 +13,17 @@ SETTINGS = (
 ).read_text()
 
 
-def test_decode_priority_copy_describes_prefill_behavior():
-    translations = json.loads((ROOT / "omlx_web/i18n/en.json").read_text())
-
-    assert (
-        translations["settings.resource.decode_fairness"]
-        == "Prioritize Decoding During Prefill"
-    )
-    assert "Prefill pauses between chunks" in translations[
-        "settings.resource.decode_fairness_description"
-    ]
-
-
-def test_decode_priority_toggle_keeps_its_fixed_width():
-    binding = "globalSettings.scheduler.decode_fairness ="
+def _concurrent_priority_select():
+    binding = 'x-model="globalSettings.scheduler.concurrent_priority"'
     binding_start = SETTINGS.index(binding)
-    button_start = SETTINGS.rindex("<button", 0, binding_start)
-    button_end = SETTINGS.index("</button>", binding_start)
-    button = SETTINGS[button_start:button_end]
+    select_start = SETTINGS.rindex("<select", 0, binding_start)
+    return SETTINGS[select_start : SETTINGS.index("</select>", binding_start)]
 
-    assert "flex-shrink-0" in button
+
+def test_concurrent_priority_options_send_server_values():
+    values = re.findall(r'<option value="([a-z_]+)"', _concurrent_priority_select())
+
+    assert tuple(values) == CONCURRENT_PRIORITIES
 
 
 def test_loading_cache_settings_preserves_size_until_slider_edit():

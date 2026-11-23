@@ -14,6 +14,7 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
     make_prompt_cache,
 )
+from mlx_vlm.turboquant import _state_length
 
 from omlx.affine4 import (
     Affine4KVCache,
@@ -160,6 +161,65 @@ def test_singleton_cache_converts_when_another_request_joins(
     joined = generate._extend_cache(single, [caches[1]])
     assert type(joined[0]) is batch_class
     assert joined[0].left_padding.shape == (2,)
+
+
+def _affine8_cache(length, seed):
+    cache = Affine8KVCache()
+    keys = mx.random.normal((1, 2, length, 64), key=mx.random.key(seed))
+    cache.update_and_fetch(keys.astype(mx.float16), keys.astype(mx.float16))
+    return cache
+
+
+def _row_fields(cache, row, start, end):
+    return [
+        part[row : row + 1, :, start:end] for state in cache.state for part in state
+    ]
+
+
+def _fields_equal(left, right):
+    return all(mx.array_equal(a, b).item() for a, b in zip(left, right))
+
+
+def test_join_writes_end_aligned_rows_with_room_to_grow():
+    generate = importlib.import_module("mlx_lm.generate")
+    running, joining = _affine8_cache(300, 1), _affine8_cache(700, 2)
+    expected = [_row_fields(running, 0, 0, 300), _row_fields(joining, 0, 0, 700)]
+    cache_a, cache_b = [running], [joining]
+
+    batch = generate._extend_cache(cache_a, cache_b)[0]
+
+    assert cache_a == [None] and cache_b == [None]
+    assert batch.left_padding.tolist() == [400, 0]
+    capacity = _state_length(batch.keys)
+    assert capacity > 700
+    batch.update_and_fetch(
+        mx.zeros((2, 2, 1, 64), mx.float16), mx.zeros((2, 2, 1, 64), mx.float16)
+    )
+    assert _state_length(batch.keys) == capacity
+    assert _fields_equal(_row_fields(batch, 0, 400, 700), expected[0])
+    assert _fields_equal(_row_fields(batch, 1, 0, 700), expected[1])
+
+
+def test_merge_of_several_requests_drops_donors_and_keeps_empty_rows_zero():
+    generate = importlib.import_module("mlx_lm.generate")
+    requests = [
+        [_affine8_cache(600, 3), _affine8_cache(600, 4)],
+        [Affine8KVCache(), Affine8KVCache()],
+        [_affine8_cache(300, 5), _affine8_cache(300, 6)],
+    ]
+    expected = [
+        [_row_fields(c, 0, 0, c.offset) for c in requests[0]],
+        [_row_fields(c, 0, 0, c.offset) for c in requests[2]],
+    ]
+
+    merged = generate._merge_caches(requests)
+
+    assert all(layer is None for request in requests for layer in request)
+    for i, batch in enumerate(merged):
+        assert batch.left_padding.tolist() == [0, 600, 300]
+        assert _fields_equal(_row_fields(batch, 0, 0, 600), expected[0][i])
+        assert not mx.any(batch.keys.norms[1]).item()
+        assert _fields_equal(_row_fields(batch, 2, 300, 600), expected[1][i])
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from omlx.api.thinking import ThinkingParser, extract_thinking
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -464,6 +465,31 @@ def test_model_lightning_mtp_runs_only_when_the_plan_holds_the_head():
     # A plan without room for the head cannot run it.
     unplanned = DistributedBatchedEngine(_deployment(), model_settings=settings)
     assert not unplanned._supervisor.deployment.execution.mtp
+
+
+def test_model_prefill_settings_reach_v41_tensor_parallel_ranks():
+    def execution(deployment, model_type, settings=None):
+        engine = DistributedBatchedEngine(
+            deployment, model_settings=settings, config_model_type=model_type
+        )
+        found = engine._supervisor.deployment.execution
+        return found.ced_prefill, found.a8_prefill
+
+    tensor = replace(_deployment(), tensor_parallel_size=2)
+    # Unset, CED is on and A8 off, as on a single Mac.
+    assert execution(tensor, "deepseek_v41") == (True, False)
+    saved = SimpleNamespace(a8_prefill_enabled=True)
+    assert execution(tensor, "deepseek_v41", saved) == (True, True)
+    # Model settings leave the A8 threshold unchecked while A8 is off.
+    off = SimpleNamespace(
+        deepseek_v41_ced_prefill_enabled=False,
+        a8_prefill_enabled=False,
+        a8_prefill_min_tokens=0,
+    )
+    assert execution(tensor, "deepseek_v41", off) == (False, False)
+    # Other models and pipeline stages do not read them.
+    assert execution(tensor, "qwen3_5_moe") == (False, False)
+    assert execution(_deployment(), "deepseek_v41") == (False, False)
 
 
 @pytest.mark.asyncio
@@ -1443,3 +1469,64 @@ async def test_local_stop_passes_scope_to_supervisor(monkeypatch):
     assert calls == [{"local_only": True}]
     assert engine._client is None
     assert not engine._loaded
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_recovers_reasoning_only_reply_as_content():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning": "Paris is the answer.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat([{"role": "user", "content": "Capital?"}])
+    finally:
+        await engine._client.aclose()
+
+    assert extract_thinking(output.text) == ("", "Paris is the answer.")
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_recovers_reasoning_only_reply_as_content():
+    events = [
+        {"choices": [{"delta": {"reasoning": "Paris "}, "finish_reason": None}]},
+        {"choices": [{"delta": {"reasoning": "is it."}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 2}},
+    ]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+
+    def handler(request):
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=content
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Capital?"}]
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    parser = ThinkingParser()
+    for output in outputs:
+        parser.feed(output.new_text)
+    assert parser.finish() == ("", "Paris is it.")

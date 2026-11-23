@@ -1,0 +1,74 @@
+MLX CUDA rebuilds an affine weight as T(q) * scale + bias in the element type. For bfloat16 and
+float16 that rounds the product and the sum separately; Metal rounds the float32 sum once. The two
+differ in 50-64% of the weights by one unit, so quantized_matmul and gather_qmm outputs agree with
+Metal in only about 30% of their bfloat16 elements (relative error 5e-3). Rebuilding in float32 and
+rounding once brings gather_qmm to 99.9% (4-bit group 64 expert bank, 8192 rows) at the same speed.
+The 3, 5 and 6-bit branches of affine_dequantize are left as they are.
+
+diff --git a/mlx/backend/cuda/device/cute_dequant.cuh b/mlx/backend/cuda/device/cute_dequant.cuh
+index 6416c5b87..30ed3c3a6 100644
+--- a/mlx/backend/cuda/device/cute_dequant.cuh
++++ b/mlx/backend/cuda/device/cute_dequant.cuh
+@@ -163,12 +163,19 @@ cute_vectorized_dequant(TensorW w, TensorS s, TensorZ z, TensorO out) {
+   constexpr int N = size(layout);
+   auto& w_vec = *(reinterpret_cast<const cutlass::Array<Quant, N>*>(
+       raw_pointer_cast(w.data())));
+-  Element scale{s[0]};
+-  cutlass::NumericArrayConverter<Element, Quant, N> converter;
+-  auto w_dq = converter(w_vec) * scale;
++  // Multiply and add in float32 and round once to the element type: the
++  // 16-bit types would round the product and the sum separately.
++  cutlass::NumericArrayConverter<float, Quant, N> to_float;
++  cutlass::Array<float, N> w_f = to_float(w_vec);
++  const float scale = static_cast<float>(Element{s[0]});
++  float zero_point = 0.0f;
+   if constexpr (quant_has_bias_v<Quant>) {
+-    Element zero_point{z[0]};
+-    w_dq = w_dq + zero_point;
++    zero_point = static_cast<float>(Element{z[0]});
++  }
++  cutlass::Array<Element, N> w_dq;
++  CUTLASS_PRAGMA_UNROLL
++  for (int i = 0; i < N; ++i) {
++    w_dq[i] = Element(w_f[i] * scale + zero_point);
+   }
+   copy(make_tensor(make_rmem_ptr<Element>(&w_dq), out.layout()), out);
+ }
+@@ -183,10 +190,18 @@ cute_naive_dequant(TensorW w, TensorS s, TensorZ z, TensorO out) {
+   using Element = typename decltype(out)::value_type;
+   using Quant = typename decltype(w)::value_type;
+   using Scale = typename decltype(s)::value_type;
+-  transform(w, out, [](Quant q) { return Element(q); });
+-  transform(out, s, out, [](Element e, Scale s) { return e * Element(s); });
++  // Float32 math, rounded once (see cute_vectorized_dequant).
+   if constexpr (quant_has_bias_v<Quant>) {
+-    transform(out, z, out, plus{});
++    using Bias = typename decltype(z)::value_type;
++    CUTE_UNROLL
++    for (int i = 0; i < size(out); ++i) {
++      out(i) = Element(
++          static_cast<float>(Element(w(i))) * static_cast<float>(Element(s(i))) +
++          static_cast<float>(Element(Bias(z(i)))));
++    }
++  } else {
++    transform(w, out, [](Quant q) { return Element(q); });
++    transform(out, s, out, [](Element e, Scale s) { return e * Element(s); });
+   }
+ }
+ 
+diff --git a/mlx/backend/cuda/quantized/affine_quantize.cu b/mlx/backend/cuda/quantized/affine_quantize.cu
+index 6e94b1e70..2d023041d 100644
+--- a/mlx/backend/cuda/quantized/affine_quantize.cu
++++ b/mlx/backend/cuda/quantized/affine_quantize.cu
+@@ -219,7 +219,10 @@ __global__ void affine_dequantize(
+       } else if (bits == 8) {
+         d = val;
+       }
+-      out[i] = scale * static_cast<T>(d) + bias;
++      // Float32 math, rounded once.
++      out[i] = static_cast<T>(
++          static_cast<float>(scale) * static_cast<float>(d) +
++          static_cast<float>(bias));
+     }
+   }
+ }

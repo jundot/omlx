@@ -959,6 +959,16 @@ def test_two_resident_models_keep_their_own_settings():
     assert dispatch._config_for(long.proj).min_tokens == 4096
 
 
+def test_opted_in_model_gets_its_own_ssd_numerics_revision():
+    """KV computed from INT8 activations must not serve a model with A8 off."""
+    import mlx.nn as nn
+
+    from omlx.cache.paged_ssd_cache import numerics_revision_for_model
+
+    assert numerics_revision_for_model(nn.Linear(4, 4)) is None
+    assert numerics_revision_for_model(_opt_in(nn.Linear(4, 4))) == "a8-prefill-1"
+
+
 @pytest.mark.parametrize("batch", [1, 4])
 def test_single_token_mlp_stays_on_decode_when_floor_is_one(monkeypatch, batch):
     from unittest.mock import Mock

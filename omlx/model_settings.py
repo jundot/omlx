@@ -16,7 +16,6 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from .custom_kernels.quant_matmul import fast as quant_fast
 from .model_profiles import (
     MODEL_SPECIFIC_PROFILE_FIELDS,
     RENAMED_FIELDS,
@@ -33,7 +32,7 @@ from .model_profiles import (
 logger = logging.getLogger(__name__)
 
 # Current settings file format version
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
 # Keep API validation and runtime normalization on the same contract.
@@ -44,6 +43,44 @@ MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 # experts the generic SwitchGLU adapter leaves resident (see
 # apply_moe_expert_offload's mtp_resident).
 MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next", "qwen4_exp")
+
+
+# Paths that run the targeted projections from the checkpoint weights, or
+# bypass the model forward, so an adapter would be skipped without notice.
+_LORA_CONFLICTS = (
+    ("dflash_enabled", "DFlash"),
+    ("vlm_mtp_enabled", "VLM MTP"),
+    ("qwen35_ane_prefill_enabled", "ANE prefill"),
+    ("moe_expert_offload_enabled", "MoE expert offload"),
+    ("prefill_helper_node_id", "a Prefill Accelerator"),
+    ("external_engine", "an external engine"),
+)
+
+
+def lora_adapter_conflict(settings: dict) -> str | None:
+    """Name the first enabled setting that cannot run with a LoRA adapter."""
+    for key, label in _LORA_CONFLICTS:
+        if settings.get(key):
+            return label
+    return None
+
+
+def resolve_lora_conflicts(data: dict) -> tuple:
+    """Clear the settings a LoRA adapter cannot run with; returns (data, names).
+
+    The adapter wins because it shapes output content while the others change
+    speed or placement. Used for profile merges and persisted files so
+    ``ModelSettings.__post_init__`` does not reject the whole blob.
+    """
+    if not data.get("lora_adapter"):
+        return data, []
+    names = [key for key, _ in _LORA_CONFLICTS if data.get(key)]
+    if not names:
+        return data, []
+    resolved = dict(data)
+    for key in names:
+        resolved[key] = False if key.endswith("_enabled") else None
+    return resolved, names
 
 
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
@@ -200,7 +237,6 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
     if not (data.get("a8_prefill_enabled") and data.get("qwen35_ane_prefill_enabled")):
         return data, []
     resolved = dict(data)
-    # Unset, A8 yields to ANE prefill (see a8_prefill_on).
     resolved.pop("a8_prefill_enabled")
     return resolved, ["qwen35_ane_prefill_enabled"]
 
@@ -213,24 +249,31 @@ def _setting(settings: Any, name: str) -> Any:
     return getattr(settings, name, None)
 
 
+def specprefill_draft(settings: Any) -> str | None:
+    """Return the SpecPrefill draft path, or None while SpecPrefill is off."""
+    if not _setting(settings, "specprefill_enabled"):
+        return None
+    return _setting(settings, "specprefill_draft_model") or None
+
+
 def a8_prefill_on(settings: Any) -> bool:
-    """A8 prefill unless it was saved off. Left unset, it yields to ANE
-    prefill, which claims the same projections."""
-    value = _setting(settings, "a8_prefill_enabled")
-    if value is None:
-        return not _setting(settings, "qwen35_ane_prefill_enabled")
-    return bool(value)
+    """A8 prefill only when it was saved on: it changes numerics."""
+    return bool(_setting(settings, "a8_prefill_enabled"))
+
+
+_A8_EXACT_MODEL_TYPES = ("qwen4_exp", "deepseek_v41", "minimax_m3", "minimax_m3_vl")
 
 
 def oq_a8_model_supported(config_type: str | None) -> bool:
     """True for the model families the A8 prefill paths can route.
 
-    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) and
-    DeepSeek V4.1 match exactly: only those validated checkpoint families have
-    routed-expert A8, so a ``qwen4`` prefix would admit unvalidated models.
+    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``),
+    DeepSeek V4.1 and MiniMax M3/M3.1 match exactly: only those validated
+    checkpoint families have routed-expert A8, so a ``qwen4`` prefix would
+    admit unvalidated models.
     """
     config_type = str(config_type or "").lower().replace("-", "_")
-    return config_type in ("qwen4_exp", "deepseek_v41") or config_type.startswith(
+    return config_type in _A8_EXACT_MODEL_TYPES or config_type.startswith(
         ("qwen3_5", "qwen3_6", "qwen3_8")
     )
 
@@ -240,8 +283,19 @@ def ced_prefill_on(settings: Any) -> bool:
     return _setting(settings, "deepseek_v41_ced_prefill_enabled") is not False
 
 
-PROFILES_VERSION = 1
-TEMPLATES_VERSION = 1
+PROFILES_VERSION = 2
+TEMPLATES_VERSION = 2
+
+
+def _drop_ui_default_mtp_depth(settings: dict) -> bool:
+    """Drop the mtp_adaptive_max_depth 3 that the UIs saved for "Default" before
+    settings v3 and profiles / templates v2, so the model's own default applies."""
+    if settings.get("mtp_adaptive_max_depth") != 3:
+        return False
+    del settings["mtp_adaptive_max_depth"]
+    return True
+
+
 _LEGACY_TURBOQUANT_PROFILE_FIELDS = frozenset(
     {"turboquant_kv_enabled", "turboquant_kv_bits"}
 )
@@ -334,17 +388,21 @@ class ModelSettings:
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
-        a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8 and DeepSeek V4.1
-            prefill matmuls through the INT8-activation (QxA8) tensor kernels.
+        a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8, DeepSeek V4.1 and
+            MiniMax M3 prefill matmuls through the INT8-activation (QxA8)
+            tensor kernels.
             Prefill only, and only a speed-up on hardware with native INT8
             tensor operations -- M5-series and newer. On anything older it
-            applies only to a Prefill Accelerator Mac's layers. On unless
-            saved off. Decode is unaffected. Changes numerics: activations
+            applies only to a Prefill Accelerator Mac's layers. Off unless
+            saved on. Decode is unaffected. Changes numerics: activations
             are quantized to INT8.
             Also covers the routed-expert gate/up of Qwen3.8-Flash-Next
             (affine Q4 / GS64 experts); the MTP draft layer and the down
             projection stay on the A16 path. DeepSeek V4.1 covers its affine
-            GS64 routed experts, shared expert and dense projections.
+            GS64 routed experts, shared expert and dense projections. MiniMax
+            M3/M3.1 covers its affine GS64 routed experts (NVFP4 experts stay
+            on the A16 path), shared expert and dense projections except the
+            sparse-attention indexer.
             Mutually exclusive with qwen35_ane_prefill_enabled.
         a8_prefill_min_tokens: Shortest sequence routed to the kernels.
         moe_expert_offload_enabled: Stream MoE expert weights from the
@@ -433,6 +491,7 @@ class ModelSettings:
     # fused one-row decode route, not only the oQe allow-list.
     qwen4_gdn_decode_wide_proj: bool = False
     deepseek_v41_engram_ssd_offload: bool = False
+    hy4_engram_ssd_offload: bool = False
     # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
@@ -504,8 +563,7 @@ class ModelSettings:
     # The kernel reads the checkpoint's own packed weight stream, so a routed
     # projection costs no extra weight memory and the module's arrays stay
     # readable by the decode path.
-    # None (never saved) means on where the kernels or a Prefill Accelerator
-    # Mac can run it; only a saved False turns it off.
+    # None (never saved) means off.
     a8_prefill_enabled: Optional[bool] = None
     a8_prefill_min_tokens: int = 128
 
@@ -561,6 +619,10 @@ class ModelSettings:
     vlm_mtp_draft_block_size: Optional[int] = (
         None  # Tokens per draft round (None = mlx-vlm default)
     )
+
+    # LoRA adapter folder applied on top of the weights at load (PEFT or mlx).
+    # The adapter is never served on its own; profiles can expose a variant.
+    lora_adapter: Optional[str] = None
 
     # Model management flags
     is_pinned: bool = False
@@ -657,6 +719,13 @@ class ModelSettings:
                     "vlm_mtp decode path does not apply"
                 )
         validate_moe_expert_offload(self.to_dict())
+        if self.lora_adapter:
+            conflict = lora_adapter_conflict(self.to_dict())
+            if conflict:
+                raise ValueError(
+                    f"A LoRA adapter cannot be combined with {conflict}; "
+                    "turn it off or remove the adapter"
+                )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -744,9 +813,10 @@ class ModelSettingsManager:
                     document = json.loads(originals[path])
                 else:
                     document = {"version": version, key: {}}
+                # Older versions load unchanged; only a newer build's format is skipped.
                 if (
                     not isinstance(document, dict)
-                    or document.get("version", 1) != version
+                    or document.get("version", 1) > version
                 ):
                     raise ValueError(f"Unsupported profile storage format: {path.name}")
                 records = document.get(key, {})
@@ -864,16 +934,12 @@ class ModelSettingsManager:
             # Load model settings
             models_data = data.get("models", {})
             self._settings = {}
+            ui_default_depth = isinstance(version, int) and version < 3
 
-            # Before version 2 every save stored A8 as False. Where the kernels
-            # cannot run, the setting could never be turned on, so that False
-            # was never a choice.
-            unset_a8 = version < 2 and not quant_fast.oq_a8_available()
             for model_id, model_data in models_data.items():
                 model_data = rename_legacy_fields(model_data)
-                if unset_a8 and model_data.get("a8_prefill_enabled") is False:
-                    model_data = dict(model_data)
-                    del model_data["a8_prefill_enabled"]
+                if ui_default_depth:
+                    _drop_ui_default_mtp_depth(model_data)
                 # Settings saved before the vlm_mtp exclusivity rule may
                 # combine vlm_mtp_enabled with processor-backed settings;
                 # __post_init__ would raise and the except below would drop
@@ -898,6 +964,14 @@ class ModelSettingsManager:
                         "re-enable A8 prefill.",
                         model_id,
                         ", ".join(prefill_conflicts),
+                    )
+                model_data, lora_conflicts = resolve_lora_conflicts(model_data)
+                if lora_conflicts:
+                    logger.warning(
+                        "Model '%s': %s turned off on load; it cannot be "
+                        "combined with the LoRA adapter.",
+                        model_id,
+                        ", ".join(lora_conflicts),
                     )
                 try:
                     self._settings[model_id] = ModelSettings.from_dict(model_data)
@@ -1141,6 +1215,7 @@ class ModelSettingsManager:
                     f"Profiles file version {version} differs from current {PROFILES_VERSION}"
                 )
             self._profiles = data.get("profiles", {}) or {}
+            ui_default_depth = isinstance(version, int) and version < 2
             # Migration: strip ttl_seconds from existing profile settings and
             # add api_name for exposed-model IDs without changing internal keys.
             changed = False
@@ -1158,6 +1233,8 @@ class ModelSettingsManager:
                         del settings["ttl_seconds"]
                         changed = True
                         model_changed = True
+                    if settings and ui_default_depth:
+                        changed |= _drop_ui_default_mtp_depth(settings)
                     if settings and settings.keys() & RENAMED_FIELDS.keys():
                         profile["settings"] = settings = rename_legacy_fields(settings)
                         changed = True
@@ -1321,6 +1398,7 @@ class ModelSettingsManager:
         merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
         merged, _ = resolve_vlm_mtp_conflicts(merged)
         merged, _ = resolve_qwen35_prefill_conflicts(merged)
+        merged, _ = resolve_lora_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
@@ -1699,9 +1777,11 @@ class ModelSettingsManager:
         overlay = filter_profile_fields(profile_settings)
         merged.update(overlay)
         # A profile that sets the Lightning MTP toggle also owns the depth
-        # choice; no fixed depth there selects adaptive depth.
-        if "mtp_enabled" in overlay and "mtp_fixed_depth" not in overlay:
-            merged["mtp_fixed_depth"] = None
+        # choice; a depth it leaves out is adaptive up to the model default.
+        if "mtp_enabled" in overlay:
+            for key in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
+                if key not in overlay:
+                    merged[key] = None
         merged["active_profile_name"] = name
         if settings_sanitizer is not None:
             settings_sanitizer(merged)
@@ -1802,11 +1882,14 @@ class ModelSettingsManager:
                     f"Templates file version {version} differs from current {TEMPLATES_VERSION}"
                 )
             self._templates = data.get("templates", {}) or {}
+            ui_default_depth = isinstance(version, int) and version < 2
             # Migration: strip ttl_seconds from existing template settings
             for name, template in self._templates.items():
                 settings = template.get("settings")
                 if settings and "ttl_seconds" in settings:
                     del settings["ttl_seconds"]
+                if settings and ui_default_depth:
+                    _drop_ui_default_mtp_depth(settings)
         except Exception as e:
             logger.error(f"Failed to load templates file: {e}")
             self._templates = {}
