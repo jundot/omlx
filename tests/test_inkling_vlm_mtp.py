@@ -1626,3 +1626,62 @@ def test_inkling2_flash_decode_guards_wide_heads_and_unaligned_keys(dtype):
         expected = kernels._masked_attention(q, k, v, rel, sink, scale, 0, None)
         diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
         assert diff.max().item() < 1e-2
+
+
+def test_inkling2_fits_threadgroup_caches_and_only_swallows_size_errors():
+    from omlx.patches.inkling2 import kernels
+
+    calls = []
+
+    def rejected():
+        calls.append(1)
+        raise ValueError(
+            "Thread group size (576) is greater than  the maximum allowed "
+            "threads per threadgroup (448)."
+        )
+
+    key = ("test-variant", 1)
+    kernels._launch_ok.pop(key, None)
+    try:
+        assert kernels._fits_threadgroup(key, rejected) is False
+        assert kernels._fits_threadgroup(key, rejected) is False
+        assert calls == [1], "a variant is probed once"
+    finally:
+        kernels._launch_ok.pop(key, None)
+
+    def other_error():
+        raise ValueError("shape mismatch")
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        kernels._fits_threadgroup(("test-variant", 2), other_error)
+    assert ("test-variant", 2) not in kernels._launch_ok
+
+
+def test_inkling2_attn_res_fused_falls_back_when_threadgroup_rejected(monkeypatch):
+    """M1-class GPUs cap some fused variants below their 576-thread groups
+    (hidden 2304); those calls must return None so the MLX ops run instead."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    hidden = 2304
+    blocks = [mx.random.normal((1, 2, hidden)) for _ in range(4)]
+    args = (
+        blocks,
+        mx.random.normal((1, 2, hidden)),
+        mx.random.normal((3, hidden)),
+        1.0,
+    )
+    kwargs = dict(
+        unit_eps=1e-6,
+        norm_weight=mx.ones((hidden,)),
+        norm_eps=1e-6,
+        out_dtype=mx.float16,
+        want_partial=True,
+    )
+    monkeypatch.setattr(kernels, "_fits_threadgroup", lambda key, launch: False)
+    assert kernels.attn_res_fused(*args, **kwargs) is None
+    monkeypatch.setattr(kernels, "_fits_threadgroup", lambda key, launch: True)
+    monkeypatch.setattr(kernels, "_launch_ok", {})
+    out = kernels.attn_res_fused(*args, **kwargs)
+    assert out is not None
