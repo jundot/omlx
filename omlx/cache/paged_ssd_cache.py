@@ -1828,6 +1828,25 @@ def _resolved_cache_path(path: Path | str) -> Path:
         return Path(os.path.abspath(candidate))
 
 
+def _cache_path_tail_matches(file_path: Path | str, rel_key: Path) -> bool:
+    """Compare two cache files by their directory tail, without any syscall.
+
+    ``rel_key`` is the path relative to the shared cache directory, so its
+    tail is enough to identify a file even when one spelling goes through a
+    symlink (``/tmp`` vs ``/private/tmp`` on macOS) and the other does not.
+    """
+    parts = Path(file_path).parts
+    tail = rel_key.parts
+    return len(parts) >= len(tail) and parts[-len(tail) :] == tail
+
+
+def _metadata_block_hash(metadata: Any) -> bytes | None:
+    """Return the block hash a manager's index keys an entry on."""
+    if isinstance(metadata, GDNCheckpointMetadata):
+        return metadata.source_block_hash
+    return getattr(metadata, "block_hash", None)
+
+
 def _make_owner_ref(budget_ref: weakref.ref, owner_id: int, owner: Any) -> weakref.ref:
     """Weak ref to ``owner`` that detaches its budget entries when collected.
 
@@ -1853,8 +1872,11 @@ class SharedSSDBudget:
     managers count once, and gives the whole directory a single limit.
     """
 
-    def __init__(self, max_bytes: int):
+    def __init__(self, max_bytes: int, *, cache_dir: Path | str | None = None):
         self._max_bytes = max(0, int(max_bytes))
+        self._cache_root = (
+            _resolved_cache_path(cache_dir) if cache_dir is not None else None
+        )
         self._entries: dict[Path, _SSDBudgetEntry] = {}
         self._total_bytes = 0
         self._detached = 0
@@ -1998,8 +2020,21 @@ class SharedSSDBudget:
             if entry.owner_ref is None:
                 self._detached = max(0, self._detached - 1)
 
-    def forget_path(self, path: Path | str, *, exclude: Any = None) -> None:
-        """Drop every manager's index copy of a file that is now gone."""
+    def forget_path(
+        self,
+        path: Path | str,
+        *,
+        block_hash: bytes | None = None,
+        exclude: Any = None,
+    ) -> None:
+        """Drop every manager's index copy of a file that is now gone.
+
+        The block hash and the cache-relative path travel with the broadcast
+        so each manager can drop its copy with a dict lookup instead of
+        resolving every indexed path (a startup trim evicts thousands of
+        files, and a per-entry ``Path.resolve()`` made that quadratic in
+        syscalls).
+        """
         key = _resolved_cache_path(path)
         with self._lock:
             entry = self._entries.pop(key, None)
@@ -2007,11 +2042,23 @@ class SharedSSDBudget:
                 self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
                 if entry.owner_ref is None:
                     self._detached = max(0, self._detached - 1)
+                if block_hash is None:
+                    block_hash = entry.block_hash
             managers = [ref() for ref in self._managers]
+        rel_key = self._relative_key(key)
         for manager in managers:
             if manager is None or manager is exclude:
                 continue
-            manager._forget_path_from_indexes(key)
+            manager._forget_path_from_indexes(rel_key, block_hash, key)
+
+    def _relative_key(self, key: Path) -> Path:
+        """Return ``key`` relative to the cache root, using string ops only."""
+        if self._cache_root is not None:
+            try:
+                return key.relative_to(self._cache_root)
+            except ValueError:
+                pass
+        return Path(key.name)
 
     def evict_to(
         self,
@@ -2117,7 +2164,7 @@ def get_shared_ssd_budget(cache_dir: Path | str, max_bytes: int) -> SharedSSDBud
     with _SHARED_SSD_BUDGETS_LOCK:
         budget = _SHARED_SSD_BUDGETS.get(key)
         if budget is None:
-            budget = SharedSSDBudget(max_bytes)
+            budget = SharedSSDBudget(max_bytes, cache_dir=key)
             _SHARED_SSD_BUDGETS[key] = budget
         else:
             budget.reconcile_max_bytes(max_bytes)
@@ -2891,26 +2938,52 @@ class PagedSSDCacheManager(CacheManager):
             return False
         return self._unlink_evicted(removed, source_index)
 
-    def _forget_path_from_indexes(self, key: Path) -> None:
-        """Drop our copies of a file another manager already unlinked."""
+    def _forget_path_from_indexes(
+        self,
+        rel_key: Path,
+        block_hash: bytes | None,
+        key: Path,
+    ) -> None:
+        """Drop our copies of a file another manager already unlinked.
+
+        ``block_hash`` lets the two block indexes drop their copy with a dict
+        lookup; ``rel_key`` (relative to the shared cache directory) identifies
+        the file with plain string comparisons when the hash is unknown.  No
+        ``Path.resolve()`` happens per indexed entry: a startup trim evicts
+        thousands of files and resolving every path for each of them turned
+        the broadcast into millions of syscalls.
+        """
         # No self._lock: this can be driven by any other manager's eviction,
         # and taking a second manager's lock from inside an eviction opened a
         # lock-order cycle with three or more loaded managers. The per-index
         # locks make each remove atomic on its own.
-        for metadata in self._index.get_all_metadata():
-            if _resolved_cache_path(metadata.file_path) == key:
-                self._index.remove(metadata.block_hash)
-        for metadata in self._incompatible_index.get_all_metadata():
-            if _resolved_cache_path(metadata.file_path) == key:
-                self._incompatible_index.remove(metadata.block_hash)
+        if block_hash is not None:
+            self._index.remove(block_hash)
+            self._incompatible_index.remove(block_hash)
+        else:
+            for metadata in self._index.get_all_metadata():
+                if _cache_path_tail_matches(metadata.file_path, rel_key):
+                    self._index.remove(metadata.block_hash)
+            for metadata in self._incompatible_index.get_all_metadata():
+                if _cache_path_tail_matches(metadata.file_path, rel_key):
+                    self._incompatible_index.remove(metadata.block_hash)
+        # Sidecars key on (signature_digest, source_block_hash), so the hash
+        # alone cannot address them; the sidecar index is far smaller than the
+        # block indexes, and the comparison below stays syscall-free.
         for metadata in self._gdn_sidecar_index.get_all_metadata():
-            if _resolved_cache_path(metadata.file_path) == key:
+            if block_hash is not None and metadata.source_block_hash != block_hash:
+                continue
+            if _cache_path_tail_matches(metadata.file_path, rel_key):
                 self._gdn_sidecar_index.remove_key(metadata.key)
 
-    def _notify_ssd_path_removed(self, path: Path) -> None:
+    def _notify_ssd_path_removed(
+        self, path: Path, block_hash: bytes | None = None
+    ) -> None:
         """Tell every other manager on this directory that ``path`` is gone."""
         if self._shared_ssd_budget is not None:
-            self._shared_ssd_budget.forget_path(path, exclude=self)
+            self._shared_ssd_budget.forget_path(
+                path, block_hash=block_hash, exclude=self
+            )
 
     def _evict_ssd_to(
         self,
@@ -5710,7 +5783,9 @@ class PagedSSDCacheManager(CacheManager):
                 e,
             )
             return False
-        self._notify_ssd_path_removed(metadata.file_path)
+        self._notify_ssd_path_removed(
+            metadata.file_path, _metadata_block_hash(metadata)
+        )
         return True
 
     def clear_hot_cache(self) -> int:
