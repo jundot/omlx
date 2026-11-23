@@ -738,7 +738,7 @@ def _patch_language_model(inkling_lang: Any) -> None:
                 conv[idx] = xp[:, keep : keep + k_minus_1, :]
         return accepted
 
-    def mtp_take_primed(self, cache, main_tok):
+    def mtp_take_primed(self, cache, main_tok, cache_offset=None):
         """Consume the sliding-window prompt capture at MTP activation.
 
         Folds all active blocks chained over the captured window (pass j
@@ -753,7 +753,11 @@ def _patch_language_model(inkling_lang: Any) -> None:
             return None
         if not (ctx.valid and ctx.total > 0 and ctx.pending_hidden is not None):
             return None
-        offset = prompt_priming._activation_offset(cache)
+        offset = (
+            prompt_priming._activation_offset(cache)
+            if cache_offset is None
+            else cache_offset
+        )
         if offset is None or ctx.expected_offset != offset - 1:
             logger.debug(
                 "inkling MTP priming discarded: seam offset mismatch (%s vs %s)",

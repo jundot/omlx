@@ -114,10 +114,10 @@ class DSparkMixin:
             logits, states = logits[:, -logits_keep:], states[:, -logits_keep:]
         return (logits, states) if return_hidden else logits
 
-    def mtp_take_primed(self, cache, main_token):
+    def mtp_take_primed(self, cache, main_token, cache_offset=None):
         from ..mlx_lm_mtp.deepseek_v4_dspark import take_primed
 
-        return take_primed(self, cache, main_token)
+        return take_primed(self, cache, main_token, target_offset=cache_offset)
 
     def mtp_shared_verify_rows(self):
         """Rows one mtp_verify_rows forward holds, or 0 when requests cannot verify together
