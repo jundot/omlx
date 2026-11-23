@@ -8,6 +8,7 @@ enabling larger effective cache sizes than GPU memory allows.
 
 import errno
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ from omlx.cache.paged_ssd_cache import (
     _restore_tensor_from_bytes,
     _signature_turboquant_bits,
     _write_safetensors_no_mx,
+    get_shared_ssd_budget,
     numerics_revision_for_model,
     parse_size,
 )
@@ -4955,3 +4957,196 @@ class TestTurboquantBitsSignature:
             assert payload["turboquant_kv_bits"] == 6.0
         finally:
             mgr.close()
+
+
+class TestSharedSSDBudgetAcrossManagers:
+    """Regression tests for jundot/omlx#5497.
+
+    Several managers loaded against one cache directory used to each enforce
+    the full configured limit against their own index only: the directory
+    could reach N x limit, and the next startup scan trimmed other models'
+    live blocks without telling their owners.
+    """
+
+    _PAYLOAD = 4096
+    _BLOCK_BYTES = 4400  # payload + safetensors header, with slack
+    _LIMIT = 5 * _BLOCK_BYTES
+
+    @classmethod
+    def _write_block(
+        cls,
+        root: Path,
+        model: str,
+        idx: int,
+        last_access: float,
+    ) -> tuple[bytes, Path, int]:
+        digest = hashlib.sha256(f"{model}:{idx}".encode()).digest()
+        subdir = root / digest.hex()[0]
+        subdir.mkdir(parents=True, exist_ok=True)
+        path = subdir / f"{digest.hex()}.safetensors"
+        file_size = _write_safetensors_no_mx(
+            str(path),
+            {"kv": (b"\0" * cls._PAYLOAD, "F32", [cls._PAYLOAD // 4])},
+            {
+                "block_hash": digest.hex(),
+                "omlx_cache_format_version": "3",
+                "token_count": "256",
+                "num_layers": "1",
+                "model_name": model,
+                "block_size": "1024",
+            },
+        )
+        os.utime(path, (last_access, last_access))
+        return digest, path, file_size
+
+    @classmethod
+    def _admit(
+        cls,
+        manager: PagedSSDCacheManager,
+        root: Path,
+        model: str,
+        idx: int,
+        last_access: float,
+    ) -> None:
+        """Drive the same admission path the SSD writer thread uses."""
+        digest, path, file_size = cls._write_block(root, model, idx, last_access)
+        manager._enforce_size_limit_for_new_block(file_size)
+        manager._incompatible_index.remove(digest)
+        manager._index.add(
+            PagedSSDBlockMetadata(
+                block_hash=digest,
+                file_path=path,
+                file_size=file_size,
+                token_count=256,
+                created_at=last_access,
+                last_access=last_access,
+                num_layers=1,
+                model_name=model,
+                block_size=1024,
+            )
+        )
+
+    @staticmethod
+    def _files(root: Path) -> set[Path]:
+        return {p.resolve() for p in root.rglob("*.safetensors")}
+
+    @staticmethod
+    def _indexed_union(*managers: PagedSSDCacheManager) -> set[Path]:
+        paths: set[Path] = set()
+        for manager in managers:
+            for index in (manager._index, manager._incompatible_index):
+                for metadata in index.get_all_metadata():
+                    paths.add(metadata.file_path.resolve())
+        return paths
+
+    def test_two_managers_share_one_directory_budget(self, tmp_path: Path):
+        cache_dir = tmp_path / "ssd_cache"
+        a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=self._LIMIT,
+            expected_model_name="model-a",
+        )
+        b = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=self._LIMIT,
+            expected_model_name="model-b",
+        )
+        try:
+            for i in range(3):
+                self._admit(a, cache_dir, "model-a", i, time.time() - 100 + i)
+            for i in range(3):
+                self._admit(b, cache_dir, "model-b", i, time.time() + i)
+
+            total = sum(p.stat().st_size for p in self._files(cache_dir))
+            assert total <= self._LIMIT
+            # Global LRU trims the oldest writer, but both keep live blocks.
+            assert a._index.count == 2
+            assert b._index.count == 3
+            assert self._indexed_union(a, b) == self._files(cache_dir)
+
+            assert a._shared_ssd_budget is b._shared_ssd_budget
+            assert a._shared_ssd_budget is get_shared_ssd_budget(cache_dir, self._LIMIT)
+        finally:
+            a.close()
+            b.close()
+
+    @pytest.mark.skipif(not _has_mlx(), reason="startup scan requires MLX")
+    def test_new_manager_scan_keeps_blocks_within_shared_budget(self, tmp_path: Path):
+        cache_dir = tmp_path / "ssd_cache"
+        a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=self._LIMIT,
+            expected_model_name="model-a",
+        )
+        b = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=self._LIMIT,
+            expected_model_name="model-b",
+        )
+        c = None
+        try:
+            for i in range(3):
+                self._admit(a, cache_dir, "model-a", i, time.time() - 100 + i)
+            for i in range(3):
+                self._admit(b, cache_dir, "model-b", i, time.time() + i)
+
+            before = self._files(cache_dir)
+            assert len(before) == 5
+
+            c = PagedSSDCacheManager(
+                cache_dir=cache_dir,
+                max_size_bytes=self._LIMIT,
+                expected_model_name="model-c",
+            )
+
+            # The directory already fits the shared budget, so a new
+            # manager's startup scan must not delete live blocks.
+            assert self._files(cache_dir) == before
+            assert c._tracked_ssd_size() == sum(p.stat().st_size for p in before)
+        finally:
+            if c is not None:
+                c.close()
+            a.close()
+            b.close()
+
+    def test_cross_manager_eviction_clears_owner_index(self, tmp_path: Path):
+        limit = 4 * self._BLOCK_BYTES
+        cache_dir = tmp_path / "ssd_cache"
+        a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=limit,
+            expected_model_name="model-a",
+        )
+        b = None
+        try:
+            old = time.time() - 1000
+            a_hashes = []
+            for i in range(2):
+                digest, _, _ = self._write_block(cache_dir, "model-a", i, old + i)
+                self._admit(a, cache_dir, "model-a", i, old + i)
+                a_hashes.append(digest)
+
+            # B walks the directory on startup and also owns a view of A's
+            # blocks; B's later writes drive the eviction that removes them.
+            b = PagedSSDCacheManager(
+                cache_dir=cache_dir,
+                max_size_bytes=limit,
+                expected_model_name="model-b",
+            )
+            assert b._incompatible_index.count == 2
+            for i in range(4):
+                self._admit(b, cache_dir, "model-b", i, time.time() + i)
+
+            assert b._index.count == 4
+            # The owning manager must have been told about the deletion
+            # instead of keeping permanently inflated accounting.
+            assert a._tracked_ssd_size() == 0
+            assert a._index.count == 0
+            assert a._incompatible_index.count == 0
+            for digest in a_hashes:
+                assert a._index.get(digest) is None
+            assert self._indexed_union(a, b) == self._files(cache_dir)
+        finally:
+            if b is not None:
+                b.close()
+            a.close()

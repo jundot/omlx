@@ -29,6 +29,7 @@ import struct
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -1255,17 +1256,28 @@ class PagedSSDCacheIndex:
     Thread-safe for concurrent access.
     """
 
-    def __init__(self, max_size_bytes: int):
+    def __init__(
+        self,
+        max_size_bytes: int,
+        *,
+        budget: SharedSSDBudget | None = None,
+        owner: Any = None,
+    ):
         """
         Initialize the SSD cache index.
 
         Args:
             max_size_bytes: Maximum total size of SSD cache files.
+            budget: Optional shared budget charged on every add/remove so
+                managers on the same directory see one total.
+            owner: Manager the budget attributes charged files to.
         """
         self._index: dict[bytes, PagedSSDBlockMetadata] = {}
         self._lru: OrderedDict[bytes, float] = OrderedDict()
         self._total_size: int = 0
         self._max_size: int = max_size_bytes
+        self._budget = budget
+        self._budget_owner = owner
         self._lock = threading.RLock()
 
     def add(self, metadata: PagedSSDBlockMetadata) -> None:
@@ -1285,6 +1297,14 @@ class PagedSSDCacheIndex:
             self._index[metadata.block_hash] = metadata
             self._lru[metadata.block_hash] = metadata.last_access
             self._total_size += metadata.file_size
+            if self._budget is not None:
+                self._budget.charge(
+                    metadata.file_path,
+                    metadata.file_size,
+                    metadata.block_hash,
+                    self._budget_owner,
+                    last_access=metadata.last_access,
+                )
 
     def sort_lru_by_last_access(self) -> None:
         """Restore LRU ordering from each entry's last access timestamp."""
@@ -1330,6 +1350,8 @@ class PagedSSDCacheIndex:
             metadata = self._index.pop(block_hash)
             del self._lru[block_hash]
             self._total_size -= metadata.file_size
+            if self._budget is not None:
+                self._budget.release(metadata.file_path)
             return metadata
 
     def touch(self, block_hash: bytes) -> None:
@@ -1439,6 +1461,14 @@ class PagedSSDCacheIndex:
             if entry is not None:
                 self._total_size += actual_size - entry.file_size
                 entry.file_size = actual_size
+                if self._budget is not None:
+                    self._budget.charge(
+                        entry.file_path,
+                        actual_size,
+                        block_hash,
+                        self._budget_owner,
+                        last_access=entry.last_access,
+                    )
 
     def get_all_hashes(self) -> list[bytes]:
         """Get all indexed block hashes."""
@@ -1493,11 +1523,19 @@ class GDNCheckpointLookup:
 class GDNCheckpointIndex:
     """Thread-safe size/LRU index for durable GDN sidecar files."""
 
-    def __init__(self, max_size_bytes: int):
+    def __init__(
+        self,
+        max_size_bytes: int,
+        *,
+        budget: SharedSSDBudget | None = None,
+        owner: Any = None,
+    ):
         self._index: dict[tuple[str, bytes], GDNCheckpointMetadata] = {}
         self._lru: OrderedDict[tuple[str, bytes], float] = OrderedDict()
         self._total_size = 0
         self._max_size = max_size_bytes
+        self._budget = budget
+        self._budget_owner = owner
         self._lock = threading.RLock()
 
     def add(self, metadata: GDNCheckpointMetadata) -> None:
@@ -1510,6 +1548,14 @@ class GDNCheckpointIndex:
             self._index[key] = metadata
             self._lru[key] = metadata.last_access
             self._total_size += metadata.file_size
+            if self._budget is not None:
+                self._budget.charge(
+                    metadata.file_path,
+                    metadata.file_size,
+                    metadata.source_block_hash,
+                    self._budget_owner,
+                    last_access=metadata.last_access,
+                )
 
     def get(
         self, source_block_hash: bytes, cache_signature_digest: str
@@ -1527,17 +1573,19 @@ class GDNCheckpointIndex:
                 return None
             self._lru.pop(key, None)
             self._total_size -= metadata.file_size
+            if self._budget is not None:
+                self._budget.release(metadata.file_path)
             return metadata
 
-    def remove_key(
-        self, key: tuple[str, bytes]
-    ) -> GDNCheckpointMetadata | None:
+    def remove_key(self, key: tuple[str, bytes]) -> GDNCheckpointMetadata | None:
         with self._lock:
             metadata = self._index.pop(key, None)
             if metadata is None:
                 return None
             self._lru.pop(key, None)
             self._total_size -= metadata.file_size
+            if self._budget is not None:
+                self._budget.release(metadata.file_path)
             return metadata
 
     def touch(self, source_block_hash: bytes, cache_signature_digest: str) -> None:
@@ -1761,6 +1809,321 @@ class SharedHotCacheBudget:
         return victims
 
 
+@dataclass
+class _SSDBudgetEntry:
+    """One on-disk file as seen by the shared SSD budget."""
+
+    size_bytes: int
+    block_hash: bytes
+    last_access: float
+    owner_ref: weakref.ref | None
+
+
+def _resolved_cache_path(path: Path | str) -> Path:
+    """Resolve a cache path so every manager spelling maps to the same key."""
+    candidate = Path(path)
+    try:
+        return candidate.resolve()
+    except OSError:
+        return Path(os.path.abspath(candidate))
+
+
+def _make_owner_ref(budget_ref: weakref.ref, owner_id: int, owner: Any) -> weakref.ref:
+    """Weak ref to ``owner`` that detaches its budget entries when collected.
+
+    The callback keeps only a weak reference to the budget, so a dead manager
+    never pins the process and every file it left on disk stays reclaimable.
+    """
+
+    def _collected(_dead):
+        budget = budget_ref()
+        if budget is not None:
+            budget._detach_owner(owner_id)
+
+    return weakref.ref(owner, _collected)
+
+
+class SharedSSDBudget:
+    """Byte budget for the SSD files under one cache directory.
+
+    Every manager loaded against the same directory used to enforce the
+    configured size against its own index only, so the directory could reach
+    N × limit and the next startup scan trimmed other loaded models' live
+    blocks.  Charging by resolved file path makes a file indexed by several
+    managers count once, and gives the whole directory a single limit.
+    """
+
+    def __init__(self, max_bytes: int):
+        self._max_bytes = max(0, int(max_bytes))
+        self._entries: dict[Path, _SSDBudgetEntry] = {}
+        self._total_bytes = 0
+        self._detached = 0
+        self._lock = threading.Lock()
+        self._managers: list[weakref.ref] = []
+        self._owner_refs: dict[int, weakref.ref] = {}
+        self._conflict_warned = False
+
+    @property
+    def max_bytes(self) -> int:
+        with self._lock:
+            return self._max_bytes
+
+    @property
+    def total_bytes(self) -> int:
+        with self._lock:
+            return self._total_bytes
+
+    def reconcile_max_bytes(self, max_bytes: int) -> None:
+        """Keep the smallest limit: one directory has one budget."""
+        max_bytes = max(0, int(max_bytes))
+        with self._lock:
+            if max_bytes == self._max_bytes:
+                return
+            previous = self._max_bytes
+            if max_bytes < previous:
+                self._max_bytes = max_bytes
+            chosen = self._max_bytes
+            warn = not self._conflict_warned
+            self._conflict_warned = True
+        if warn:
+            logger.warning(
+                "SSD cache managers sharing one directory disagree on the "
+                "budget (%s vs %s); using the smaller %s for the shared budget",
+                format_bytes(previous),
+                format_bytes(max_bytes),
+                format_bytes(chosen),
+            )
+
+    def register(self, manager: Any) -> None:
+        ref = self._owner_ref(manager)
+        with self._lock:
+            self._managers = [
+                existing
+                for existing in self._managers
+                if existing() is not None and existing() is not manager
+            ]
+            self._managers.append(ref)
+
+    def unregister(self, manager: Any) -> None:
+        """Stop trusting this manager's view; its files stay budgeted.
+
+        The files usually outlive the manager (the SSD cache is meant to be
+        reused by the next load), so the entries are kept but marked detached:
+        the budget can still unlink them directly when the directory needs
+        room, without holding the torn-down manager alive.
+        """
+        with self._lock:
+            self._managers = [
+                existing
+                for existing in self._managers
+                if existing() is not None and existing() is not manager
+            ]
+            owner_ref = self._owner_refs.get(id(manager))
+            if owner_ref is None:
+                return
+            for entry in self._entries.values():
+                if entry.owner_ref is owner_ref:
+                    entry.owner_ref = None
+                    self._detached += 1
+
+    def _owner_ref(self, owner: Any) -> weakref.ref:
+        owner_id = id(owner)
+        # One ref per manager: the death callback matches entries by identity,
+        # so creating a second ref for the same owner would strand them.
+        with self._lock:
+            ref = self._owner_refs.get(owner_id)
+            if ref is None:
+                ref = _make_owner_ref(weakref.ref(self), owner_id, owner)
+                self._owner_refs[owner_id] = ref
+            return ref
+
+    def _detach_owner(self, owner_id: int) -> None:
+        with self._lock:
+            owner_ref = self._owner_refs.pop(owner_id, None)
+            if owner_ref is None:
+                return
+            for entry in self._entries.values():
+                if entry.owner_ref is owner_ref:
+                    entry.owner_ref = None
+                    self._detached += 1
+
+    def charge(
+        self,
+        path: Path | str,
+        size_bytes: int,
+        block_hash: bytes,
+        owner: Any,
+        *,
+        last_access: float | None = None,
+    ) -> None:
+        """Account one file, idempotently per resolved path.
+
+        A second manager scanning the same file reuses the existing entry
+        instead of double counting it, and re-homes a detached entry (owner
+        already gone) to the manager that can now see the file.
+        """
+        key = _resolved_cache_path(path)
+        size_bytes = max(0, int(size_bytes))
+        if last_access is None:
+            last_access = time.time()
+        owner_ref = self._owner_ref(owner)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self._entries[key] = _SSDBudgetEntry(
+                    size_bytes=size_bytes,
+                    block_hash=block_hash,
+                    last_access=float(last_access),
+                    owner_ref=owner_ref,
+                )
+                self._total_bytes += size_bytes
+                return
+            self._total_bytes = max(
+                0, self._total_bytes + size_bytes - entry.size_bytes
+            )
+            entry.size_bytes = size_bytes
+            entry.block_hash = block_hash
+            entry.last_access = float(last_access)
+            if entry.owner_ref is None:
+                entry.owner_ref = owner_ref
+                self._detached = max(0, self._detached - 1)
+
+    def release(self, path: Path | str) -> None:
+        key = _resolved_cache_path(path)
+        with self._lock:
+            entry = self._entries.pop(key, None)
+            if entry is None:
+                return
+            self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+            if entry.owner_ref is None:
+                self._detached = max(0, self._detached - 1)
+
+    def forget_path(self, path: Path | str, *, exclude: Any = None) -> None:
+        """Drop every manager's index copy of a file that is now gone."""
+        key = _resolved_cache_path(path)
+        with self._lock:
+            entry = self._entries.pop(key, None)
+            if entry is not None:
+                self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+                if entry.owner_ref is None:
+                    self._detached = max(0, self._detached - 1)
+            managers = [ref() for ref in self._managers]
+        for manager in managers:
+            if manager is None or manager is exclude:
+                continue
+            manager._forget_path_from_indexes(key)
+
+    def evict_to(
+        self,
+        target_bytes: int,
+        *,
+        max_count: int | None = None,
+        protected_paths: Any = None,
+    ) -> int:
+        """Delete globally oldest files until the directory fits.
+
+        Candidates are merged from the live managers' indexes only when an
+        eviction is actually needed, so the save path pays no O(N) merge.
+        """
+        target_bytes = max(0, int(target_bytes))
+        protected = {_resolved_cache_path(p) for p in (protected_paths or ())}
+        skipped: set[Path] = set()
+        evicted = 0
+        while True:
+            with self._lock:
+                over = self._total_bytes > target_bytes
+            if not over:
+                break
+            if max_count is not None and evicted >= max_count:
+                break
+            victim = self._pick_victim(protected | skipped)
+            if victim is None:
+                break
+            key, owner, metadata = victim
+            if owner is None:
+                if not self._unlink_detached(key):
+                    skipped.add(key)
+                    continue
+                self.release(key)
+                evicted += 1
+                continue
+            # The owner removes its own index entry and unlinks the file, then
+            # broadcasts so other managers drop the same path (issue #5497:
+            # their accounting would otherwise stay inflated forever).
+            if not owner._evict_ssd_entry(metadata):
+                skipped.add(key)
+                continue
+            evicted += 1
+        return evicted
+
+    @staticmethod
+    def _unlink_detached(key: Path) -> bool:
+        """Unlink a file whose owning manager is gone.
+
+        Keys are resolved, so no path component can still be a symlink; a
+        missing file already satisfies the budget.
+        """
+        try:
+            if key.is_symlink():
+                return False
+            key.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+
+    def _pick_victim(self, protected: set[Path]) -> tuple[Path, Any, Any] | None:
+        best_order: tuple[float, int, str] | None = None
+        best: tuple[Path, Any, Any] | None = None
+        with self._lock:
+            managers = [ref() for ref in self._managers]
+            detached = self._detached
+        for manager in managers:
+            if manager is None:
+                continue
+            candidate = manager._peek_global_lru_candidate()
+            if candidate is None:
+                continue
+            last_access, rank, metadata = candidate
+            key = _resolved_cache_path(metadata.file_path)
+            if key in protected:
+                continue
+            order = (last_access, rank, str(key))
+            if best_order is None or order < best_order:
+                best_order = order
+                best = (key, manager, metadata)
+        if detached:
+            with self._lock:
+                orphans = [
+                    (entry.last_access, key)
+                    for key, entry in self._entries.items()
+                    if entry.owner_ref is None and key not in protected
+                ]
+            if orphans:
+                last_access, key = min(orphans)
+                order = (last_access, -1, str(key))
+                if best_order is None or order < best_order:
+                    best_order = order
+                    best = (key, None, None)
+        return best
+
+
+_SHARED_SSD_BUDGETS: dict[Path, SharedSSDBudget] = {}
+_SHARED_SSD_BUDGETS_LOCK = threading.Lock()
+
+
+def get_shared_ssd_budget(cache_dir: Path | str, max_bytes: int) -> SharedSSDBudget:
+    """Return the single budget used by every manager on ``cache_dir``."""
+    key = _resolved_cache_path(cache_dir)
+    with _SHARED_SSD_BUDGETS_LOCK:
+        budget = _SHARED_SSD_BUDGETS.get(key)
+        if budget is None:
+            budget = SharedSSDBudget(max_bytes)
+            _SHARED_SSD_BUDGETS[key] = budget
+        else:
+            budget.reconcile_max_bytes(max_bytes)
+        return budget
+
+
 class PagedSSDCacheManager(CacheManager):
     """
     Manages SSD storage for KV cache blocks.
@@ -1861,12 +2224,25 @@ class PagedSSDCacheManager(CacheManager):
         self._cache_dir = cache_dir
         self._auto_size = auto_size
         self._max_size = max_size_bytes
-        self._index = PagedSSDCacheIndex(max_size_bytes)
-        self._incompatible_index = PagedSSDCacheIndex(max_size_bytes)
+        # One budget per resolved cache directory: managers loaded for other
+        # models on the same dir must share the limit and the LRU walk instead
+        # of each enforcing the full limit against its own view (#5497).
+        self._shared_ssd_budget: SharedSSDBudget | None = None
+        if cache_dir is not None and not hot_cache_only:
+            self._shared_ssd_budget = get_shared_ssd_budget(cache_dir, max_size_bytes)
+            self._shared_ssd_budget.register(self)
+        self._index = PagedSSDCacheIndex(
+            max_size_bytes, budget=self._shared_ssd_budget, owner=self
+        )
+        self._incompatible_index = PagedSSDCacheIndex(
+            max_size_bytes, budget=self._shared_ssd_budget, owner=self
+        )
         # Durable GDN checkpoints are kept in a separate namespace and never
         # promoted into the raw-byte hot cache.  They still consume the same
         # shared SSD budget as the two main block indexes.
-        self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
+        self._gdn_sidecar_index = GDNCheckpointIndex(
+            max_size_bytes, budget=self._shared_ssd_budget, owner=self
+        )
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
@@ -2465,6 +2841,91 @@ class PagedSSDCacheManager(CacheManager):
             + self._gdn_sidecar_index.count
         )
 
+    def _total_ssd_bytes(self) -> int:
+        """Return the directory-wide bytes this manager must stay within."""
+        if self._shared_ssd_budget is not None:
+            return self._shared_ssd_budget.total_bytes
+        return self._tracked_ssd_size()
+
+    def _effective_ssd_max(self) -> int:
+        """Return the limit after disk pressure and shared-budget reconciliation."""
+        limit = self._get_effective_max_size()
+        if self._shared_ssd_budget is not None:
+            # Same directory means same configuration; a mismatch was already
+            # logged when the second manager registered.
+            limit = min(limit, self._shared_ssd_budget.max_bytes)
+        return limit
+
+    def _peek_global_lru_candidate(self) -> tuple[float, int, Any] | None:
+        """Return the oldest tracked file without removing it from any index."""
+        candidates: list[tuple[float, int, Any]] = []
+        compatible = self._index.get_lru_entries(1)
+        if compatible:
+            candidates.append((compatible[0].last_access, 0, compatible[0]))
+        incompatible = self._incompatible_index.get_lru_entries(1)
+        if incompatible:
+            candidates.append((incompatible[0].last_access, 1, incompatible[0]))
+        sidecars = self._gdn_sidecar_index.get_lru_entries(1)
+        if sidecars:
+            candidates.append((sidecars[0].last_access, 2, sidecars[0]))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: (item[0], item[1]))
+
+    def _evict_ssd_entry(self, metadata: Any) -> bool:
+        """Remove one entry selected by the shared budget and unlink its file."""
+        # Deliberately no self._lock: the shared budget may pick this manager
+        # while it is the *other* manager in another thread's eviction, and
+        # grabbing two manager locks in opposite orders would deadlock. The
+        # index locks below make each remove atomic on their own.
+        if isinstance(metadata, GDNCheckpointMetadata):
+            source_index: Any = self._gdn_sidecar_index
+            removed = source_index.remove_key(metadata.key)
+        else:
+            source_index = self._index
+            removed = source_index.remove(metadata.block_hash)
+            if removed is None:
+                source_index = self._incompatible_index
+                removed = source_index.remove(metadata.block_hash)
+        if removed is None:
+            return False
+        return self._unlink_evicted(removed, source_index)
+
+    def _forget_path_from_indexes(self, key: Path) -> None:
+        """Drop our copies of a file another manager already unlinked."""
+        # No self._lock: this can be driven by any other manager's eviction,
+        # and taking a second manager's lock from inside an eviction opened a
+        # lock-order cycle with three or more loaded managers. The per-index
+        # locks make each remove atomic on its own.
+        for metadata in self._index.get_all_metadata():
+            if _resolved_cache_path(metadata.file_path) == key:
+                self._index.remove(metadata.block_hash)
+        for metadata in self._incompatible_index.get_all_metadata():
+            if _resolved_cache_path(metadata.file_path) == key:
+                self._incompatible_index.remove(metadata.block_hash)
+        for metadata in self._gdn_sidecar_index.get_all_metadata():
+            if _resolved_cache_path(metadata.file_path) == key:
+                self._gdn_sidecar_index.remove_key(metadata.key)
+
+    def _notify_ssd_path_removed(self, path: Path) -> None:
+        """Tell every other manager on this directory that ``path`` is gone."""
+        if self._shared_ssd_budget is not None:
+            self._shared_ssd_budget.forget_path(path, exclude=self)
+
+    def _evict_ssd_to(
+        self,
+        target_size: int,
+        *,
+        max_count: int | None = None,
+    ) -> int:
+        """Evict oldest tracked files until the directory fits ``target_size``."""
+        if self._shared_ssd_budget is not None:
+            return self._shared_ssd_budget.evict_to(target_size, max_count=max_count)
+        evicted = self._evict_tracked_until_size(target_size, max_count=max_count)
+        for source_index, metadata in evicted:
+            self._unlink_evicted(metadata, source_index)
+        return len(evicted)
+
     def _scan_existing_files(self) -> None:
         """Scan cache directory for existing files and build the compatible index.
 
@@ -2553,19 +3014,23 @@ class PagedSSDCacheManager(CacheManager):
         logger.info(log_msg)
 
         # Startup can find a cache directory that already exceeds the shared
-        # SSD budget. Converge immediately before serving requests.
-        tracked_size = self._tracked_ssd_size()
-        if tracked_size > 0 and tracked_size > self._get_effective_max_size():
-            tracked_count = self._tracked_ssd_count()
-            self._enforce_size_limit_for_new_block(0, unbounded=True)
-            logger.warning(
-                "SSD cache startup cleanup: evicted=%d, freed=%s, remaining=%s, "
-                "limit=%s",
-                tracked_count - self._tracked_ssd_count(),
-                format_bytes(tracked_size - self._tracked_ssd_size()),
-                format_bytes(self._tracked_ssd_size()),
-                format_bytes(self._get_effective_max_size()),
-            )
+        # SSD budget. Converge immediately before serving requests, but only
+        # when the *directory* is over: other managers' live blocks are not
+        # this manager's to trim otherwise. Keep the emptiness check in front
+        # of the limit lookup so an empty cache never polls disk usage.
+        tracked_size = self._total_ssd_bytes()
+        if tracked_size > 0:
+            limit = self._effective_ssd_max()
+            if tracked_size > limit:
+                evicted = self._enforce_size_limit_for_new_block(0, unbounded=True)
+                logger.warning(
+                    "SSD cache startup cleanup: evicted=%d, freed=%s, "
+                    "remaining=%s, limit=%s",
+                    evicted,
+                    format_bytes(tracked_size - self._total_ssd_bytes()),
+                    format_bytes(self._total_ssd_bytes()),
+                    format_bytes(limit),
+                )
 
     def _scan_existing_gdn_sidecars(self) -> tuple[int, int, int]:
         """Index existing sidecars using only path and stat metadata.
@@ -2841,7 +3306,9 @@ class PagedSSDCacheManager(CacheManager):
                 return False
             try:
                 deleted = self._unlink_gdn_sidecar_file(metadata)
-                if not deleted:
+                if deleted:
+                    self._notify_ssd_path_removed(metadata.file_path)
+                else:
                     self._gdn_sidecar_index.add(metadata)
                 return deleted
             except OSError as e:
@@ -3335,6 +3802,7 @@ class PagedSSDCacheManager(CacheManager):
                     )
                     with contextlib.suppress(Exception):
                         file_path.unlink()
+                    self._notify_ssd_path_removed(file_path)
                 return True
             except Exception as e:
                 if isinstance(e, OSError) and e.errno in (
@@ -3376,6 +3844,7 @@ class PagedSSDCacheManager(CacheManager):
                     with contextlib.suppress(Exception):
                         if p is not None and isinstance(p, Path) and p.exists():
                             p.unlink()
+                self._notify_ssd_path_removed(file_path)
                 return False
 
     @contextlib.contextmanager
@@ -4376,6 +4845,7 @@ class PagedSSDCacheManager(CacheManager):
             self._index.remove(block_hash)
             try:
                 file_path.unlink()
+                self._notify_ssd_path_removed(file_path)
             except Exception as e:
                 logger.warning(
                     "Failed to remove corrupted SSD cache file %s: %s",
@@ -4585,6 +5055,7 @@ class PagedSSDCacheManager(CacheManager):
             self._index.remove(block_hash)
             try:
                 file_path.unlink()
+                self._notify_ssd_path_removed(file_path)
             except Exception as e:
                 logger.warning(
                     "Failed to remove corrupted SSD cache file %s: %s",
@@ -4993,6 +5464,7 @@ class PagedSSDCacheManager(CacheManager):
             try:
                 if metadata.file_path.exists():
                     metadata.file_path.unlink()
+                    self._notify_ssd_path_removed(metadata.file_path)
                     logger.debug(f"Deleted SSD cache file: {metadata.file_path}")
                 return True
             except Exception as e:
@@ -5112,15 +5584,17 @@ class PagedSSDCacheManager(CacheManager):
         *,
         max_unlinks: int | None = None,
         unbounded: bool = False,
-    ) -> None:
-        """Enforce size limit before adding a new block.
+    ) -> int:
+        """Enforce the directory budget before adding a new block.
 
         ``estimated_new_size`` should be the actual byte size of the block
         about to be inserted. The 1 MiB default is for callers that don't
         yet know the size at the time eviction is needed; passing the
         actual size avoids cache oscillation around the configured limit.
+
+        Returns the number of files evicted.
         """
-        effective_max = self._get_effective_max_size()
+        effective_max = self._effective_ssd_max()
 
         # Warn when disk pressure shrinks effective limit well below configured
         # (throttled to once per 60s to avoid log spam)
@@ -5142,33 +5616,28 @@ class PagedSSDCacheManager(CacheManager):
         if max_count is None and not unbounded:
             max_count = _MAX_INLINE_UNLINKS_PER_SAVE
 
-        if self._tracked_ssd_size() > target_size:
-            evicted = self._evict_tracked_until_size(
-                target_size,
-                max_count=max_count,
-            )
-            # Inline unlinks on the calling thread. Eviction typically returns
-            # a single entry per save because the tracked LRU walk stops as
-            # soon as the shared SSD budget is back under target. Inline
-            # removes bounded-queue contention entirely. Hot cache is NOT
-            # touched here — ``delete_block()`` is the only path that clears
-            # both tiers.
+        if self._total_ssd_bytes() > target_size:
+            # Eviction runs inline on the calling thread. Inline removes
+            # bounded-queue contention entirely. Hot cache is NOT touched
+            # here — ``delete_block()`` is the only path that clears both
+            # tiers.
             #
             # Bounded inline burst. The ENOSPC-recovery path invalidates the
             # 30 s disk-usage cache, which can shrink the next
-            # ``_get_effective_max_size`` call sharply. Cap the burst at
+            # ``_effective_ssd_max`` call sharply. Cap the burst at
             # ``_MAX_INLINE_UNLINKS_PER_SAVE`` and leave remaining LRU
             # entries in their indexes so subsequent saves drain the rest.
             # Bounds per-call latency at the cost of taking multiple saves
             # to fully reconverge.
-            for source_index, metadata in evicted:
-                self._unlink_evicted(metadata, source_index)
-            if max_count is not None and len(evicted) >= max_count:
+            evicted = self._evict_ssd_to(target_size, max_count=max_count)
+            if max_count is not None and evicted >= max_count:
                 logger.debug(
                     f"Inline eviction capped at {max_count} entries; "
-                    f"{self._tracked_ssd_size() - target_size} bytes remain "
+                    f"{self._total_ssd_bytes() - target_size} bytes remain "
                     f"above target for subsequent saves to drain"
                 )
+            return evicted
+        return 0
 
     def enforce_size_limit(self) -> int:
         """
@@ -5180,27 +5649,25 @@ class PagedSSDCacheManager(CacheManager):
         # Decide what to evict under the lock, but perform unlinks outside
         # it: a single unlink on a slow disk (NFS / encrypted FS / ENOSPC
         # retry path) can block tens to hundreds of ms, and every
-        # _get_effective_max_size() / writer-thread cache-invalidation
-        # contends on self._lock. The index has its own internal lock
+        # _effective_ssd_max() / writer-thread cache-invalidation shows as
+        # contention on self._lock. The index has its own internal lock
         # protecting the LRU/size accounting.
         with self._lock:
-            initial_size = self._tracked_ssd_size()
-            effective_max = self._get_effective_max_size()
+            initial_size = self._total_ssd_bytes()
+            effective_max = self._effective_ssd_max()
 
             if initial_size <= effective_max:
                 return 0
 
             target_size = int(effective_max * 0.9)  # 90% of effective max
-            evicted = self._evict_tracked_until_size(target_size)
 
         # Do NOT remove from hot cache — see _enforce_size_limit_for_new_block
-        for source_index, metadata in evicted:
-            self._unlink_evicted(metadata, source_index)
+        evicted = self._evict_ssd_to(target_size)
 
-        freed = initial_size - self._tracked_ssd_size()
+        freed = initial_size - self._total_ssd_bytes()
         logger.info(
             f"SSD cache size enforcement: freed {format_bytes(freed)}, "
-            f"evicted {len(evicted)} files"
+            f"evicted {evicted} files"
         )
         return freed
 
@@ -5208,7 +5675,7 @@ class PagedSSDCacheManager(CacheManager):
         self,
         metadata: Any,
         source_index: Any | None = None,
-    ) -> None:
+    ) -> bool:
         """Delete an evicted block file from disk.
 
         On unlink failure other than FileNotFoundError, re-add the
@@ -5216,6 +5683,9 @@ class PagedSSDCacheManager(CacheManager):
         on-disk bytes; without this, accumulated failures would let the
         cache silently exceed ``max_size`` (the index would report free
         space that does not exist on disk).
+
+        Returns ``True`` once the file is gone, so a caller sharing the
+        directory with other managers can broadcast the removal.
         """
         try:
             if isinstance(metadata, GDNCheckpointMetadata):
@@ -5223,7 +5693,7 @@ class PagedSSDCacheManager(CacheManager):
                     restore_index = source_index or self._gdn_sidecar_index
                     restore_index.add(metadata)
                     self._stats["evict_unlink_failures"] += 1
-                    return
+                    return False
             else:
                 metadata.file_path.unlink(missing_ok=True)
             self._stats["evictions"] += 1
@@ -5239,6 +5709,9 @@ class PagedSSDCacheManager(CacheManager):
                 metadata.file_path,
                 e,
             )
+            return False
+        self._notify_ssd_path_removed(metadata.file_path)
+        return True
 
     def clear_hot_cache(self) -> int:
         """Clear all in-memory (hot) cache entries.
@@ -5358,6 +5831,7 @@ class PagedSSDCacheManager(CacheManager):
                     continue
                 try:
                     if self._unlink_gdn_sidecar_file(metadata):
+                        self._notify_ssd_path_removed(metadata.file_path)
                         count += 1
                     else:
                         self._gdn_sidecar_index.add(metadata)
@@ -5615,6 +6089,9 @@ class PagedSSDCacheManager(CacheManager):
         with self._pending_write_hashes_lock:
             self._pending_write_buffers.clear()
             self._pending_write_hashes.clear()
+
+        if self._shared_ssd_budget is not None:
+            self._shared_ssd_budget.unregister(self)
 
         logger.debug("PagedSSDCacheManager closed")
 
