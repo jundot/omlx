@@ -23,7 +23,7 @@ from omlx_cuda_helper.control import ControlServer
 from omlx_cuda_helper.files import ModelStore
 from omlx_cuda_helper.pairing import Joiner, PairingError
 from omlx_cuda_helper.state import State
-from omlx_cuda_helper.supervisor import Supervisor
+from omlx_cuda_helper.supervisor import RESERVE_BYTES, Supervisor
 from omlx_cuda_helper.worker import Upstream
 
 CAPS = {"chip": "2x NVIDIA RTX A6000", "ram_gb": 96.0, "control": "agent"}
@@ -223,6 +223,7 @@ def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
     try:
         info = agent.remote_info(target)
         assert info["budgets"] == [48 << 30, 48 << 30]
+        assert info["reserve"] == RESERVE_BYTES
         assert info["contracts"] == {"fake": 7} and info["lending"] is None
         assert info["device"] == "2x NVIDIA RTX A6000"
         assert info["links"] == [cable]

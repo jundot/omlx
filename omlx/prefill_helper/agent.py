@@ -46,7 +46,7 @@ VIA = "control"
 CONTROL_VERSION = 1
 # The helper release in this source tree (apps/omlx-cuda-helper). An older
 # helper still serves the families it reports, but its check warns.
-MIN_HELPER_VERSION = "0.1.7"
+MIN_HELPER_VERSION = "0.1.8"
 _READY_TIMEOUT_S = 900.0
 # The helper ends its workers within 10 s, by force if it must.
 _STOP_TIMEOUT_S = 15.0
@@ -335,6 +335,7 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         "oqh": info.get("oqh") or {},
         "budgets": budgets,
         "budget": sum(budgets),
+        "reserve": info.get("reserve"),
         "memory": sum(int(gpu["total"]) for gpu in gpus),
         "integrated": any(gpu.get("integrated") for gpu in gpus),
         "device": device,

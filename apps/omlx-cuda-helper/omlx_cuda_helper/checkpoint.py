@@ -97,6 +97,12 @@ def quantization(config: dict[str, Any], module: str) -> dict[str, Any] | None:
     return {k: v for k, v in quant.items() if not isinstance(v, dict)}
 
 
+def packable(quant: dict[str, Any] | None) -> bool:
+    """Whether a stage may keep a quantized linear packed: affine codes only.
+    The floating point modes have no 16-bit scales to compute in."""
+    return quant is not None and quant.get("mode", "affine") == "affine"
+
+
 # oQh tensors (see ``oqh``): the input rotation signs name an oQh linear.
 OQH_SIGNS = "oqh_signs"
 OQH_VERSION = 1

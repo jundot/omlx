@@ -15,6 +15,7 @@ from mlx_lm.models.activations import swiglu
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches.m5_gather_qmm import fused_gate_up_activation
+from omlx.patches.m5_gather_qmm_nax import split_affine_swiglu
 from omlx.patches.moe_routes import sort_routes
 
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
@@ -569,7 +570,40 @@ class SwitchGLU(nn.Module):
             and quant_fast.has_symbol("affine_gather_qmm_pair_concat_blocks")
         )
         x_act = None
-        if fused_gate_up:
+        if (
+            getattr(self, "_split_affine_prefill", False)
+            and mx.default_device() == mx.gpu
+            and not fused_gate_up
+            and not self.training
+            and block_plan is None
+            and token_rows is not None
+            and _nax_prefers_stock(idx.size)
+            and all(
+                isinstance(proj, QuantizedSwitchLinear)
+                and proj._has_affine_metadata_dtype(x.dtype)
+                for proj in (self.gate_proj, self.up_proj)
+            )
+            and self.gate_proj.bits == self.up_proj.bits
+            and self.gate_proj.group_size == self.up_proj.group_size
+        ):
+            original_rows, row_map = token_rows
+            gate, up = (
+                tuple(proj[name] for name in ("weight", "scales", "biases"))
+                for proj in (self.gate_proj, self.up_proj)
+            )
+            x_act = split_affine_swiglu(
+                original_rows,
+                gate,
+                up,
+                idx.astype(mx.uint32),
+                row_map.astype(mx.uint32),
+                getattr(self.activation, "limit", None),
+                bits=self.gate_proj.bits,
+                group_size=self.gate_proj.group_size,
+            )
+        if x_act is not None:
+            x = x_act
+        elif fused_gate_up:
             if (
                 do_sort
                 and block_plan is None

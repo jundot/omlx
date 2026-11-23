@@ -243,6 +243,14 @@ class HyV4Processor:
             kwargs.pop(key, None)
         tokenizer = AutoTokenizer.from_pretrained(path, **kwargs)
         load_chat_template(tokenizer, path)
+        # A raw HF tokenizer skips mlx-lm's think marker inference.
+        start, end = "<think:opensource>", "</think:opensource>"
+        vocab = tokenizer.get_vocab()
+        if start in vocab and end in vocab:
+            tokenizer.think_start = start
+            tokenizer.think_end = end
+            tokenizer.think_start_id = vocab[start]
+            tokenizer.think_end_id = vocab[end]
         config_path = Path(path) / "processor_config.json"
         config = json.loads(config_path.read_text()) if config_path.exists() else {}
         image_config = config.get("image_processor", config)

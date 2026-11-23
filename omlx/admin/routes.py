@@ -453,6 +453,7 @@ class ModelSettingsRequest(BaseModel):
     qwen4_ple_ssd_offload: bool | None = None
     qwen4_gdn_decode_wide_proj: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
+    hy4_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
     prefill_helper_node_id: str | None = None
     prefill_helper_layers: int | None = None
@@ -2612,6 +2613,15 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 )
 
         deepseek_v41_engram_ssd_offload_supported = False
+        hy4_engram_ssd_offload_supported = False
+        if model_info.get("config_model_type") == "hy_v4_flash":
+            from ..patches.hy_v4.engram_ssd import plan_engram_ssd
+
+            try:
+                plan_engram_ssd(model_info["model_path"])
+                hy4_engram_ssd_offload_supported = True
+            except (KeyError, OSError, TypeError, ValueError):
+                logger.debug("Could not inspect Hy4 Engram tables for %s", model_id)
         deepseek_v41_engram_ssd_offload_forced = False
         v41_resident_bytes = 0
         v41_mmap_bytes = 0
@@ -2716,6 +2726,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "deepseek_v41_engram_ssd_offload_forced": deepseek_v41_engram_ssd_offload_forced,
             "deepseek_v41_engram_resident_bytes": v41_resident_bytes,
             "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
+            "hy4_engram_ssd_offload_supported": hy4_engram_ssd_offload_supported,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
             "activation_fp16_supported": activation_fp16_supported,
@@ -3251,6 +3262,11 @@ async def update_model_settings(
         ).lower() == "deepseek_v41"
         current_settings.deepseek_v41_engram_ssd_offload = bool(
             request.deepseek_v41_engram_ssd_offload and is_deepseek_v41
+        )
+    if "hy4_engram_ssd_offload" in sent:
+        current_settings.hy4_engram_ssd_offload = bool(
+            request.hy4_engram_ssd_offload
+            and entry.config_model_type == "hy_v4_flash"
         )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (

@@ -1046,6 +1046,10 @@ def maybe_apply_pre_load_patches(
                 # The M5 packed verify kernels keep a 5-row verify close to
                 # a 4-row one on dense Qwen, so depth 4 pays there.
                 set_mtp_depth(4)
+            elif model_type == "deepseek_v41":
+                # DSpark drafts a whole dspark_block_size block per cycle.
+                block = (text_config or config).get("dspark_block_size")
+                set_mtp_depth(int(block) if block else 3)
             else:
                 set_mtp_depth(3)
             if mtp_enabled:

@@ -23,6 +23,7 @@ from mlx_lm.models.cache import (  # noqa: E402
 
 from omlx import oq  # noqa: E402
 from omlx.adapter.output_parser import correct_tool_parser_type  # noqa: E402
+from omlx.api.thinking import prompt_opens_thinking  # noqa: E402
 from omlx.custom_kernels import nax  # noqa: E402
 from omlx.engine.vlm import (  # noqa: E402
     _apply_template_thinking_mode,
@@ -150,6 +151,56 @@ def _model(config):
 
 def _ids(seed, n=SEQ):
     return np.random.default_rng(seed).integers(10, VOCAB - 20, size=n)
+
+
+@pytest.mark.parametrize("affine", [False, True])
+def test_engram_ssd_matches_resident(tmp_path, monkeypatch, affine):
+    from mlx_vlm import utils
+
+    from omlx.patches.hy_v4 import apply_patch
+    from omlx.patches.hy_v4.engram_ssd import load, plan_engram_ssd
+
+    apply_patch()
+    config = _flash_config()
+    config["text_config"]["engram_n_embed_per_ngram"] = 64
+    weights = dict(tree_flatten(_model(config).parameters()))
+    recipe = {"bits": 4, "group_size": 32, "mode": "affine"}
+    index = {}
+    for i, (key, value) in enumerate(list(weights.items())):
+        if not key.endswith(".multi_head_embedding.embedding.weight"):
+            continue
+        tensors = {key: value.astype(mx.bfloat16)}
+        if affine:
+            prefix = key.removesuffix(".weight")
+            packed, scales, biases = mx.quantize(tensors[key], **recipe)
+            tensors = {key: packed}
+            tensors.update({f"{prefix}.scales": scales, f"{prefix}.biases": biases})
+            config.setdefault("quantization", dict(recipe))[prefix] = dict(recipe)
+        shard = f"table-{i}.safetensors"
+        mx.save_safetensors(str(tmp_path / shard), tensors, metadata={"format": "mlx"})
+        index.update(dict.fromkeys(tensors, shard))
+        del weights[key]
+    mx.save_safetensors(
+        str(tmp_path / "backbone.safetensors"), weights, metadata={"format": "mlx"}
+    )
+    index.update(dict.fromkeys(weights, "backbone.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": index})
+    )
+    monkeypatch.setattr(utils, "load_processor", lambda *a, **k: object())
+    monkeypatch.setattr(utils, "load_image_processor", lambda *a, **k: None)
+
+    resident, _ = utils.load(tmp_path)
+    expected = _run(resident, _ids(3), [24, 9, 7])
+    model, _ = load(tmp_path)
+    try:
+        params = dict(tree_flatten(model.parameters()))
+        skipped = plan_engram_ssd(tmp_path).skipped.values()
+        assert not any(k in params for keys in skipped for k in keys)
+        np.testing.assert_array_equal(expected, _run(model, _ids(3), [24, 9, 7]))
+    finally:
+        model._omlx_engram_ssd.close()
 
 
 def _run(model, ids, chunks):
@@ -893,6 +944,33 @@ def _vision_config(config):
     config.update(image_token_id=_IMAGE_ID, video_token_id=_IMAGE_ID + 1)
     config["vision_config"] = dict(_TINY_VISION, out_hidden_size=128)
     return config
+
+
+@pytest.mark.parametrize("effort", ["high", "no_think"])
+def test_loaded_processor_detects_prompt_opened_thinking(tmp_path, effort):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0, "prompt": 1}, "[UNK]")),
+        unk_token="[UNK]",
+        chat_template=(
+            "prompt<think:opensource>"
+            "{% if reasoning_effort == 'no_think' %}</think:opensource>{% endif %}"
+        ),
+    )
+    tokenizer.add_tokens(["<think:opensource>", "</think:opensource>"])
+    tokenizer.save_pretrained(tmp_path)
+    processor = HyV4Processor.from_pretrained(tmp_path)
+    prompt = processor.apply_chat_template(
+        [{"role": "user", "content": "Hi"}],
+        tokenize=False,
+        add_generation_prompt=True,
+        reasoning_effort=effort,
+    )
+    detected, _ = prompt_opens_thinking(processor.tokenizer, prompt)
+    assert detected == (effort == "high")
 
 
 def test_sanitize_maps_checkpoint_vision_weights():

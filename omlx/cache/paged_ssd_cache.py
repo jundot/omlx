@@ -367,6 +367,8 @@ _NUMERICS_REVISIONS = {
     "mlx_vlm.models.deepseekocr.vision": "mlx-vlm-138d761",
     "mlx_vlm.models.minicpmv4_6.vision": "mlx-vlm-138d761",
     "mlx_vlm.quantization.nvfp4": "mlx-vlm-138d761",
+    # Hy4 Flash blocks stored after a restore before #5534 hold wrong ranges.
+    "omlx.patches.hy_v4.flash": "hy4-flash-ranges-1",
 }
 
 

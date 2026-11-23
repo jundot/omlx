@@ -303,6 +303,7 @@ class MoE(nn.Module):
             args.n_routed_experts,
             activation=ClampedSwiGLU(args.swiglu_limit),
         )
+        self.switch_mlp._split_affine_prefill = True
         self.shared_experts = MLP(
             args, args.moe_intermediate_size * args.n_shared_experts
         )
