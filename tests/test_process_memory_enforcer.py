@@ -2666,6 +2666,7 @@ class TestTwoWatermarkPressureLevels:
             gpf.side_effect = lambda: next(readings, 88 * 1024**3)
             await enforcer_2wm._check_and_enforce()
         assert "-> hard" not in caplog.text, caplog.text
+        assert "Hard memory reading not confirmed" in caplog.text, caplog.text
         assert enforcer_2wm._pressure_level == "soft"
         enforcer_2wm._engine_pool._unload_engine.assert_not_called()
 

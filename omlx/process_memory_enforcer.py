@@ -1371,12 +1371,25 @@ class ProcessMemoryEnforcer:
         Returns ``current`` unchanged when it is already below ``hard``, and
         stops at the first reading below it.
         """
+        if current < hard:
+            return current
+        first = current
         step = self._HARD_READING_CONFIRM_WINDOW_S / self._HARD_READING_CONFIRM_READS
-        for _ in range(self._HARD_READING_CONFIRM_READS):
-            if current < hard:
-                break
+        reads = 0
+        while reads < self._HARD_READING_CONFIRM_READS and current >= hard:
             await asyncio.sleep(step)
             current = min(current, self._current_usage_bytes())
+            reads += 1
+        logger.info(
+            "Hard memory reading %s: %s, lowest of %d more reading(s) over %.0f ms "
+            "is %s (hard=%s)",
+            "confirmed" if current >= hard else "not confirmed",
+            _format_gb(first),
+            reads,
+            reads * step * 1000,
+            _format_gb(current),
+            _format_gb(hard),
+        )
         return current
 
     def _pool_bytes(self) -> int:
