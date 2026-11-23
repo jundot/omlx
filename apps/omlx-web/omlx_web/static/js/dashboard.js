@@ -8415,9 +8415,12 @@
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 const table = model?.engram_precision;
                 const source = table?.source_precision;
+                const autoBits = table?.auto_bits?.[this.oqLevel];
                 const suffix16 = {bf16: 'BF16', fp16: 'FP16'}[source];
                 const labels = {
-                    auto: window.t('models.oq.engramPrecisionAuto'),
+                    auto: autoBits
+                        ? window.t('models.oq.engramPrecisionAutoBits').replace('{bits}', autoBits)
+                        : window.t('models.oq.engramPrecisionAuto'),
                     8: window.t('models.oq.engramPrecision8') + (source === 'fp8' ? ' (FP8)' : ' (MLX affine)'),
                     16: window.t('models.oq.engramPrecision16') + (suffix16 ? ' (' + suffix16 + ')' : ''),
                 };

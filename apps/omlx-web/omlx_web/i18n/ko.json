@@ -2467,6 +2467,8 @@
   "cluster.device_card.helper_ready": "{name}에서 이 Mac 모델의 긴 프롬프트를 빠르게 처리할 수 있습니다.",
   "models.oq.engram_precision": "Engram 테이블 정밀도",
   "models.oq.engramPrecisionAuto": "자동",
+  "models.oq.engramPrecisionAutoBits": "자동 ({bits}비트)",
+  "models.oq.engramPrecisionHelp": "Engram 및 N-gram PLE 테이블에만 적용됩니다. 자동은 기존 oQ 규칙을 따릅니다.",
   "models.oq.engramPrecision8": "8비트",
   "models.oq.engramPrecision16": "16비트"
 }

@@ -2467,6 +2467,8 @@
   "cluster.device_card.helper_ready": "{name} can speed up long prompts for models on this Mac.",
   "models.oq.engram_precision": "Précision de la table Engram",
   "models.oq.engramPrecisionAuto": "Automatique",
+  "models.oq.engramPrecisionAutoBits": "Auto ({bits} bits)",
+  "models.oq.engramPrecisionHelp": "S’applique uniquement aux tables Engram et PLE de n-grammes. Le mode Auto suit les règles actuelles d’oQ.",
   "models.oq.engramPrecision8": "8 bits",
   "models.oq.engramPrecision16": "16 bits"
 }

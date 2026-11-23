@@ -137,6 +137,14 @@ oQ works with models that mlx-lm or mlx-vlm can load, including MoE and vision-l
 
 Models that are already MLX-quantized cannot be used as a source.
 
+In the web quantizer, **Engram table precision** controls the offloaded
+Engram or N-gram PLE tables independently of the model's oQ level.
+**Auto** follows the existing oQ policy and shows the table bit width for
+the selected level. For example, Hy4 Flash at oQ3.5e shows **Auto (4-bit)**.
+The output-size preview includes the selected table precision. The 8-bit
+and 16-bit choices appear only when supported by the source checkpoint
+and its SSD loader.
+
 Some models have their own rules:
 
 - **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision. Engram tables are 4-bit at `Auto`. The legacy API parameter `preserve_ngram_table=true` still copies the original tables and keeps the `-ngram` suffix.

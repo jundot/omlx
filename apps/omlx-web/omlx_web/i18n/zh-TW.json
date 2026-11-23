@@ -2467,6 +2467,8 @@
   "cluster.device_card.helper_ready": "{name} can speed up long prompts for models on this Mac.",
   "models.oq.engram_precision": "Engram 表精度",
   "models.oq.engramPrecisionAuto": "自動",
+  "models.oq.engramPrecisionAutoBits": "自動（{bits} 位元）",
+  "models.oq.engramPrecisionHelp": "僅適用於 Engram 與 N-gram PLE 資料表。自動模式沿用現有的 oQ 規則。",
   "models.oq.engramPrecision8": "8 位元",
   "models.oq.engramPrecision16": "16 位元"
 }

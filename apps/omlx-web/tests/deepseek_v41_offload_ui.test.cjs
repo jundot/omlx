@@ -95,9 +95,17 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
     let estimateCallback;
     let firstEstimate;
     const requests = [];
+    const locales = path.join(root, 'omlx_web/i18n');
+    const loadCatalog = file => JSON.parse(fs.readFileSync(path.join(locales, file), 'utf8'));
+    for (const file of fs.readdirSync(locales).filter(file => file.endsWith('.json'))) {
+        const catalog = loadCatalog(file);
+        assert.match(catalog['models.oq.engramPrecisionAutoBits'], /\{bits\}/);
+        assert.ok(catalog['models.oq.engramPrecisionHelp']);
+    }
+    let catalog = loadCatalog('en.json');
     const oqContext = {
         localStorage: {getItem: () => null},
-        window: {t: k => k},
+        window: {t: key => catalog[key] ?? key},
         console,
         URLSearchParams,
         setTimeout: fn => { estimateCallback = fn; return 1; },
@@ -123,6 +131,7 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
         }},
         {path: 'hy4', model_type: 'hy_v4_flash', engram_precision: {
             source_precision: 'bf16', available: ['auto', '8', '16'],
+            auto_bits: {'3.5': 4, 6: 6},
         }},
         {path: 'hy4-vl', model_type: 'hy_v4_vl'},
         {path: 'nvfp4', model_type: 'deepseek_v41', engram_precision: {
@@ -137,6 +146,14 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
     app.oqSelectedModelPath = 'hy4';
     app.oqApplyModelPolicy();
     assert.deepEqual(Array.from(app.oqEngramPrecisionChoices(), c => c.value), ['auto', '8', '16']);
+    app.oqLevel = 3.5;
+    assert.equal(app.oqEngramPrecisionChoices()[0].label, 'Auto (4-bit)');
+    app.oqLevel = 6;
+    assert.equal(app.oqEngramPrecisionChoices()[0].label, 'Auto (6-bit)');
+    catalog = loadCatalog('ko.json');
+    app.oqLevel = 3.5;
+    assert.equal(app.oqEngramPrecisionChoices()[0].label, '자동 (4비트)');
+    catalog = loadCatalog('en.json');
     assert.match(app.oqEngramPrecisionChoices()[1].label, /MLX affine/);
     assert.match(app.oqEngramPrecisionChoices()[2].label, /BF16/);
 

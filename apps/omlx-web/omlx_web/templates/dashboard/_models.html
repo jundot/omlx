@@ -1564,8 +1564,11 @@
                                             </button>
                                         </div>
                                         <div x-show="oqEngramPrecisionChoices().length > 1" x-cloak class="flex items-center justify-between">
-                                            <label for="oq-engram-precision" class="text-sm text-neutral-600">{{ t('models.oq.engram_precision') }}</label>
-                                            <select id="oq-engram-precision" x-model="oqEngramPrecision"
+                                            <div class="mr-3">
+                                                <label for="oq-engram-precision" class="text-sm text-neutral-600">{{ t('models.oq.engram_precision') }}</label>
+                                                <p id="oq-engram-precision-help" class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.engramPrecisionHelp') }}</p>
+                                            </div>
+                                            <select id="oq-engram-precision" x-model="oqEngramPrecision" aria-describedby="oq-engram-precision-help"
                                                     class="flex-shrink-0 text-sm border border-neutral-200 rounded px-2 py-1 bg-white">
                                                 <template x-for="choice in oqEngramPrecisionChoices()" :key="choice.value">
                                                     <option :value="choice.value" x-text="choice.label"></option>

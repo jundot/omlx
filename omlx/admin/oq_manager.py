@@ -202,6 +202,8 @@ class OQManager:
                 _resolve_hf_cache_entry,
             )
             from ..oq import (
+                OQ_LEVELS,
+                _offload_table_bits,
                 detect_engram_table_precision,
                 estimate_memory,
                 validate_quantizable,
@@ -320,6 +322,12 @@ class OQManager:
                                     info_full["engram_precision"] = {
                                         "source_precision": table["source_precision"],
                                         "available": table["available"],
+                                        "auto_bits": {
+                                            str(level): _offload_table_bits(level)
+                                            for level in sorted(OQ_LEVELS)
+                                        }
+                                        if len(table["available"]) > 1
+                                        else {},
                                     }
                                 source_models.append(info_full)
                         except Exception:

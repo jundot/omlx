@@ -923,6 +923,17 @@ async def test_engram_formats_are_checked_in_model_list_and_start(
     assert sources[0]["engram_precision"] == {
         "source_precision": "fp8",
         "available": ["auto", "8"],
+        "auto_bits": {
+            "2": 4,
+            "2.5": 4,
+            "2.7": 4,
+            "3": 4,
+            "3.5": 4,
+            "4": 4,
+            "5": 5,
+            "6": 6,
+            "8": 8,
+        },
     }
     with pytest.raises(ValueError, match="16-bit Engram export is not supported"):
         await manager.start_quantization(str(source), 4, engram_precision="16")
