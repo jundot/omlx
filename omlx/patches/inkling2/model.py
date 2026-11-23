@@ -506,8 +506,54 @@ def _part(x: mx.array, i: int) -> mx.array:
     return x[i : i + 1].squeeze(0)
 
 
+def _bf16_loop_weights(layer: nn.Module):
+    """Cached BF16 transposed controller weights outside the parameter tree.
+
+    Only built when ``loop_down`` and ``loop_gain_forget`` are exact BF16
+    values (all published checkpoints); synthetic FP32 weights stay on FP32.
+    """
+    down, gf = layer.loop_down, layer.loop_gain_forget
+    hidden, rank = down.shape[2], down.shape[3]
+    if not kernels.loop_bf16_supported(hidden, rank):
+        return None
+    cached = layer.__dict__.get("_omlx_loop_bf16")
+    if cached is not None and cached[0] is down and cached[1] is gf:
+        return cached[2]
+    packed = None
+    d_bf = down.astype(mx.bfloat16)
+    g_bf = gf.astype(mx.bfloat16)
+    lossless = bool(
+        mx.array_equal(d_bf.astype(mx.float32), down)
+        and mx.array_equal(g_bf.astype(mx.float32), gf)
+    )
+    if lossless:
+        g_bf4 = g_bf.reshape(4, rank, 2, hidden)
+        pre = (
+            mx.contiguous(d_bf[:3].transpose(0, 1, 3, 2)),
+            mx.contiguous(g_bf4[:3].transpose(0, 3, 2, 1)),
+        )
+        post = (
+            mx.contiguous(d_bf[3:].transpose(0, 1, 3, 2)),
+            mx.contiguous(g_bf4[3:].transpose(0, 3, 2, 1)),
+        )
+        mx.eval(*pre, *post)
+        packed = (pre, post)
+    object.__setattr__(layer, "_omlx_loop_bf16", (down, gf, packed))
+    return packed
+
+
 def _mix_messages_normed(
-    mixed, messages, m0, n, down, gain_forget, norm_w, norm_eps, dtype, want_f32=False
+    mixed,
+    messages,
+    m0,
+    n,
+    down,
+    gain_forget,
+    norm_w,
+    norm_eps,
+    dtype,
+    want_f32=False,
+    bf16_weights=None,
 ):
     """``_mix_messages`` and the following RMSNorm and cast, with the steps
     around its matmuls in kernels; None to fall back. Input i is query i of
@@ -515,9 +561,17 @@ def _mix_messages_normed(
     if norm_w is None or not kernels.loop_messages_supported(mixed, messages):
         return None
     hidden = mixed.shape[-1]
-    z = kernels.loop_message_inputs(mixed, messages, m0, n)
-    low = _row_matmul(z, down.reshape(2 * n, hidden, -1))
-    gates = _row_matmul(kernels.loop_message_low(low), gain_forget)
+    rows = mixed.shape[0] * mixed.shape[1]
+    if bf16_weights is not None and (
+        rows <= _COMPILED_MAX_TOKENS or is_row_exact_armed()
+    ):
+        down_t, gf_t = bf16_weights
+        low = kernels.loop_message_down_bf16(mixed, messages, down_t, m0)
+        gates = kernels.loop_message_gates_bf16(low, gf_t)
+    else:
+        z = kernels.loop_message_inputs(mixed, messages, m0, n)
+        low = _row_matmul(z, down.reshape(2 * n, hidden, -1))
+        gates = _row_matmul(kernels.loop_message_low(low), gain_forget)
     return kernels.loop_message_outputs(
         gates, mixed, messages, m0, n, norm_w, norm_eps, dtype, want_f32
     )
@@ -840,6 +894,8 @@ class Inkling2Layer(nn.Module):
             if self.layer_idx > 0:
                 mixed = self.attn_input(blocks, h_n)
         if messages is not None:
+            cached_loop = self.__dict__.get("_omlx_loop_bf16")
+            loop_bf16 = cached_loop[2] if cached_loop is not None else None
             normed = _mix_messages_normed(
                 mixed[:, :, : 1 if self.sliding else 3],
                 messages,
@@ -850,6 +906,7 @@ class Inkling2Layer(nn.Module):
                 attn_w,
                 self._norm_eps,
                 dtype,
+                bf16_weights=loop_bf16[0] if loop_bf16 is not None else None,
             )
             if normed is not None:
                 xq, xk, xv = (_part(normed[0], i) for i in range(3))
@@ -911,6 +968,8 @@ class Inkling2Layer(nn.Module):
                 y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
             normed = None
             if messages is not None:
+                cached_loop = self.__dict__.get("_omlx_loop_bf16")
+                loop_bf16 = cached_loop[2] if cached_loop is not None else None
                 normed = _mix_messages_normed(
                     fused[0] if fused is not None else y[:, :, None],
                     messages,
@@ -922,6 +981,7 @@ class Inkling2Layer(nn.Module):
                     self.mlp_norm.eps,
                     h.dtype,
                     want_f32=True,
+                    bf16_weights=loop_bf16[1] if loop_bf16 is not None else None,
                 )
             if normed is not None:
                 x, x32 = _part(normed[0], 0), _part(normed[1], 0)
@@ -984,6 +1044,8 @@ class Inkling2Layer(nn.Module):
                 _fp32_norm_stack(self, norms[-1:], "mlp"),
             ),
         )
+        if bank is not None:
+            _bf16_loop_weights(self)
         compiled = length <= _COMPILED_MAX_TOKENS
         if compiled and length > 1 and is_row_exact_armed():
             pre, post = self._pre_exact, self._post_exact
