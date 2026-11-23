@@ -9,6 +9,7 @@ import pytest
 
 from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches import qwen35_packed_linear as pl
+from omlx.patches import qwen35_verify_qmm as vq
 
 pytestmark = pytest.mark.skipif(not is_nax_available(), reason="needs an M5 (NAX) GPU")
 
@@ -62,6 +63,26 @@ def test_dispatch_keeps_small_and_wide_calls_off_the_skinny_kernel(monkeypatch):
     monkeypatch.setattr(pl, "_skinny", spy)
     K, N = 512, 25600
     packed = pl._pack([_linear(K, N, seed=5)])[0]
-    for M in (8, 9, 48, 49):
+    for M in (2, 8, 9, 48, 49):
         mx.eval(packed(_rows(M, K, seed=M)))
     assert calls == [9, 48]
+
+
+def test_armed_verify_rows_take_the_skinny_kernel_and_keep_their_bits():
+    K, N = 512, 25600
+    packed = pl._pack([_linear(K, N, seed=6)])[0]
+    x = _rows(9, K, seed=7)
+    full = packed(x)
+    decode = packed(x[:5])
+    vq.set_verify_qmm_armed(True)
+    try:
+        verify = {M: packed(x[:M]) for M in (1, 2, 5, 8)}
+        mx.eval(full, decode, *verify.values())
+    finally:
+        vq.set_verify_qmm_armed(False)
+    # A verify row gets the bits it has in a 9..48-row block; one row stays a matvec.
+    for M in (2, 5, 8):
+        assert mx.array_equal(verify[M], full[:M]).item(), M
+    assert mx.array_equal(verify[1], packed(x[:1])).item()
+    # Unarmed calls of the same rows stay on the small kernel.
+    assert not mx.array_equal(decode, full[:5]).item()

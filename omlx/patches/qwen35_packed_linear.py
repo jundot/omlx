@@ -20,7 +20,8 @@ gate/up) share one buffer, so a verify forward serves them in one dispatch.
 Every row count runs on packed kernels: one row on a SIMD matvec, 2..8 rows
 on a tensor-unit kernel, 9..48 rows on a skinny tensor-unit kernel that reads
 each weight once for all rows, more rows on a tensor-unit GEMM that
-dequantizes each group tile into threadgroup memory. ``PackedLinear`` does not
+dequantizes each group tile into threadgroup memory. An armed MTP verify
+takes the skinny kernel from two rows. ``PackedLinear`` does not
 subclass ``nn.QuantizedLinear``, so code that reads stock quantized weights
 directly skips it and calls the module instead.
 """
@@ -37,6 +38,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..custom_kernels import nax_skinny_qmm
+from .qwen35_verify_qmm import _is_armed as _verify_armed
 
 logger = logging.getLogger(__name__)
 
@@ -389,9 +391,24 @@ def _gemm_tile(M: int) -> tuple[int, int, int, int]:
     return 128, 64, 2, 2
 
 
-# Up to 8 rows the small kernel stays: it applies scale and bias after the code
-# dot product, so it rounds less. From 64 rows the GEMM can be faster.
+# Up to 8 rows the small kernel stays for decode and prefill: it applies scale
+# and bias after the code dot product, so it rounds less. From 64 rows the GEMM
+# can be faster.
 _SKINNY_MAX_ROWS = nax_skinny_qmm.MAX_ROWS
+# An armed MTP verify takes the skinny kernel from two rows. Its cost is flat in
+# rows where the small kernel's grows: on Qwen3.8-27B (M5 Pro) a verify forward
+# is 2 to 4 ms shorter at 2..5 rows and 4 to 8 ms at 6..8. Unlike the small
+# kernel (bit-identical to 1-row _matvec), the skinny kernel rounds dequantized
+# 4-bit weights to bf16 (matching M=9..48); logits shift by 0.16..0.22 median
+# max (180/180 argmax agree on real Qwen3.8-27B rows) while keeping verify rows
+# bit-consistent across M=2..48.
+_VERIFY_SKINNY_MIN_ROWS = 2
+
+
+def _takes_skinny(M: int) -> bool:
+    if M > _SMALL_ROWS:
+        return M <= _SKINNY_MAX_ROWS
+    return M >= _VERIFY_SKINNY_MIN_ROWS and _verify_armed()
 
 
 def _skinny(x2: mx.array, w, sc, bi, K: int, N: int) -> mx.array:
@@ -405,7 +422,7 @@ def packed_matmul(x2: mx.array, w, sc, bi, K: int, N: int) -> mx.array:
     kernels = _kernels()
     M = int(x2.shape[0])
     x2 = mx.contiguous(x2)
-    if _SMALL_ROWS < M <= _SKINNY_MAX_ROWS:
+    if _takes_skinny(M):
         return _skinny(x2, w, sc, bi, K, N)
     if M > _SMALL_ROWS:
         bm, bn, wm, wn = _gemm_tile(M)
