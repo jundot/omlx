@@ -848,6 +848,15 @@ def _lilicorr_capture_adapter(cls: type) -> type:
         capture = kwargs.get("capture_layer_ids")
         if capture is not None:
             kwargs["capture_layer_ids"] = shift_lilicorr_capture_ids(capture)
+        if kwargs.get("n_confirmed"):
+            # A block-drafter verify forward (the chain cycle always passes
+            # ``n_confirmed``) has to run through mlx-vlm's native exact
+            # verifier: only that route returns the per-layer Mamba states
+            # ``rollback_speculative_cache`` replays a partial accept
+            # through. The stock body leaves ``gdn_states`` empty, which the
+            # batch generator reads as "cache layer rejects chain rollback"
+            # and falls back to standard decoding on every step.
+            kwargs["speculative_verify"] = True
         return super(adapter, self).__call__(*args, **kwargs)
 
     adapter = type(
@@ -886,6 +895,11 @@ def apply_lilicorr_target(target_model: Any) -> Any:
         raise TypeError(
             "LiLiCorr target adapter expects a Nemotron-H language model with a "
             f"block stack; {type(language_model).__name__} has none."
+        )
+    if not callable(getattr(language_model, "speculative_verify_dflash_hidden", None)):
+        raise TypeError(
+            "LiLiCorr verify requires mlx-vlm's native exact verifier route "
+            f"(speculative_verify=True); {type(language_model).__name__} has none."
         )
     cls = type(language_model)
     if not getattr(cls, _ADAPTER_MARKER, False):

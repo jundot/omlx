@@ -93,6 +93,28 @@ def _concat_captured(captured: Sequence[mx.array]) -> mx.array:
     return mx.concatenate(list(captured), axis=-1)
 
 
+def _activation_dtype(model: nn.Module) -> mx.Dtype:
+    """Dtype the drafter's activations and KV ring compute in.
+
+    A ModelOpt NVFP4 drafter stores its block scales as ``uint8`` E4M3 bit
+    patterns, so the projection's ``scales`` dtype is not a compute type: a
+    ring or residual allocated from it truncates every hidden row. Read the
+    model's own floating parameters instead, preferring the drafter's
+    projection norms over the borrowed target embedding table.
+    """
+    for name in ("hidden_norm", "norm", "fc", "embed_tokens"):
+        module = getattr(model, name, None)
+        if module is None:
+            continue
+        for attribute in ("weight", "scales"):
+            value = getattr(module, attribute, None)
+            if isinstance(value, mx.array) and mx.issubdtype(
+                value.dtype, mx.floating
+            ):
+                return value.dtype
+    return mx.bfloat16
+
+
 class DFlashDrafter:
     """Row-wise DFlash drafting against per-request context caches."""
 
@@ -651,10 +673,7 @@ class DFlashDrafter:
         block = self.block_size
         dtype = getattr(model, "context_dtype", None)
         if dtype is None:
-            fc = model.encoder.fc if hasattr(model, "encoder") else model.fc
-            dtype = fc.weight.dtype if hasattr(fc, "weight") else mx.bfloat16
-            if hasattr(fc, "scales"):
-                dtype = fc.scales.dtype
+            dtype = _activation_dtype(model)
 
         # Context segments: keep at most ``slots`` newest tokens per row and
         # count the rest as skipped so absolute positions stay aligned. A

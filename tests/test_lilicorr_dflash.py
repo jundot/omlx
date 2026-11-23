@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx.utils import tree_map
 
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
 from omlx.speculative import dflash as dd
@@ -379,6 +380,9 @@ def test_target_adapter_marks_the_instance_and_shifts_capture_ids():
         def rollback_speculative_cache(self, *args, **kwargs):
             return 0
 
+        def speculative_verify_dflash_hidden(self, *args, **kwargs):
+            return None
+
         def __call__(self, *args, **kwargs):
             self.records.append(dict(kwargs))
             return None
@@ -389,8 +393,16 @@ def test_target_adapter_marks_the_instance_and_shifts_capture_ids():
     assert language._omlx_drafter_single_row is True
     language(capture_layer_ids=[1, 18, 35])
     assert language.records[0]["capture_layer_ids"] == [0, 17, 34]
+    assert "speculative_verify" not in language.records[0]
     language(inputs=None)
     assert "capture_layer_ids" not in language.records[1]
+    # A block-drafter verify forward (n_confirmed set) must run through the
+    # native exact verifier: only that route returns the Mamba states the
+    # chain rollback replays, and without them every cycle reconciles.
+    language(inputs=None, n_confirmed=1)
+    assert language.records[-1]["speculative_verify"] is True
+    language(inputs=None)
+    assert "speculative_verify" not in language.records[-1]
     # Loading and attaching both adapt the target; the second call must not
     # stack another wrapper.
     adapted = type(language)
@@ -403,6 +415,106 @@ def test_target_adapter_marks_the_instance_and_shifts_capture_ids():
     assert not hasattr(_ProbeLanguage, "_omlx_lilicorr_target")
 
 
+def test_target_adapter_requires_the_native_verifier_route():
+    class _NoVerifier:
+        def __init__(self):
+            self.backbone = SimpleNamespace(layers=[object()])
+
+        def rollback_speculative_cache(self, *args, **kwargs):
+            return 0
+
+    with pytest.raises(TypeError, match="speculative_verify"):
+        lilicorr.apply_lilicorr_target(_NoVerifier())
+
+
+def test_target_dtype_probe_reads_the_backbone_embedding():
+    embed = nn.Embedding(VOCAB, HIDDEN)
+    embed.weight = embed.weight.astype(mx.bfloat16)
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(backbone=SimpleNamespace(embeddings=embed))
+    )
+    assert dd._target_float_dtype(target) == mx.bfloat16
+    # bf16 drafts against a bf16 target: nothing to cast, nothing to raise.
+    assert dd.match_target_dtype(_tiny_drafter().model, target) == 0
+
+    bare = SimpleNamespace(language_model=SimpleNamespace())
+    assert dd._target_float_dtype(bare) is None
+    assert dd.match_target_dtype(_tiny_drafter().model, bare) == 0
+
+
+def test_nvfp4_scales_do_not_define_the_draft_activation_dtype():
+    """ModelOpt NVFP4 block scales are uint8 E4M3 bits, not a compute dtype.
+
+    Reading ``fc.scales.dtype`` allocated the draft KV ring in uint8, so every
+    context key/value was truncated to an integer and the draft block lost its
+    target agreement (accept=0). The activation dtype must come from a floating
+    parameter and never from a quantized carrier.
+    """
+    drafter = _tiny_drafter()
+    model = drafter.model
+
+    class _ModelOptLinear(nn.Module):
+        """A projection whose ModelOpt NVFP4 scales are packed uint8 bytes."""
+
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.weight = mx.zeros((2,), dtype=mx.uint32)
+            self.scales = mx.zeros((2,), dtype=mx.uint8)
+
+        def __call__(self, x):
+            return self.inner(x)
+
+    model.fc = _ModelOptLinear(model.fc)
+    model.update(
+        tree_map(
+            lambda p: p.astype(mx.bfloat16)
+            if isinstance(p, mx.array) and mx.issubdtype(p.dtype, mx.floating)
+            else p,
+            model.parameters(),
+        )
+    )
+    assert model.fc.weight.dtype == mx.uint32
+    assert model.fc.scales.dtype == mx.uint8
+    assert dd.drafter._activation_dtype(model) == mx.bfloat16
+
+    seen = {}
+    original = lilicorr.LiLiCorrHead.score
+
+    def score(self, hidden, logits, token_embeddings, anchor_context):
+        seen["hidden"] = hidden.dtype
+        return original(self, hidden, logits, token_embeddings, anchor_context)
+
+    lilicorr.LiLiCorrHead.score = score
+    state = SimpleNamespace(
+        uid=0, drafts=None, draft_lps=None, draft_accept_lps=None, depth=1,
+        controller=None,
+    )
+    try:
+        drafter.draft(
+            [
+                (
+                    None,
+                    state,
+                    [mx.zeros((1, 1, HIDDEN)) for _ in TARGET_LAYER_IDS],
+                    mx.array([3], dtype=mx.uint32),
+                    None,
+                )
+            ]
+        )
+    finally:
+        lilicorr.LiLiCorrHead.score = original
+    assert drafter._cohort is not None
+    assert drafter._cohort.keys[0].dtype == mx.bfloat16
+    assert drafter._cohort.values[0].dtype == mx.bfloat16
+    assert seen["hidden"] == mx.bfloat16
+    assert state.drafts.shape[0] == BLOCK - 1
+
+    # An fp16 drafter still follows its own floating parameters.
+    model.hidden_norm.weight = model.hidden_norm.weight.astype(mx.float16)
+    assert dd.drafter._activation_dtype(model) == mx.float16
+
+
 def test_attach_drafter_adapts_only_lilicorr_targets():
     class _Host:
         def __init__(self):
@@ -411,6 +523,9 @@ def test_attach_drafter_adapts_only_lilicorr_targets():
 
         def rollback_speculative_cache(self, *args, **kwargs):
             return 0
+
+        def speculative_verify_dflash_hidden(self, *args, **kwargs):
+            return None
 
         def __call__(self, *args, **kwargs):
             self.calls.append(dict(kwargs))
