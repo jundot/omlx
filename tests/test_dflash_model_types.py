@@ -12,6 +12,8 @@ from omlx.utils.model_loading import dflash_batched_supported, dflash_compatibil
         ("qwen3_5_moe", "vlm"),
         ("minicpmv4_7", "vlm"),
         ("qwen3_moe", "batched"),
+        ("nemotron_h", "vlm"),
+        ("nemotron_h_omni", "vlm"),
     ],
 )
 def test_supported_targets(model_type, engine_type):
@@ -25,6 +27,13 @@ def test_minicpm_v47_is_a_vlm_target_only():
     assert not dflash_batched_supported("minicpmv4_7", "batched")
 
 
+def test_nemotron_h_is_a_vlm_target_only():
+    # Bolt's LiLiCorr drafter binds through the VLM engine's mlx-vlm model; the
+    # text batched engine has no Nemotron-H capture/rollback wiring.
+    assert not dflash_batched_supported("nemotron_h", "batched")
+    assert not dflash_batched_supported("nemotron_h_omni", None)
+
+
 @pytest.mark.parametrize(
     ("model_type", "engine_type"),
     [("llama", "vlm"), (None, "vlm"), ("minicpmv4_7", None)],
@@ -34,3 +43,4 @@ def test_unsupported_targets_report_their_model_type(model_type, engine_type):
     assert not supported
     assert f"model_type='{model_type or ''}'" in reason
     assert "MiniCPM-V 4.7" in reason
+    assert "Nemotron-H" in reason

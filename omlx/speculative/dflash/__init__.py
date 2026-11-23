@@ -31,6 +31,7 @@ from mlx_vlm.utils import get_model_path
 from ...model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
 from ...patches import qwen35_packed_linear
 from .drafter import DFlashDrafter
+from .lilicorr import apply_lilicorr_patch, apply_lilicorr_target
 from .variants import apply_partial_rope, load_mask_embedding
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,9 @@ def load_dflash_drafter(
     checkpoint's context window.
     """
     adaptive = resolve_verify_mode(verify_mode)
+    # Registers the ``lilicorr`` drafter module (and its ModelOpt NVFP4 tag
+    # translation) before mlx-vlm resolves the checkpoint's model type.
+    apply_lilicorr_patch()
     model, kind = load_drafter(path, kind="dflash")
     if kind != "dflash":
         raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
@@ -212,6 +216,11 @@ def load_dflash_drafter(
     else:
         model.bind(target_model)
     language_model = getattr(target_model, "language_model", target_model)
+    if getattr(model.config, "model_type", None) == "lilicorr":
+        # Do this inside the loader so a target without Nemotron-H block
+        # captures raises here, where the engine pool disables the draft
+        # instead of failing the model load.
+        apply_lilicorr_target(target_model)
     block = resolve_block_size(
         model,
         block_size,
@@ -243,6 +252,12 @@ def load_dflash_drafter(
 
 def attach_drafter(language_model: Any, drafter: DFlashDrafter) -> None:
     """Expose the drafter to Lightning MTP through the language model markers."""
+    if getattr(getattr(drafter.model, "config", None), "model_type", None) == (
+        "lilicorr"
+    ):
+        # LiLiCorr capture ids denote layer inputs and the Nemotron-H rollback
+        # needs uniform acceptance; adapt this target instance only.
+        apply_lilicorr_target(language_model)
     language_model._omlx_drafter = drafter
     language_model._omlx_mtp_decode_enabled = True
     language_model._omlx_mtp_multi_request = not getattr(

@@ -36,6 +36,7 @@ from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import Scheduler
 from omlx.speculative import dflash as dd
 from omlx.speculative.dflash import kernels, selection, variants
+from omlx.speculative.dflash.lilicorr import LiLiCorrConfig, LiLiCorrDraftModel
 
 VOCAB = 64
 HIDDEN = 32
@@ -242,6 +243,74 @@ def test_load_rejects_a_reduced_draft_vocabulary(monkeypatch):
         dflash.load_dflash_drafter("draft", _tiny_target())
 
 
+def _tiny_lilicorr_drafter(seed=0):
+    """Grouped dynamic causal convs plus the LiLiCorr correlation head."""
+    config = LiLiCorrConfig.from_dict(
+        {
+            "model_type": "qwen3",
+            "hidden_size": HIDDEN,
+            "intermediate_size": 48,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": VOCAB,
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 4096,
+            "num_target_layers": TARGET_LAYERS,
+            "sliding_window": WINDOW,
+            "layer_types": ["sliding_attention", "sliding_attention"],
+            "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+            "tie_word_embeddings": False,
+            "block_size": BLOCK,
+            "dflash_config": {
+                "block_size": BLOCK,
+                "conv_group_size": 8,
+                "conv_kernel_size": 2,
+                "mask_token_id": VOCAB - 1,
+                "target_layer_ids": TARGET_LAYER_IDS,
+                "projector_type": "lilicorr",
+                "lilicorr_hidden_size": 16,
+                "lilicorr_candidate_topk": 4,
+                "lilicorr_num_heads": 2,
+                "lilicorr_num_layers": 1,
+                "lilicorr_mlp_ratio": 2.0,
+                "lilicorr_factor_dim": 16,
+                "lilicorr_vector_eps": 1e-4,
+                "lilicorr_logit_scale": 8.0,
+            },
+        }
+    )
+    mx.random.seed(seed)
+    model = LiLiCorrDraftModel(config)
+    params = {
+        key: mx.random.normal(value.shape) * 0.2
+        for key, value in nn.utils.tree_flatten(model.parameters())
+    }
+    model.load_weights(list(params.items()), strict=False)
+    model.bind(_tiny_target())
+    mx.eval(model.parameters())
+    return dd.DFlashDrafter(model, block_size=BLOCK, source_path="tiny")
+
+
+# LiLiCorr's anchor is a committed context row, so a ring that keeps none
+# cannot draft (and says so).
+_tiny_lilicorr_drafter.requires_ring_context = True
+
+
+DRAFTER_FAMILIES = pytest.mark.parametrize(
+    "make_drafter",
+    [
+        _tiny_drafter,
+        _tiny_laguna_drafter,
+        _tiny_muse_drafter,
+        _tiny_dspark_drafter,
+        _tiny_lilicorr_drafter,
+    ],
+    ids=["dflash2", "laguna", "muse", "dspark", "lilicorr"],
+)
+
+
 def _captured(n, seed):
     mx.random.seed(seed)
     return [mx.random.normal((1, n, HIDDEN)) for _ in TARGET_LAYER_IDS]
@@ -285,6 +354,8 @@ def _run_cycles(drafter, plan, cycle_offset=0):
 )
 def test_batched_forward_matches_rows_drafted_alone(make_drafter, window):
     """Padding, masks, vector RoPE offsets and ring writes must not leak across rows."""
+    if window == 1 and getattr(make_drafter, "requires_ring_context", False):
+        pytest.skip("LiLiCorr anchors on a committed context row")
     plan = [
         {0: (5, 3), 1: (1, 9)},
         {0: (2, 11), 1: (3, 4), 2: (7, 5)},
@@ -313,7 +384,12 @@ def test_batched_forward_matches_rows_drafted_alone(make_drafter, window):
     assert batched.context_length(2) == sum(rows[2][0] for rows in plan if 2 in rows)
 
 
-def test_predraft_adopt_matches_drafting_committed_rows():
+@pytest.mark.parametrize(
+    "make_drafter",
+    [_tiny_drafter, _tiny_lilicorr_drafter],
+    ids=["dflash2", "lilicorr"],
+)
+def test_predraft_adopt_matches_drafting_committed_rows(make_drafter):
     """A predraft over every verify row equals drafting the committed rows, and
     a discarded one leaves the ring as it was, across ring wrap-around."""
 
@@ -342,7 +418,7 @@ def test_predraft_adopt_matches_drafting_committed_rows():
 
     counts = [2, 4, 1, 4, 3, 2, 4, 1]
     for mode in ("adopt", "discard"):
-        plain, other = _tiny_drafter(), _tiny_drafter()
+        plain, other = make_drafter(), make_drafter()
         for d in (plain, other):
             d.seed(0, _captured(WINDOW - 3, seed=77))
             d.draft(

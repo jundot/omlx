@@ -18,6 +18,7 @@ oMLX runs DFlash inside its standard engines. `BatchedEngine` (mlx-lm text model
 | Gemma 4 (`gemma4`, `gemma4_unified`) | VLM | single row |
 | Muse Glimmer (`muse_glimmer`) | VLM | single row |
 | MiniCPM-V 4.7 (`minicpmv4_7`) | VLM | concurrent rows |
+| Nemotron-H / Bolt (`nemotron_h`, `nemotron_h_omni`) | VLM | single row (uniform acceptance) |
 
 "Single row" means a request speculates while it decodes alone; a batch of two or more decodes normally, since rows that accept different counts would need a ragged rollback of sliding-window caches. MiMo V2 checkpoints with the omnimodal vision sidecar load on the VLM engine and run without DFlash; other model types also load without DFlash and log a warning. The gate lives in `omlx/utils/model_loading.py` (`dflash_batched_supported`, `dflash_compatibility`).
 
@@ -57,6 +58,12 @@ Removed with the external engine: the dflash-mlx L1/L2 prefix caches (`dflash_in
 | `omlx/engine_pool.py` | Gate, drafter load after engine start, memory estimate. |
 
 Draft checkpoints load through mlx-vlm's drafter classes (DFlash v1, DFlash2, Laguna, Muse Glimmer assistant). oMLX rebuilds partial RoPE from the checkpoint config because mlx-vlm rotates the whole head, and applies MiMo's attention value scale and trained mask embedding, which the v1 class does not read.
+
+### LiLiCorr (Nemotron-H / Bolt)
+
+`omlx/speculative/dflash/lilicorr.py` adds the LiLiCorr head used by `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr`. It keeps the DFlash2 draft block (grouped dynamic causal convolutions) and replaces the candidate selector with a correlation head: eight candidates per proposal position, five per-candidate features (log probability, probability, relative log probability, normalized rank, rank-0 flag), `slot`/`rank` embeddings, and two correlation layers with a precomputed additive slot bias. Proposals walk the lattice from the anchor: position 0 scores `anchor_out . in[0]`, and position `p` scores `out[p-1] . in[p]` for the candidate picked just before. No unary LM logits are added.
+
+`load_dflash_drafter` calls `apply_lilicorr_patch()` first, which registers the `lilicorr` drafter module, maps model type `lilicorr` to the `dflash` round loop, and reads ModelOpt's `modelopt_fp4` tag as `modelopt` for LiLiCorr checkpoints only, so packed NVFP4 weights stay packed. LiLiCorr layer ids denote layer *inputs* while `NemotronHModel.hidden_sink` records block *outputs*; `apply_lilicorr_target` marks the target instance and shifts every requested capture id `i` to `i - 1` (`[1, 18, 35, 51, 68, 85]` becomes `[0, 17, 34, 50, 67, 84]` for Bolt's 88 blocks), and pins `_omlx_drafter_single_row` because `rollback_speculative_cache` requires uniform acceptance. The generic `drafter_target.py` patch is not applied to Nemotron-H.
 
 ## Tests
 
