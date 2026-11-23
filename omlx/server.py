@@ -3960,9 +3960,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
             ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx", model_type="markitdown")
         )
 
-    if macos_say.model_visible(_server_state.global_settings) and not any(
-        m.id == macos_say.MODEL_ID for m in models
-    ):
+    if macos_say.enabled(_server_state.global_settings):
         models.append(
             ModelInfo(id=macos_say.MODEL_ID, owned_by="omlx", model_type="audio_tts")
         )
