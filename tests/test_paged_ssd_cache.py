@@ -62,6 +62,85 @@ def cyclic_gc_disabled():
             gc.enable()
 
 
+@pytest.mark.parametrize("hot_cache_max_bytes", [0, 1024**2])
+@pytest.mark.parametrize("older_write_fails", [False, True])
+@pytest.mark.parametrize("inline", [False, True])
+def test_superseded_ssd_write_preserves_replacement(
+    tmp_path, monkeypatch, hot_cache_max_bytes, older_write_fails, inline
+):
+    mx = pytest.importorskip("mlx.core")
+    from omlx.cache import paged_ssd_cache
+
+    monkeypatch.setattr(paged_ssd_cache, "_PENDING_WRITE_PUT_TIMEOUT_SECONDS", 0.05)
+    block_hash = b"replacement_test"
+    started = threading.Event()
+    release = threading.Event()
+    replacement_started = threading.Event()
+    release_replacement = threading.Event()
+    write_safetensors = paged_ssd_cache._write_safetensors_no_mx
+
+    def hold_first_write(path, tensors_raw, metadata):
+        if metadata["block_hash"] == block_hash.hex():
+            if not started.is_set():
+                started.set()
+                assert release.wait(5)
+                if older_write_fails:
+                    raise OSError(errno.EIO, "simulated write failure")
+            elif not inline:
+                replacement_started.set()
+                assert release_replacement.wait(5)
+        return write_safetensors(path, tensors_raw, metadata)
+
+    monkeypatch.setattr(paged_ssd_cache, "_write_safetensors_no_mx", hold_first_write)
+    manager = PagedSSDCacheManager(
+        cache_dir=tmp_path,
+        max_size_bytes=100 * 1024**2,
+        expected_block_size_tokens=2048,
+        expected_kv_bytes_per_token=10**12,
+        hot_cache_max_bytes=hot_cache_max_bytes,
+    )
+
+    def save(key, value, *, replace=False):
+        kv = mx.full((1, 2, 16, 16), value)
+        return manager.save_block(
+            key,
+            [(kv, kv)],
+            token_count=16,
+            layer_cache_types=["KVCache"],
+            hot_cache_write_back=False,
+            replace_existing=replace,
+        )
+
+    try:
+        assert save(block_hash, 1.0)
+        assert started.wait(5)
+        if inline:
+            assert save(b"fill_write_queue", 0.0)
+        assert save(block_hash, 2.0, replace=True)
+        assert manager.get_stats().ssd_inline_write_fallbacks == int(inline)
+        release.set()
+        if not inline:
+            assert replacement_started.wait(5)
+            pending = manager.load_block(block_hash)
+            assert pending is not None
+            assert mx.all(pending[0][0] == 2.0).item()
+            release_replacement.set()
+        assert manager.wait_for_pending_writes(5)
+        assert manager.has_block(block_hash)
+    finally:
+        release.set()
+        release_replacement.set()
+        manager.close()
+
+    reopened = PagedSSDCacheManager(cache_dir=tmp_path, max_size_bytes=100 * 1024**2)
+    try:
+        restored = reopened.load_block(block_hash)
+        assert restored is not None
+        assert mx.all(restored[0][0] == 2.0).item()
+    finally:
+        reopened.close()
+
+
 class TestParseSize:
     """Tests for parse_size utility function."""
 
@@ -2480,51 +2559,50 @@ class TestAsyncBackgroundWrite:
         ).item()
 
     def test_save_block_uses_background_write(self, tmp_path, mx):
-        """Verify save_block enqueues bytes for background writer (no mx.save_safetensors)."""
+        """The background thread persists bytes while reads can use the buffer."""
+        from omlx.cache import paged_ssd_cache
+
         manager = PagedSSDCacheManager(
             cache_dir=tmp_path / "async_test",
             max_size_bytes=100 * 1024**2,
         )
-
         block_hash = b"async_write_test_hsh"
         cache_data = [(mx.ones((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))]
+        started = threading.Event()
+        release = threading.Event()
+        write_safetensors = paged_ssd_cache._write_safetensors_no_mx
 
-        # Patch mx.save_safetensors to ensure it's NOT called
-        with patch("mlx.core.save_safetensors") as mock_save:
-            result = manager.save_block(
-                block_hash=block_hash,
-                cache_data=cache_data,
-                token_count=16,
-            )
-            assert result is True
-            # mx.save_safetensors should NOT be called (we use _write_safetensors_no_mx)
-            mock_save.assert_not_called()
+        def hold_write(path, tensors_raw, metadata):
+            started.set()
+            assert release.wait(5)
+            assert all(isinstance(raw, bytes) for raw, _, _ in tensors_raw.values())
+            return write_safetensors(path, tensors_raw, metadata)
 
-        # Hot cache buffer should store tensors_raw (bytes), not arrays (mx.array)
-        with manager._hot_cache_lock:
-            pending = manager._hot_cache.get(block_hash)
-        assert pending is not None
-        assert "tensors_raw" in pending
-        assert "arrays" not in pending  # Old key should not exist
+        try:
+            with (
+                patch.object(
+                    paged_ssd_cache, "_write_safetensors_no_mx", side_effect=hold_write
+                ),
+                patch("mlx.core.save_safetensors") as mock_save,
+            ):
+                assert manager.save_block(block_hash, cache_data, token_count=16)
+                assert started.wait(5)
+                assert mx.array_equal(
+                    manager.load_block(block_hash)[0][0], cache_data[0][0]
+                ).item()
+                release.set()
+                assert manager.wait_for_pending_writes(5)
+                mock_save.assert_not_called()
 
-        # Wait for background write and verify file exists
-        for _ in range(50):
             file_path = manager._get_file_path(block_hash)
-            if file_path.exists():
-                break
-            time.sleep(0.05)
-        assert file_path.exists()
-
-        # Verify file is loadable by mx.load. V3 stores state elements as
-        # ``layer_{i}_state_{k}`` keys with a ``layer_{i}_state_count`` meta
-        # entry, polyfilled from V2 ``(keys, values)`` 2-tuples on save.
-        loaded, meta = mx.load(str(file_path), return_metadata=True)
-        assert "layer_0_state_0" in loaded
-        assert "layer_0_state_1" in loaded
-        assert meta.get("layer_0_state_count") == "2"
-        assert meta["block_hash"] == block_hash.hex()
-
-        manager.close()
+            loaded, meta = mx.load(str(file_path), return_metadata=True)
+            assert "layer_0_state_0" in loaded
+            assert "layer_0_state_1" in loaded
+            assert meta.get("layer_0_state_count") == "2"
+            assert meta["block_hash"] == block_hash.hex()
+        finally:
+            release.set()
+            manager.close()
 
     def test_pending_writes_bytes_readback(self, tmp_path, mx):
         """Verify load_block can restore mx.arrays from bytes-based pending_writes."""
