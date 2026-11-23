@@ -1024,6 +1024,67 @@ def test_inkling2_compiled_tails_keep_the_eager_bits():
     assert mx.array_equal(got, expected)
 
 
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+def test_inkling2_fused_layer_kernels_keep_the_mlx_bits(dims, monkeypatch):
+    """The kernels that fold a layer's small ops together (projection
+    epilogue, attention-residual norms, loop controllers, expert sum) give the
+    MLX ops' bits on eager prefill chunks and compiled decode rows."""
+    if mx.default_device() != mx.gpu:
+        pytest.skip("fused kernels are GPU-only")
+    from omlx.patches.inkling2 import kernels
+
+    # 128-wide heads: the projection epilogue covers that width only.
+    wide = dict(
+        head_dim=128,
+        swa_head_dim=128,
+        num_attention_heads=2,
+        swa_num_attention_heads=2,
+        num_key_value_heads=1,
+        swa_num_key_value_heads=1,
+    )
+    ids = mx.random.randint(0, 300, (1, 20))
+
+    def run(model):
+        from mlx.utils import tree_flatten
+
+        # BF16 activations, with the FP32 tensors the loader keeps.
+        keep = model.cast_predicate
+        cast = [
+            (k, v.astype(mx.bfloat16))
+            for k, v in tree_flatten(model.parameters())
+            if v.dtype == mx.float32 and keep(k)
+        ]
+        model.load_weights(cast, strict=False)
+        cache = model.make_cache()
+        outs = [model(ids[:, :17], cache=cache)]
+        outs += [model(ids[:, t : t + 1], cache=cache) for t in range(17, 20)]
+        mx.eval(outs)
+        return outs
+
+    names = ("qkv_post", "attn_res_fused", "moe_short_conv", "loop_message_outputs")
+    used = dict.fromkeys(names, 0)
+    for name in names:
+        original = getattr(kernels, name)
+
+        def spy(*args, _original=original, _name=name, **kwargs):
+            out = _original(*args, **kwargs)
+            used[_name] += out is not None
+            return out
+
+        monkeypatch.setattr(kernels, name, spy)
+    fused = run(_inkling2_tiny(**wide, **dims))
+    expected_used = set(names) - (set() if dims else {"loop_message_outputs"})
+    assert {n for n, count in used.items() if count} == expected_used
+
+    for name in ("qkv_post", "attn_res_fused", "moe_short_conv"):
+        monkeypatch.setattr(kernels, name, lambda *a, **k: None)
+    monkeypatch.setattr(kernels, "loop_messages_supported", lambda *a: False)
+    # A fresh model: compiled layer stages keep the graph of their first trace.
+    reference = run(_inkling2_tiny(**wide, **dims))
+    for got, want in zip(fused, reference):
+        assert mx.array_equal(got, want)
+
+
 def test_inkling2_model_is_freed_without_cyclic_gc():
     import gc
     import weakref
