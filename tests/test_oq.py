@@ -55,6 +55,9 @@ from omlx.oq import (
     _forward_layer,
     _forward_layer_result,
     _get_predicate_bits,
+    _ENGRAM_PRECISION_CHOICES,
+    detect_engram_table_precision,
+    resolve_engram_precision,
     _imatrix_expert_coverage_stats,
     _imatrix_expert_coverage_sufficient,
     _imatrix_requires_expert_counts,
@@ -1328,6 +1331,141 @@ class TestStreamingHelpers:
         )
 
         assert (bits, gs, mode) == (4, 64, "affine")
+
+    @pytest.mark.parametrize(
+        "engram_mode, expected",
+        [
+            ("auto", (4, 32, "affine")),
+            ("affine8", (8, 32, "affine")),
+            ("preserve", (None, None, None)),
+            ("preserve_fp8", (None, None, None)),
+        ],
+    )
+    def test_engram_mode_overrides_offload_policy(self, engram_mode, expected):
+        path = (
+            "model.layers.1.ple.ple_embedding.ngram_embedding."
+            "shards.0.weight"
+        )
+        config = {"model_type": "qwen4_exp"}
+        assert _get_predicate_bits(path, config, 2, 64, engram_mode) == expected
+
+
+class TestEngramPrecisionOption:
+    """Static tests for the Engram precision option (no model loading)."""
+
+    @staticmethod
+    def _write_header(tmp_path, model_type, table_key, dtype):
+        config = {"model_type": model_type}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        header = {
+            table_key: {
+                "dtype": dtype,
+                "shape": [8, 96],
+                "data_offsets": [0, 8 * 96 * 2],
+            }
+        }
+        payload = json.dumps(header).encode("utf-8")
+        (tmp_path / "model.safetensors").write_bytes(
+            len(payload).to_bytes(8, "little") + payload + b"\x00" * (8 * 96 * 2)
+        )
+        return config
+
+    @pytest.mark.parametrize(
+        "model_type, table_key, dtype, expected",
+        [
+            (
+                "hy_v4_flash",
+                "model.layers.0.engram_layer.multi_head_embedding.embedding",
+                "BF16",
+                "bf16",
+            ),
+            (
+                "deepseek_v41",
+                "model.layers.0.engram.embed.0.weight",
+                "F8_E4M3",
+                "fp8",
+            ),
+            (
+                "qwen4_exp",
+                "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0",
+                "F8_E4M3",
+                "fp8",
+            ),
+        ],
+    )
+    def test_detect_precision_from_header(
+        self, tmp_path, model_type, table_key, dtype, expected
+    ):
+        config = self._write_header(tmp_path, model_type, table_key, dtype)
+        detected = detect_engram_table_precision(tmp_path, config)
+        assert detected["source_precision"] == expected
+        assert table_key in detected["weight_keys"]
+
+    @pytest.mark.parametrize(
+        "dtype, requested, expected_mode",
+        [
+            ("BF16", "auto", "auto"),
+            ("BF16", "8", "affine8"),
+            ("BF16", "16", "preserve"),
+            ("F8_E4M3", "auto", "auto"),
+            ("F8_E4M3", "8", "preserve_fp8"),
+        ],
+    )
+    def test_resolve_precision(self, tmp_path, dtype, requested, expected_mode):
+        config = self._write_header(
+            tmp_path, "deepseek_v41", "model.layers.0.engram.embed.0.weight", dtype
+        )
+        plan = resolve_engram_precision(tmp_path, config, requested)
+        assert plan["mode"] == expected_mode
+        assert plan["requested"] == requested
+
+    def test_resolve_rejects_16bit_on_fp8(self, tmp_path):
+        config = self._write_header(
+            tmp_path, "deepseek_v41", "model.layers.0.engram.embed.0.weight", "F8_E4M3"
+        )
+        with pytest.raises(ValueError, match="float table"):
+            resolve_engram_precision(tmp_path, config, "16")
+
+    def test_resolve_rejects_8bit_on_mxfp4(self, tmp_path):
+        config = self._write_header(
+            tmp_path, "deepseek_v41", "model.layers.0.engram.embed.0.weight", "U8"
+        )
+        with pytest.raises(ValueError, match="not supported"):
+            resolve_engram_precision(tmp_path, config, "8")
+
+    def test_resolve_rejects_unknown_choice(self, tmp_path):
+        config = self._write_header(
+            tmp_path, "deepseek_v41", "model.layers.0.engram.embed.0.weight", "BF16"
+        )
+        with pytest.raises(ValueError, match="Invalid Engram precision"):
+            resolve_engram_precision(tmp_path, config, "4")
+
+    def test_legacy_preserve_flag_maps_to_preserve(self, tmp_path):
+        config = self._write_header(
+            tmp_path, "deepseek_v41", "model.layers.0.engram.embed.0.weight", "F8_E4M3"
+        )
+        plan = resolve_engram_precision(tmp_path, config, "auto", True)
+        assert plan["mode"] == "preserve"
+
+    @pytest.mark.parametrize(
+        "precision, expected",
+        [
+            ("auto", "model-oQ4"),
+            ("8", "model-oQ4-engram8"),
+            ("16", "model-oQ4-engram16"),
+        ],
+    )
+    def test_output_name_suffix(self, precision, expected):
+        assert resolve_output_name("model", 4, engram_precision=precision) == expected
+
+    def test_output_name_strips_existing_engram_suffix(self):
+        assert (
+            resolve_output_name("model-oQ4-engram8", 4, engram_precision="16")
+            == "model-oQ4-engram16"
+        )
+
+    def test_choices_are_auto_8_16(self):
+        assert _ENGRAM_PRECISION_CHOICES == ("auto", "8", "16")
 
     def test_qwen4_ngram_is_exempt_from_strict_imatrix_lookup(self):
         from omlx.oq import OQImatrixData, _lookup_imatrix_importance

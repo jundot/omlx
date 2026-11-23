@@ -989,6 +989,7 @@ class OQStartRequest(BaseModel):
     mtp_assistant_model_path: str = ""
     preserve_ngram_table: bool = False
     hadamard: bool = False
+    engram_precision: str = "auto"
 
 
 class HFUploadRequest(BaseModel):
@@ -10104,6 +10105,7 @@ async def estimate_oq(
     oq_level: float,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
+    engram_precision: str = "auto",
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -10117,6 +10119,7 @@ async def estimate_oq(
             64,  # group_size (default)
             preserve_mtp,
             preserve_ngram_table,
+            engram_precision,
         )
         return result
     except Exception as e:
@@ -10182,6 +10185,7 @@ async def start_oq_quantization(
             mtp_assistant_model_path=request.mtp_assistant_model_path,
             preserve_ngram_table=request.preserve_ngram_table,
             hadamard=request.hadamard,
+            engram_precision=request.engram_precision,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

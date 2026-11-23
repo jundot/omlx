@@ -490,6 +490,7 @@ def quantize(
     imatrix_seq_length=512,
     preserve_ngram_table=False,
     hadamard=False,
+    engram_mode="auto",
 ):
     from ...oq import (
         _OQ_BPW_TARGETS,
@@ -508,7 +509,12 @@ def quantize(
         )
     # Engram sits outside the bit budget and calibration reads the source
     # checkpoint, so keeping it at source precision changes no other tensor.
-    engram_bits = None if preserve_ngram_table else _offload_table_bits(oq_level)
+    if engram_mode in ("preserve", "preserve_fp8"):
+        engram_bits = None
+    elif engram_mode == "affine8":
+        engram_bits = 8
+    else:
+        engram_bits = _offload_table_bits(oq_level)
     if oq_level == 4 and (sensitivity_model_path or sensitivity_map_override):
         raise ValueError(
             "V4.1 original-precision oQ4 does not use sensitivity overrides"
@@ -616,7 +622,7 @@ def quantize(
     projection_start = engram_start + engram_span
     for i, (name, table) in enumerate(tables.items()):
         if engram_bits is not None and _get_predicate_bits(
-            name + ".weight", config, oq_level, 64
+            name + ".weight", config, oq_level, 64, engram_mode
         ) != (engram_bits, 32, "affine"):
             raise ValueError("V4.1 Engram policy differs from Qwen4-Exp")
         filename = f".model-engram-{i:02d}.safetensors"

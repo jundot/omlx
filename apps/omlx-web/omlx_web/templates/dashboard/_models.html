@@ -1579,6 +1579,19 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
+                                        <!-- Engram / N-gram PLE table precision -->
+                                        <div x-show="oqHasEngramTables()" x-cloak class="flex items-center justify-between">
+                                            <div class="flex-1 min-w-0 pr-3">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.engram_precision') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.engram_precision_help') }}</p>
+                                            </div>
+                                            <select x-model="oqEngramPrecision"
+                                                    class="flex-shrink-0 text-sm border border-neutral-200 rounded px-2 py-1 bg-white">
+                                                <template x-for="choice in oqEngramPrecisionChoices()" :key="choice.value">
+                                                    <option :value="choice.value" x-text="choice.label"></option>
+                                                </template>
+                                            </select>
+                                        </div>
                                         <!-- Combine an MTP head: gemma4 assistant checkpoint, or a
                                              same-geometry donor's native mtp.* head for qwen3.5/3.6 -->
                                         <div x-show="oqMtpAssistantCandidates().length > 0" x-cloak>

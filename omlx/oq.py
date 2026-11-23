@@ -1132,6 +1132,123 @@ def _offload_table_bits(oq_level) -> int:
     return max(_base_bits_for_level(oq_level), _OFFLOAD_TABLE_MIN_BITS)
 
 
+# Explicit precision choice for SSD-offloaded Engram / N-gram PLE tables.
+# "auto" keeps the existing oQ policy; "8" means an 8-bit table (affine for
+# float sources, original FP8 for FP8 sources); "16" keeps the original float
+# dtype. The on-disk dtype, not the checkpoint name, decides what is allowed.
+_ENGRAM_PRECISION_CHOICES = ("auto", "8", "16")
+
+
+def _is_offload_table_tensor(tensor_name: str, config: dict) -> bool:
+    """True for Engram / N-gram PLE tables kept outside the resident bit budget."""
+    return (
+        _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+        or (
+            str(config.get("model_type", "")).replace("-", "_").lower()
+            == "deepseek_v41"
+            and ".engram.embed" in tensor_name
+        )
+        or _is_hy_v4_engram_table(tensor_name, config)
+    )
+
+
+def detect_engram_table_precision(model_path, config=None) -> dict:
+    """Inspect safetensors headers for the storage precision of offload tables.
+
+    Only headers are read, so F8_E8M0 scale tensors that ``mx.load`` rejects
+    are still classified. The checkpoint name is deliberately ignored: Tencent
+    Hy4 Flash FP8 keeps BF16 Engram tables, while DeepSeek V4.1 official keeps
+    FP8 tables, and the NVIDIA conversion stores MXFP4.
+    """
+    from .patches.deepseek_v41.residency import header_with_offset
+
+    source = Path(model_path)
+    if config is None:
+        with open(source / "config.json") as f:
+            config = json.load(f)
+    result = {
+        "source_precision": "none",
+        "available": ["auto"],
+        "weight_keys": [],
+        "scale_keys": [],
+    }
+    files = sorted(source.glob("*.safetensors")) + sorted(
+        (source / "engram").glob("*.safetensors")
+    )
+    headers = {}
+    for file in files:
+        st = file.stat()
+        headers[file] = header_with_offset(str(file), st.st_size, st.st_mtime_ns)[0]
+    weight_keys, scale_keys, dtypes = [], [], []
+    for header in headers.values():
+        for key, info in header.items():
+            if key == "__metadata__" or not _is_offload_table_tensor(key, config):
+                continue
+            if key.endswith((".scale", ".scales", ".biases", "_scale")):
+                scale_keys.append(key)
+            else:
+                weight_keys.append(key)
+                dtypes.append(str(info.get("dtype", "")))
+    if not weight_keys:
+        return result
+    result["weight_keys"] = sorted(weight_keys)
+    result["scale_keys"] = sorted(scale_keys)
+    dtype = dtypes[0]
+    if dtype == "BF16":
+        precision = "bf16"
+    elif dtype == "F16":
+        precision = "fp16"
+    elif dtype == "F32":
+        precision = "fp32"
+    elif dtype.startswith("F8_E4M3"):
+        precision = "fp8"
+    elif dtype in ("U8", "I8"):
+        precision = "mxfp4"
+    elif dtype == "U32":
+        precision = "affine"
+    else:
+        precision = "unknown"
+    result["source_precision"] = precision
+    if precision in ("bf16", "fp16", "fp32"):
+        result["available"] = ["auto", "8", "16"]
+    elif precision == "fp8":
+        result["available"] = ["auto", "8"]
+    return result
+
+
+def resolve_engram_precision(
+    model_path, config, requested="auto", preserve_ngram_table=False
+) -> dict:
+    """Resolve an Engram precision request into a concrete export plan."""
+    if requested not in _ENGRAM_PRECISION_CHOICES:
+        raise ValueError(
+            f"Invalid Engram precision {requested!r}. "
+            f"Must be one of {_ENGRAM_PRECISION_CHOICES}"
+        )
+    detected = detect_engram_table_precision(model_path, config)
+    precision = detected["source_precision"]
+    if requested == "auto":
+        mode = "preserve" if preserve_ngram_table else "auto"
+    elif requested == "16":
+        if precision not in ("bf16", "fp16", "fp32"):
+            raise ValueError(
+                f"16-bit Engram preservation needs a float table, but the "
+                f"source stores {precision!r}"
+            )
+        mode = "preserve"
+    else:  # requested == "8"
+        if precision == "fp8":
+            mode = "preserve_fp8"
+        elif precision in ("bf16", "fp16", "fp32"):
+            mode = "affine8"
+        else:
+            raise ValueError(
+                f"8-bit Engram export is not supported for source precision "
+                f"{precision!r}"
+            )
+    return {**detected, "requested": requested, "mode": mode}
+
+
 def _budgeted_shapes(named_shapes: dict[str, tuple], config: dict) -> dict[str, tuple]:
     """Return the shapes that compete for the level's bit budget.
 
@@ -2042,6 +2159,7 @@ def resolve_output_name(
     enhanced: bool = False,
     preserve_ngram_table: bool = False,
     hadamard: bool = False,
+    engram_precision: str = "auto",
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
@@ -2062,7 +2180,7 @@ def resolve_output_name(
             + preserve_mtp -> "DeepSeek-V4.1-Flash-oQ4e-ngram-mtp"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+[eh]?|[0-9]+[_-]?bit|fp\d+|bf\d+|ngram|mtp)$",
+        r"-(oQ[\d.]+[eh]?|[0-9]+[_-]?bit|fp\d+|bf\d+|engram(?:8|16)|ngram|mtp)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -2077,6 +2195,8 @@ def resolve_output_name(
         suffix += "-fp16"
     if preserve_ngram_table:
         suffix += "-ngram"
+    elif engram_precision in ("8", "16"):
+        suffix += f"-engram{engram_precision}"
     if preserve_mtp:
         suffix += "-mtp"
     return f"{base}{suffix}"
@@ -4108,6 +4228,7 @@ def estimate_bpw_and_size(
     group_size: int = 64,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
+    engram_precision: str = "auto",
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -4155,12 +4276,18 @@ def estimate_bpw_and_size(
         mapping = json.loads((source / "model.safetensors.index.json").read_text())[
             "weight_map"
         ]
+        plan = resolve_engram_precision(source, config, engram_precision, preserve_ngram_table)
+        engram_bits = (
+            None
+            if plan["mode"] in ("preserve", "preserve_fp8")
+            else (8 if plan["mode"] == "affine8" else _offload_table_bits(oq_level))
+        )
         budget = source_budget(
             source,
             config,
             mapping,
             preserve_mtp=preserve_mtp,
-            engram_bits=None if preserve_ngram_table else _offload_table_bits(oq_level),
+            engram_bits=engram_bits,
         )
         remaining = budget["remaining_weights"]
         # Allocations below oQ4 are not known until calibration. Quote their
@@ -4256,6 +4383,10 @@ def estimate_bpw_and_size(
     # the per-tensor pricing loop below (the flag changes which predicate
     # branch answers).
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
+    engram_plan = resolve_engram_precision(
+        source, config, engram_precision, preserve_ngram_table
+    )
+    engram_mode = engram_plan["mode"]
 
     # Pre-quantized tensors that pass through in source precision (mirrors
     # the decision in quantize_oq_streaming, evaluated pre-boost).
@@ -4266,7 +4397,7 @@ def estimate_bpw_and_size(
         if _info is None:
             continue
         _floor_bits, _, _ = _get_predicate_bits(
-            f"{_path}.weight", _pre_boost_config, oq_level, group_size
+            f"{_path}.weight", _pre_boost_config, oq_level, group_size, engram_mode
         )
         if _floor_bits is not None and _floor_bits >= _info["bits"]:
             fixed_overrides[_path] = {
@@ -4320,7 +4451,7 @@ def estimate_bpw_and_size(
             total_output_bytes += n_elements * 2
             continue
 
-        bits, gs, _mode = _get_predicate_bits(name, config, oq_level, group_size)
+        bits, gs, _mode = _get_predicate_bits(name, config, oq_level, group_size, engram_mode)
         if bits is None:
             total_params += n_elements
             total_weighted_bits += n_elements * 16
@@ -5479,12 +5610,20 @@ def _is_mtp_protected_tensor(name: str) -> bool:
 
 
 def _get_predicate_bits(
-    tensor_name: str, config: dict, oq_level: int, group_size: int
+    tensor_name: str,
+    config: dict,
+    oq_level: int,
+    group_size: int,
+    engram_mode: str = "auto",
 ) -> tuple:
     """Get quantization bits, group_size, and mode for a tensor.
 
     Returns:
         (bits, group_size, mode) or (None, None, None) if not quantized.
+
+    ``engram_mode`` overrides the offload-table policy: "affine8" forces
+    8-bit affine, while "preserve"/"preserve_fp8" leave the table unquantized
+    so the streaming loop copies it through.
     """
     # See _is_mtp_protected_tensor for why these tensors stay full precision.
     if _is_mtp_protected_tensor(tensor_name):
@@ -5497,14 +5636,11 @@ def _get_predicate_bits(
     # and use the group-32 layout published by existing Qwen4-Exp
     # quantizations. Embeddings have no input-channel imatrix entry; the
     # streaming loop deliberately applies ordinary affine quantization.
-    if (
-        _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
-        or (
-            config.get("model_type") == "deepseek_v41"
-            and ".engram.embed" in tensor_name
-        )
-        or _is_hy_v4_engram_table(tensor_name, config)
-    ):
+    if _is_offload_table_tensor(tensor_name, config):
+        if engram_mode in ("preserve", "preserve_fp8"):
+            return None, None, None
+        if engram_mode == "affine8":
+            return 8, _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
         return _offload_table_bits(oq_level), _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
 
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
@@ -7310,6 +7446,7 @@ def quantize_oq_streaming(
     stream_calibration: bool | None = None,
     preserve_ngram_table: bool = False,
     hadamard: bool = False,
+    engram_precision: str = "auto",
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -7391,6 +7528,12 @@ def quantize_oq_streaming(
             widths (see oqh.targets.reinvest), so the size stays the same.
             Implies the oQe calibration. It needs the original weights, so a
             source that only a proxy can calibrate is refused.
+        engram_precision: Precision for SSD-offloaded Engram / N-gram PLE
+            tables: "auto" (default) follows the oQ level policy, "8" stores
+            an 8-bit table (affine for float sources, original FP8 for FP8
+            sources), and "16" keeps the original float dtype. Choices are
+            validated against the actual safetensors dtype. ``preserve_ngram_table``
+            remains a backward-compatible alias for keeping source tables.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -7431,6 +7574,10 @@ def quantize_oq_streaming(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+    engram_plan = resolve_engram_precision(
+        source, config, engram_precision, preserve_ngram_table
+    )
+    engram_mode = engram_plan["mode"]
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
@@ -7470,6 +7617,7 @@ def quantize_oq_streaming(
             progress_callback=progress_callback,
             preserve_ngram_table=preserve_ngram_table,
             hadamard=hadamard,
+            engram_mode=engram_mode,
         )
     if (
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
@@ -8109,12 +8257,12 @@ def quantize_oq_streaming(
                     tensor_name, all_weights.plan_shape(tensor_name)
                 )
                 and not (
-                    preserve_ngram_table
-                    and _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+                    engram_mode in ("preserve", "preserve_fp8")
+                    and _is_offload_table_tensor(tensor_name, config)
                 )
             ):
                 bits, gs, qmode = _get_predicate_bits(
-                    tensor_name, config, oq_level, group_size
+                    tensor_name, config, oq_level, group_size, engram_mode
                 )
                 if bits is not None and bits >= src_info["bits"]:
                     qw, scales = all_weights.pop_packed(tensor_name)
@@ -8163,11 +8311,11 @@ def quantize_oq_streaming(
                 continue
 
             if _should_quantize_tensor(tensor_name, shape) and not (
-                preserve_ngram_table
-                and _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+                engram_mode in ("preserve", "preserve_fp8")
+                and _is_offload_table_tensor(tensor_name, config)
             ):
                 bits, gs, qmode = _get_predicate_bits(
-                    tensor_name, config, oq_level, group_size
+                    tensor_name, config, oq_level, group_size, engram_mode
                 )
 
                 if tensor_name.removesuffix(".weight") in oqh_plan:

@@ -637,6 +637,7 @@
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
             oqPreserveNgram: false,
+            oqEngramPrecision: 'auto',
             oqMtpAssistantPath: '',
             oqEnhanced: false,
             oqHadamard: false,
@@ -8263,6 +8264,7 @@
                         mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
                             ? this.oqMtpAssistantPath : '',
                         preserve_ngram_table: this.oqPreservesNgram(),
+                        engram_precision: this.oqEngramPrecision,
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -8415,6 +8417,22 @@
                 return this.oqSelectedModelType() === 'deepseek_v41' && this.oqPreserveNgram;
             },
 
+            // Engram / N-gram PLE precision choices. Auto follows the oQ level
+            // policy; 8 stores an 8-bit table; 16 keeps the original float dtype.
+            oqHasEngramTables() {
+                const t = this.oqSelectedModelType();
+                return t === 'deepseek_v41' || t === 'hy_v4_flash' || t === 'hy_v4_vl'
+                    || t.startsWith('qwen4_exp');
+            },
+
+            oqEngramPrecisionChoices() {
+                return [
+                    { value: 'auto', label: this.t('models.oq.engramPrecisionAuto') },
+                    { value: '8', label: this.t('models.oq.engramPrecision8') },
+                    { value: '16', label: this.t('models.oq.engramPrecision16') },
+                ];
+            },
+
             oqAvailableLevels() {
                 return this.oqSelectedModelType() === 'deepseek_v41'
                     ? [2, 2.5, 2.7, 3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
@@ -8498,6 +8516,7 @@
                             oq_level: this.oqLevel,
                             preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
                             preserve_ngram_table: this.oqPreservesNgram() ? 'true' : 'false',
+                            engram_precision: this.oqEngramPrecision,
                         });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
                         if (resp.ok) {

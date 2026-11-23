@@ -92,6 +92,7 @@ class QuantTask:
     mtp_assistant_model_path: str = ""
     preserve_ngram_table: bool = False
     hadamard: bool = False
+    engram_precision: str = "auto"
 
     @property
     def variant(self) -> str:
@@ -120,6 +121,7 @@ class QuantTask:
             "dtype": self.dtype,
             "enhanced": self.enhanced,
             "hadamard": self.hadamard,
+            "engram_precision": self.engram_precision,
             "imatrix_cache_path": self.imatrix_cache_path,
         }
 
@@ -332,6 +334,7 @@ class OQManager:
         mtp_assistant_model_path: str = "",
         preserve_ngram_table: bool = False,
         hadamard: bool = False,
+        engram_precision: str = "auto",
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -365,7 +368,13 @@ class OQManager:
             validate_mtp_donor_pair,
         )
         from ..utils.model_loading import _checkpoint_has_mtp_weights
+        from ..oq import _ENGRAM_PRECISION_CHOICES, resolve_engram_precision
 
+        if engram_precision not in _ENGRAM_PRECISION_CHOICES:
+            raise ValueError(
+                f"Invalid engram_precision {engram_precision!r}. "
+                f"Must be one of {_ENGRAM_PRECISION_CHOICES}"
+            )
         if oq_level not in OQ_LEVELS:
             raise ValueError(
                 f"Invalid oQ level {oq_level}. Must be one of {sorted(OQ_LEVELS)}"
@@ -386,6 +395,10 @@ class OQManager:
                 "Keeping the original Engram tables is only available for "
                 "DeepSeek V4.1"
             )
+        # Validate the requested precision against the actual table dtype.
+        # This also rejects "16" on FP8 tables and "8" on MXFP4 tables.
+        if engram_precision != "auto" or preserve_ngram_table:
+            resolve_engram_precision(source, config, engram_precision, preserve_ngram_table)
         _validate_oq_dtype_for_model(config, dtype)
 
         source_size = _safetensors_size(source)
@@ -437,6 +450,7 @@ class OQManager:
             enhanced=enhanced,
             preserve_ngram_table=preserve_ngram_table,
             hadamard=hadamard,
+            engram_precision=engram_precision,
         )
         if mtp_assistant_model_path and not output_name.endswith("-mtp"):
             output_name += "-mtp"
@@ -457,6 +471,7 @@ class OQManager:
                 and task.enhanced == enhanced
                 and task.hadamard == hadamard
                 and task.preserve_ngram_table == preserve_ngram_table
+                and task.engram_precision == engram_precision
                 and task.status in _ACTIVE_STATUSES
             ):
                 raise ValueError(
@@ -508,6 +523,7 @@ class OQManager:
             mtp_assistant_model_path=mtp_assistant_model_path,
             preserve_ngram_table=preserve_ngram_table,
             hadamard=hadamard,
+            engram_precision=engram_precision,
         )
         self._tasks[task_id] = task
 
@@ -689,6 +705,7 @@ class OQManager:
                     imatrix_seq_length=task.imatrix_seq_length,
                     preserve_ngram_table=task.preserve_ngram_table,
                     hadamard=task.hadamard,
+                    engram_precision=task.engram_precision,
                 )
 
                 if task_id in self._cancelled:
