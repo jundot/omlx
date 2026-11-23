@@ -636,7 +636,6 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
-            oqPreserveNgram: false,
             oqEngramPrecision: 'auto',
             oqMtpAssistantPath: '',
             oqEnhanced: false,
@@ -8263,8 +8262,7 @@
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
                         mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
                             ? this.oqMtpAssistantPath : '',
-                        preserve_ngram_table: this.oqPreservesNgram(),
-                        engram_precision: this.oqEngramPrecision,
+                        engram_precision: this.oqSelectedEngramPrecision(),
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -8413,24 +8411,22 @@
                 return model?.model_type || '';
             },
 
-            oqPreservesNgram() {
-                return this.oqSelectedModelType() === 'deepseek_v41' && this.oqPreserveNgram;
-            },
-
-            // Engram / N-gram PLE precision choices. Auto follows the oQ level
-            // policy; 8 stores an 8-bit table; 16 keeps the original float dtype.
-            oqHasEngramTables() {
-                const t = this.oqSelectedModelType();
-                return t === 'deepseek_v41' || t === 'hy_v4_flash' || t === 'hy_v4_vl'
-                    || t.startsWith('qwen4_exp');
-            },
-
             oqEngramPrecisionChoices() {
-                return [
-                    { value: 'auto', label: this.t('models.oq.engramPrecisionAuto') },
-                    { value: '8', label: this.t('models.oq.engramPrecision8') },
-                    { value: '16', label: this.t('models.oq.engramPrecision16') },
-                ];
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                const table = model?.engram_precision;
+                const source = table?.source_precision;
+                const suffix16 = {bf16: 'BF16', fp16: 'FP16'}[source];
+                const labels = {
+                    auto: window.t('models.oq.engramPrecisionAuto'),
+                    8: window.t('models.oq.engramPrecision8') + (source === 'fp8' ? ' (FP8)' : ' (MLX affine)'),
+                    16: window.t('models.oq.engramPrecision16') + (suffix16 ? ' (' + suffix16 + ')' : ''),
+                };
+                return (table?.available || ['auto']).map(value => ({value, label: labels[value]}));
+            },
+
+            oqSelectedEngramPrecision() {
+                return this.oqEngramPrecisionChoices().some(choice => choice.value === this.oqEngramPrecision)
+                    ? this.oqEngramPrecision : 'auto';
             },
 
             oqAvailableLevels() {
@@ -8439,6 +8435,10 @@
             },
 
             oqApplyModelPolicy() {
+                if (this._oqEngramModelPath !== this.oqSelectedModelPath) {
+                    this._oqEngramModelPath = this.oqSelectedModelPath;
+                    this.oqEngramPrecision = 'auto';
+                }
                 if (this.oqSelectedModelType() !== 'deepseek_v41') return;
                 if (!this.oqAvailableLevels().includes(this.oqLevel)) this.oqLevel = 4;
                 this.oqDtype = 'bfloat16';
@@ -8505,22 +8505,22 @@
             oqRefreshEstimate() {
                 // Debounce: wait 300ms after last change
                 if (this._oqEstimateTimer) clearTimeout(this._oqEstimateTimer);
-                if (!this.oqSelectedModelPath) {
-                    this.oqEstimate = null;
-                    return;
-                }
+                const revision = (this._oqEstimateRevision || 0) + 1;
+                this._oqEstimateRevision = revision;
+                this.oqEstimate = null;
+                if (!this.oqSelectedModelPath) return;
+                const params = new URLSearchParams({
+                    model_path: this.oqSelectedModelPath,
+                    oq_level: this.oqLevel,
+                    preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
+                    engram_precision: this.oqSelectedEngramPrecision(),
+                });
                 this._oqEstimateTimer = setTimeout(async () => {
                     try {
-                        const params = new URLSearchParams({
-                            model_path: this.oqSelectedModelPath,
-                            oq_level: this.oqLevel,
-                            preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
-                            preserve_ngram_table: this.oqPreservesNgram() ? 'true' : 'false',
-                            engram_precision: this.oqEngramPrecision,
-                        });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
                         if (resp.ok) {
-                            this.oqEstimate = await resp.json();
+                            const estimate = await resp.json();
+                            if (this._oqEstimateRevision === revision) this.oqEstimate = estimate;
                         }
                     } catch (e) {
                         console.error('Failed to estimate oQ:', e);

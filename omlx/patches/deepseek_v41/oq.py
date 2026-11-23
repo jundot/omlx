@@ -495,9 +495,9 @@ def quantize(
     from ...oq import (
         _OQ_BPW_TARGETS,
         _emit_progress,
+        _engram_output_bits,
         _get_predicate_bits,
         _lookup_imatrix_importance,
-        _offload_table_bits,
         _validate_v41_oq_settings,
     )
 
@@ -509,12 +509,9 @@ def quantize(
         )
     # Engram sits outside the bit budget and calibration reads the source
     # checkpoint, so keeping it at source precision changes no other tensor.
-    if engram_mode in ("preserve", "preserve_fp8"):
-        engram_bits = None
-    elif engram_mode == "affine8":
-        engram_bits = 8
-    else:
-        engram_bits = _offload_table_bits(oq_level)
+    if preserve_ngram_table:
+        engram_mode = "preserve"
+    engram_bits = _engram_output_bits(engram_mode, oq_level)
     if oq_level == 4 and (sensitivity_model_path or sensitivity_map_override):
         raise ValueError(
             "V4.1 original-precision oQ4 does not use sensitivity overrides"

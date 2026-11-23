@@ -1139,114 +1139,266 @@ def _offload_table_bits(oq_level) -> int:
 _ENGRAM_PRECISION_CHOICES = ("auto", "8", "16")
 
 
+def _is_v41_engram_config(config):
+    return str(config.get("model_type", "")).replace("-", "_").lower() == "deepseek_v41"
+
+
 def _is_offload_table_tensor(tensor_name: str, config: dict) -> bool:
     """True for Engram / N-gram PLE tables kept outside the resident bit budget."""
     return (
         _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
-        or (
-            str(config.get("model_type", "")).replace("-", "_").lower()
-            == "deepseek_v41"
-            and ".engram.embed" in tensor_name
-        )
+        or (_is_v41_engram_config(config) and ".engram.embed." in tensor_name)
         or _is_hy_v4_engram_table(tensor_name, config)
     )
 
 
-def detect_engram_table_precision(model_path, config=None) -> dict:
-    """Inspect safetensors headers for the storage precision of offload tables.
+class _StoredEngramTensor(NamedTuple):
+    path: Path
+    dtype: str
+    shape: tuple[int, ...]
+    offset: int
+    size: int
 
-    Only headers are read, so F8_E8M0 scale tensors that ``mx.load`` rejects
-    are still classified. The checkpoint name is deliberately ignored: Tencent
-    Hy4 Flash FP8 keeps BF16 Engram tables, while DeepSeek V4.1 official keeps
-    FP8 tables, and the NVIDIA conversion stores MXFP4.
-    """
+
+def _qwen_ple_scale_key(weight_key):
+    return weight_key.split(".ngram_embedding.", 1)[0] + ".ngram_embedding.weight_scale"
+
+
+def _engram_source_tensors(source, config):
     from .patches.deepseek_v41.residency import header_with_offset
 
+    def header(path):
+        stat = path.stat()
+        entries, offset = header_with_offset(str(path), stat.st_size, stat.st_mtime_ns)
+        return entries, offset, stat.st_size
+
+    index = source / "model.safetensors.index.json"
+    if index.is_file():
+        mapping = json.loads(index.read_text())["weight_map"]
+    else:
+        mapping = {
+            key: file.name
+            for file in _source_weight_files(source)
+            for key in header(file)[0]
+        }
+
+    weights = [
+        key
+        for key in mapping
+        if key.endswith(".weight") and _is_offload_table_tensor(key, config)
+    ]
+    companions = set()
+    for key in weights:
+        base = key.removesuffix(".weight")
+        companions.update(
+            base + suffix
+            for suffix in (".scale", ".scales", ".biases", ".weight_scale_inv")
+        )
+        if ".ngram_embedding." in key:
+            companions.add(_qwen_ple_scale_key(key))
+    tensors = {}
+    headers = {}
+    for key in sorted(set(weights) | (companions & mapping.keys())):
+        file = source / mapping[key]
+        if file not in headers:
+            headers[file] = header(file)
+        entries, offset, file_size = headers[file]
+        entry = entries[key]
+        start, end = entry["data_offsets"]
+        if not 0 <= start < end <= file_size - offset:
+            raise ValueError(f"Invalid Engram tensor offsets: {key}")
+        tensors[key] = _StoredEngramTensor(
+            file, entry["dtype"], tuple(entry["shape"]), offset + start, end - start
+        )
+    return weights, tensors
+
+
+def detect_engram_table_precision(model_path, config=None) -> dict:
+    """Inspect the indexed tables and their scale layouts without loading weights."""
     source = Path(model_path)
     if config is None:
-        with open(source / "config.json") as f:
-            config = json.load(f)
-    result = {
-        "source_precision": "none",
-        "available": ["auto"],
-        "weight_keys": [],
-        "scale_keys": [],
-    }
-    files = sorted(source.glob("*.safetensors")) + sorted(
-        (source / "engram").glob("*.safetensors")
-    )
-    headers = {}
-    for file in files:
-        st = file.stat()
-        headers[file] = header_with_offset(str(file), st.st_size, st.st_mtime_ns)[0]
-    weight_keys, scale_keys, dtypes = [], [], []
-    for header in headers.values():
-        for key, info in header.items():
-            if key == "__metadata__" or not _is_offload_table_tensor(key, config):
-                continue
-            if key.endswith((".scale", ".scales", ".biases", "_scale")):
-                scale_keys.append(key)
-            else:
-                weight_keys.append(key)
-                dtypes.append(str(info.get("dtype", "")))
-    if not weight_keys:
+        config = json.loads((source / "config.json").read_text())
+    model_type = config.get("model_type")
+    qwen = _is_qwen4_exp_config(config)
+    v41 = _is_v41_engram_config(config)
+    hy4 = model_type == "hy_v4_flash"
+    result = {"source_precision": "none", "available": ["auto"], "tensors": {}}
+    if not (qwen or v41 or hy4):
         return result
-    result["weight_keys"] = sorted(weight_keys)
-    result["scale_keys"] = sorted(scale_keys)
-    dtype = dtypes[0]
-    if dtype == "BF16":
-        precision = "bf16"
-    elif dtype == "F16":
-        precision = "fp16"
-    elif dtype == "F32":
-        precision = "fp32"
-    elif dtype.startswith("F8_E4M3"):
-        precision = "fp8"
-    elif dtype in ("U8", "I8"):
-        precision = "mxfp4"
-    elif dtype == "U32":
-        precision = "affine"
-    else:
-        precision = "unknown"
-    result["source_precision"] = precision
-    if precision in ("bf16", "fp16", "fp32"):
-        result["available"] = ["auto", "8", "16"]
-    elif precision == "fp8":
-        result["available"] = ["auto", "8"]
+
+    weights, tensors = _engram_source_tensors(source, config)
+    if not weights:
+        return result
+    precisions = set()
+    modes = {"8": set(), "16": set()}
+    float_types = {"BF16": "bf16", "F16": "fp16", "F32": "fp32"}
+    for key in weights:
+        tensor = tensors[key]
+        base = key.removesuffix(".weight")
+        scale = tensors.get(base + ".scale") or tensors.get(base + ".scales")
+        bias = tensors.get(base + ".biases")
+        inv_scale = tensors.get(base + ".weight_scale_inv")
+        shared = tensors.get(_qwen_ple_scale_key(key)) if qwen else None
+        dtype, shape = tensor.dtype, tensor.shape
+        precision = float_types.get(dtype, "unknown")
+        mode8 = mode16 = None
+        if len(shape) == 2 and all(shape):
+            rows, width = shape
+            valid_shared = (
+                shared is not None
+                and shared.dtype in float_types
+                and shared.shape == (1,)
+            )
+            if (
+                dtype in float_types
+                and not (scale or bias or inv_scale)
+                and (shared is None or valid_shared)
+            ):
+                if width % 32 == 0:
+                    mode8 = "affine8"
+                if (
+                    dtype in ("BF16", "F16")
+                    and (not hy4 or dtype == "BF16")
+                    and (not v41 or width % 32 == 0)
+                ):
+                    mode16 = "preserve"
+            elif dtype.startswith("F8_E4M3"):
+                precision = "fp8"
+                if (
+                    qwen
+                    and dtype == "F8_E4M3"
+                    and valid_shared
+                    and not (scale or bias or inv_scale)
+                ):
+                    mode8 = "preserve_fp8"
+                if (
+                    v41
+                    and not (bias or inv_scale)
+                    and scale
+                    and scale.dtype.startswith("F8_E8M0")
+                    and width % 32 == 0
+                    and scale.shape == (rows, width // 32)
+                ):
+                    mode8 = "preserve_fp8"
+            elif dtype == "U32" and scale and bias:
+                precision = "affine"
+            elif (
+                dtype in ("U8", "I8")
+                and scale
+                and not bias
+                and scale.dtype.startswith("F8_E8M0")
+                and width % 16 == 0
+                and scale.shape == (rows, width // 16)
+            ):
+                precision = "mxfp4"
+        precisions.add(precision)
+        modes["8"].add(mode8)
+        modes["16"].add(mode16)
+    result["source_precision"] = precisions.pop() if len(precisions) == 1 else "mixed"
+    result["modes"] = {
+        choice: next(iter(options))
+        for choice, options in modes.items()
+        if len(options) == 1 and None not in options
+    }
+    result["available"].extend(result["modes"])
+    result["tensors"] = tensors
     return result
 
 
 def resolve_engram_precision(
     model_path, config, requested="auto", preserve_ngram_table=False
 ) -> dict:
-    """Resolve an Engram precision request into a concrete export plan."""
+    """Resolve the requested choice into a table recipe and any raw copies."""
     if requested not in _ENGRAM_PRECISION_CHOICES:
         raise ValueError(
             f"Invalid Engram precision {requested!r}. "
             f"Must be one of {_ENGRAM_PRECISION_CHOICES}"
         )
-    detected = detect_engram_table_precision(model_path, config)
-    precision = detected["source_precision"]
+    if preserve_ngram_table and _is_v41_engram_config(config):
+        return {"mode": "preserve", "tensors": {}}
     if requested == "auto":
-        mode = "preserve" if preserve_ngram_table else "auto"
-    elif requested == "16":
-        if precision not in ("bf16", "fp16", "fp32"):
-            raise ValueError(
-                f"16-bit Engram preservation needs a float table, but the "
-                f"source stores {precision!r}"
-            )
-        mode = "preserve"
-    else:  # requested == "8"
-        if precision == "fp8":
-            mode = "preserve_fp8"
-        elif precision in ("bf16", "fp16", "fp32"):
-            mode = "affine8"
-        else:
-            raise ValueError(
-                f"8-bit Engram export is not supported for source precision "
-                f"{precision!r}"
-            )
-    return {**detected, "requested": requested, "mode": mode}
+        mode = (
+            "preserve"
+            if preserve_ngram_table and _is_qwen4_exp_config(config)
+            else "auto"
+        )
+        return {"mode": mode, "tensors": {}}
+
+    detected = detect_engram_table_precision(model_path, config)
+    mode = detected.get("modes", {}).get(requested)
+    if mode is None:
+        raise ValueError(
+            f"{requested}-bit Engram export is not supported for the "
+            f"{detected['source_precision']} table layout in this checkpoint"
+        )
+    tensors = detected["tensors"] if mode in ("preserve", "preserve_fp8") else {}
+    return {"mode": mode, "tensors": tensors}
+
+
+def _engram_output_bits(mode, oq_level):
+    if mode in ("preserve", "preserve_fp8"):
+        return None
+    return 8 if mode == "affine8" else _offload_table_bits(oq_level)
+
+
+def _engram_copy_targets(tensors, sanitize_plan=None):
+    """Carry stored bytes under the output keys chosen by the sanitizer."""
+    if not tensors or sanitize_plan is None:
+        return tensors
+    copies = {}
+    matched = set()
+    for name, spec in sanitize_plan.items():
+        sources = spec["sources"]
+        if not any(key in tensors for key in sources):
+            continue
+        if (
+            len(sources) != 1
+            or spec["transform"] != "passthrough"
+            or spec.get("recipe")
+        ):
+            raise ValueError(f"Cannot preserve transformed Engram tensor {name}")
+        key = sources[0]
+        if key in matched:
+            raise ValueError(f"Cannot preserve duplicated Engram tensor {key}")
+        copies[name] = tensors[key]
+        matched.add(key)
+    if matched != tensors.keys():
+        missing = sorted(tensors.keys() - matched)
+        raise ValueError(
+            f"Missing Engram tensors in streaming sanitize plan: {missing}"
+        )
+    return copies
+
+
+def _write_engram_source_shard(destination, tensors):
+    """Copy safetensors slices byte for byte without materializing MLX arrays."""
+    header = {"__metadata__": {"format": "mlx"}}
+    offset = 0
+    for key, tensor in tensors.items():
+        header[key] = {
+            "dtype": tensor.dtype,
+            "shape": tensor.shape,
+            "data_offsets": [offset, offset + tensor.size],
+        }
+        offset += tensor.size
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    with tempfile.TemporaryDirectory(dir=destination.parent) as temporary:
+        partial = Path(temporary) / destination.name
+        with partial.open("wb") as out:
+            out.write(_struct.pack("<Q", len(encoded)))
+            out.write(encoded)
+            for tensor in tensors.values():
+                with tensor.path.open("rb") as source:
+                    source.seek(tensor.offset)
+                    remaining = tensor.size
+                    while remaining:
+                        chunk = source.read(min(remaining, 8 << 20))
+                        if not chunk:
+                            raise ValueError(f"Truncated Engram source: {tensor.path}")
+                        out.write(chunk)
+                        remaining -= len(chunk)
+        partial.rename(destination)
 
 
 def _budgeted_shapes(named_shapes: dict[str, tuple], config: dict) -> dict[str, tuple]:
@@ -4276,12 +4428,10 @@ def estimate_bpw_and_size(
         mapping = json.loads((source / "model.safetensors.index.json").read_text())[
             "weight_map"
         ]
-        plan = resolve_engram_precision(source, config, engram_precision, preserve_ngram_table)
-        engram_bits = (
-            None
-            if plan["mode"] in ("preserve", "preserve_fp8")
-            else (8 if plan["mode"] == "affine8" else _offload_table_bits(oq_level))
+        plan = resolve_engram_precision(
+            source, config, engram_precision, preserve_ngram_table
         )
+        engram_bits = _engram_output_bits(plan["mode"], oq_level)
         budget = source_budget(
             source,
             config,
@@ -4387,6 +4537,9 @@ def estimate_bpw_and_size(
         source, config, engram_precision, preserve_ngram_table
     )
     engram_mode = engram_plan["mode"]
+    engram_copies = _engram_copy_targets(
+        engram_plan["tensors"], plan_view._plan if plan_view is not None else None
+    )
 
     # Pre-quantized tensors that pass through in source precision (mirrors
     # the decision in quantize_oq_streaming, evaluated pre-boost).
@@ -4445,13 +4598,22 @@ def estimate_bpw_and_size(
         if _should_skip_tensor(name, preserve_mtp=preserve_mtp):
             continue
 
+        if name in engram_copies:
+            tensor_bytes = engram_copies[name].size
+            total_params += n_elements
+            total_weighted_bits += tensor_bytes * 8
+            total_output_bytes += tensor_bytes
+            continue
+
         if not _should_quantize_tensor(name, shape):
             total_params += n_elements
             total_weighted_bits += n_elements * 16
             total_output_bytes += n_elements * 2
             continue
 
-        bits, gs, _mode = _get_predicate_bits(name, config, oq_level, group_size, engram_mode)
+        bits, gs, _mode = _get_predicate_bits(
+            name, config, oq_level, group_size, engram_mode
+        )
         if bits is None:
             total_params += n_elements
             total_weighted_bits += n_elements * 16
@@ -7513,15 +7675,10 @@ def quantize_oq_streaming(
             Inkling 2 never builds a proxy: its packed source is calibrated
             resident and needs that much live memory, and the DSpark draft
             is copied with the config's mtp_config whatever preserve_mtp says.
-        preserve_ngram_table: Write the qwen4_exp N-gram PLE table
-            (``ple_embedding.ngram_embedding`` shard tensors) unquantized, in
-            the checkpoint dtype, instead of at the selected oQ level. The
-            table can then be quantized separately (its measured
-            sensitivity is far below the core's), and a passthrough leaves
-            no per-layer quantization entry so loaders treat the shards as
-            plain weights. DeepSeek V4.1 keeps its Engram tables in the
-            official FP8 storage instead of 4-bit affine. No effect on other
-            model types.
+        preserve_ngram_table: Legacy option. DeepSeek V4.1 copies source
+            Engram tables as stored, overriding engram_precision. The legacy
+            Qwen4-Exp option skips affine quantization; use engram_precision
+            to keep the actual on-disk bytes.
         hadamard: Build oQh: the decoder linears become rotated uniform codes
             with one scale per row (see omlx/oqh/format.py), quantized against
             their input Gram. The bytes the affine plan gives them buy the
@@ -8081,6 +8238,7 @@ def quantize_oq_streaming(
     # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
     # keep mtp.* in the output and apply the +1 RMSNorm shift to MTP
     # norms. No stash/merge wrapper needed — the patch covers both paths.
+    engram_copies = engram_plan["tensors"]
     if sanitize_fn is not None:
         try:
             plan = _discover_sanitize_plan(sanitize_fn, all_weights)
@@ -8090,6 +8248,10 @@ def quantize_oq_streaming(
                 f"{len(all_weights)} output tensors"
             )
         except Exception as e:
+            if engram_copies:
+                raise RuntimeError(
+                    "Cannot preserve Engram without a streaming sanitize plan"
+                ) from e
             if inkling2_layout.is_inkling2(config):
                 raise RuntimeError(
                     f"oQ{oq_level:g}: Inkling 2 sanitize-plan discovery failed "
@@ -8118,6 +8280,11 @@ def quantize_oq_streaming(
                 )
             except Exception as e2:
                 logger.warning(f"Sanitize failed ({e2}), using original names")
+
+    engram_copies = _engram_copy_targets(
+        engram_copies,
+        all_weights._plan if isinstance(all_weights, _DiscoveredPlan) else None,
+    )
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
     config["_oq_sensitivity_map"] = {str(k): v for k, v in sensitivity_map.items()}
@@ -8198,7 +8365,7 @@ def quantize_oq_streaming(
 
     cb("loading", 20.0, "Starting tensor quantization")
 
-    tensor_names = list(all_weights.keys())
+    tensor_names = [key for key in all_weights if key not in engram_copies]
     out_shard_data = {}
     out_shard_idx = 0
     weight_map = {}
@@ -8327,11 +8494,17 @@ def quantize_oq_streaming(
                     # Cast to target dtype before quantize: scales/biases inherit
                     # the input dtype, which drives inference speed on Apple
                     # Silicon (M1/M2 prefer float16, M3/M4 handle both).
+                    storage_dtype = target_dtype
+                    if engram_mode == "affine8" and _is_hy_v4_engram_table(
+                        tensor_name, config
+                    ):
+                        # Hy4's SSD loader requires BF16 scales and biases.
+                        storage_dtype = mx.bfloat16
                     if (
                         mx.issubdtype(w_mx.dtype, mx.floating)
-                        and w_mx.dtype != target_dtype
+                        and w_mx.dtype != storage_dtype
                     ):
-                        w_mx = w_mx.astype(target_dtype)
+                        w_mx = w_mx.astype(storage_dtype)
                     importance = None
                     if imatrix_data is not None and qmode == "affine":
                         importance = _lookup_imatrix_importance(
@@ -8453,7 +8626,7 @@ def quantize_oq_streaming(
         upstream_writer.finish()
     if out_shard_data:
         total_shards = out_shard_idx + 1
-        if total_shards == 1:
+        if total_shards == 1 and not engram_copies:
             shard_name = "model.safetensors"
         else:
             shard_name = f"model-{out_shard_idx + 1:05d}-of-PLACEHOLDER.safetensors"
@@ -8463,6 +8636,16 @@ def quantize_oq_streaming(
             weight_map[k] = shard_name
         out_shard_idx += 1
         del out_shard_data
+
+    # Group copies by source shard to keep the original table granularity.
+    source_shards = {}
+    for key, tensor in engram_copies.items():
+        source_shards.setdefault(tensor.path, {})[key] = tensor
+    for tensors in source_shards.values():
+        shard_name = f"model-{out_shard_idx + 1:05d}-of-PLACEHOLDER.safetensors"
+        _write_engram_source_shard(output / shard_name, tensors)
+        weight_map.update(dict.fromkeys(tensors, shard_name))
+        out_shard_idx += 1
 
     oqh_report = None
     if hadamard:
@@ -8489,7 +8672,7 @@ def quantize_oq_streaming(
         out_shard_idx = oqh_report.pop("shards")
 
     total_shards = out_shard_idx
-    if total_shards > 1:
+    if total_shards > 1 or engram_copies:
         for i in range(total_shards):
             old_name = f"model-{i + 1:05d}-of-PLACEHOLDER.safetensors"
             new_name = f"model-{i + 1:05d}-of-{total_shards:05d}.safetensors"
@@ -8523,7 +8706,7 @@ def quantize_oq_streaming(
     has_decision_head = any(
         (source / name).is_file() for name in DECISION_SIDECAR_WEIGHTS
     )
-    if total_shards > 1 or has_decision_head:
+    if total_shards > 1 or engram_copies or engram_mode == "affine8" or has_decision_head:
         total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
         index = {
             "metadata": {"total_size": total_size},

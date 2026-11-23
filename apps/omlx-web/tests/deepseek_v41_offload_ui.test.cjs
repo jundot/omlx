@@ -92,28 +92,78 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
 }
 
 (async () => {
-    // A separate context keeps this fetch stub away from the modal test above.
-    const oqContext = {localStorage: {getItem: () => null}, window: {t: k => k}, console};
+    let estimateCallback;
+    let firstEstimate;
+    const requests = [];
+    const oqContext = {
+        localStorage: {getItem: () => null},
+        window: {t: k => k},
+        console,
+        URLSearchParams,
+        setTimeout: fn => { estimateCallback = fn; return 1; },
+        clearTimeout: () => {},
+        fetch: async (url, init) => {
+            if (init) {
+                requests.push(JSON.parse(init.body).engram_precision);
+                return {ok: false, json: async () => ({detail: 'stop'})};
+            }
+            const precision = new URLSearchParams(url.split('?')[1]).get('engram_precision');
+            if (precision === 'auto') {
+                return new Promise(resolve => { firstEstimate = resolve; });
+            }
+            return {ok: true, json: async () => ({output_size_bytes: 16})};
+        },
+    };
     vm.createContext(oqContext);
     vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js'), 'utf8'), oqContext);
     const app = oqContext.dashboard();
     app.oqModels = [
-        {path: 'v41', model_type: 'deepseek_v41'},
-        {path: 'llama', model_type: 'llama'},
+        {path: 'v41', model_type: 'deepseek_v41', engram_precision: {
+            source_precision: 'fp8', available: ['auto', '8'],
+        }},
+        {path: 'hy4', model_type: 'hy_v4_flash', engram_precision: {
+            source_precision: 'bf16', available: ['auto', '8', '16'],
+        }},
+        {path: 'hy4-vl', model_type: 'hy_v4_vl'},
+        {path: 'nvfp4', model_type: 'deepseek_v41', engram_precision: {
+            source_precision: 'mxfp4', available: ['auto'],
+        }},
     ];
-    const payloads = [];
-    oqContext.fetch = async (_url, init) => {
-        payloads.push(JSON.parse(init.body));
-        return {ok: false, json: async () => ({detail: 'stop'})};
-    };
-    app.oqPreserveNgram = true;
-    for (const model of ['v41', 'llama']) {
-        app.oqSelectedModelPath = model;
-        await app.startOQQuantization();
-    }
-    assert.deepEqual(payloads.map(p => p.preserve_ngram_table), [true, false]);
     const html = fs.readFileSync(path.join(root,
         'omlx_web/templates/dashboard/_models.html'), 'utf8');
-    assert.match(html.match(/x-effect="([^"\n]*oqApplyModelPolicy[^"\n]*)"/)[1], /oqPreserveNgram/);
-    console.log('PASS: Engram toggle reaches the oQ start payload for DeepSeek V4.1 only');
+    const effect = html.match(/x-effect="([^"\n]*oqApplyModelPolicy[^"\n]*)"/)[1];
+    assert.match(effect, /oqEngramPrecision/);
+
+    app.oqSelectedModelPath = 'hy4';
+    app.oqApplyModelPolicy();
+    assert.deepEqual(Array.from(app.oqEngramPrecisionChoices(), c => c.value), ['auto', '8', '16']);
+    assert.match(app.oqEngramPrecisionChoices()[1].label, /MLX affine/);
+    assert.match(app.oqEngramPrecisionChoices()[2].label, /BF16/);
+
+    app.oqRefreshEstimate();
+    const stale = estimateCallback();
+    app.oqEngramPrecision = '16';
+    vm.runInNewContext('with (app) { ' + effect + ' }', {app});
+    await estimateCallback();
+    firstEstimate({ok: true, json: async () => ({output_size_bytes: 4})});
+    await stale;
+    assert.equal(app.oqEstimate.output_size_bytes, 16);
+    await app.startOQQuantization();
+
+    app.oqSelectedModelPath = 'v41';
+    app.oqApplyModelPolicy();
+    assert.equal(app.oqEngramPrecision, 'auto');
+    assert.deepEqual(Array.from(app.oqEngramPrecisionChoices(), c => c.value), ['auto', '8']);
+    assert.match(app.oqEngramPrecisionChoices()[1].label, /FP8/);
+    app.oqEngramPrecision = '8';
+    await app.startOQQuantization();
+    app.oqEngramPrecision = '16';
+    await app.startOQQuantization();
+
+    for (const model of ['hy4-vl', 'nvfp4']) {
+        app.oqSelectedModelPath = model;
+        assert.deepEqual(Array.from(app.oqEngramPrecisionChoices(), c => c.value), ['auto']);
+        await app.startOQQuantization();
+    }
+    assert.deepEqual(requests, ['16', '8', 'auto', 'auto', 'auto']);
 })().catch(error => {console.error(error); process.exitCode = 1});

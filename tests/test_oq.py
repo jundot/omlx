@@ -24,6 +24,7 @@ except ImportError:
     HAS_MLX = False
 
 from omlx.oq import (
+    _ENGRAM_PRECISION_CHOICES,
     _LEVEL_BITS,
     _LEVEL_EXPERT_DOWN_BOOST,
     _MAX_MODEL_RAM_FRACTION,
@@ -45,8 +46,8 @@ from omlx.oq import (
     _checkpoint_storage_bytes,
     _collect_imatrix_from_model,
     _commit_layer_forward_aux,
-    _configure_minimax_shared_expert_layout,
     _config_expects_moe_expert_counts,
+    _configure_minimax_shared_expert_layout,
     _discover_sanitize_plan,
     _DiscoveredPlan,
     _extract_layer_index,
@@ -55,9 +56,6 @@ from omlx.oq import (
     _forward_layer,
     _forward_layer_result,
     _get_predicate_bits,
-    _ENGRAM_PRECISION_CHOICES,
-    detect_engram_table_precision,
-    resolve_engram_precision,
     _imatrix_expert_coverage_stats,
     _imatrix_expert_coverage_sufficient,
     _imatrix_requires_expert_counts,
@@ -65,36 +63,38 @@ from omlx.oq import (
     _is_audio_tensor,
     _is_moe_router,
     _LazyTensorIndex,
-    _mandatory_head_bits,
     _load_builtin_calibration,
+    _mandatory_head_bits,
     _measure_sensitivity,
     _measure_sensitivity_from_model,
     _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
     _normalize_sensitivity_map_override,
     _oqe_calibration_batch_plan,
+    _OQGramCollector,
+    _OQRefineWriter,
     _perturb_bits_for,
     _prepare_layer_inputs,
     _progress_total_bytes,
     _quantize_chunked,
+    _refine_affine_codes,
     _sensitivity_lm_config_override,
     _should_quantize_tensor,
-    _source_imatrix_signature,
+    _shrunk_gram,
     _source_has_nextn_tensors,
+    _source_imatrix_signature,
     _source_weight_files,
     _TrackedTensor,
-    _validate_oq_dtype_for_model,
     _uses_minimax_mxfp8_scale_inv_source,
-    _OQGramCollector,
-    _OQRefineWriter,
-    _refine_affine_codes,
-    _shrunk_gram,
+    _validate_oq_dtype_for_model,
     _weighted_lsq_refit,
     _weighted_lsq_refit_metal,
+    detect_engram_table_precision,
     estimate_bpw_and_size,
     estimate_memory,
     make_predicate,
     quantize_oq_streaming,
+    resolve_engram_precision,
     resolve_output_name,
     universal_quant_predicate,
     validate_quantizable,
@@ -1354,20 +1354,39 @@ class TestEngramPrecisionOption:
     """Static tests for the Engram precision option (no model loading)."""
 
     @staticmethod
-    def _write_header(tmp_path, model_type, table_key, dtype):
+    def _write_tensors(path, tensors):
+        header = {}
+        payload = b""
+        for key, (dtype, shape, data) in tensors.items():
+            start = len(payload)
+            payload += data
+            header[key] = {
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [start, len(payload)],
+            }
+        encoded = json.dumps(header).encode()
+        encoded += b" " * (-len(encoded) % 8)
+        path.write_bytes(len(encoded).to_bytes(8, "little") + encoded + payload)
+
+    @classmethod
+    def _write_header(cls, tmp_path, model_type, table_key, dtype):
         config = {"model_type": model_type}
         (tmp_path / "config.json").write_text(json.dumps(config))
-        header = {
-            table_key: {
-                "dtype": dtype,
-                "shape": [8, 96],
-                "data_offsets": [0, 8 * 96 * 2],
-            }
-        }
-        payload = json.dumps(header).encode("utf-8")
-        (tmp_path / "model.safetensors").write_bytes(
-            len(payload).to_bytes(8, "little") + payload + b"\x00" * (8 * 96 * 2)
-        )
+        shape = (8, 96)
+        itemsize = 2 if dtype == "BF16" else 1
+        tensors = {table_key: (dtype, shape, bytes(8 * 96 * itemsize))}
+        if dtype == "F8_E4M3":
+            if model_type == "qwen4_exp":
+                scale_key = table_key.split(".shard_")[0] + ".weight_scale"
+                tensors[scale_key] = ("BF16", (1,), b"\x80?")
+            else:
+                scale_key = table_key.removesuffix(".weight") + ".scale"
+                tensors[scale_key] = ("F8_E8M0", (8, 3), bytes([127]) * 24)
+        elif dtype == "U8":
+            scale_key = table_key.removesuffix(".weight") + ".scale"
+            tensors[scale_key] = ("F8_E8M0", (8, 6), bytes([127]) * 48)
+        cls._write_tensors(tmp_path / "model.safetensors", tensors)
         return config
 
     @pytest.mark.parametrize(
@@ -1375,7 +1394,7 @@ class TestEngramPrecisionOption:
         [
             (
                 "hy_v4_flash",
-                "model.layers.0.engram_layer.multi_head_embedding.embedding",
+                "model.layers.0.engram_layer.multi_head_embedding.embedding.weight",
                 "BF16",
                 "bf16",
             ),
@@ -1387,7 +1406,7 @@ class TestEngramPrecisionOption:
             ),
             (
                 "qwen4_exp",
-                "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0",
+                "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
                 "F8_E4M3",
                 "fp8",
             ),
@@ -1399,7 +1418,7 @@ class TestEngramPrecisionOption:
         config = self._write_header(tmp_path, model_type, table_key, dtype)
         detected = detect_engram_table_precision(tmp_path, config)
         assert detected["source_precision"] == expected
-        assert table_key in detected["weight_keys"]
+        assert table_key in detected["tensors"]
 
     @pytest.mark.parametrize(
         "dtype, requested, expected_mode",
@@ -1417,13 +1436,15 @@ class TestEngramPrecisionOption:
         )
         plan = resolve_engram_precision(tmp_path, config, requested)
         assert plan["mode"] == expected_mode
-        assert plan["requested"] == requested
+        assert bool(plan["tensors"]) == (
+            requested == "16" or expected_mode == "preserve_fp8"
+        )
 
     def test_resolve_rejects_16bit_on_fp8(self, tmp_path):
         config = self._write_header(
             tmp_path, "deepseek_v41", "model.layers.0.engram.embed.0.weight", "F8_E4M3"
         )
-        with pytest.raises(ValueError, match="float table"):
+        with pytest.raises(ValueError, match="fp8 table layout"):
             resolve_engram_precision(tmp_path, config, "16")
 
     def test_resolve_rejects_8bit_on_mxfp4(self, tmp_path):
@@ -1446,6 +1467,210 @@ class TestEngramPrecisionOption:
         )
         plan = resolve_engram_precision(tmp_path, config, "auto", True)
         assert plan["mode"] == "preserve"
+
+    def test_source_choices_check_all_indexed_shards_and_scale_layout(self, tmp_path):
+        prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+        first, second = (f"{prefix}.shard_{index}.weight" for index in range(2))
+        shared = f"{prefix}.weight_scale"
+        config = {"model_type": "qwen4_exp"}
+        self._write_tensors(
+            tmp_path / "a.safetensors",
+            {
+                first: ("F8_E4M3", (2, 32), bytes(64)),
+                shared: ("BF16", (1,), bytes((128, 63))),
+            },
+        )
+        self._write_tensors(
+            tmp_path / "b.safetensors", {second: ("BF16", (2, 32), bytes(128))}
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        first: "a.safetensors",
+                        shared: "a.safetensors",
+                        second: "b.safetensors",
+                    }
+                }
+            )
+        )
+        table = detect_engram_table_precision(tmp_path, config)
+        assert table["source_precision"] == "mixed"
+        assert table["available"] == ["auto"]
+
+        # E4M3 alone is insufficient: its shared scale must be indexed.
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {first: "a.safetensors"}})
+        )
+        table = detect_engram_table_precision(tmp_path, config)
+        assert table["source_precision"] == "fp8"
+        assert table["available"] == ["auto"]
+
+    def test_hy4_fp16_source_cannot_be_preserved_for_ssd(self, tmp_path):
+        key = "model.layers.0.engram_layer.multi_head_embedding.embedding.weight"
+        self._write_tensors(
+            tmp_path / "model.safetensors", {key: ("F16", (2, 96), bytes(384))}
+        )
+        assert detect_engram_table_precision(tmp_path, {"model_type": "hy_v4_flash"})[
+            "available"
+        ] == ["auto", "8"]
+        assert detect_engram_table_precision(tmp_path, {"model_type": "hy_v4_vl"})[
+            "available"
+        ] == ["auto"]
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="Requires MLX on macOS")
+    @pytest.mark.parametrize(
+        "family,choice",
+        [("qwen4_exp", "8"), ("hy_v4_flash", "16"), ("hy_v4_flash", "8")],
+    )
+    def test_streaming_engram_storage_with_mock_quantizer(
+        self, tmp_path, monkeypatch, family, choice
+    ):
+        import mlx.core as mx
+
+        from omlx import oq
+        from omlx.patches.deepseek_v41.residency import header_with_offset
+        from omlx.patches.hy_v4.engram_ssd import plan_engram_ssd
+
+        source = tmp_path / "source"
+        source.mkdir()
+        output = tmp_path / "output"
+        config = {"model_type": family, "num_hidden_layers": 2}
+        tensors = {}
+        renamed = {}
+        if family == "qwen4_exp":
+            config["text_config"] = {"ple_layer_ids": [2], "split_ngram_parts": 1}
+            prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+            key = f"{prefix}.shard_0.weight"
+            scale = f"{prefix}.weight_scale"
+            tensors[key] = ("F8_E4M3", (2, 32), bytes(range(64)))
+            tensors[scale] = ("BF16", (1,), bytes((0, 64)))
+            renamed = {
+                key: key.replace(
+                    "model.language_model.", "language_model.model."
+                ).replace("shard_0", "shards.0"),
+                scale: scale.replace("model.language_model.", "language_model.model."),
+            }
+        else:
+            config["text_config"] = {"engram_layer_ids": [1]}
+            key = "model.layers.0.engram_layer.multi_head_embedding.embedding.weight"
+            tensors[key] = ("BF16", (2, 96), bytes((0, 63)) * 192)
+        self._write_tensors(source / "model.safetensors", tensors)
+        (source / "config.json").write_text(json.dumps(config))
+        monkeypatch.setattr(oq, "_qwen4_exp_apply_compat_patch", lambda: None)
+        monkeypatch.setattr(
+            oq,
+            "_build_model_sanitizer",
+            lambda *a, **kw: (
+                lambda weights: {
+                    renamed.get(name, name): value for name, value in weights.items()
+                }
+            ),
+        )
+        monkeypatch.setattr(oq, "_build_non_quantizable_set", lambda config: set())
+        monkeypatch.setattr(
+            oq, "_calibration_memory_budget", lambda *a, **kw: {"requires_proxy": False}
+        )
+
+        def no_model(*args, **kwargs):
+            pytest.fail("Model loading or calibration is outside this test")
+
+        monkeypatch.setattr(oq, "_measure_sensitivity", no_model)
+        monkeypatch.setattr(mx, "quantize", no_model)
+
+        calls = []
+
+        def fake_quantize(values, group, bits, mode, **kwargs):
+            calls.append((values.dtype, group, bits, mode))
+            return (
+                mx.zeros((2, 24), dtype=mx.uint32),
+                mx.zeros((2, 3), dtype=mx.bfloat16),
+                mx.zeros((2, 3), dtype=mx.bfloat16),
+            )
+
+        monkeypatch.setattr(oq, "_quantize_chunked", fake_quantize)
+
+        estimate = estimate_bpw_and_size(str(source), 4, engram_precision=choice)
+        quantize_oq_streaming(
+            str(source),
+            str(output),
+            4,
+            dtype="float16",
+            engram_precision=choice,
+            sensitivity_map_override={0: 1.0},
+        )
+        index = json.loads((output / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
+        if family == "hy_v4_flash":
+            table = plan_engram_ssd(output).tables[1]
+            assert table.bits == (8 if choice == "8" else None)
+        if family == "hy_v4_flash" and choice == "8":
+            assert calls == [(mx.bfloat16, 32, 8, "affine")]
+            assert estimate["output_size_bytes"] == 216
+        else:
+            assert not calls
+            assert set(index) == {renamed.get(name, name) for name in tensors}
+            for name, (dtype, shape, payload) in tensors.items():
+                out_key = renamed.get(name, name)
+                shard = output / index[out_key]
+                stat = shard.stat()
+                header, offset = header_with_offset(
+                    str(shard), stat.st_size, stat.st_mtime_ns
+                )
+                entry = header[out_key]
+                start, end = entry["data_offsets"]
+                assert entry["dtype"] == dtype and tuple(entry["shape"]) == shape
+                assert shard.read_bytes()[offset + start : offset + end] == payload
+            assert estimate["output_size_bytes"] == sum(
+                len(tensor[2]) for tensor in tensors.values()
+            )
+        if family == "qwen4_exp":
+            from omlx.patches import mlx_vlm_qwen4_exp_compat
+
+            mlx_vlm_qwen4_exp_compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+            from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
+
+            reader = DiskBackedShardedEmbedding(output, prefix, 2, 32, 1)
+            try:
+                reader.weight_scale = mx.array(2.0, dtype=mx.bfloat16)
+                row = reader(mx.array([1]))
+                raw = mx.array(list(tensors[key][2][32:]), dtype=mx.uint8)
+                expected = mx.from_fp8(raw, dtype=mx.bfloat16) * reader.weight_scale
+                assert mx.array_equal(row[0], expected).item()
+            finally:
+                reader.close()
+
+    def test_legacy_deepseek_option_overrides_explicit_precision(
+        self, tmp_path, monkeypatch
+    ):
+        pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v41 import oq as v41
+
+        config = {"model_type": "deepseek_v41"}
+        assert (
+            resolve_engram_precision(tmp_path, config, "16", True)["mode"] == "preserve"
+        )
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {}}')
+
+        class ReachedBudgetError(Exception):
+            pass
+
+        def capture(source, config, mapping, *, engram_bits, **kwargs):
+            assert engram_bits is None
+            raise ReachedBudgetError
+
+        monkeypatch.setattr(v41, "source_budget", capture)
+        with pytest.raises(ReachedBudgetError):
+            v41.quantize(tmp_path, tmp_path / "output", preserve_ngram_table=True)
+        with pytest.raises(ReachedBudgetError):
+            v41.quantize(
+                tmp_path,
+                tmp_path / "output",
+                preserve_ngram_table=True,
+                engram_mode="affine8",
+            )
 
     @pytest.mark.parametrize(
         "precision, expected",

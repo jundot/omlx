@@ -201,7 +201,11 @@ class OQManager:
                 _iter_readable_entries,
                 _resolve_hf_cache_entry,
             )
-            from ..oq import estimate_memory, validate_quantizable
+            from ..oq import (
+                detect_engram_table_precision,
+                estimate_memory,
+                validate_quantizable,
+            )
             from ..utils.model_loading import (
                 _checkpoint_has_mtp_weights,
                 _has_mtp_heads,
@@ -308,6 +312,15 @@ class OQManager:
                                     )
                                     info_full["num_experts"] = tc.get("n_routed_experts", 0)
                                 info_full["memory_streaming"] = estimate_memory(size)
+                                try:
+                                    table = detect_engram_table_precision(path, config)
+                                except (OSError, ValueError, KeyError) as exc:
+                                    logger.debug("Cannot inspect Engram in %s: %s", path, exc)
+                                else:
+                                    info_full["engram_precision"] = {
+                                        "source_precision": table["source_precision"],
+                                        "available": table["available"],
+                                    }
                                 source_models.append(info_full)
                         except Exception:
                             continue
@@ -358,17 +371,18 @@ class OQManager:
             ValueError: On invalid inputs or output conflict.
         """
         from ..oq import (
+            _ENGRAM_PRECISION_CHOICES,
             GEMMA4_ASSISTANT_TYPES,
             OQ_DTYPES,
             OQ_LEVELS,
             _validate_oq_dtype_for_model,
             _validate_v41_oq_settings,
+            resolve_engram_precision,
             resolve_output_name,
             validate_gemma4_assistant_pair,
             validate_mtp_donor_pair,
         )
         from ..utils.model_loading import _checkpoint_has_mtp_weights
-        from ..oq import _ENGRAM_PRECISION_CHOICES, resolve_engram_precision
 
         if engram_precision not in _ENGRAM_PRECISION_CHOICES:
             raise ValueError(
@@ -395,10 +409,11 @@ class OQManager:
                 "Keeping the original Engram tables is only available for "
                 "DeepSeek V4.1"
             )
-        # Validate the requested precision against the actual table dtype.
-        # This also rejects "16" on FP8 tables and "8" on MXFP4 tables.
-        if engram_precision != "auto" or preserve_ngram_table:
-            resolve_engram_precision(source, config, engram_precision, preserve_ngram_table)
+        if preserve_ngram_table:
+            # The legacy option owns the storage recipe and output name.
+            engram_precision = "auto"
+        if engram_precision != "auto":
+            resolve_engram_precision(source, config, engram_precision)
         _validate_oq_dtype_for_model(config, dtype)
 
         source_size = _safetensors_size(source)

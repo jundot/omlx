@@ -883,13 +883,59 @@ async def test_v41_preserve_ngram_table_names_output_and_reaches_export(
     monkeypatch.setattr("omlx.oq.quantize_oq_streaming", _fake_quantize)
     manager = OQManager(model_dirs=[str(tmp_path)])
     task = await manager.start_quantization(
-        str(source), 4, enhanced=True, preserve_ngram_table=True
+        str(source), 4, enhanced=True, preserve_ngram_table=True, engram_precision="16"
     )
     await manager._active_tasks[task.task_id]
 
     assert task.status is QuantStatus.COMPLETED
     assert task.output_name == "DeepSeek-V4.1-oQ4e-ngram"
     assert [call["preserve_ngram_table"] for call in calls] == [True]
+    assert [call["engram_precision"] for call in calls] == ["auto"]
+
+
+@pytest.mark.asyncio
+async def test_engram_formats_are_checked_in_model_list_and_start(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "Qwen-Flash-Next"
+    source.mkdir()
+    config = {"model_type": "qwen4_exp"}
+    (source / "config.json").write_text(json.dumps(config))
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    header = {
+        f"{prefix}.shard_0.weight": {
+            "dtype": "F8_E4M3",
+            "shape": [2, 32],
+            "data_offsets": [0, 64],
+        },
+        f"{prefix}.weight_scale": {
+            "dtype": "BF16",
+            "shape": [1],
+            "data_offsets": [64, 66],
+        },
+    }
+    encoded = json.dumps(header).encode()
+    (source / "model.safetensors").write_bytes(
+        len(encoded).to_bytes(8, "little") + encoded + bytes(66)
+    )
+    manager = OQManager(model_dirs=[str(tmp_path)])
+    sources, _ = await manager.list_quantizable_models()
+    assert sources[0]["engram_precision"] == {
+        "source_precision": "fp8",
+        "available": ["auto", "8"],
+    }
+    with pytest.raises(ValueError, match="16-bit Engram export is not supported"):
+        await manager.start_quantization(str(source), 4, engram_precision="16")
+    assert not manager._active_tasks
+
+    async def noop(task_id):
+        pass
+
+    monkeypatch.setattr(manager, "_run_quantization", noop)
+    task = await manager.start_quantization(str(source), 4, engram_precision="8")
+    await manager._active_tasks[task.task_id]
+    assert task.output_name == "Qwen-Flash-Next-oQ4-engram8"
+    assert task.to_dict()["engram_precision"] == "8"
 
 
 @pytest.mark.asyncio

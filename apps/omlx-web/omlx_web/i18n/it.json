@@ -2466,7 +2466,6 @@
   "cluster.cuda_guide.spark_run": "DGX OS include Docker e NVIDIA Container Toolkit. Avvia l'helper. Compare in questa pagina: premi Abbina e digita il codice dal suo log.",
   "cluster.device_card.helper_ready": "{name} può accelerare i prompt lunghi per i modelli su questo Mac.",
   "models.oq.engram_precision": "Precisione della tabella Engram",
-  "models.oq.engram_precision_help": "Auto segue il livello oQ. 8 memorizza una tabella a 8 bit (affine, o FP8 originale per sorgenti FP8). 16 conserva il tipo float originale.",
   "models.oq.engramPrecisionAuto": "Automatico",
   "models.oq.engramPrecision8": "8 bit",
   "models.oq.engramPrecision16": "16 bit"
