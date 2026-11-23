@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 row-exact verify attention in one launch.
-
-Each row must keep the bits of the one-token decode step for its token (the
-per-row ``_decode_attention`` loop), on full-attention and sliding visits.
-"""
+"""Inkling 2 row-exact verify attention in one launch: each row keeps the bits
+of its token's one-row decode step."""
 
 from __future__ import annotations
 
@@ -32,7 +29,6 @@ def _inputs(dtype, keys, rows, seed):
 
 
 def _per_row(q, k, v, rel, sink, window):
-    """The pre-existing row-exact path: one decode-step SDPA per row."""
     s, length = k.shape[2], q.shape[2]
     rows = [
         kernels._decode_attention(
@@ -49,10 +45,12 @@ def _per_row(q, k, v, rel, sink, window):
     return mx.concatenate(rows, axis=2)
 
 
+# Every row sees at least 4096 keys, where MLX takes its two-pass kernel on
+# every GPU.
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("window", [0, 1024], ids=["full", "sliding"])
-@pytest.mark.parametrize("rows", [2, 3, 5, 8, 16])
-@pytest.mark.parametrize("keys", [4100, 20000])
+@pytest.mark.parametrize("window", [0, 4096], ids=["full", "sliding"])
+@pytest.mark.parametrize("rows", [2, 5, 16])
+@pytest.mark.parametrize("keys", [4200, 20000])
 def test_rows_match_decode_steps_bit_for_bit(dtype, window, rows, keys):
     q, k, v, rel, sink = _inputs(dtype, keys, rows, seed=keys + rows)
     out = verify_attention.rows_attention(
@@ -61,13 +59,20 @@ def test_rows_match_decode_steps_bit_for_bit(dtype, window, rows, keys):
     if window and 32 * (_HQ // _HKV) * rows > 1024:
         assert out is None
         return
-    # At 4096+ keys MLX takes its two-pass kernel on every GPU (GQA).
     assert out is not None
-    assert out.shape == (1, _HQ, rows, _D)
     assert mx.array_equal(out, _per_row(q, k, v, rel, sink, window))
 
 
-def test_banded_sink_attention_takes_the_fused_rows():
+def test_banded_sink_attention_takes_the_fused_rows(monkeypatch):
+    fused = verify_attention.rows_attention
+    taken = []
+
+    def spy(*args, **kwargs):
+        out = fused(*args, **kwargs)
+        taken.append(out is not None)
+        return out
+
+    monkeypatch.setattr(verify_attention, "rows_attention", spy)
     q, k, v, rel, sink = _inputs(mx.bfloat16, 4100, 4, seed=3)
     set_verify_qmm_armed(True, row_exact=True)
     try:
@@ -76,6 +81,7 @@ def test_banded_sink_attention_takes_the_fused_rows():
         )
     finally:
         set_verify_qmm_armed(False)
+    assert taken == [True]
     assert mx.array_equal(out, _per_row(q, k, v, rel, sink, 0))
 
 

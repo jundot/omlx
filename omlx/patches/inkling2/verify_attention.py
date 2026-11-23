@@ -1,25 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Row-exact verify attention for Inkling 2 in one launch per visit.
 
-A row-exact verify forward (``is_row_exact_armed``) runs each of its L rows as
-the one-token decode step of that token: ``_decode_attention`` over the keys
-up to the row's own position, through MLX's ``scaled_dot_product_attention``.
-That is L mask builds and L two-pass SDPA calls per attention visit, and on a
-full-attention visit each call streams the whole KV cache again.
-
-This module runs the same L rows in one pair of kernels. Pass 1 is MLX
-0.32.4's ``sdpa_vector_2pass_1`` (``sdpa_vector.h``) with one simdgroup per
-(query head, row) in each threadgroup: every row keeps its own key count and
-window start, walks its keys in the same block-strided order with the same
-per-key update, reads its bias band and sink in place of the materialized
-mask, and writes its partials where a single-row call would. Pass 2 is
-``sdpa_vector_2pass_2`` over (head, row). Row ``r`` therefore equals the
-decode call for that token bit for bit, while rows of a full-attention visit
-read each key tile together (once from DRAM).
-
-The fused path takes a block only when MLX would run every row through the
-two-pass kernel with the standard (masked, sinked) variant; otherwise the
-caller keeps its per-row loop.
+Each row must keep the bits of its token's one-row decode step, which MLX
+0.32.4 runs through ``sdpa_vector_2pass``. Pass 1 and pass 2 below repeat that
+kernel's arithmetic for all rows at once, so rerun
+tests/test_inkling2_verify_attention.py after an MLX pin change.
 """
 
 from __future__ import annotations
@@ -31,8 +16,7 @@ import mlx.core as mx
 
 # Lightning MTP copy blocks verify up to 16 rows.
 MAX_ROWS = 16
-# Rows one simdgroup carries (its q, accumulators and softmax state stay in
-# registers; M1-class GPUs lose occupancy past ~64 registers per thread).
+# Rows one simdgroup carries; more cost occupancy on M1-class GPUs.
 SHARED_MAX_ROWS = 4
 _TK = 4
 
@@ -51,15 +35,12 @@ _PASS1 = r"""
     const int n_keys = rows_n[row];
     const int lo = rows_lo[row];
 
-    // q: [B, HQ, L, D] (any strides)
     const device T* qp = q + batch * q_strides[0] + qh * q_strides[1] +
         row * q_strides[2] + int(lane) * QK * q_strides[3];
-    // k, v: [B, HKV, S, D]; this row's keys start at its window offset
     const device T* keys = k + batch * k_strides[0] + kv_head * k_strides[1] +
         (lo + block) * k_strides[2] + int(lane) * QK * k_strides[3];
     const device T* values = v + batch * v_strides[0] + kv_head * v_strides[1] +
         (lo + block) * v_strides[2] + int(lane) * VP * v_strides[3];
-    // rel: [B, L, HQ, R]
     const device T* relp = rel + batch * rel_strides[0] + row * rel_strides[1] +
         qh * rel_strides[2];
     const int rel_step = rel_strides[3];
@@ -156,11 +137,9 @@ _PASS1 = r"""
     }
 """
 
-# Full-attention visits: every row starts at key 0, so one simdgroup per query
-# head takes all L rows. Each block-strided key is loaded once and applied to
-# every row whose key count covers it; per row, the scores, the online softmax
-# and the accumulators follow pass 1 above step for step (keys in the same
-# order, the same expressions), so the partials are the same bits.
+# Full-attention visits: one simdgroup per query head takes RPS rows and loads
+# each key once for all of them. Per row it repeats pass 1 step for step, so
+# the partials keep the same bits.
 _PASS1_SHARED = r"""
     constexpr int BD = 32;
     constexpr int QK = D / BD;
@@ -171,7 +150,6 @@ _PASS1_SHARED = r"""
     const int g = int(thread_position_in_threadgroup.y);
     const uint lane = thread_index_in_simdgroup;
     const int qh = GQA * kv_head + g;
-    // Rows [base, base + RPS) of the block, clipped to L.
     const int base = int(thread_position_in_threadgroup.z) * RPS;
     const int count = min(RPS, L - base);
 
@@ -265,7 +243,7 @@ _PASS1_SHARED = r"""
 """
 
 
-# sdpa_vector_2pass_2, one threadgroup per (batch * head, row).
+# sdpa_vector_2pass_2 over (batch * head, row).
 _PASS2 = r"""
     constexpr int BN = 32;
     constexpr int BD = 32;
@@ -282,7 +260,6 @@ _PASS2 = r"""
         simd_lid * EPT;
     const device float* sp = sums + q_offset * BLOCKS;
     const device float* mp = maxs + q_offset * BLOCKS;
-    // Rows land as [B, L, HQ, D], the layout the output projection reads.
     device T* op = out + (q_seq_idx * HQ + head_idx) * D + simd_gid * EPT;
 
     float sum_exp_score = 0.0;
@@ -354,10 +331,7 @@ def _pass2():
 
 @cache
 def _arch_suffix() -> str:
-    try:
-        return str(mx.device_info().get("architecture", ""))[-1:]
-    except Exception:  # noqa: BLE001
-        return ""
+    return str(mx.device_info().get("architecture", ""))[-1:]
 
 
 def _two_pass(n_keys: int, gqa: int) -> bool:
@@ -401,15 +375,14 @@ def _blocks(n_keys: int, gqa: int) -> int:
 def rows_attention(q, k, v, rel, sink, *, scale: float, window: int):
     """The row-exact verify rows of ``banded_sink_attention`` in one launch.
 
-    Same arguments as the per-row loop (q ``[1, Hq, L, D]``; k, v
-    ``[1, Hkv, S, D]`` with the block's rows last; rel ``[1, L, Hq, R]``; sink
-    ``[1, L, Hq]``). Returns ``[1, Hq, L, D]``, or None when some row would not
-    take MLX's two-pass kernel (the caller then keeps its loop).
+    Returns ``[1, Hq, L, D]``, or None when some row would not take MLX's
+    two-pass kernel, so the caller keeps its per-row loop.
     """
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
     if (
-        b != 1
+        mx.default_device() != mx.gpu
+        or b != 1
         or not 1 < length <= MAX_ROWS
         or hq % hkv
         or d % 32
@@ -433,8 +406,6 @@ def rows_attention(q, k, v, rel, sink, *, scale: float, window: int):
     if len(blocks) != 1:
         return None
     blocks = blocks.pop()
-    if blocks % 32:
-        return None
     windowed = any(lo_rows)
     if windowed and 32 * gqa * length > 1024:
         # One simdgroup per (head, row) would not fit a threadgroup.
@@ -455,10 +426,8 @@ def rows_attention(q, k, v, rel, sink, *, scale: float, window: int):
         ("R", int(rel.shape[-1])),
         ("BLOCKS", blocks),
     ]
-    if not any(lo_rows):
-        # Short caches: one simdgroup per query head keeps up to four rows.
-        # Past ~16K keys the per-key chain dominates, and two rows per
-        # simdgroup measured fastest on an M1 Max.
+    if not windowed:
+        # Past ~16K keys two rows per simdgroup measured fastest (M1 Max).
         rps = min(length, SHARED_MAX_ROWS if s < 16384 else 2)
         groups = (length + rps - 1) // rps
         partials, sums, maxs = _pass1_shared()(

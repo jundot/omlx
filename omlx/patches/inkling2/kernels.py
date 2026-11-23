@@ -421,9 +421,7 @@ def banded_sink_attention(
         return _decode_attention(q, k, v, rel, sink, scale, window)
     if b == 1 and left_padding is None and is_row_exact_armed():
         # Row-exact verify: each row is the decode step of its token, over the
-        # keys up to its own position. One launch runs every row with MLX's
-        # two-pass decode arithmetic when MLX would take that kernel for all
-        # of them (see ``verify_attention``).
+        # keys up to its own position.
         fused = verify_attention.rows_attention(
             q, k, v, rel, sink, scale=scale, window=window
         )
