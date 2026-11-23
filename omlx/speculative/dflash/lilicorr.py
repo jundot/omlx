@@ -79,6 +79,14 @@ _TARGET_MARKER = "_omlx_lilicorr_target"
 _ADAPTER_MARKER = "_omlx_lilicorr_capture_inputs"
 _SINGLE_ROW_MARKER = "_omlx_drafter_single_row"
 
+# Read by ``mlx_lm_mtp.batch_generator._row_exact_verify``: an armed verify
+# forward then keeps one-row decode arithmetic instead of the Qwen sg8/split-K
+# verify kernels. Measured on Bolt: the plain arming reroutes the verifier's
+# attention q/k/v tuple through ``vk_group_sg8`` (8 rows, K=4096, affine 4-bit
+# group 64), which differs from the per-row matvec at bf16 tail-ULP level and
+# flipped a 1-ULP greedy tie; row-exact arming is bit-identical to decode.
+_ROW_EXACT_MARKER = "_omlx_mtp_row_exact_verify"
+
 
 def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
@@ -881,8 +889,10 @@ def apply_lilicorr_target(target_model: Any) -> Any:
 
     Marks *this* target only (never the class globally), shifts every requested
     capture id ``i`` to ``i - 1`` because ``NemotronHModel.hidden_sink`` appends
-    block *outputs*, and pins ``_omlx_drafter_single_row`` since
-    ``rollback_speculative_cache`` needs uniform acceptance across the batch.
+    block *outputs*, pins ``_omlx_drafter_single_row`` since
+    ``rollback_speculative_cache`` needs uniform acceptance across the batch,
+    and opts the target into row-exact verify arming: the generic MTP verify
+    qmm routing perturbs this target's already-exact verify forward.
     """
     language_model = getattr(target_model, "language_model", target_model)
     if not hasattr(language_model, "rollback_speculative_cache"):
@@ -906,6 +916,7 @@ def apply_lilicorr_target(target_model: Any) -> Any:
         language_model.__class__ = _lilicorr_capture_adapter(cls)
     setattr(language_model, _TARGET_MARKER, True)
     setattr(language_model, _SINGLE_ROW_MARKER, True)
+    setattr(language_model, _ROW_EXACT_MARKER, True)
     return target_model
 
 

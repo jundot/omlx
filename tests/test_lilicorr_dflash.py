@@ -391,6 +391,10 @@ def test_target_adapter_marks_the_instance_and_shifts_capture_ids():
     lilicorr.apply_lilicorr_target(language)
     assert language._omlx_lilicorr_target is True
     assert language._omlx_drafter_single_row is True
+    # The target opts out of the generic MTP verify qmm routing: armed plain,
+    # it reroutes the verifier's q/k/v tuple and leaves decode-exact bits.
+    assert language._omlx_mtp_row_exact_verify is True
+    assert bg._row_exact_verify(SimpleNamespace(language_model=language)) is True
     language(capture_layer_ids=[1, 18, 35])
     assert language.records[0]["capture_layer_ids"] == [0, 17, 34]
     assert "speculative_verify" not in language.records[0]
@@ -425,6 +429,70 @@ def test_target_adapter_requires_the_native_verifier_route():
 
     with pytest.raises(TypeError, match="speculative_verify"):
         lilicorr.apply_lilicorr_target(_NoVerifier())
+
+
+def test_verify_arming_keeps_one_row_arithmetic_for_the_target():
+    """Armed MTP verify must not perturb the exact verifier's arithmetic.
+
+    Measured on Bolt: plain arming claims the verifier's attention q/k/v tuple
+    for ``vk_group_sg8`` (rows=8, K=4096, affine 4-bit group 64); its fp32
+    lane-strided reduction differs from the per-row matvec at bf16 tail-ULP
+    level and flipped a 1-ULP greedy tie. The LiLiCorr target opts into
+    row-exact arming, which declines the route and keeps decode bits.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("verify qmm kernels need Metal")
+    from mlx_vlm.models.nemotron_h.speculative_verifier import (
+        NemotronHExactSpeculativeVerifier,
+    )
+
+    from omlx.patches.qwen35_verify_qmm import (
+        apply_verify_qmm_patch,
+        set_verify_qmm_armed,
+        sg8_group_eligible,
+    )
+
+    assert apply_verify_qmm_patch() is True
+    mx.random.seed(7)
+    linears = []
+    for _ in range(3):
+        linear = nn.QuantizedLinear(512, 4096, bias=False)
+        weight, scales, biases = mx.quantize(
+            mx.random.normal((4096, 512)), group_size=64, bits=4
+        )
+        linear.weight = weight
+        linear.scales = scales.astype(mx.bfloat16)
+        linear.biases = biases.astype(mx.bfloat16)
+        mx.eval(linear.parameters())
+        linears.append(linear)
+    linears = tuple(linears)
+    x = mx.random.normal((1, 8, 512)).astype(mx.bfloat16)
+    mx.eval(x)
+    verifier = NemotronHExactSpeculativeVerifier()
+
+    set_verify_qmm_armed(False)
+    try:
+        baseline = verifier._linears(linears, x)
+        mx.eval(*baseline)
+        set_verify_qmm_armed(True)
+        # The trap: generic arming claims the verifier's q/k/v tuple.
+        assert sg8_group_eligible(linears, x) is True
+        set_verify_qmm_armed(True, row_exact=True)
+        # What the LiLiCorr target requests: row-exact arming declines it.
+        assert sg8_group_eligible(linears, x) is False
+        armed = verifier._linears(linears, x)
+        mx.eval(*armed)
+    finally:
+        set_verify_qmm_armed(False)
+    for base, routed in zip(baseline, armed):
+        assert mx.array_equal(base, routed)
+    per_row = tuple(
+        mx.concatenate([linear(x[:, row : row + 1]) for row in range(8)], axis=1)
+        for linear in linears
+    )
+    mx.eval(*per_row)
+    for routed, decode in zip(armed, per_row):
+        assert mx.array_equal(routed, decode)
 
 
 def test_target_dtype_probe_reads_the_backbone_embedding():
