@@ -1719,6 +1719,158 @@ class TestPrepareVisionInputs:
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
+    def test_gemma3_boi_token_satisfies_image_token_check(self, mock_prepare):
+        """Gemma 3 prompts carry boi_token (<start_of_image>) before expansion."""
+        from PIL import Image
+
+        engine = self._setup_engine_for_vision(model_type="gemma3")
+        engine._processor.image_token = "<image_soft_token>"
+        engine._processor.boi_token = "<start_of_image>"
+        engine._processor.apply_chat_template.side_effect = (
+            lambda msgs, **kwargs: "<bos>"
+            + "".join(
+                f"<start_of_turn>{m['role']}\n{m['content']}<end_of_turn>\n"
+                for m in msgs
+            )
+            + "<start_of_turn>model\n"
+        )
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What color is this image?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64,a"},
+                    },
+                ],
+            }
+        ]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        engine._prepare_vision_inputs(messages, images)
+
+        mock_prepare.assert_called_once()
+        prompts = mock_prepare.call_args.kwargs["prompts"]
+        assert len(prompts) == 1
+        assert "<start_of_image>" in prompts[0]
+        assert "<image_soft_token>" not in prompts[0]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_gemma3_missing_both_image_and_boi_tokens_rejected(
+        self, mock_vlm_act, mock_prepare
+    ):
+        """A text-only template emitting neither image_token nor boi_token still fails."""
+        from PIL import Image
+
+        engine = self._setup_engine_for_vision(model_type="gemma3")
+        engine._processor.image_token = "<image_soft_token>"
+        engine._processor.boi_token = "<start_of_image>"
+        engine._processor.apply_chat_template.return_value = (
+            "<bos><start_of_turn>user\nDescribe this.<end_of_turn>\n"
+            "<start_of_turn>model\n"
+        )
+        mock_vlm_act.return_value = [{"role": "user", "content": "Describe this."}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        messages = [{"role": "user", "content": "Describe this."}]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        with pytest.raises(InvalidRequestError, match="text-only chat template"):
+            engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_real_gemma3_processor_boi_token_passes_validation(
+        self, mock_prepare, monkeypatch
+    ):
+        """Real mlx-vlm Gemma3Processor sets distinct image_token and boi_token."""
+        from mlx_vlm.models.gemma3.processing_gemma3 import Gemma3Processor
+        from PIL import Image
+
+        monkeypatch.setattr(
+            ProcessorMixin,
+            "check_argument_for_proper_class",
+            lambda self, name, arg: None,
+        )
+
+        class _StubGemma3Tokenizer:
+            image_token = "<image_soft_token>"
+            image_token_id = 262144
+            boi_token = "<start_of_image>"
+            eoi_token = "<end_of_image>"
+
+            def apply_chat_template(self, msgs, **kwargs):
+                return (
+                    "<bos>"
+                    + "".join(
+                        f"<start_of_turn>{m['role']}\n{m['content']}<end_of_turn>\n"
+                        for m in msgs
+                    )
+                    + "<start_of_turn>model\n"
+                )
+
+        processor = Gemma3Processor(
+            image_processor=SimpleNamespace(),
+            tokenizer=_StubGemma3Tokenizer(),
+            image_seq_length=4,
+        )
+        assert processor.image_token == "<image_soft_token>"
+        assert processor.boi_token == "<start_of_image>"
+
+        engine = _make_loaded_engine(model_type="gemma3")
+        engine._processor = processor
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        messages = [{"role": "user", "content": "Describe both images."}]
+        images = [Image.new("RGB", (4, 4), "red"), Image.new("RGB", (4, 4), "blue")]
+
+        engine._prepare_vision_inputs(messages, images)
+
+        mock_prepare.assert_called_once()
+        prompts = mock_prepare.call_args.kwargs["prompts"]
+        assert prompts[0].count("<start_of_image>") == 2
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_processor_without_boi_token_still_requires_image_token(
+        self, mock_vlm_act, mock_prepare
+    ):
+        """Processors without boi_token (e.g. GLM) keep enforcing image_token."""
+        from PIL import Image
+
+        engine = _make_loaded_engine(model_type="glm5_next")
+        engine._processor = SimpleNamespace(
+            image_token="<|image|>",
+            apply_chat_template=MagicMock(return_value="user: Describe this."),
+            tokenizer=engine._tokenizer,
+        )
+        mock_vlm_act.return_value = [{"role": "user", "content": "Describe this."}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        messages = [{"role": "user", "content": "Describe this."}]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        with pytest.raises(InvalidRequestError, match="text-only chat template"):
+            engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_bytesio_audio_survives_missing_resample_export(
         self, mock_vlm_act, mock_prepare, monkeypatch
