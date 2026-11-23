@@ -1446,3 +1446,149 @@ def test_inkling2_varloop_single_pass_and_dspark_visit_guard(tmp_path):
             json.dumps({"model_type": "inkling2_loop", "text_config": override_text, "mtp_config": mtp})
         )
         assert bundled_inkling2_dspark_path(tmp_path) is None
+
+
+def _decode_attention_case(batch, heads, kv_heads, length, keys, extent, dtype, dim=64):
+    mx.random.seed(3)
+    q = (mx.random.normal((batch, heads, length, dim)) * 0.3).astype(dtype)
+    # K/V as a slice of a larger cache buffer, as the caches hand them over.
+    shape = (batch, kv_heads, keys + 40, dim)
+    k = (mx.random.normal(shape) * 0.3).astype(dtype)[:, :, 7 : 7 + keys]
+    v = mx.random.normal(shape).astype(dtype)[:, :, 7 : 7 + keys]
+    rel = mx.random.normal((batch, length, heads, extent)).astype(dtype)
+    sink = (mx.random.normal((batch, length, heads)) * 2).astype(dtype)
+    return q, k, v, rel, sink
+
+
+def _small_decode_chunks(monkeypatch, kernels):
+    """Several chunks at test sizes."""
+    monkeypatch.setattr(kernels, "_DECODE_CHUNK", 64)
+    monkeypatch.setattr(kernels, "_DECODE_SLIDING_CHUNK", 16)
+
+
+@pytest.mark.parametrize(
+    "heads, kv_heads, length, keys, window, left_padding",
+    [
+        (6, 2, 1, 1, 0, None),
+        (6, 2, 1, 300, 0, [0, 113]),
+        (6, 2, 1, 90, 32, [0, 70]),
+        (6, 2, 4, 300, 0, [41, 0]),
+        (6, 2, 5, 300, 32, None),
+        (12, 1, 2, 300, 0, None),
+    ],
+)
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_flash_decode_matches_masked_sdpa(
+    heads, kv_heads, length, keys, window, left_padding, dtype, monkeypatch
+):
+    """Batched decode and verify blocks; 300 keys are five chunks of 64, a
+    window of 32 is two chunks of 16, and 12 heads on one KV head fill two
+    simdgroups."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    _small_decode_chunks(monkeypatch, kernels)
+    args = _decode_attention_case(
+        2, heads, kv_heads, length, keys, 32, getattr(mx, dtype)
+    )
+    lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
+    scale = args[0].shape[-1] ** -0.5
+    expected = kernels._masked_attention(*args, scale, window, lp)
+    got = kernels.gqa_flash_decode_attention(
+        *args, scale=scale, window=window, left_padding=lp
+    )
+    routed = kernels.banded_sink_attention(
+        *args, scale=scale, window=window, left_padding=lp
+    )
+    assert mx.array_equal(routed, got)
+    assert got.shape == expected.shape and got.dtype == expected.dtype
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
+    assert diff.item() < 1e-2
+    # Keys strided in the head dimension take the scalar staging loop.
+    q, k, v, rel, sink = args
+    wide = mx.repeat(k, 2, axis=-1)[..., ::2], mx.repeat(v, 2, axis=-1)[..., ::2]
+    strided = kernels.gqa_flash_decode_attention(
+        q, *wide, rel, sink, scale=scale, window=window, left_padding=lp
+    )
+    assert mx.array_equal(strided, got)
+
+
+@pytest.mark.parametrize("window", [0, 32])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_flash_decode_rows_have_the_bits_of_one_row_calls(
+    window, dtype, monkeypatch
+):
+    """Each row of a left-padded batch of verify blocks is the decode step of
+    its token: one query over that row's own keys, alone."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    _small_decode_chunks(monkeypatch, kernels)
+    length, keys, pads = 8, 300, [0, 113]
+    q, k, v, rel, sink = _decode_attention_case(
+        2, 6, 2, length, keys, 32, getattr(mx, dtype)
+    )
+    scale = q.shape[-1] ** -0.5
+    block = kernels.banded_sink_attention(
+        q,
+        k,
+        v,
+        rel,
+        sink,
+        scale=scale,
+        window=window,
+        left_padding=mx.array(pads, dtype=mx.int32),
+    )
+    for row, pad in enumerate(pads):
+        for pos in range(length):
+            end = keys - length + 1 + pos
+            step = kernels.gqa_flash_decode_attention(
+                q[row : row + 1, :, pos : pos + 1],
+                k[row : row + 1, :, pad:end],
+                v[row : row + 1, :, pad:end],
+                rel[row : row + 1, pos : pos + 1],
+                sink[row : row + 1, pos : pos + 1],
+                scale=scale,
+                window=window,
+            )
+            assert mx.array_equal(block[row : row + 1, :, pos : pos + 1], step)
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_flash_decode_guards_wide_heads_and_unaligned_keys(dtype):
+    """A head too wide for the kernel's threadgroup memory falls back instead
+    of failing to load, and K/V views whose rows or base are off the 16-byte
+    grid of the vector load have the bits of their contiguous copies."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    dt = getattr(mx, dtype)
+    wide = _decode_attention_case(2, 2, 1, 1, 40, 32, dt, dim=512)
+    assert not kernels._use_flash_decode(wide[0], wide[1])
+    scale = 512**-0.5
+    assert mx.array_equal(
+        kernels.banded_sink_attention(*wide, scale=scale),
+        kernels._masked_attention(*wide, scale, 0, None),
+    )
+
+    q, _, _, rel, sink = _decode_attention_case(1, 6, 2, 1, 300, 32, dt)
+    scale = q.shape[-1] ** -0.5
+    # (buffer width, first row, first column): unaligned rows, unaligned base.
+    for width, row, col in ((71, 8, 0), (72, 7, 1)):
+        shape = (1, 2, 344, width)
+        view = (slice(None), slice(None), slice(row, row + 300), slice(col, col + 64))
+        k = (mx.random.normal(shape) * 0.3).astype(dt)[view]
+        v = mx.random.normal(shape).astype(dt)[view]
+        got = kernels.gqa_flash_decode_attention(
+            q, k, v, rel, sink, scale=scale, window=0
+        )
+        packed = kernels.gqa_flash_decode_attention(
+            q, mx.contiguous(k), mx.contiguous(v), rel, sink, scale=scale, window=0
+        )
+        assert mx.array_equal(got, packed)
+        expected = kernels._masked_attention(q, k, v, rel, sink, scale, 0, None)
+        diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+        assert diff.max().item() < 1e-2
