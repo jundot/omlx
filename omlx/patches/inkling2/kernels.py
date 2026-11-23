@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import verify_attention
+
+logger = logging.getLogger(__name__)
 
 # Upper bound on one additive mask block (elements) in the general attention
 # path; queries are split into sub-blocks so the mask stays below it.
@@ -16,6 +20,32 @@ _MASK_BUDGET = 1 << 29
 
 _ATTN_RES_TG = 256
 _attn_res_kernels: dict = {}
+# Fused kernels whose threadgroup this GPU accepts, by variant. A pipeline's
+# thread limit depends on its register use, so it is found by launching each
+# variant once (M1 Pro accepts 576 threads for some attn_res variants and only
+# 384-512 for others).
+_launch_ok: dict = {}
+
+
+def _fits_threadgroup(key, launch) -> bool:
+    """Run ``launch`` (a tiny launch of the variant) once per ``key``; False
+    when Metal rejects its threadgroup size, so the caller falls back."""
+    ok = _launch_ok.get(key)
+    if ok is None:
+        try:
+            mx.eval(launch())
+            ok = True
+        except ValueError as exc:
+            if "threads per threadgroup" not in str(exc):
+                raise
+            logger.info(
+                "Inkling 2 fused kernel %s exceeds this GPU's threadgroup "
+                "limit; using the MLX ops",
+                key,
+            )
+            ok = False
+        _launch_ok[key] = ok
+    return ok
 
 
 def _attn_res_kernel(blocks: int, queries: int):
@@ -333,6 +363,7 @@ def attn_res_fused(
     out_dtype=None,
     want_f32: bool = False,
     want_partial: bool = False,
+    _probe: bool = False,
 ):
     """``attn_res_mix(blocks, unit_rms(partial), ...)``, then per query
     ``rms_norm(mix, norm_weight).astype(out_dtype)`` when ``norm_weight`` is
@@ -354,6 +385,25 @@ def attn_res_fused(
     ):
         return None
     f32 = norm and want_f32
+    variant = ("attn_res", len(blocks), nq, norm, f32, want_partial, hidden)
+    variant += (partial.dtype, out_dtype)
+    if not _probe and not _fits_threadgroup(
+        variant,
+        lambda: attn_res_fused(
+            [mx.zeros((1, 1, hidden), dtype=mx.float32) for _ in blocks],
+            mx.zeros((1, 1, hidden), dtype=partial.dtype),
+            mx.zeros(query.shape, dtype=mx.float32),
+            scale,
+            unit_eps=unit_eps,
+            norm_weight=mx.ones(norm_weight.shape, dtype=mx.float32) if norm else None,
+            norm_eps=norm_eps,
+            out_dtype=out_dtype,
+            want_f32=want_f32,
+            want_partial=want_partial,
+            _probe=True,
+        ),
+    ):
+        return None
     kernel = _attn_res_fused_kernel(len(blocks), nq, norm, f32, want_partial)
     rows = b * length
     inputs = [
