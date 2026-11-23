@@ -1455,6 +1455,19 @@
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
                                     <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.max_concurrent') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.max_concurrent_hint') }}</p>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="number" min="1" max="8" step="1"
+                                               :value="globalSettings.integrations.splash_max_concurrent_requests ?? ''"
+                                               @change="saveSplashConcurrency($event.target)"
+                                               placeholder="{{ t('settings.integrations.splash.auto') }}"
+                                               class="w-24 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    </div>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.ane_prefill') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.ane_prefill_hint') }}</p>
                                     </div>

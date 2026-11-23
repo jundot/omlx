@@ -45,7 +45,9 @@ final class IntegrationsScreenVM {
     /// Whole GB as text; empty means automatic.
     var splashMaxMemoryGb: String = ""
     var splashSsdCacheGb: String = ""
-    private var splashLimitsLoaded = ("", "")
+    /// Whole number 1-8 as text; empty means Splash's default.
+    var splashMaxConcurrentRequests: String = ""
+    private var splashLimitsLoaded = ("", "", "")
 
     // MarkItDown
     var markitdownEnabled = true
@@ -239,7 +241,8 @@ final class IntegrationsScreenVM {
     }
 
     var hasPendingSplashLimits: Bool {
-        (Self.trimmed(splashMaxMemoryGb), Self.trimmed(splashSsdCacheGb)) != splashLimitsLoaded
+        (Self.trimmed(splashMaxMemoryGb), Self.trimmed(splashSsdCacheGb),
+         Self.trimmed(splashMaxConcurrentRequests)) != splashLimitsLoaded
     }
 
     func beginEditingSplashPath() {
@@ -305,7 +308,9 @@ final class IntegrationsScreenVM {
                 self.splashAnePrefill     = it.splashAnePrefill ?? true
                 self.splashMaxMemoryGb    = Self.gigabytesText(it.splashMaxMemoryGb)
                 self.splashSsdCacheGb     = Self.gigabytesText(it.splashSsdCacheGb)
-                self.splashLimitsLoaded   = (self.splashMaxMemoryGb, self.splashSsdCacheGb)
+                self.splashMaxConcurrentRequests = it.splashMaxConcurrentRequests.map(String.init) ?? ""
+                self.splashLimitsLoaded   = (self.splashMaxMemoryGb, self.splashSsdCacheGb,
+                                             self.splashMaxConcurrentRequests)
             }
             self.markitdownEnabled = settings.integrations?.markitdownEnabled ?? true
             self.markitdownExposeModel = settings.integrations?.markitdownExposeModel ?? false
@@ -387,8 +392,15 @@ final class IntegrationsScreenVM {
                                         comment: "Error when a Splash memory or SSD cache size is not a whole number")
                 return
             }
+            guard let concurrent = Self.concurrencyPatch(splashMaxConcurrentRequests) else {
+                self.lastError = String(localized: "integrations.splash.max_concurrent.invalid",
+                                        defaultValue: "Enter a whole number from 1 to 8, or leave the field empty for automatic.",
+                                        comment: "Error when the Splash concurrent request limit is out of range")
+                return
+            }
             patch.splashMaxMemoryGb = memory
             patch.splashSsdCacheGb = ssd
+            patch.splashMaxConcurrentRequests = concurrent
         case .markitdownEnabled:
             guard !isSavingMarkitdownVisibility, markitdownEnabled != markitdownLoaded.enabled else { return }
             patch.markitdownEnabled = markitdownEnabled
@@ -440,7 +452,8 @@ final class IntegrationsScreenVM {
                 // Reload for the launcher status the server resolved.
                 await load(client: client)
             case .splashLimits:
-                self.splashLimitsLoaded = (Self.trimmed(splashMaxMemoryGb), Self.trimmed(splashSsdCacheGb))
+                self.splashLimitsLoaded = (Self.trimmed(splashMaxMemoryGb), Self.trimmed(splashSsdCacheGb),
+                                           Self.trimmed(splashMaxConcurrentRequests))
             case .markitdownEnabled:
                 if let value = patch.markitdownEnabled { markitdownLoaded.enabled = value }
                 try await refreshModels(client: client)
@@ -620,6 +633,14 @@ final class IntegrationsScreenVM {
         if value.isEmpty { return .null }
         guard let gigabytes = Int(value), gigabytes >= minimum else { return nil }
         return .value(gigabytes)
+    }
+
+    /// `.null` for an empty field, the value for 1-8, nil when invalid.
+    private static func concurrencyPatch(_ text: String) -> PatchOptionalInt? {
+        let value = trimmed(text)
+        if value.isEmpty { return .null }
+        guard let count = Int(value), (1...8).contains(count) else { return nil }
+        return .value(count)
     }
 
     // MARK: - Shell helpers

@@ -107,6 +107,7 @@ from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_ACTIVATIONS,
     SPLASH_KV_FORMATS,
+    SPLASH_MAX_CONCURRENT_REQUESTS,
     ConcurrentPriority,
     SubKeyEntry,
     burst_decode_env,
@@ -909,6 +910,7 @@ class GlobalSettingsRequest(BaseModel):
     splash_max_memory_gb: float | None = None
     splash_ssd_cache_gb: float | None = None
     splash_ane_prefill: bool | None = None
+    splash_max_concurrent_requests: int | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -5122,6 +5124,7 @@ def _global_settings_response(global_settings):
             "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
+            "splash_max_concurrent_requests": global_settings.integrations.splash_max_concurrent_requests,
         },
         "external_engines": {"splash": _splash_status(global_settings)},
         "system": {
@@ -6079,6 +6082,18 @@ async def update_global_settings(
         global_settings.integrations.splash_ane_prefill = bool(
             request.splash_ane_prefill
         )
+        integrations_changed = True
+    if "splash_max_concurrent_requests" in request.model_fields_set:
+        concurrent = request.splash_max_concurrent_requests
+        if concurrent is not None and not (
+            1 <= concurrent <= SPLASH_MAX_CONCURRENT_REQUESTS
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="splash_max_concurrent_requests must be between 1 and "
+                f"{SPLASH_MAX_CONCURRENT_REQUESTS}",
+            )
+        global_settings.integrations.splash_max_concurrent_requests = concurrent
         integrations_changed = True
     if "markitdown_enabled" in request.model_fields_set:
         global_settings.integrations.markitdown_enabled = bool(

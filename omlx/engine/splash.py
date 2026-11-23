@@ -152,6 +152,10 @@ PRUNED_EXPERTS_VERSION = (1, 4, 1)
 # release on M5+ `auto` quantizes attention queries to int8, so oMLX pins bf16
 # by default and only sends the flag where it is understood.
 ACTIVATIONS_VERSION = (1, 6, 1)
+# Splash 1.7.1 adds --max-concurrent-requests (1-8, default 4); older
+# launchers reject the flag.
+MAX_CONCURRENT_REQUESTS_VERSION = (1, 7, 1)
+SPLASH_MAX_CONCURRENT_REQUESTS = 8
 _PRUNED_EXPERTS_MULTIPLE = 8
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
@@ -301,6 +305,10 @@ class SplashBinary:
     @property
     def accepts_activations(self) -> bool:
         return self.version_tuple >= ACTIVATIONS_VERSION
+
+    @property
+    def accepts_max_concurrent_requests(self) -> bool:
+        return self.version_tuple >= MAX_CONCURRENT_REQUESTS_VERSION
 
 
 def _version_tuple(version: str) -> tuple[int, int, int] | None:
@@ -1212,6 +1220,8 @@ class SplashOptions:
     ane_prefill: bool = True
     cache_disk_bytes: int = 0
     cache_dir: Path | None = None
+    # None leaves Splash's own default (4 concurrent requests).
+    max_concurrent_requests: int | None = None
 
 
 # -- engine -------------------------------------------------------------------------
@@ -1378,6 +1388,22 @@ class SplashEngine(BaseEngine):
             command += ["--max-memory", str(options.max_memory_bytes)]
         if not options.ane_prefill:
             command.append("--disable-ane")
+        if (
+            options.max_concurrent_requests
+            and self._target.binary.accepts_max_concurrent_requests
+        ):
+            command += [
+                "--max-concurrent-requests",
+                str(
+                    max(
+                        1,
+                        min(
+                            options.max_concurrent_requests,
+                            SPLASH_MAX_CONCURRENT_REQUESTS,
+                        ),
+                    )
+                ),
+            ]
         if options.cache_disk_bytes > 0 and options.cache_dir is not None:
             command += [
                 "--max-cache-disk",

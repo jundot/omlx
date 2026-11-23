@@ -1093,6 +1093,37 @@ class TestRequestTranslation:
     def test_default_activation_precision_keeps_bf16(self):
         assert SplashOptions().activations == "bf16"
 
+    def test_serve_command_sends_max_concurrent_requests_when_supported(
+        self, tmp_path
+    ):
+        engine = _engine(tmp_path, version="1.7.1", max_concurrent_requests=6)
+
+        command = engine._serve_command(9000)
+
+        assert command[command.index("--max-concurrent-requests") + 1] == "6"
+
+    def test_serve_command_caps_max_concurrent_requests_at_splash_limit(
+        self, tmp_path
+    ):
+        engine = _engine(tmp_path, version="1.7.1", max_concurrent_requests=16)
+
+        command = engine._serve_command(9000)
+
+        assert command[command.index("--max-concurrent-requests") + 1] == "8"
+
+    def test_serve_command_skips_max_concurrent_requests_for_older_launchers(
+        self, tmp_path
+    ):
+        # Splash < 1.7.1 rejects --max-concurrent-requests.
+        engine = _engine(tmp_path, version="1.7.0", max_concurrent_requests=6)
+
+        assert "--max-concurrent-requests" not in engine._serve_command(9000)
+
+    def test_serve_command_leaves_unset_concurrency_to_splash(self, tmp_path):
+        engine = _engine(tmp_path, version="1.7.1")
+
+        assert "--max-concurrent-requests" not in engine._serve_command(9000)
+
     def test_serve_command_leaves_unset_limits_to_splash(self, tmp_path):
         command = _engine(tmp_path)._serve_command(9000)
 
@@ -1911,6 +1942,7 @@ class TestAdminAPI:
             splash_ssd_cache_gb=0,
             splash_ane_prefill=False,
             splash_activations="auto",
+            splash_max_concurrent_requests=6,
         )
 
         assert "integrations" in result["runtime_applied"]
@@ -1921,11 +1953,19 @@ class TestAdminAPI:
         )
         assert (restored.splash_ssd_cache_gb, restored.splash_ane_prefill) == (0, False)
         assert restored.splash_activations == "auto"
+        assert restored.splash_max_concurrent_requests == 6
+        await _post_global(settings, splash_max_concurrent_requests=None)
+        assert (
+            GlobalSettings.load(base_path=tmp_path).integrations.splash_max_concurrent_requests
+            is None
+        )
         for fields in (
             {"splash_kv_format": "fp8"},
             {"splash_activations": "fp8"},
             {"splash_max_memory_gb": 0},
             {"splash_ssd_cache_gb": -1},
+            {"splash_max_concurrent_requests": 0},
+            {"splash_max_concurrent_requests": 9},
         ):
             with pytest.raises(HTTPException):
                 await _post_global(settings, **fields)

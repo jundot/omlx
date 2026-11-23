@@ -2463,6 +2463,7 @@ class EnginePool:
                 ane_prefill=integrations.splash_ane_prefill,
                 cache_disk_bytes=cache_disk_bytes,
                 cache_dir=cache_dir,
+                max_concurrent_requests=integrations.splash_max_concurrent_requests,
             ),
         )
 

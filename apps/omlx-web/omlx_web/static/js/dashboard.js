@@ -222,6 +222,7 @@
                     splash_max_memory_gb: null,
                     splash_ssd_cache_gb: null,
                     splash_ane_prefill: true,
+                    splash_max_concurrent_requests: null,
                 },
                 external_engines: {
                     splash: { available: false, path: null, auto_detected: null, version: null, label: null, reason: '', install_hint: '', models: [] },
@@ -4819,6 +4820,7 @@
                             splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
                             splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
                             splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
+                            splash_max_concurrent_requests: this.globalSettings.integrations.splash_max_concurrent_requests,
                         }),
                     });
                     if (!response.ok) {
@@ -4898,6 +4900,24 @@
                 let error = '';
                 if (value !== null && !(value >= minimum)) {
                     error = window.t('settings.integrations.splash.invalid_size');
+                } else {
+                    this.globalSettings.integrations[field] = value;
+                    error = await this.saveIntegrationSettings();
+                }
+                if (error) {
+                    this.globalSettings.integrations[field] = previous;
+                    input.value = previous ?? '';
+                }
+                this.splashOptionsError = error;
+            },
+
+            async saveSplashConcurrency(input) {
+                const field = 'splash_max_concurrent_requests';
+                const previous = this.globalSettings.integrations[field];
+                const value = this.optionalNumber(input.value);
+                let error = '';
+                if (value !== null && !(Number.isInteger(value) && value >= 1 && value <= 8)) {
+                    error = window.t('settings.integrations.splash.invalid_concurrency');
                 } else {
                     this.globalSettings.integrations[field] = value;
                     error = await this.saveIntegrationSettings();
