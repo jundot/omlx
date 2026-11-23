@@ -1172,6 +1172,9 @@ def prefill_mask_elements() -> int | None:
     return None if _use_flash(_FLASH_MIN_QUERIES, 0) else _MASK_BUDGET
 
 
+_FLASH_SCALE_CACHE: dict[float, mx.array] = {}
+
+
 def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=None):
     """``banded_sink_attention`` for BF16/FP16 prefill blocks; same arguments and result."""
     global _flash_kernel
@@ -1185,12 +1188,15 @@ def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=No
             source=_FLASH_SOURCE,
             ensure_row_contiguous=False,
         )
-    lp = (
-        left_padding.astype(mx.int32)
-        if left_padding is not None
-        else mx.zeros((b,), dtype=mx.int32)
-    )
-    dims = mx.concatenate([mx.array([length, s], dtype=mx.int32), lp])
+    if left_padding is None:
+        dims = mx.array([length, s] + [0] * b, dtype=mx.int32)
+    else:
+        dims = mx.concatenate(
+            [mx.array([length, s], dtype=mx.int32), left_padding.astype(mx.int32)]
+        )
+    scale_arr = _FLASH_SCALE_CACHE.get(scale)
+    if scale_arr is None:
+        scale_arr = _FLASH_SCALE_CACHE[scale] = mx.array([scale], dtype=mx.float32)
     out = _flash_kernel(
         inputs=[
             q,
@@ -1199,7 +1205,7 @@ def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=No
             mx.contiguous(rel),
             mx.contiguous(sink.astype(mx.float32)),
             dims,
-            mx.array([scale], dtype=mx.float32),
+            scale_arr,
         ],
         template=[
             ("T", q.dtype),

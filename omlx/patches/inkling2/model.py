@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import math
+import os
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -398,8 +399,13 @@ class Inkling2Experts(nn.Module):
         (NVFP4 tensor scale included), before ``moe_sum``."""
         xe = mx.expand_dims(x, (-2, -3))
         # Sorting regroups the pairs by expert and changes their arithmetic;
-        # row-exact verify rows keep the per-pair gather of a decode step.
-        do_sort = inds.size >= 64 and not is_row_exact_armed()
+        # row-exact verify rows keep the per-pair gather of a decode step
+        # unless explicitly overridden via OMLX_INKLING2_MOE_SORT_MIN.
+        sort_env = os.environ.get("OMLX_INKLING2_MOE_SORT_MIN")
+        if sort_env is not None:
+            do_sort = inds.size >= int(sort_env)
+        else:
+            do_sort = inds.size >= 64 and not is_row_exact_armed()
         idx = inds
         inv = None
         if do_sort:
@@ -516,8 +522,16 @@ def _mix_messages_normed(
         return None
     hidden = mixed.shape[-1]
     z = kernels.loop_message_inputs(mixed, messages, m0, n)
-    low = _row_matmul(z, down.reshape(2 * n, hidden, -1))
-    gates = _row_matmul(kernels.loop_message_low(low), gain_forget)
+    if down.dtype == mx.bfloat16:
+        low = _row_matmul(z.astype(mx.bfloat16), down.reshape(2 * n, hidden, -1)).astype(
+            mx.float32
+        )
+        gates = _row_matmul(
+            kernels.loop_message_low(low).astype(mx.bfloat16), gain_forget
+        ).astype(mx.float32)
+    else:
+        low = _row_matmul(z, down.reshape(2 * n, hidden, -1))
+        gates = _row_matmul(kernels.loop_message_low(low), gain_forget)
     return kernels.loop_message_outputs(
         gates, mixed, messages, m0, n, norm_w, norm_eps, dtype, want_f32
     )
@@ -644,10 +658,22 @@ class Inkling2Attention(nn.Module):
                 # Looped passes give q, k and v their own inputs; project only
                 # the row slices of ``in_proj`` that each input uses.
                 c0, c1, c2 = self._cuts[:3]
-                q = _project_slice(self.in_proj, xq, 0, c0)
+                if (
+                    type(self.in_proj) is nn.QuantizedLinear
+                    and is_row_exact_armed()
+                    and xq.shape[-2] > 1
+                ):
+                    from ..row_exact_qmv import quantized_linears as _row_exact_group
+
+                    q, tail = _row_exact_group(
+                        (_row_slice(self.in_proj, 0, c0), _row_slice(self.in_proj, c2, None)),
+                        xq,
+                    )
+                else:
+                    q = _project_slice(self.in_proj, xq, 0, c0)
+                    tail = _project_slice(self.in_proj, xq, c2, None)
                 k = _project_slice(self.in_proj, xk, c0, c1)
                 v = _project_slice(self.in_proj, xv, c1, c2)
-                tail = _project_slice(self.in_proj, xq, c2, None)
                 r, gate, sink = mx.split(tail, self._tail_cuts, axis=-1)
             else:
                 # Wrapped projections (e.g. LoRALinear) fall back to the full
@@ -840,13 +866,15 @@ class Inkling2Layer(nn.Module):
             if self.layer_idx > 0:
                 mixed = self.attn_input(blocks, h_n)
         if messages is not None:
+            ld = self.__dict__.get("_omlx_loop_down_bf16", self.loop_down)
+            lgf = self.__dict__.get("_omlx_loop_gf_bf16", self.loop_gain_forget)
             normed = _mix_messages_normed(
                 mixed[:, :, : 1 if self.sliding else 3],
                 messages,
                 0,
                 3,
-                self.loop_down[:3],
-                self.loop_gain_forget[:3],
+                ld[:3],
+                lgf[:3],
                 attn_w,
                 self._norm_eps,
                 dtype,
@@ -911,13 +939,15 @@ class Inkling2Layer(nn.Module):
                 y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
             normed = None
             if messages is not None:
+                ld = self.__dict__.get("_omlx_loop_down_bf16", self.loop_down)
+                lgf = self.__dict__.get("_omlx_loop_gf_bf16", self.loop_gain_forget)
                 normed = _mix_messages_normed(
                     fused[0] if fused is not None else y[:, :, None],
                     messages,
                     3,
                     1,
-                    self.loop_down[3:],
-                    self.loop_gain_forget[3:],
+                    ld[3:],
+                    lgf[3:],
                     self._omlx_norm_w[1],
                     self.mlp_norm.eps,
                     h.dtype,
@@ -969,21 +999,32 @@ class Inkling2Layer(nn.Module):
             states.append(s)
         if tau is None:
             tau = self.attn.log_tau(kv, length)
-        if self.sliding:
-            norms = (self.attn_norm, self.mlp_norm)
-        else:
-            norms = (self.q_input_norm, self.k_input_norm, self.v_input_norm)
-            norms += (self.mlp_norm,)
-        for norm in norms:
-            _keep_fp32_weight(norm)
-        object.__setattr__(
-            self,
-            "_omlx_norm_w",
-            (
-                _fp32_norm_stack(self, norms[:-1], "attn"),
-                _fp32_norm_stack(self, norms[-1:], "mlp"),
-            ),
-        )
+        if self.__dict__.get("_omlx_norm_w") is None:
+            if self.sliding:
+                norms = (self.attn_norm, self.mlp_norm)
+            else:
+                norms = (self.q_input_norm, self.k_input_norm, self.v_input_norm)
+                norms += (self.mlp_norm,)
+            for norm in norms:
+                _keep_fp32_weight(norm)
+            object.__setattr__(
+                self,
+                "_omlx_norm_w",
+                (
+                    _fp32_norm_stack(self, norms[:-1], "attn"),
+                    _fp32_norm_stack(self, norms[-1:], "mlp"),
+                ),
+            )
+        if (
+            bank is not None
+            and os.environ.get("OMLX_INKLING2_LOOP_BF16", "0") == "1"
+            and "_omlx_loop_down_bf16" not in self.__dict__
+        ):
+            ld_bf = self.loop_down.astype(mx.bfloat16)
+            lgf_bf = self.loop_gain_forget.astype(mx.bfloat16)
+            mx.eval(ld_bf, lgf_bf)
+            object.__setattr__(self, "_omlx_loop_down_bf16", ld_bf)
+            object.__setattr__(self, "_omlx_loop_gf_bf16", lgf_bf)
         compiled = length <= _COMPILED_MAX_TOKENS
         if compiled and length > 1 and is_row_exact_armed():
             pre, post = self._pre_exact, self._post_exact
@@ -1052,7 +1093,10 @@ class Inkling2TextModel(nn.Module):
 
     def visit_caches(self, cache: list) -> list[tuple]:
         """``(KVCache or None, state)`` of every layer visit in ``cache``."""
-        layout = self.cache_layout()
+        layout = self.__dict__.get("_omlx_cache_layout")
+        if layout is None:
+            layout = self.cache_layout()
+            object.__setattr__(self, "_omlx_cache_layout", layout)
         entries = layout[-1][1] + 1 if layout else 0
         if len(cache) != entries:
             # A per-layer cache would silently skip the later loop passes.
@@ -1079,6 +1123,7 @@ class Inkling2TextModel(nn.Module):
         visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
         blocks: list = []
         prelude = bank = tau = None
+        flush_every = int(os.environ.get("OMLX_INKLING2_FLUSH_EVERY", "0"))
         for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
             layer = self.layers[idx]
             if idx == self._core_start and prelude is None:
@@ -1104,6 +1149,8 @@ class Inkling2TextModel(nn.Module):
                 bank=bank if loop_pass else None,
                 tau=None if layer.sliding else tau,
             )
+            if flush_every > 0 and (visit + 1) % flush_every == 0:
+                mx.async_eval(h)
         _keep_fp32_weight(self.norm)
         norm_w = _fp32_norm_stack(self, (self.norm,), "final")
         fused = None
