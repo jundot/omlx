@@ -182,12 +182,8 @@ def _keep_fp32_weight(norm: nn.Module) -> None:
 
 
 def _fp32_norm_stack(owner: nn.Module, norms, tag: str) -> mx.array | None:
-    """The FP32 weight copies of ``norms`` as one [N, H] array, for the norm
-    phase of ``kernels.attn_res_fused``; None unless every norm keeps one.
-
-    Built outside compiled traces and cached on ``owner`` per weight arrays,
-    like ``_keep_fp32_weight``.
-    """
+    """The FP32 weight copies of ``norms`` stacked [N, H], or None. Built outside
+    compiled traces and cached on ``owner``."""
     copies = []
     for norm in norms:
         held = norm.__dict__.get("_omlx_fp32_weight")
@@ -513,14 +509,9 @@ def _part(x: mx.array, i: int) -> mx.array:
 def _mix_messages_normed(
     mixed, messages, m0, n, down, gain_forget, norm_w, norm_eps, dtype, want_f32=False
 ):
-    """``_mix_messages`` of ``n`` inputs and the RMSNorm and cast that follow
-    it, with the steps around its two matmuls in kernels; None to fall back.
-
-    ``mixed``: [B, L, Q, H] FP32 attention-residual mix (input i is query i,
-    or query 0 when Q == 1); ``messages``: [B, L, 4, H] FP32, input i reads
-    message ``m0 + i``. Returns the normalized inputs [n, B, L, H] in
-    ``dtype`` (and their FP32 copy with ``want_f32``).
-    """
+    """``_mix_messages`` and the following RMSNorm and cast, with the steps
+    around its matmuls in kernels; None to fall back. Input i is query i of
+    ``mixed`` (or query 0) and message ``m0 + i``. Returns [n, B, L, H]."""
     if norm_w is None or not kernels.loop_messages_supported(mixed, messages):
         return None
     hidden = mixed.shape[-1]
@@ -827,8 +818,6 @@ class Inkling2Layer(nn.Module):
         attn_w = self._omlx_norm_w[0]
         fused = None
         if self.layer_idx > 0:
-            # Without messages the attention norms follow the mix directly
-            # and run in the same kernel.
             fused = kernels.attn_res_fused(
                 blocks,
                 h,
@@ -843,7 +832,6 @@ class Inkling2Layer(nn.Module):
         if fused is not None:
             mixed, h_n = fused
             if messages is None and attn_w is not None:
-                # ``mixed`` holds the normalized inputs: q, or q, k and v.
                 parts = [_part(mixed, i) for i in range(mixed.shape[0])]
                 xq, xk, xv = (parts[0], None, None) if self.sliding else parts
                 return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
@@ -915,7 +903,6 @@ class Inkling2Layer(nn.Module):
             want_f32=True,
         )
         if fused is not None and norm_w is not None:
-            # The router reads the rounded input in FP32; the kernel wrote it.
             x, x32 = _part(fused[0], 0), _part(fused[1], 0)
         else:
             if fused is not None:

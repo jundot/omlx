@@ -122,14 +122,9 @@ def attn_res_mix(blocks: list, partial_n: mx.array, query: mx.array, scale: floa
     return out
 
 
-# The fused kernels below repeat the arithmetic of the MLX ops they replace
-# (rms_norm and reduce kernels of the pinned MLX), so decode, verify and
-# prefill keep their bits. test_inkling2_fused_layer_kernels_keep_the_mlx_bits
-# compares the two paths; rerun it when the MLX pin changes.
-#
-# rms_norm's reduction (MLX's single-row kernel): the simdgroup partials go
-# through a zeroed threadgroup array and a second simd_sum, then precise rsqrt
-# of the mean over a runtime width.
+# The fused kernels below repeat the arithmetic of the pinned MLX's rms_norm
+# and reduce kernels, so outputs keep their bits. Rerun
+# test_inkling2_fused_layer_kernels_keep_the_mlx_bits after an MLX pin change.
 _RMS_INV_HEADER = """
 inline float omlx_inkling2_rms_inv(
     float acc,
@@ -169,14 +164,8 @@ def _rms_threads(hidden: int) -> int:
 def _attn_res_fused_kernel(
     blocks: int, queries: int, norm: bool, f32: bool, pout: bool
 ):
-    """``attn_res_mix`` with the unit-RMS of its partial-sum input and, given
-    ``norm``, the per-query RMSNorm and cast of its output, as one kernel.
-
-    The phases repeat the kernels they replace: MLX's single-row rms_norm (4
-    adjacent values per thread, fused multiply-adds, a second simd_sum over
-    the simdgroup partials, precise rsqrt over a runtime width) for both
-    norms, and the unfused mixing kernel on its first 256 threads.
-    """
+    """``attn_res_mix`` with its input unit-RMS and, given ``norm``, its output
+    RMSNorm and cast in one kernel."""
     key = (blocks, queries, norm, f32, pout)
     kernel = _attn_res_fused_kernels.get(key)
     if kernel is not None:
@@ -344,17 +333,11 @@ def attn_res_fused(
     want_f32: bool = False,
     want_partial: bool = False,
 ):
-    """``attn_res_mix(blocks, unit_rms(partial), query, scale)`` and, given
-    ``norm_weight`` ([Q, H] FP32), ``rms_norm(mix, weight).astype(out_dtype)``
-    per query, as one kernel; None off the GPU or for unsupported widths.
-
-    ``partial`` is the raw partial sum [B, L, H] (any float dtype; it is read
-    as FP32, like ``partial.astype(float32)``). Returns a tuple: the mix
-    ([B, L, Q, H], FP32, or ``out_dtype`` when normalized), then the FP32
-    copy of the normalized mix if ``want_f32``, then the unit-RMS partial if
-    ``want_partial``. Normalized outputs are [Q, B, L, H], so each query's
-    rows stay contiguous.
-    """
+    """``attn_res_mix(blocks, unit_rms(partial), ...)``, then per query
+    ``rms_norm(mix, norm_weight).astype(out_dtype)`` when ``norm_weight`` is
+    given, as one kernel; None when unsupported. Returns the mix ([B, L, Q, H]
+    FP32, or [Q, B, L, H] when normalized), its FP32 copy if ``want_f32`` and
+    the unit-RMS partial if ``want_partial``."""
     b, length, hidden = partial.shape
     nq = query.shape[0]
     norm = norm_weight is not None
@@ -411,13 +394,10 @@ def attn_res_fused(
     )
 
 
-# Loop controllers (model._mix_messages) around their two MLX matmuls. The
-# rms phases repeat rms_norm's single-row kernel; the elementwise steps keep
-# the compiled graph's one statement per op, so nothing is contracted.
+# Elementwise steps keep one statement per op, as the compiled graph does, so
+# nothing is contracted into a fused multiply-add.
 
 
-# z[2i + half] = bf16-rounded unit RMS of input i (half 0) or its message
-# (half 1); one threadgroup per (row, 2i + half).
 _LOOP_IN_SOURCE = """
     const uint tid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
@@ -454,8 +434,7 @@ _LOOP_IN_SOURCE = """
     }
 """
 
-# The two halves of the down projection summed as MLX's small column reduce
-# (each plus zero, the second added to the first), then rounded to BF16.
+# MLX's small column reduce adds zero to each value, then the second to the first.
 _LOOP_LOW_SOURCE = """
     const uint idx = thread_position_in_grid.x;
     const uint n = low_shape[0] / 2;
@@ -471,8 +450,6 @@ _LOOP_LOW_SOURCE = """
     out[idx] = float(bfloat16_t(s));
 """
 
-# (1 - tanh(forget)) * x + tanh(gain) * message, then the RMSNorm with weight
-# row (NW > 1 ? i : 0) and the cast; one threadgroup per (row, i).
 _LOOP_OUT_SOURCE = """
     const uint tid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
@@ -1000,16 +977,10 @@ def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
     return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
 
 
-# The attention projection epilogue as one kernel: L2 clips of q, k and the
-# relative state r, the unit-RMS of v, the full-attention log scaling and the
-# casts. Each 32-thread threadgroup owns one head of one token; the arithmetic
-# repeats the MLX ops it replaces bit for bit:
-# - clip sums: each lane adds the squares of its 4 adjacent values (squares
-#   rounded first, as the separate multiply kernel does), then simd_sum, as
-#   MLX's row reduce of a 128-wide row; d_rel rows are summed in order, as its
-#   small-row reduce.
-# - v: rms_norm's single-row kernel with its fused multiply-adds, its second
-#   simd_sum over the threadgroup partials and precise rsqrt.
+# One head of one token per 32-thread threadgroup. Clip sums add rounded
+# squares (MLX squares in a separate kernel), 4 adjacent values per lane then
+# simd_sum, as MLX's row reduce; d_rel rows are summed in order. v follows
+# rms_norm, whose squares are fused multiply-adds.
 _QKV_POST_SOURCE = """
     const uint lane = thread_index_in_simdgroup;
     const uint task = threadgroup_position_in_grid.x;
@@ -1096,15 +1067,9 @@ _qkv_post_kernel = None
 
 
 def qkv_post(q, k, v, r, q_scale, r_scale, qk_clip, r_clip, tau, heads, kv_heads):
-    """The clipped q, k and r and the unit-RMS v of the attention projections,
-    as ``Inkling2Attention.project`` computes them with MLX ops; None when the
-    shapes are not the ones this kernel covers.
-
-    ``q``/``r``: [B, L, Hq * D] and [B, L, Hq * R] in the activation dtype
-    (strided views are read in place); ``k``: [B, L, Hkv * D] in that dtype;
-    ``v``: [B, L, Hkv * D] FP32; ``tau``: None or [B or 1, L, 1, 1] FP32.
-    Returns q, k, v as [B, L, H, D] and r as [B, L, Hq, R] in q's dtype.
-    """
+    """``Inkling2Attention.project``'s clips, v unit-RMS and log scaling as one
+    kernel, or None when unsupported. Returns q, k, v as [B, L, H, D] and r as
+    [B, L, Hq, R] in q's dtype."""
     global _qkv_post_kernel
     b, length, dq = q.shape
     dkv = k.shape[-1]
@@ -1140,8 +1105,6 @@ def qkv_post(q, k, v, r, q_scale, r_scale, qk_clip, r_clip, tau, heads, kv_heads
             ensure_row_contiguous=False,
         )
     has_tau = tau is not None
-    # Without log scaling, a scalar stands in and is never read. A shared
-    # scaling is broadcast with stride 0 rather than copied per row.
     # 0-d arrays would be bound by value; the kernel indexes them.
     qk_clip = qk_clip.reshape(1)
     r_clip = r_clip.reshape(1)
@@ -1266,9 +1229,7 @@ inline float omlx_inkling2_padded(
     return i < p ? float(srow[i * ss]) : float(T(xrow[(i - p) * xs]));
 }
 
-// Row i of [state, x] where x is the routed experts' weighted sum: the FP32
-// products z * w, each plus zero, added in expert order, as MLX's small
-// column reduce sums them. zcol points at token 0, expert 0 of one channel.
+// x is the experts' weighted sum, added as MLX's small column reduce does.
 // The weights may be bound in the constant address space (fewer than 8).
 template <typename T, typename S, typename Z, int KE, typename WP>
 inline float omlx_inkling2_padded_moe(
@@ -1415,7 +1376,6 @@ def short_conv(
     return out, xp
 
 
-# _SHORT_CONV_SOURCE reading its input as the routed experts' weighted sum.
 _SHORT_CONV_MOE_SOURCE = (
     _SHORT_CONV_SOURCE.replace("const int C = x_shape[2];", "const int C = x_shape[3];")
     .replace(
@@ -1446,13 +1406,8 @@ def moe_short_conv(
     residual: mx.array,
     dtype,
 ):
-    """``short_conv(sum(z.astype(float32) * weights[..., None], axis=-2), ...)``
-    with the expert sum done in the conv kernel; None when it does not apply.
-
-    ``z``: [B, L, E, C] expert outputs (contiguous); ``weights``: [B, L, E]
-    FP32 routing weights; the other arguments as ``short_conv`` (FP32 input,
-    a residual, output in ``dtype``).
-    """
+    """``short_conv`` of the expert sum ``moe_sum(z, weights)`` with the sum done
+    in the kernel, or None when unsupported."""
     global _short_conv_moe_kernel
     b, length, experts, channels = z.shape
     if mx.default_device() != mx.gpu or experts > _MOE_SUM_MAX_EXPERTS:
