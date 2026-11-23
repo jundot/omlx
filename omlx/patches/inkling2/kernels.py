@@ -597,7 +597,25 @@ def loop_message_outputs(
     )
 
 
-def _decode_attention(q, k, v, rel, sink, scale, window):
+def _decode_attention(q, k, v, rel, sink, scale, window, left_padding=None):
+    if q.shape[0] > 1:
+        # SDPA sinks are per head, and the sink logits differ per row.
+        return mx.concatenate(
+            [
+                _decode_attention(
+                    q[i : i + 1],
+                    k[i : i + 1],
+                    v[i : i + 1],
+                    rel[i : i + 1],
+                    sink[i : i + 1],
+                    scale,
+                    window,
+                    None if left_padding is None else left_padding[i : i + 1],
+                )
+                for i in range(q.shape[0])
+            ],
+            axis=0,
+        )
     s = k.shape[2]
     lo = max(0, s - window) if window else 0
     if lo:
@@ -611,6 +629,10 @@ def _decode_attention(q, k, v, rel, sink, scale, window):
     if n < sv:
         tail = mx.concatenate([mx.zeros((hq, sv - n), dtype=tail.dtype), tail], -1)
     mask = tail.reshape(1, hq, 1, sv).astype(q.dtype)
+    if left_padding is not None:
+        # A batch cache keeps padding before the row's first token; hide it.
+        pad = (lo + mx.arange(sv)) < left_padding.astype(mx.int32)[0]
+        mask = mx.where(pad.reshape(1, 1, 1, sv), mx.array(-mx.inf, q.dtype), mask)
     return mx.fast.scaled_dot_product_attention(
         q, k, v, scale=scale, mask=mask, sinks=sink[0, 0].astype(q.dtype)
     )
@@ -891,8 +913,10 @@ def banded_sink_attention(
     keys to d < window (sliding layers use window == R).
     """
     b, length = q.shape[0], q.shape[2]
-    if b == 1 and length == 1 and left_padding is None:
-        return _decode_attention(q, k, v, rel, sink, scale, window)
+    if length == 1:
+        # Batch caches (BatchKVCache, padded sliding windows) pass left_padding;
+        # without this, decode took the masked path over every cached key.
+        return _decode_attention(q, k, v, rel, sink, scale, window, left_padding)
     if b == 1 and left_padding is None and is_row_exact_armed():
         # Row-exact verify: each row is the decode step of its token, over the
         # keys up to its own position. The rows are joined as [B, L, H, D], so
