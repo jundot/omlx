@@ -1460,6 +1460,14 @@ def _decode_attention_case(batch, heads, kv_heads, length, keys, extent, dtype, 
     return q, k, v, rel, sink
 
 
+def _small_decode_chunks(monkeypatch, kernels):
+    """Several chunks at test sizes, and full-attention decode steps on the
+    kernel from the first key on."""
+    monkeypatch.setattr(kernels, "_DECODE_CHUNK", 64)
+    monkeypatch.setattr(kernels, "_DECODE_SLIDING_CHUNK", 16)
+    monkeypatch.setattr(kernels, "_DECODE_MIN_KEYS", 0)
+
+
 @pytest.mark.parametrize(
     "batch, heads, kv_heads, length, keys, window, extent, left_padding",
     [
@@ -1489,21 +1497,27 @@ def test_inkling2_flash_decode_matches_masked_sdpa(
     monkeypatch,
 ):
     """Decode steps, batched decode and verify blocks; 300 keys are five
-    chunks of 64, and 12 heads on one KV head fill two simdgroups."""
+    chunks of 64, a window of 32 is two chunks of 16, and 12 heads on one KV
+    head fill two simdgroups."""
     from omlx.patches.inkling2 import kernels
 
     if mx.default_device() != mx.gpu:
         pytest.skip("Metal kernel")
-    monkeypatch.setattr(kernels, "_DECODE_CHUNK", 64)
+    _small_decode_chunks(monkeypatch, kernels)
     args = _decode_attention_case(
         batch, heads, kv_heads, length, keys, extent, getattr(mx, dtype)
     )
     lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
     scale = args[0].shape[-1] ** -0.5
     expected = kernels._masked_attention(*args, scale, window, lp)
-    got = kernels.banded_sink_attention(
+    got = kernels.gqa_flash_decode_attention(
         *args, scale=scale, window=window, left_padding=lp
     )
+    if batch > 1 or length > 1 or not window:
+        routed = kernels.banded_sink_attention(
+            *args, scale=scale, window=window, left_padding=lp
+        )
+        assert mx.array_equal(routed, got)
     assert got.shape == expected.shape and got.dtype == expected.dtype
     diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
     assert diff.item() < 1e-2
@@ -1531,7 +1545,7 @@ def test_inkling2_flash_decode_rows_have_the_bits_of_one_row_calls(
 
     if mx.default_device() != mx.gpu:
         pytest.skip("Metal kernel")
-    monkeypatch.setattr(kernels, "_DECODE_CHUNK", 64)
+    _small_decode_chunks(monkeypatch, kernels)
     length, keys, pads = 8, 300, [0, 113]
     q, k, v, rel, sink = _decode_attention_case(
         2, 6, 2, length, keys, 32, getattr(mx, dtype)
@@ -1550,7 +1564,7 @@ def test_inkling2_flash_decode_rows_have_the_bits_of_one_row_calls(
     for row, pad in enumerate(pads):
         for pos in range(length):
             end = keys - length + 1 + pos
-            step = kernels.banded_sink_attention(
+            step = kernels.gqa_flash_decode_attention(
                 q[row : row + 1, :, pos : pos + 1],
                 k[row : row + 1, :, pad:end],
                 v[row : row + 1, :, pad:end],
@@ -1560,3 +1574,47 @@ def test_inkling2_flash_decode_rows_have_the_bits_of_one_row_calls(
                 window=window,
             )
             assert mx.array_equal(block[row : row + 1, :, pos : pos + 1], step)
+
+
+@pytest.mark.parametrize(
+    "window, min_keys", [(0, 0), (0, 296), (0, 1 << 20), (32, 0)]
+)
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_row_exact_block_rows_are_their_decode_steps(
+    window, min_keys, dtype, monkeypatch
+):
+    """A row-exact verify block has, row by row, the bits of the decode step
+    of that token, whichever of SDPA and the decode kernel the step takes:
+    its rows see 293 to 300 keys, so with 296 the first three stay on SDPA."""
+    from omlx.patches.inkling2 import kernels
+    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    _small_decode_chunks(monkeypatch, kernels)
+    monkeypatch.setattr(kernels, "_DECODE_MIN_KEYS", min_keys)
+    length, keys = 8, 300
+    q, k, v, rel, sink = _decode_attention_case(
+        1, 6, 2, length, keys, 32, getattr(mx, dtype)
+    )
+    scale = q.shape[-1] ** -0.5
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        block = kernels.banded_sink_attention(
+            q, k, v, rel, sink, scale=scale, window=window
+        )
+        mx.eval(block)
+    finally:
+        set_verify_qmm_armed(False)
+    for pos in range(length):
+        end = keys - length + 1 + pos
+        step = kernels.banded_sink_attention(
+            q[:, :, pos : pos + 1],
+            k[:, :, :end],
+            v[:, :, :end],
+            rel[:, pos : pos + 1],
+            sink[:, pos : pos + 1],
+            scale=scale,
+            window=window,
+        )
+        assert mx.array_equal(block[:, :, pos : pos + 1], step)

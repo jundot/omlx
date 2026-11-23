@@ -1021,7 +1021,8 @@ _DECODE_FOLD_SOURCE = """
     const int h = (row / L) % HQ;
     const int b = row / (L * HQ);
     constexpr int PER = (D + 31) / 32;
-    float m = float(sink[(b * L + pos) * HQ + h]) * LOG2E;
+    float m = float(sink[b * sink_strides[0] + pos * sink_strides[1]
+                         + h * sink_strides[2]]) * LOG2E;
     float l = 1.0f;
     float o[PER];
     for (int i = 0; i < PER; ++i) {
@@ -1060,11 +1061,21 @@ _DECODE_FOLD_SOURCE = """
     }
 """
 _decode_kernels = None
-# Distances per chunk of the decode kernel. A constant: the chunk layout must
-# not depend on the call (see _DECODE_PART_SOURCE).
+# Distances per chunk of the decode kernel, for full and for sliding layers.
+# Constants of the layer: the chunk layout must not depend on the call (see
+# _DECODE_PART_SOURCE). A threadgroup walks its chunk tile by tile on one GPU
+# core, so a sliding window is cut into several chunks to spread over cores;
+# a long full-attention read is bound by memory and prefers few partials.
 _DECODE_CHUNK = 1024
+_DECODE_SLIDING_CHUNK = 128
 # Simdgroups staging one tile (the first ones also run the queries).
 _DECODE_STAGERS = 2
+# A decode step takes the kernel in a full-attention layer once its query
+# sees this many keys. One query over fewer keys, or over a sliding window,
+# is bound by launches, not by reading keys, and one SDPA call launches less:
+# on an M5 Pro it takes 0.06 ms for a window against the kernel's 0.07 ms,
+# the two meet near 13K keys, and the kernel leads by 6% at 16K, 19% at 64K.
+_DECODE_MIN_KEYS = 13 * 1024
 
 
 def _use_flash_decode(q, k) -> bool:
@@ -1103,18 +1114,18 @@ def gqa_flash_decode_attention(
                 input_names=["part_o", "part_m", "part_l", "sink"],
                 output_names=["out"],
                 source=_DECODE_FOLD_SOURCE,
+                ensure_row_contiguous=False,
             ),
         )
     part, fold = _decode_kernels
     reach = min(s, window) if window else s
-    ns = max(1, -(-reach // _DECODE_CHUNK))
+    chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
+    ns = max(1, -(-reach // chunk))
     nsg = max(-(-g // 8), _DECODE_STAGERS)
-    lp = (
-        left_padding.astype(mx.int32)
-        if left_padding is not None
-        else mx.zeros((b,), dtype=mx.int32)
-    )
-    dims = mx.concatenate([mx.array([length, s, ns], dtype=mx.int32), lp])
+    # Constants where they can be: every op here is one more launch per visit.
+    dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
+    if left_padding is not None:
+        dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
     part_o, part_m, part_l = part(
         inputs=[
             q,
@@ -1132,7 +1143,7 @@ def gqa_flash_decode_attention(
             ("G", g),
             ("R", rel.shape[-1]),
             ("WINDOW", int(window)),
-            ("CHUNK", _DECODE_CHUNK),
+            ("CHUNK", chunk),
             ("NSG", nsg),
         ],
         grid=(ns * nsg * 32, hkv * length, b),
@@ -1145,7 +1156,7 @@ def gqa_flash_decode_attention(
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
     return fold(
-        inputs=[part_o, part_m, part_l, mx.contiguous(sink.astype(mx.float32))],
+        inputs=[part_o, part_m, part_l, sink],
         template=[("T", q.dtype), ("D", d), ("HQ", hq), ("L", length), ("NS", ns)],
         grid=(b * hq * length * 32, 1, 1),
         threadgroup=(32, 1, 1),
@@ -1236,38 +1247,77 @@ def banded_sink_attention(
     keys to d < window (sliding layers use window == R).
     """
     b, length = q.shape[0], q.shape[2]
-    row_exact = b == 1 and left_padding is None and is_row_exact_armed()
+    s = k.shape[2]
+    single = b == 1 and left_padding is None
+    row_exact = single and is_row_exact_armed()
+    # Leading rows of the block that stay on SDPA.
+    sdpa_rows = length
     if (length < _FLASH_MIN_QUERIES or row_exact) and _use_flash_decode(q, k):
-        # Decode steps, batched decode and verify blocks; its rows are those
-        # of one-row calls, so a row-exact verify needs no other path.
-        return gqa_flash_decode_attention(
-            q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
-        )
-    if b == 1 and length == 1 and left_padding is None:
+        sdpa_rows = 0
+        if single and (length == 1 or row_exact):
+            # A decode step, or a verify block whose rows must have the bits
+            # of their tokens' decode steps: the path depends only on the
+            # row's own key count, which grows by one per row.
+            sdpa_rows = length
+            if not window:
+                sdpa_rows = max(0, min(length, _DECODE_MIN_KEYS - (s - length + 1)))
+        if not sdpa_rows or (row_exact and sdpa_rows < length):
+            # Batched decode, verify blocks and long-context decode steps.
+            # The kernel's rows are those of one-row calls, so a row-exact
+            # verify takes it for the rows whose decode step does.
+            tail = gqa_flash_decode_attention(
+                q[:, :, sdpa_rows:] if sdpa_rows else q,
+                k,
+                v,
+                rel[:, sdpa_rows:] if sdpa_rows else rel,
+                sink[:, sdpa_rows:] if sdpa_rows else sink,
+                scale=scale,
+                window=window,
+                left_padding=left_padding,
+            )
+            if not sdpa_rows:
+                return tail
+    if single and length == 1:
         return _decode_attention(q, k, v, rel, sink, scale, window)
     if row_exact:
         # Row-exact verify: each row is the decode step of its token, over the
-        # keys up to its own position.
-        fused = verify_attention.rows_attention(
-            q, k, v, rel, sink, scale=scale, window=window
-        )
-        if fused is not None:
-            return fused
+        # keys up to its own position. The leading ``sdpa_rows`` rows are SDPA
+        # decode steps, which one launch computes with the same bits.
+        if sdpa_rows == length:
+            fused = verify_attention.rows_attention(
+                q, k, v, rel, sink, scale=scale, window=window
+            )
+            if fused is not None:
+                return fused
+        else:
+            fused = verify_attention.rows_attention(
+                q[:, :, :sdpa_rows],
+                k[:, :, : s - length + sdpa_rows],
+                v[:, :, : s - length + sdpa_rows],
+                rel[:, :sdpa_rows],
+                sink[:, :sdpa_rows],
+                scale=scale,
+                window=window,
+            )
         # The rows are joined as [B, L, H, D], so the output projection reads
         # them without a transpose copy.
-        s = k.shape[2]
-        rows = [
-            _decode_attention(
-                q[:, :, r : r + 1],
-                k[:, :, : s - length + 1 + r],
-                v[:, :, : s - length + 1 + r],
-                rel[:, r : r + 1],
-                sink[:, r : r + 1],
-                scale,
-                window,
-            ).transpose(0, 2, 1, 3)
-            for r in range(length)
-        ]
+        if fused is not None:
+            rows = [fused.transpose(0, 2, 1, 3)]
+        else:
+            rows = [
+                _decode_attention(
+                    q[:, :, r : r + 1],
+                    k[:, :, : s - length + 1 + r],
+                    v[:, :, : s - length + 1 + r],
+                    rel[:, r : r + 1],
+                    sink[:, r : r + 1],
+                    scale,
+                    window,
+                ).transpose(0, 2, 1, 3)
+                for r in range(sdpa_rows)
+            ]
+        if sdpa_rows < length:
+            rows.append(tail.transpose(0, 2, 1, 3))
         return mx.concatenate(rows, axis=1).transpose(0, 2, 1, 3)
     if q.dtype in (mx.bfloat16, mx.float16) and _use_flash(length, window):
         return flash_banded_attention(
