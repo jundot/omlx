@@ -141,6 +141,12 @@ struct QuantizationScreen: View {
         .onChange(of: vm.preserveMtp) { _, _ in
             vm.scheduleEstimateRefresh(client: services.client)
         }
+        .onChange(of: vm.textOnly) { _, _ in
+            vm.scheduleEstimateRefresh(client: services.client)
+        }
+        .onChange(of: vm.dtype) { _, _ in
+            vm.scheduleEstimateRefresh(client: services.client)
+        }
         .sheet(item: $vm.uploadTarget) { task in
             UploadModalView(task: task, vm: vm, client: services.client)
         }
