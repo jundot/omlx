@@ -176,6 +176,30 @@ class TestQueueFullAfterResponseStarted:
         body = json.loads("".join(chunks))
         assert body["error"]["type"] == "server_error"
         assert "cluster preflight failed" in body["error"]["message"]
+        # Only _openai_error_body emits these keys; the generic fallback does
+        # not, so their presence pins this branch against mutation.
+        assert "param" in body["error"]
+        assert "code" in body["error"]
+
+    @pytest.mark.asyncio
+    async def test_late_invalid_request_is_reported_as_400_with_param(self):
+        import omlx.server as srv
+        from omlx.exceptions import InvalidRequestError
+
+        async def _raise_late():
+            await asyncio.sleep(0.01)
+            raise InvalidRequestError("prompt must not be empty", field="messages")
+
+        chunks = [
+            chunk
+            async for chunk in srv._with_json_keepalive(
+                self._Request(), _raise_late(), disconnect_poll=0.001
+            )
+        ]
+        body = json.loads("".join(chunks))
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["param"] == "messages"
+        assert "must not be empty" in body["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_late_unexpected_error_still_yields_parseable_body(self):

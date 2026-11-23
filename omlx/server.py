@@ -3321,11 +3321,21 @@ async def _with_json_keepalive(
             logger.warning("JSON keepalive request rejected (distributed): %s", e)
             yield json.dumps(_openai_error_body(str(e), 503))
             return
+        except InvalidRequestError as e:
+            # Scheduler.add_request validates after the queue-full check, so a
+            # caller error (e.g. an empty prompt) can also land here late.
+            # Mirror the pre-commit handler's 400 + param so a bad request is
+            # not reported as a retryable server error.
+            logger.warning("JSON keepalive request rejected (invalid): %s", e)
+            yield json.dumps(_openai_error_body(str(e), 400, param=e.field))
+            return
         except Exception as e:
             # Parity with _with_sse_keepalive: anything else that escaped the
             # task must still reach the client as a parseable body instead of
             # a truncated 200 (which surfaces as IncompleteRead client-side).
-            logger.error("JSON keepalive request failed: %s", e)
+            # The traceback is kept because this is the only place an
+            # unforeseen late failure will surface.
+            logger.exception("JSON keepalive request failed: %s", e)
             yield json.dumps({"error": {"message": str(e), "type": "server_error"}})
             return
         if result is not None:
