@@ -1584,6 +1584,48 @@ def test_chat_usage_reports_reasoning_tokens(
     assert usage["completion_tokens_details"]["reasoning_tokens"] == reasoning_tokens
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_usage_reasoning_tokens_never_exceed_completion_tokens(
+    client, mock_llm_engine, stream
+):
+    # Re-tokenizing the reasoning text can yield more tokens than the model
+    # generated (e.g. the scheduler's synthetic "<think>\n" prefix on a
+    # prompt-opened block). Clients reject usage where reasoning > completion.
+    text = "<think>\nOne two three four five six seven"
+    output = MockGenerationOutput(
+        text=text, new_text=text, completion_tokens=5, finish_reason="length"
+    )
+    payload = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+    if stream:
+
+        async def stream_chat(messages, **kwargs):
+            yield output
+
+        mock_llm_engine.stream_chat = stream_chat
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    else:
+        mock_llm_engine.chat = AsyncMock(return_value=output)
+
+    response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        usage = next(event["usage"] for event in events if event.get("usage"))
+    else:
+        usage = response.json()["usage"]
+    assert usage["completion_tokens"] == 5
+    assert usage["completion_tokens_details"]["reasoning_tokens"] == 5
+
+
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""
 
