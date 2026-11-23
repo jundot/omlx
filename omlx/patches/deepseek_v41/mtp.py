@@ -119,6 +119,11 @@ class DSparkMixin:
 
         return take_primed(self, cache, main_token, target_offset=cache_offset)
 
+    def mtp_batch_activation_ok(self, cache, rows):
+        """Whether one batched decode can advance these `rows` requests by a token and
+        return their DSpark target hidden."""
+        return self._batched_decode_ok((rows, 1), cache, cache[0].make_mask(1), None, True, {})
+
     def mtp_shared_verify_rows(self):
         """Rows one mtp_verify_rows forward holds, or 0 when requests cannot verify together
         (layers off the fused kernels, tensor ranks). Pipeline ranks vote on the first call,

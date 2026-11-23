@@ -157,6 +157,8 @@ FP8 activation boundary and layout checks: `python -m pytest tests/test_deepseek
 
 Fused decode kernels: `python -m pytest tests/test_deepseek_v41_fused_decode.py -q`. A five-layer random model with MXFP or oQ2-oQ3 affine layouts (2-8 bits) runs each decode layer against the unfused block, batched and MTP verify blocks are checked bitwise against single-token decode (including the matrix-tile kernels an MTP-enabled model uses), and DSpark generation must reproduce greedy decoding.
 
+Batched DSpark activation: `python -m pytest tests/test_deepseek_v41_fused_decode.py tests/test_deepseek_v41_mtp.py -q -k 'draft_inputs or activate_drafting or primes_each_row'`. A batched decode that captures the DSpark target hidden must give each request its single-request logits and hidden, every (re)activation of a batch must advance all requests with one forward while each keeps its greedy tokens, and each row must adopt its own primed draft context.
+
 MoE activation reuse and per-expert reference checks: `python -m pytest tests/test_deepseek_v41_moe.py -q`. These cover sorted prefill, decode, independent routed/shared activation policies, and repeated outputs with small quantized weights.
 
 DeepSeek V4.1 Metal arithmetic and sparse-addressing checks: `python -m pytest tests/test_deepseek_v41_kernels.py -q` (no checkpoint required).

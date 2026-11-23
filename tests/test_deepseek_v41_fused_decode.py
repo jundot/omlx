@@ -833,6 +833,69 @@ def test_batched_decode_returns_each_requests_draft_inputs(fmt, batch):
         assert batched[0].extract(r).size() == cache[0].size()
 
 
+@pytest.mark.parametrize("count", [2, 8])
+def test_requests_activate_drafting_in_one_forward(monkeypatch, count):
+    """Every (re)activation of a batch's drafting advances all requests with one batched
+    forward, and each request still reproduces its own greedy decoding."""
+    from mlx_lm.generate import BatchGenerator
+
+    from omlx.patches.mlx_lm_mtp import batch_generator, batch_policy
+
+    batch_generator.apply()
+    model = _dspark_build()
+    prompts = [[3 + r + j for j in range(9)] for r in range(0, 9 * count, 9)]
+    model.configure_mtp(True, 3)
+    model._omlx_mtp_depth_fixed = True
+    expected = []
+    for prompt in prompts:
+        tokens, cache = [], model.make_cache()
+        for s in range(0, len(prompt) - 1, 4):
+            model(mx.array([prompt[s : min(s + 4, len(prompt) - 1)]]), cache=cache)
+        ids = mx.array([prompt[-1:]])
+        for _ in range(16):
+            token = int(mx.argmax(model(ids, cache=cache)[0, -1]).item())
+            tokens.append(token)
+            ids = mx.array([[token]])
+        expected.append(tokens)
+    activations = []
+    real = batch_generator._initial_batch_forward
+
+    def counted(gen_batch):
+        shared = real(gen_batch)
+        activations.append((len(gen_batch.uids), shared is not None))
+        return shared
+
+    monkeypatch.setattr(batch_generator, "_initial_batch_forward", counted)
+    # An ordinary step every few batch steps drops the drafting state, so the
+    # batch re-activates the way it does after a park.
+    steps = []
+
+    def needs_standard(self):
+        steps.append(1)
+        return len(steps) % 4 == 0
+
+    monkeypatch.setattr(batch_policy.BatchPolicy, "needs_standard", needs_standard)
+    generator = BatchGenerator(
+        model, max_tokens=16, prefill_step_size=4, prefill_batch_size=count,
+        sampler=lambda logits: mx.argmax(logits, -1),
+    )
+    result = {}
+    try:
+        uids = generator.insert(prompts)
+        for _ in range(96):
+            _, responses = generator.next()
+            for response in responses:
+                result.setdefault(response.uid, []).append(response.token)
+            if all(len(result.get(uid, [])) >= 16 for uid in uids):
+                break
+    finally:
+        generator.close()
+    full = [shared for rows, shared in activations if rows == count]
+    assert len(full) >= 2 and all(full), activations
+    for uid, want in zip(uids, expected):
+        assert result[uid][:16] == want
+
+
 # Two pipeline ranks run batched Lightning MTP for two requests (rank 0 holds the head and
 # the DSpark target layers, rank 1 replays its cycles).
 _CLUSTER_MTP_BATCH_RANK = """
