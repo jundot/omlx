@@ -244,8 +244,13 @@ from .exceptions import (
     RequestAbortedError,
     SchedulerQueueFullError,
 )
-from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .model_settings import (
+    forced_ct_keys,
+    merge_chat_template_request_kwargs,
+    specprefill_draft,
+)
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
 from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
 from .prefill_progress import get_prefill_tracker
@@ -2103,6 +2108,25 @@ def _no_repeat_ngram_kwargs(request) -> dict[str, int]:
 
 def _ignore_eos_kwargs(request) -> dict[str, bool]:
     return {"ignore_eos": True} if getattr(request, "ignore_eos", False) else {}
+
+
+def _specprefill_kwargs(
+    engine: BaseEngine, model_id: str, resolved_model: str
+) -> dict[str, bool | float]:
+    """Return the SpecPrefill values of the requested model or exposed profile.
+
+    The attached draft serves requests with different values, so each one carries its own.
+    """
+    sm = _server_state.settings_manager
+    if sm is None or not getattr(engine, "specprefill_draft_path", None):
+        return {}
+    runtime = sm.get_exposed_profile_runtime_settings_for_request(model_id)
+    settings = runtime[1] if runtime else sm.get_settings(resolved_model)
+    return {
+        "specprefill": specprefill_draft(settings) == engine.specprefill_draft_path,
+        "specprefill_keep_pct": settings.specprefill_keep_pct or DEFAULT_KEEP_RATE,
+        "specprefill_threshold": settings.specprefill_threshold or DEFAULT_THRESHOLD,
+    }
 
 
 # `off` keeps a one-shot request out of the prefix cache; lookups still run.
@@ -4523,6 +4547,9 @@ async def _chat_model_decisions(
     multimodal = isinstance(engine, VLMBatchedEngine) or getattr(
         engine, "supports_multimodal_fallback", False
     )
+    chat_kwargs = _specprefill_kwargs(
+        engine, request.model, _serving_model_id(lease, request.model)
+    )
 
     def _prepare_readout(messages):
         try:
@@ -4539,7 +4566,9 @@ async def _chat_model_decisions(
                 ) from e
             raise
         validate_context_window(num_prompt_tokens, request.model)
-        return {} if prepared is None else {"_prepared_prompt": prepared}
+        if prepared is None:
+            return chat_kwargs
+        return {**chat_kwargs, "_prepared_prompt": prepared}
 
     async def _decide():
         await _raise_if_llm_lease_abort_requested(lease)
@@ -4730,6 +4759,9 @@ async def create_completion(
             gen_kwargs.update(_no_repeat_ngram_kwargs(request))
             gen_kwargs.update(_ignore_eos_kwargs(request))
             gen_kwargs.update(_cache_store_kwargs(http_request))
+            gen_kwargs.update(
+                _specprefill_kwargs(engine, request.model, resolved_model)
+            )
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -5227,6 +5259,7 @@ async def create_chat_completion(
         chat_kwargs.update(_no_repeat_ngram_kwargs(request))
         chat_kwargs.update(_ignore_eos_kwargs(request))
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_specprefill_kwargs(engine, request.model, resolved_model))
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -6134,6 +6167,9 @@ async def stream_completion(
     gen_kwargs.update(_ignore_eos_kwargs(request))
     if skip_cache_store:
         gen_kwargs["skip_cache_store"] = True
+    gen_kwargs.update(
+        _specprefill_kwargs(engine, request.model, resolved_model or request.model)
+    )
     outputs = engine.stream_generate(
         prompt=prompt,
         max_tokens=max_tokens,
@@ -8112,6 +8148,7 @@ async def create_anthropic_message(
             chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_specprefill_kwargs(engine, request.model, resolved_model))
 
         # Validate context window before sending to model
         num_prompt_tokens, prepared_prompt = await _prepare_prompt_off_loop(
@@ -8938,6 +8975,7 @@ async def create_response(
             chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_specprefill_kwargs(engine, request.model, resolved_model))
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.

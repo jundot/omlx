@@ -249,6 +249,13 @@ def _setting(settings: Any, name: str) -> Any:
     return getattr(settings, name, None)
 
 
+def specprefill_draft(settings: Any) -> str | None:
+    """Return the SpecPrefill draft path, or None while SpecPrefill is off."""
+    if not _setting(settings, "specprefill_enabled"):
+        return None
+    return _setting(settings, "specprefill_draft_model") or None
+
+
 def a8_prefill_on(settings: Any) -> bool:
     """A8 prefill only when it was saved on: it changes numerics."""
     return bool(_setting(settings, "a8_prefill_enabled"))

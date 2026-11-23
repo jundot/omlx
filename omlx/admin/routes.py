@@ -85,6 +85,7 @@ from ..model_settings import (
     resolve_lora_conflicts,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
+    specprefill_draft,
     validate_ane_prefill,
     validate_moe_expert_offload,
     MOE_OFFLOAD_MTP_MODEL_TYPES,
@@ -3122,6 +3123,7 @@ async def update_model_settings(
     prev_load_signature = engine_pool._engine_runtime_signature(
         model_id, current_settings
     )
+    prev_specprefill_draft = specprefill_draft(current_settings)
     is_diffusion_model = _entry_is_diffusion_model(entry)
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
@@ -3762,6 +3764,13 @@ async def update_model_settings(
         # catches Qwen ANE controls (and future signature additions) without
         # requiring a second hand-maintained field list here.
         or prev_load_signature != current_load_signature
+        # Only an unload releases a SpecPrefill draft that is no longer used.
+        or (
+            prev_specprefill_draft
+            and prev_specprefill_draft != specprefill_draft(current_settings)
+            and prev_specprefill_draft
+            == getattr(entry.engine, "specprefill_draft_path", None)
+        )
         or "index_cache_freq" in sent
         or "dflash_enabled" in sent
         or "dflash_draft_model" in sent
