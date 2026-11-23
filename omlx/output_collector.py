@@ -156,6 +156,11 @@ class RequestOutputCollector:
                 if new.generated_until is not None
                 else existing.generated_until
             ),
+            first_token_at=(
+                existing.first_token_at
+                if existing.first_token_at is not None
+                else new.first_token_at
+            ),
             tool_calls=new.tool_calls,  # Preserve tool_calls for Harmony models
             logprobs=(
                 (existing.logprobs or []) + (new.logprobs or [])
@@ -166,6 +171,11 @@ class RequestOutputCollector:
             error=new.error or existing.error,
             error_code=new.error_code or existing.error_code,
             error_metadata=new.error_metadata or existing.error_metadata,
+            # Cumulative per request, so the latest output holds all of it.
+            benchmark_prefill_chunks=new.benchmark_prefill_chunks,
+            benchmark_requested_steps=new.benchmark_requested_steps,
+            benchmark_boundary_enabled=new.benchmark_boundary_enabled,
+            benchmark_cache_block_size=new.benchmark_cache_block_size,
         )
 
     def clear(self) -> None:
