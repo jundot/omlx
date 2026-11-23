@@ -127,6 +127,45 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <!-- Anonymous (guest) chat -->
+                                <div class="px-4 sm:px-6 py-4 border-t border-neutral-100">
+                                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                                        <div>
+                                            <label class="text-sm text-neutral-700">{{ t('settings.auth.guest_chat') }}</label>
+                                            <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.auth.guest_chat_hint') }}</p>
+                                            <p class="text-xs text-red-500 mt-0.5"
+                                               x-show="globalSettings.auth.guest_chat_enabled && !isLoopbackBindHost(globalSettings.server.host)"
+                                               x-cloak>{{ t('settings.auth.guest_chat_warning') }}</p>
+                                        </div>
+                                        <button type="button"
+                                                @click="toggleGuestChat()"
+                                                :class="globalSettings.auth.guest_chat_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black shrink-0">
+                                            <span :class="globalSettings.auth.guest_chat_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+
+                                    <div x-show="globalSettings.auth.guest_chat_enabled" x-cloak
+                                         class="mt-3 p-3 bg-neutral-50 rounded-xl border border-neutral-200">
+                                        <p class="text-xs text-neutral-500 mb-2">{{ t('settings.auth.guest_chat_link') }}</p>
+                                        <div class="flex flex-col sm:flex-row gap-2">
+                                            <input type="text" readonly :value="guestChatUrl()"
+                                                   class="flex-1 px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white font-mono text-neutral-600">
+                                            <button type="button" @click="copyGuestChatUrl()"
+                                                    class="px-3 py-2 text-xs font-medium text-neutral-600 bg-neutral-100 rounded-lg hover:bg-neutral-200 transition-colors">
+                                                <span x-show="!guestChatCopied">{{ t('settings.auth.guest_chat_copy') }}</span>
+                                                <span x-show="guestChatCopied" x-cloak>{{ t('settings.auth.guest_chat_copied') }}</span>
+                                            </button>
+                                            <button type="button" @click="rotateGuestChatKey()"
+                                                    class="px-3 py-2 text-xs font-medium text-neutral-600 bg-neutral-100 rounded-lg hover:bg-neutral-200 transition-colors">
+                                                {{ t('settings.auth.guest_chat_rotate') }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <p class="text-xs text-red-500 mt-2" x-show="guestChatError" x-cloak x-text="guestChatError"></p>
+                                </div>
+
                                 <!-- Sub Keys Section -->
                                 <div class="px-6 py-4">
                                     <div class="flex items-center justify-between mb-3">

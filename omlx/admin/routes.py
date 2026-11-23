@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -214,6 +215,18 @@ class DeleteSubKeyRequest(BaseModel):
     """Request model for deleting a sub API key."""
 
     key: str
+
+
+class GuestChatRequest(BaseModel):
+    """Request model for configuring anonymous (guest) chat.
+
+    ``rotate`` issues a fresh guest key, which invalidates the one any
+    currently open guest page holds — the way to kick everyone out without
+    turning the feature off.
+    """
+
+    enabled: bool | None = None
+    rotate: bool = False
 
 
 class CacheProbeRequest(BaseModel):
@@ -1732,7 +1745,42 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     """
     global_settings = _get_global_settings()
     api_key = global_settings.auth.api_key if global_settings else ""
-    return templates.TemplateResponse(request, "chat.html", {"api_key": api_key or ""})
+    return templates.TemplateResponse(
+        request, "chat.html", {"api_key": api_key or "", "guest_mode": False}
+    )
+
+
+def render_guest_chat_page(request: Request) -> HTMLResponse:
+    """Render the anonymous chat page, or 404 when guest chat is off.
+
+    Shared by the admin-prefixed route and the top-level ``/chat`` one so
+    both answer identically — above all when guest chat is disabled, where
+    a 404 (rather than a redirect to the admin login) keeps the feature
+    from advertising itself on a server that never enabled it.
+
+    The page is handed ``guest_chat_key``, never ``auth.api_key``: an
+    anonymous visitor must not come away holding the credential that opens
+    the admin panel and every other API surface.
+    """
+    global_settings = _get_global_settings()
+    guest_key = (
+        global_settings.auth.guest_chat_credential() if global_settings else None
+    )
+    if not guest_key:
+        raise HTTPException(status_code=404, detail="Not found")
+    return templates.TemplateResponse(
+        request, "chat.html", {"api_key": guest_key, "guest_mode": True}
+    )
+
+
+@router.get("/chat/guest", response_class=HTMLResponse)
+async def guest_chat_page(request: Request):
+    """Anonymous chat page — no admin session required.
+
+    Deliberately has no ``require_admin`` dependency. Everything that
+    gates it lives in render_guest_chat_page().
+    """
+    return render_guest_chat_page(request)
 
 
 @router.get("/static/{path:path}")
@@ -2006,6 +2054,81 @@ async def create_sub_key(
 
     logger.info(f"Sub key created: {request.name or '(unnamed)'}")
     return {"success": True, "sub_key": entry.to_dict()}
+
+
+@router.get("/api/guest-chat")
+async def get_guest_chat(is_admin: bool = Depends(require_admin)):
+    """Report whether anonymous chat is on, and where it is served."""
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    auth = global_settings.auth
+    return {
+        "enabled": auth.guest_chat_enabled,
+        "key_set": bool((auth.guest_chat_key or "").strip()),
+        "path": "/chat",
+        "admin_path": "/admin/chat/guest",
+    }
+
+
+@router.post("/api/guest-chat")
+async def configure_guest_chat(
+    request: GuestChatRequest, is_admin: bool = Depends(require_admin)
+):
+    """Enable, disable, or re-key anonymous chat.
+
+    Enabling mints a guest key when none exists, so the caller never has to
+    supply one and the enabled flag is never live without a credential
+    behind it. Disabling keeps the key in settings: turning the feature back
+    on resumes the same URL, and `rotate` is the explicit way to invalidate
+    pages that are already open.
+
+    Returns:
+        JSON with the resulting state and the guest key (admin-only
+        endpoint — this is the one place the key is handed back, so the
+        operator can share the link).
+    """
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    auth = global_settings.auth
+    previous = (auth.guest_chat_enabled, auth.guest_chat_key)
+
+    if request.enabled is not None:
+        auth.guest_chat_enabled = request.enabled
+
+    needs_key = auth.guest_chat_enabled and not (auth.guest_chat_key or "").strip()
+    if request.rotate or needs_key:
+        # URL-safe and well clear of the 4-char minimum validate_api_key
+        # enforces; it travels in an Authorization header like any other key.
+        auth.guest_chat_key = secrets.token_urlsafe(32)
+
+    errors = global_settings.validate()
+    if errors:
+        auth.guest_chat_enabled, auth.guest_chat_key = previous
+        raise HTTPException(status_code=400, detail=errors)
+
+    try:
+        global_settings.save()
+    except Exception as e:
+        auth.guest_chat_enabled, auth.guest_chat_key = previous
+        raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    if request.enabled is not None and request.enabled != previous[0]:
+        logger.info(
+            "Guest chat %s", "enabled" if auth.guest_chat_enabled else "disabled"
+        )
+    if auth.guest_chat_key != previous[1]:
+        logger.info("Guest chat key rotated")
+
+    return {
+        "success": True,
+        "enabled": auth.guest_chat_enabled,
+        "guest_chat_key": auth.guest_chat_key or "",
+        "path": "/chat",
+    }
 
 
 @router.delete("/api/sub-keys")
@@ -4144,6 +4267,8 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "api_key": global_settings.auth.api_key or "",
             "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
             "sub_keys": [sk.to_dict() for sk in global_settings.auth.sub_keys],
+            "guest_chat_enabled": global_settings.auth.guest_chat_enabled,
+            "guest_chat_key": global_settings.auth.guest_chat_key or "",
         },
         "claude_code": {
             "mode": global_settings.claude_code.mode,

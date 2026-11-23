@@ -229,6 +229,8 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models.
 
+Optionally share the chat page with other people on your network — no login, no admin access, one link. Off by default; see [Anonymous chat](docs/guest-chat.md).
+
 <p align="center">
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX Chat" width="720">
 </p>

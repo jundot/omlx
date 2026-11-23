@@ -982,6 +982,10 @@
 {% endblock %}
 
 {% block content %}
+{# A guest has no admin session, so the brand link must not point at the
+   dashboard: following it would land them on the login page. Send them
+   back to the chat they are already on instead. #}
+{% set brand_href = '/chat' if guest_mode | default(false) else '/admin/dashboard' %}
 <script>
     // Apply theme immediately before render to prevent flash (match applyTheme / Alpine default)
     // Literal key on purpose: THEME_STORAGE_KEY is declared in the later app script block
@@ -1024,14 +1028,14 @@
         <div class="p-4 border-b border-line flex-shrink-0">
             <div class="flex items-center justify-between">
                 <div class="flex items-center gap-2">
-                    <a href="/admin/dashboard">
+                    <a href="{{ brand_href }}">
                         <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX"
                             class="w-[30px] h-[30px]">
                         <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX"
                             class="w-[30px] h-[30px]" x-cloak>
                     </a>
                     <div class="flex flex-col gap-0">
-                        <a href="/admin/dashboard" class="font-semibold leading-tight">{{ t('chat.brand') }}</a>
+                        <a href="{{ brand_href }}" class="font-semibold leading-tight">{{ t('chat.brand') }}</a>
                         <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
                            class="relative text-[10px] leading-none hover:opacity-80 transition-opacity"
                            style="color: var(--text-muted);"
@@ -2527,6 +2531,23 @@
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
     const SYSTEM_PROMPT_STORAGE_KEY = 'omlx_chat_system_prompt';
     const PROMPT_PROFILES_STORAGE_KEY = 'omlx_chat_prompt_profiles';
+
+    // True when this page was served to an anonymous visitor. A guest holds
+    // the guest-chat key, which authenticates the inference API and nothing
+    // under /admin, so every admin endpoint this page would otherwise call
+    // answers 401. Those calls are all optional enrichment (model aliases,
+    // cluster handles, server stats, update banner) and are already guarded
+    // by `.ok`, so standing in a not-ok response keeps the page on its
+    // existing fallback path instead of filling a guest's console with
+    // failures — and avoids the pointless round trips.
+    const GUEST_MODE = {{ guest_mode | default(false) | tojson }};
+
+    function adminFetch(...args) {
+        if (GUEST_MODE) {
+            return Promise.resolve(new Response(null, { status: 403 }));
+        }
+        return fetch(...args);
+    }
 
     function resolveChatUntitledLabel() {
         if (typeof window.t === 'function') {
@@ -4237,7 +4258,7 @@
         const modelId = stream.sourceModel || session?.model;
         if (!modelId) return;
         try {
-            const resp = await fetch('/admin/api/stats', { credentials: 'same-origin' });
+            const resp = await adminFetch('/admin/api/stats', { credentials: 'same-origin' });
             if (!resp.ok) return;
             const data = await resp.json();
             if (this.anyChatStreaming()) {
@@ -4732,13 +4753,13 @@
                 settingsResponse,
             ] = await Promise.all([
                 fetch('/v1/models', { headers: apiHeaders }),
-                fetch('/admin/api/models', { credentials: 'same-origin', headers: apiHeaders }),
-                fetch('/admin/api/cluster/deployments', {
+                adminFetch('/admin/api/models', { credentials: 'same-origin', headers: apiHeaders }),
+                adminFetch('/admin/api/cluster/deployments', {
                     credentials: 'same-origin',
                     headers: apiHeaders,
                 }),
                 fetch('/health'),
-                fetch('/admin/api/global-settings', { credentials: 'same-origin' })
+                adminFetch('/admin/api/global-settings', { credentials: 'same-origin' })
             ]);
 
             if (!modelsResponse.ok) {
@@ -4840,7 +4861,7 @@
     async fetchAdminModelsList({ force = false } = {}) {
         if (!force && this._adminModelsList) return this._adminModelsList;
         if (this._adminModelsListPromise) return this._adminModelsListPromise;
-        this._adminModelsListPromise = fetch('/admin/api/models', { credentials: 'same-origin' })
+        this._adminModelsListPromise = adminFetch('/admin/api/models', { credentials: 'same-origin' })
             .then(async (response) => {
                 if (!response.ok) throw new Error('Failed to load admin models');
                 const data = await response.json();
@@ -4957,7 +4978,7 @@
     // Poll stats during generation (per-stream request_id claims avoid bleed across chats/models)
     async fetchStats() {
         try {
-            const resp = await fetch('/admin/api/stats', { credentials: 'same-origin' });
+            const resp = await adminFetch('/admin/api/stats', { credentials: 'same-origin' });
             if (!resp.ok) return;
             const data = await resp.json();
 
@@ -7790,7 +7811,7 @@
 
     async checkForUpdate() {
         try {
-            const resp = await fetch('/admin/api/update-check');
+            const resp = await adminFetch('/admin/api/update-check');
             if (resp.ok) {
                 const data = await resp.json();
                 this.updateAvailable = data.update_available;

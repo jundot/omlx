@@ -616,6 +616,13 @@ class AuthSettings:
     secret_key: str | None = None
     skip_api_key_verification: bool = False
     sub_keys: list[SubKeyEntry] = field(default_factory=list)
+    # Anonymous chat: serves the chat page with no admin login. The page is
+    # handed guest_chat_key — never the main key — so a visitor can call the
+    # inference API but nothing under /admin. Off until an operator enables
+    # it, and the key is generated at that point rather than defaulted, so
+    # an enabled flag can never mean "no credential required".
+    guest_chat_enabled: bool = False
+    guest_chat_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -624,6 +631,8 @@ class AuthSettings:
             "secret_key": self.secret_key,
             "skip_api_key_verification": self.skip_api_key_verification,
             "sub_keys": [sk.to_dict() for sk in self.sub_keys],
+            "guest_chat_enabled": self.guest_chat_enabled,
+            "guest_chat_key": self.guest_chat_key,
         }
 
     @classmethod
@@ -634,7 +643,27 @@ class AuthSettings:
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
             sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
+            guest_chat_enabled=data.get("guest_chat_enabled", False),
+            guest_chat_key=data.get("guest_chat_key"),
         )
+
+    def guest_chat_credential(self) -> str | None:
+        """The key guest chat authenticates with, or None when it is off.
+
+        One accessor for both the route that hands the key to the page and
+        the API verifier that accepts it, so the two can never disagree
+        about whether guest access is live.
+        """
+        if not self.guest_chat_enabled:
+            return None
+        # settings.json is hand-editable, so the stored value may be any JSON
+        # type. Anything but a non-empty string means no usable credential —
+        # and therefore no guest access — rather than a type error raised on
+        # every request once the flag is on.
+        if not isinstance(self.guest_chat_key, str):
+            return None
+        key = self.guest_chat_key.strip()
+        return key or None
 
 
 @dataclass

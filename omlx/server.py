@@ -323,10 +323,17 @@ async def verify_api_key(
 ) -> bool:
     """Verify API key unless an explicitly loopback-only server allows no auth.
 
-    Checks the provided Bearer token against the main API key and all sub keys.
+    Checks the provided Bearer token against the main API key, all sub keys,
+    and the guest-chat key when anonymous chat is enabled.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import fingerprint_key, verify_any_api_key
+    from .admin.auth import (
+        compare_keys,
+        fingerprint_key,
+        resolve_guest_chat_key,
+        verify_any_api_key,
+    )
+    from .settings import SubKeyEntry
     from .utils.network import is_loopback_bind
 
     global_settings = _server_state.global_settings
@@ -339,9 +346,22 @@ async def verify_api_key(
     active_host = bind_host if isinstance(bind_host, str) else configured_host
     loopback_only = active_host is None or is_loopback_bind(active_host)
 
+    guest_key = resolve_guest_chat_key(global_settings)
+
+    def _provided_key() -> str | None:
+        if credentials is not None:
+            return credentials.credentials
+        return request.headers.get("x-api-key")
+
     # A missing key is accepted only when the configured bind is loopback-only.
     if _server_state.api_key is None:
         if loopback_only:
+            return True
+        # Guest chat is the one way to serve a LAN bind with no main key
+        # configured: the page holds the guest key, so honor it here rather
+        # than refusing every request the guest page makes.
+        provided = _provided_key()
+        if guest_key and provided and compare_keys(provided, guest_key):
             return True
         raise HTTPException(status_code=401, detail="API key required")
 
@@ -354,20 +374,21 @@ async def verify_api_key(
         return True
 
     # Extract API key from Bearer token or x-api-key header
-    if credentials is not None:
-        api_key_value = credentials.credentials
-    else:
-        # Fallback: check x-api-key header (Anthropic SDK compatibility)
-        api_key_value = request.headers.get("x-api-key")
-        if api_key_value is None:
-            raise HTTPException(status_code=401, detail="API key required")
+    api_key_value = _provided_key()
+    if api_key_value is None:
+        raise HTTPException(status_code=401, detail="API key required")
 
-    # Check main key and sub keys
-    sub_keys = (
+    # Check main key, sub keys, and the guest-chat key. The guest key is kept
+    # out of auth.sub_keys so that revoking guest access is one switch and
+    # cannot be confused with the operator's own API keys; it is appended
+    # here, at the only place sub keys are verified.
+    sub_keys = list(
         global_settings.auth.sub_keys
         if global_settings is not None
         else []
     )
+    if guest_key:
+        sub_keys.append(SubKeyEntry(key=guest_key, name="guest-chat"))
     if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
         logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -2793,6 +2814,28 @@ async def _json_response_or_keepalive(
     if lease is not None:
         generator = _release_after_stream(generator, lease)
     return StreamingResponse(generator, media_type=media_type, headers=headers)
+
+
+@app.get("/chat", include_in_schema=False)
+async def guest_chat_entrypoint(request: FastAPIRequest):
+    """Short URL for the anonymous chat page.
+
+    A link handed to someone else should not have to read ``/admin/`` —
+    guests have no admin access and the path would only invite them to look
+    for it. When guest chat is off this redirects to the normal chat page,
+    which asks for the admin login as it always has.
+    """
+    from .admin.routes import render_guest_chat_page
+
+    global_settings = _server_state.global_settings
+    guest_key = (
+        global_settings.auth.guest_chat_credential()
+        if global_settings is not None
+        else None
+    )
+    if not guest_key:
+        return RedirectResponse(url="/admin/chat", status_code=302)
+    return render_guest_chat_page(request)
 
 
 @app.get("/health")

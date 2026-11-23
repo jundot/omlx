@@ -202,6 +202,9 @@
             showNewSubKey: false,
             subKeyError: '',
             showSubKeys: {},
+            // Anonymous chat
+            guestChatError: '',
+            guestChatCopied: false,
 
             // Saving state
             saving: false,
@@ -1159,6 +1162,56 @@
                     }
                 } catch (err) {
                     this.subKeyError = window.t('js.error.save_settings_failed');
+                }
+            },
+
+            // Guest chat is toggled through its own endpoint rather than the
+            // settings form: enabling mints a key server-side, and the reply
+            // carries the shareable link. Routing it through the bulk save
+            // would mean the operator could enable the flag without ever
+            // being shown the URL it produced.
+            async toggleGuestChat() {
+                const enabling = !this.globalSettings.auth.guest_chat_enabled;
+                await this._postGuestChat({ enabled: enabling });
+            },
+
+            async rotateGuestChatKey() {
+                if (!confirm(window.t('settings.auth.guest_chat_rotate_confirm'))) return;
+                await this._postGuestChat({ rotate: true });
+            },
+
+            async _postGuestChat(body) {
+                this.guestChatError = '';
+                try {
+                    const response = await fetch('/admin/api/guest-chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    if (response.ok) {
+                        await this.loadGlobalSettings();
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json();
+                        this.guestChatError = data.detail || window.t('js.error.save_settings_failed');
+                    }
+                } catch (err) {
+                    this.guestChatError = window.t('js.error.save_settings_failed');
+                }
+            },
+
+            guestChatUrl() {
+                return `${window.location.origin}/chat`;
+            },
+
+            async copyGuestChatUrl() {
+                try {
+                    await navigator.clipboard.writeText(this.guestChatUrl());
+                    this.guestChatCopied = true;
+                    setTimeout(() => { this.guestChatCopied = false; }, 1500);
+                } catch (err) {
+                    console.error('Failed to copy guest chat URL:', err);
                 }
             },
 

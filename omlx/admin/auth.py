@@ -154,6 +154,39 @@ def fingerprint_key(api_key: str) -> str:
     return digest[:8]
 
 
+def resolve_guest_chat_key(global_settings) -> Optional[str]:
+    """The live guest-chat key for these settings, or None.
+
+    Returns None unless anonymous chat is enabled *and* a non-empty string
+    key is stored, so no caller can mistake an enabled flag for open access.
+
+    Defensive about the settings object itself: it may be a stand-in without
+    the accessor, or carry a non-string key from a hand-edited settings.json.
+    Either way the answer is "no guest access", never a value that would
+    reach compare_keys() and raise on every request.
+
+    Args:
+        global_settings: GlobalSettings, or None before initialization.
+
+    Returns:
+        The guest key, or None when guest chat is not live.
+    """
+    if global_settings is None:
+        return None
+    accessor = getattr(
+        getattr(global_settings, "auth", None), "guest_chat_credential", None
+    )
+    if not callable(accessor):
+        return None
+    try:
+        candidate = accessor()
+    except Exception:
+        return None
+    if isinstance(candidate, str) and candidate:
+        return candidate
+    return None
+
+
 def verify_api_key(api_key: str, server_api_key: str) -> bool:
     """Verify an API key using constant-time comparison.
 
