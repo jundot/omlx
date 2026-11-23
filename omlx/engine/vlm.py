@@ -56,6 +56,7 @@ from ..model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
     ced_prefill_on,
+    specprefill_draft,
 )
 from ..models.vlm import VLMModelAdapter
 from ..oqh.format import is_oqh_checkpoint
@@ -70,6 +71,7 @@ from ..patches.muse_spark import model as muse_spark_model
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..specprefill.draft import attach_specprefill_draft
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
     compute_per_image_hashes,
@@ -1841,6 +1843,8 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the DFlash block drafter attached to Lightning MTP when
         # dflash_enabled.
         self._dflash_drafter: Any | None = None
+        self.specprefill_draft_path: str | None = None
+        self.specprefill_failed_draft: str | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
@@ -2925,85 +2929,11 @@ class VLMBatchedEngine(BaseEngine):
             logger.debug("qwen3_5 padded-row attention patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
-        # SpecPrefill: load draft model and pass to scheduler
-        if self._model_settings is not None:
-            specprefill_draft = getattr(
-                self._model_settings, "specprefill_draft_model", None
+        draft_path = specprefill_draft(self._model_settings)
+        if draft_path:
+            await loop.run_in_executor(
+                get_mlx_executor(), attach_specprefill_draft, self, draft_path
             )
-            specprefill_enabled = getattr(
-                self._model_settings, "specprefill_enabled", False
-            )
-            if specprefill_enabled and specprefill_draft:
-                try:
-                    from ..utils.model_loading import (
-                        lm_load_compat as mlx_lm_load,
-                    )
-                    from ..utils.model_loading import (
-                        maybe_load_custom_quantization,
-                    )
-                    from ..utils.tokenizer import get_tokenizer_config
-
-                    def _load_draft():
-                        from ..patches.mlx_lm_mtp import set_mtp_active
-                        from ..utils.model_loading import materialize_lazy_state
-
-                        was_mtp = False
-                        try:
-                            from ..patches.mlx_lm_mtp import is_mtp_active
-
-                            was_mtp = is_mtp_active()
-                        except Exception:
-                            pass
-                        set_mtp_active(False)
-                        try:
-                            custom_loaded = maybe_load_custom_quantization(
-                                specprefill_draft,
-                                is_vlm=False,
-                            )
-                            if custom_loaded is not None:
-                                draft_model, _ = custom_loaded
-                            else:
-                                draft_tokenizer_config = get_tokenizer_config(
-                                    specprefill_draft,
-                                    trust_remote_code=self._trust_remote_code,
-                                )
-                                draft_model, _ = mlx_lm_load(
-                                    specprefill_draft,
-                                    tokenizer_config=draft_tokenizer_config,
-                                    trust_remote_code=self._trust_remote_code,
-                                )
-                            # Materialize frozen buffers (RoPE freqs, etc.)
-                            # on the loader thread. mlx_lm.load only does
-                            # mx.eval(model.parameters()) and leaves siblings
-                            # lazy bound to this thread's stream. Without
-                            # this, the first score_tokens() call from
-                            # Scheduler.step on the per-engine executor
-                            # thread raises "no Stream(gpu, X) in current
-                            # thread". Same root cause and fix as e93c408
-                            # for the VLM MTP drafter.
-                            materialize_lazy_state(draft_model)
-                            return draft_model
-                        finally:
-                            set_mtp_active(was_mtp)
-
-                    draft_model = await loop.run_in_executor(
-                        get_mlx_executor(), _load_draft
-                    )
-                    self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model,
-                        draft_model_name=specprefill_draft,
-                        keep_pct=getattr(
-                            self._model_settings, "specprefill_keep_pct", None
-                        ),
-                        threshold=getattr(
-                            self._model_settings, "specprefill_threshold", None
-                        ),
-                    )
-                    logger.info(
-                        f"SpecPrefill: draft model loaded ({specprefill_draft})"
-                    )
-                except Exception as e:
-                    logger.error(f"SpecPrefill: draft model load failed: {e}")
 
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)
@@ -3138,6 +3068,8 @@ class VLMBatchedEngine(BaseEngine):
                 "_grammar_compiler",
                 "_vlm_mtp_drafter",
                 "_dflash_drafter",
+                "specprefill_draft_path",
+                "specprefill_failed_draft",
                 "_diffusion_family",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
@@ -5011,18 +4943,16 @@ class VLMBatchedEngine(BaseEngine):
         from the full prompt token count (system-only messages usually can't be
         templated on their own). Shared by ``chat`` and ``stream_chat`` so the
         non-streaming path protects the system prompt identically. No-op unless
-        the model has SpecPrefill enabled and the request has a system prompt.
+        SpecPrefill applies to the request and the request has a system prompt.
 
         ``prompt`` is the already-tokenized VLM prompt (a list of token IDs,
         per ``_process_chat_messages``), so the full-prompt count is just its
         length rather than a re-encode.
         """
-        specprefill_model_enabled = (
-            getattr(self._model_settings, "specprefill_enabled", False)
-            if self._model_settings
-            else False
-        )
-        if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
+        enabled = kwargs.get("specprefill")
+        if enabled is None:
+            enabled = getattr(self._model_settings, "specprefill_enabled", False)
+        if not enabled:
             return
         non_system = [
             m for m in messages if m.get("role") not in ("system", "developer")

@@ -811,8 +811,7 @@ class EngineCore:
         if specprefill is not None:
             request._specprefill_enabled = specprefill
         elif self.scheduler._specprefill_draft_model is not None:
-            # Draft model is loaded → enable by default
-            request._specprefill_enabled = True
+            request._specprefill_enabled = self.scheduler._specprefill_default_enabled
         if specprefill_keep_pct is not None:
             request._specprefill_keep_pct = specprefill_keep_pct
         if specprefill_threshold is not None:

@@ -1783,6 +1783,62 @@ def test_chat_completion_returns_token_logprobs(
     ]
 
 
+@pytest.mark.parametrize(
+    "path", ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/completions"]
+)
+def test_specprefill_values_follow_the_requested_model(
+    monkeypatch, tmp_path, prepared_chat_engine, path
+):
+    """A base model and its exposed profile share the attached draft."""
+    engine = prepared_chat_engine
+    engine.specprefill_draft_path = "/draft"
+    engine.preflight_chat = engine.preflight_completion = AsyncMock()
+    engine.chat = engine.generate = AsyncMock(return_value=GenerationOutput(text="Hi"))
+    manager = ModelSettingsManager(tmp_path)
+    manager.set_settings("test-model", ModelSettings(specprefill_threshold=4096))
+    manager.save_profile(
+        "test-model",
+        name="fast",
+        display_name="Fast",
+        description=None,
+        settings={
+            "specprefill_enabled": True,
+            "specprefill_draft_model": "/draft",
+            "specprefill_keep_pct": 0.4,
+        },
+        expose_as_model=True,
+    )
+    state = ServerState()
+    state.engine_pool = _mock_pool()
+    state.settings_manager = manager
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    body = {
+        "/v1/responses": {"input": "Hi", "store": False},
+        "/v1/completions": {"prompt": "Hi"},
+    }.get(path, {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 16})
+
+    client = TestClient(srv.app, raise_server_exceptions=False)
+    for model, expected in (
+        ("test-model", (False, 0.2, 4096)),
+        ("test-model:fast", (True, 0.4, 4096)),
+    ):
+        response = client.post(path, json={"model": model, **body})
+        assert response.status_code == 200, response.text
+        sent = engine.chat.call_args.kwargs
+        assert (
+            sent["specprefill"],
+            sent["specprefill_keep_pct"],
+            sent["specprefill_threshold"],
+        ) == expected
+
+
 @pytest.mark.parametrize("subclass", [False, True])
 def test_prepare_chat_prompt_for_request_keeps_other_engine_count_path(subclass):
     class OtherBatchedEngine(BatchedEngine):

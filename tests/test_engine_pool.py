@@ -2254,6 +2254,59 @@ class TestEnginePoolAsync:
         assert second is base_engine
         profile_engine.stop.assert_awaited_once()
 
+    def test_k2_ane_prefill_keeps_specprefill_in_the_signature(
+        self, pool_with_mock_engines
+    ):
+        """The reload is what rejects this combination."""
+        pool = pool_with_mock_engines
+        pool.get_entry("model-a").config_model_type = "k2_horizon"
+
+        def signature(**specprefill):
+            settings = ModelSettings(qwen35_ane_prefill_enabled=True, **specprefill)
+            return pool._engine_runtime_signature("model-a", settings)
+
+        assert signature() != signature(
+            specprefill_enabled=True, specprefill_draft_model="/draft"
+        )
+
+    @pytest.mark.asyncio
+    async def test_specprefill_draft_attaches_without_reload(
+        self, pool_with_mock_engines
+    ):
+        """An alias adds its draft to a busy engine, which then serves both."""
+        pool = pool_with_mock_engines
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings()
+        alias, other_draft = (
+            ModelSettings(specprefill_enabled=True, specprefill_draft_model=draft)
+            for draft in ("/draft", "/other")
+        )
+        engine = MagicMock(specprefill_draft_path=None)
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+
+        def attach(engine, draft_path):
+            assert pool.get_entry("model-a").in_use == 2
+            engine.specprefill_draft_path = draft_path
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch(
+                "omlx.engine_pool.attach_specprefill_draft", side_effect=attach
+            ) as attach_mock,
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            for settings in (alias, None, alias):
+                served = await pool.get_engine("model-a", runtime_settings=settings)
+                assert served is engine
+            with pytest.raises(ModelBusyError):
+                await pool.get_engine("model-a", runtime_settings=other_draft)
+
+        attach_mock.assert_called_once_with(engine, "/draft")
+        engine.start.assert_awaited_once()
+        engine.stop.assert_not_awaited()
+        assert pool.get_entry("model-a").in_use == 1
+
     @pytest.mark.asyncio
     async def test_embedding_engine_receives_scheduler_config(self, tmp_path):
         """Embedding chunk sizing should come from the shared scheduler config."""
