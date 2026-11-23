@@ -617,11 +617,15 @@ def test_batched_engram_projects_each_request_like_a_single_request(batch):
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
 @pytest.mark.parametrize("prompt_length", [11, 2])   # full window (batched attention) / filling
 @pytest.mark.parametrize("rows,accepted", [(2, 0), (3, 2), (6, 3)])
-def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted, prompt_length, fmt):
+# 3: every token selects index_topk keys; 12: a short context, where the block's tokens see
+# different key counts and candidate widths (each selects as its own call does).
+@pytest.mark.parametrize("index_topk", [3, 12])
+def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted, prompt_length, fmt, index_topk):
     """An MTP verify block through the fused kernels gives every token bit for bit the
     logits of decoding it alone, and after a partial rollback the cache continues exactly
     like one that decoded only the accepted tokens."""
-    model = verify_exact(build(fmt=fmt, vocab_size=4096))   # the vocab head kernel (per-row exact) needs >= 4096 rows
+    # The vocab head kernel (per-row exact) needs >= 4096 rows.
+    model = verify_exact(build(fmt=fmt, vocab_size=4096, index_topk=index_topk))
     calls = []
     real = decode_fused.decode_block_verify
 
@@ -644,7 +648,7 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
     for j in range(rows):
         assert mx.array_equal(got[0, j], expected[j]).item(), f"row {j}"
     assert len(calls) == model._config.n_layers
-    # A full window with enough index keys runs the compressor and indexer once per block.
+    # A full window runs the compressor and indexer once per block.
     assert len(blocks) == (4 if prompt_length == 11 else 0)
     assert model.mtp_partial_rollback(verified, accepted, rows - 1)
     for t in tokens[: accepted + 1]:
