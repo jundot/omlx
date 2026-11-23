@@ -4955,3 +4955,410 @@ class TestTurboquantBitsSignature:
             assert payload["turboquant_kv_bits"] == 6.0
         finally:
             mgr.close()
+
+
+@pytest.mark.skipif(not _has_mlx(), reason="requires MLX")
+class TestSharedSSDDirectoryQuota:
+    """Tests for shared SSD cache quota coordination across model managers (#5497)."""
+
+    @staticmethod
+    def _make_cache_data(mx):
+        keys = mx.zeros((1, 4, 16, 32), dtype=mx.float16)
+        values = mx.zeros((1, 4, 16, 32), dtype=mx.float16)
+        return [(keys, values)]
+
+    @staticmethod
+    def _disk_cache_bytes(cache_dir: Path) -> int:
+        return sum(
+            p.stat().st_size for p in cache_dir.rglob("*.safetensors") if p.is_file()
+        )
+
+    @classmethod
+    def _measure_block_size(cls, tmp_path: Path, mx) -> int:
+        probe_dir = tmp_path / "_probe"
+        probe = PagedSSDCacheManager(
+            cache_dir=probe_dir,
+            max_size_bytes=10 * 1024 * 1024,
+            expected_model_name="probe",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        try:
+            h = b"\x01" * 32
+            assert probe.save_block(
+                block_hash=h,
+                cache_data=cls._make_cache_data(mx),
+                token_count=16,
+                model_name="probe",
+                layer_cache_types=["KVCache"],
+            )
+            assert probe.wait_for_pending_writes(5.0)
+            return probe._get_file_path(h).stat().st_size
+        finally:
+            probe.close()
+
+    def test_multi_model_concurrent_saves_respect_shared_ssd_limit(
+        self, tmp_path: Path
+    ):
+        """Two active managers sharing one directory must not overshoot max_size."""
+        import mlx.core as mx
+
+        block_size = self._measure_block_size(tmp_path, mx)
+        cache_dir = tmp_path / "shared_ssd"
+        max_size = block_size * 3 + block_size // 2
+
+        mgr_a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-a",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        mgr_b = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-b",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        try:
+            a1, a2 = b"\x11" * 32, b"\x12" * 32
+            b1, b2 = b"\x21" * 32, b"\x22" * 32
+
+            for h in (a1, a2):
+                assert mgr_a.save_block(
+                    block_hash=h,
+                    cache_data=self._make_cache_data(mx),
+                    token_count=16,
+                    model_name="model-a",
+                    layer_cache_types=["KVCache"],
+                )
+                assert mgr_a.wait_for_pending_writes(5.0)
+                time.sleep(0.01)
+
+            for h in (b1, b2):
+                assert mgr_b.save_block(
+                    block_hash=h,
+                    cache_data=self._make_cache_data(mx),
+                    token_count=16,
+                    model_name="model-b",
+                    layer_cache_types=["KVCache"],
+                )
+                assert mgr_b.wait_for_pending_writes(5.0)
+                time.sleep(0.01)
+
+            disk_bytes = self._disk_cache_bytes(cache_dir)
+            assert disk_bytes <= max_size
+            assert mgr_a._tracked_ssd_size() == disk_bytes
+            assert mgr_b._tracked_ssd_size() == disk_bytes
+            assert not mgr_a.has_block(a1)
+            assert not mgr_a._get_file_path(a1).exists()
+            assert mgr_a.has_block(a2)
+            assert mgr_b.has_block(b1)
+            assert mgr_b.has_block(b2)
+        finally:
+            mgr_a.close()
+            mgr_b.close()
+
+    def test_live_touch_protects_warm_peer_block_from_eviction(self, tmp_path: Path):
+        """A recent read on one manager updates peers' LRU so cold blocks evict first."""
+        import mlx.core as mx
+
+        block_size = self._measure_block_size(tmp_path, mx)
+        cache_dir = tmp_path / "shared_ssd_lru"
+        max_size = block_size * 2 + block_size // 2
+
+        mgr_a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-a",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        mgr_b = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-b",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        try:
+            a1, a2, b1 = b"\x31" * 32, b"\x32" * 32, b"\x33" * 32
+            for h in (a1, a2):
+                assert mgr_a.save_block(
+                    block_hash=h,
+                    cache_data=self._make_cache_data(mx),
+                    token_count=16,
+                    model_name="model-a",
+                    layer_cache_types=["KVCache"],
+                )
+                assert mgr_a.wait_for_pending_writes(5.0)
+                time.sleep(0.01)
+
+            # Touch a1 on mgr_a so a1 becomes warmer than a2 across the directory.
+            assert mgr_a.load_block(a1) is not None
+            time.sleep(0.01)
+
+            # Saving b1 on mgr_b must evict cold a2, not warm a1.
+            assert mgr_b.save_block(
+                block_hash=b1,
+                cache_data=self._make_cache_data(mx),
+                token_count=16,
+                model_name="model-b",
+                layer_cache_types=["KVCache"],
+            )
+            assert mgr_b.wait_for_pending_writes(5.0)
+
+            assert mgr_a.has_block(a1)
+            assert mgr_a._get_file_path(a1).exists()
+            assert not mgr_a.has_block(a2)
+            assert not mgr_a._get_file_path(a2).exists()
+            assert mgr_b.has_block(b1)
+        finally:
+            mgr_a.close()
+            mgr_b.close()
+
+    def test_third_model_startup_avoids_burst_eviction(self, tmp_path: Path):
+        """A newly loaded manager finds the shared directory already within budget."""
+        import mlx.core as mx
+
+        block_size = self._measure_block_size(tmp_path, mx)
+        cache_dir = tmp_path / "shared_ssd_startup"
+        max_size = block_size * 3 + block_size // 2
+
+        mgr_a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-a",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        mgr_b = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-b",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        mgr_c = None
+        try:
+            for h in (b"\x41" * 32, b"\x42" * 32):
+                assert mgr_a.save_block(
+                    block_hash=h,
+                    cache_data=self._make_cache_data(mx),
+                    token_count=16,
+                    model_name="model-a",
+                    layer_cache_types=["KVCache"],
+                )
+                assert mgr_a.wait_for_pending_writes(5.0)
+                time.sleep(0.01)
+
+            for h in (b"\x43" * 32, b"\x44" * 32):
+                assert mgr_b.save_block(
+                    block_hash=h,
+                    cache_data=self._make_cache_data(mx),
+                    token_count=16,
+                    model_name="model-b",
+                    layer_cache_types=["KVCache"],
+                )
+                assert mgr_b.wait_for_pending_writes(5.0)
+                time.sleep(0.01)
+
+            mgr_c = PagedSSDCacheManager(
+                cache_dir=cache_dir,
+                max_size_bytes=max_size,
+                expected_model_name="model-c",
+                expected_num_layers=1,
+                expected_block_size=16,
+            )
+
+            assert mgr_c.get_stats().evictions == 0
+            assert self._disk_cache_bytes(cache_dir) <= max_size
+            assert mgr_a.has_block(b"\x42" * 32)
+            assert mgr_b.has_block(b"\x43" * 32)
+            assert mgr_b.has_block(b"\x44" * 32)
+        finally:
+            mgr_a.close()
+            mgr_b.close()
+            if mgr_c is not None:
+                mgr_c.close()
+
+    def test_startup_reconcile_preserves_warm_peer_block_under_tighter_limit(
+        self, tmp_path: Path
+    ):
+        """Startup cleanup under a tighter limit uses live peer LRU and syncs removals."""
+        import mlx.core as mx
+
+        block_size = self._measure_block_size(tmp_path, mx)
+        cache_dir = tmp_path / "shared_ssd_reconcile"
+
+        mgr_a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=block_size * 4,
+            expected_model_name="model-a",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        mgr_b = None
+        try:
+            a1, a2 = b"\x51" * 32, b"\x52" * 32
+            for h in (a1, a2):
+                assert mgr_a.save_block(
+                    block_hash=h,
+                    cache_data=self._make_cache_data(mx),
+                    token_count=16,
+                    model_name="model-a",
+                    layer_cache_types=["KVCache"],
+                )
+                assert mgr_a.wait_for_pending_writes(5.0)
+            # Pin on-disk mtimes so a1 looks older on disk than a2, then touch a1 live.
+            os.utime(mgr_a._get_file_path(a1), (1000.0, 1000.0))
+            os.utime(mgr_a._get_file_path(a2), (2000.0, 2000.0))
+            mgr_a._index.get(a1).last_access = 1000.0
+            mgr_a._index.get(a2).last_access = 2000.0
+            mgr_a._index.sort_lru_by_last_access()
+            assert mgr_a.load_block(a1) is not None
+
+            # Tighter limit on mgr_b forces 1 startup eviction: a2 must go, a1 stays.
+            mgr_b = PagedSSDCacheManager(
+                cache_dir=cache_dir,
+                max_size_bytes=block_size + block_size // 2,
+                expected_model_name="model-b",
+                expected_num_layers=1,
+                expected_block_size=16,
+            )
+
+            assert mgr_a.has_block(a1)
+            assert mgr_a._get_file_path(a1).exists()
+            assert not mgr_a.has_block(a2)
+            assert not mgr_a._get_file_path(a2).exists()
+        finally:
+            mgr_a.close()
+            if mgr_b is not None:
+                mgr_b.close()
+
+    def test_gdn_sidecar_and_delete_propagate_across_peers(self, tmp_path: Path):
+        """GDN sidecar commits/forgets and block deletes stay synced across peers."""
+        import mlx.core as mx
+
+        block_size = self._measure_block_size(tmp_path, mx)
+        cache_dir = tmp_path / "shared_ssd_gdn"
+        max_size = block_size * 4
+
+        mgr_a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-a",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        mgr_b = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-b",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        try:
+            a1 = b"\x61" * 32
+            assert mgr_a.save_block(
+                block_hash=a1,
+                cache_data=self._make_cache_data(mx),
+                token_count=16,
+                model_name="model-a",
+                layer_cache_types=["KVCache"],
+            )
+            assert mgr_a.wait_for_pending_writes(5.0)
+            actual_size = mgr_a._get_file_path(a1).stat().st_size
+            assert mgr_b._tracked_ssd_size() == actual_size
+
+            # Commit a GDN sidecar on mgr_a and verify mgr_b accounts for it.
+            staged = cache_dir / "staged_sidecar.safetensors"
+            staged.write_bytes(b"g" * 2048)
+            sig = '{"model":"model-a"}'
+            committed = mgr_a.commit_gdn_checkpoint_file(
+                source_block_hash=a1,
+                staged_path=staged,
+                token_count=16,
+                model_name="model-a",
+                cache_signature=sig,
+                block_size=16,
+            )
+            assert committed is not None
+            assert mgr_b._tracked_ssd_size() == actual_size + 2048
+
+            assert mgr_a.forget_gdn_checkpoint(a1, sig) is True
+            assert mgr_b._tracked_ssd_size() == actual_size
+
+            assert mgr_a.delete_block(a1) is True
+            assert mgr_b._tracked_ssd_size() == 0
+        finally:
+            mgr_a.close()
+            mgr_b.close()
+
+        from omlx.cache import paged_ssd_cache as mod
+
+        assert cache_dir.resolve() not in mod._SHARED_SSD_DIR_REGISTRY
+
+    def test_concurrent_peer_saves_and_touches_converge_without_deadlock(
+        self, tmp_path: Path
+    ):
+        """Concurrent saves/loads across two peers stay thread-safe and bounded."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import mlx.core as mx
+
+        block_size = self._measure_block_size(tmp_path, mx)
+        cache_dir = tmp_path / "shared_ssd_concurrent"
+        max_size = block_size * 4 + block_size // 2
+
+        mgr_a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-a",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        mgr_b = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="model-b",
+            expected_num_layers=1,
+            expected_block_size=16,
+        )
+        try:
+            def _worker(mgr, prefix: int, model_name: str):
+                with mx.stream(mx.cpu):
+                    cache_data = self._make_cache_data(mx)
+                    mx.eval(cache_data[0][0], cache_data[0][1])
+                    saved_hashes = []
+                    for idx in range(6):
+                        h = bytes([prefix, idx]) + b"\x00" * 30
+                        assert mgr.save_block(
+                            block_hash=h,
+                            cache_data=cache_data,
+                            token_count=16,
+                            model_name=model_name,
+                            layer_cache_types=["KVCache"],
+                        )
+                        saved_hashes.append(h)
+                        mgr.load_block(saved_hashes[0])
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_a = pool.submit(_worker, mgr_a, 0xA0, "model-a")
+                fut_b = pool.submit(_worker, mgr_b, 0xB0, "model-b")
+                fut_a.result(timeout=15.0)
+                fut_b.result(timeout=15.0)
+
+            assert mgr_a.wait_for_pending_writes(5.0)
+            assert mgr_b.wait_for_pending_writes(5.0)
+
+            # A final pass after both writers settle converges strictly within budget.
+            mgr_a.enforce_size_limit()
+            disk_bytes = self._disk_cache_bytes(cache_dir)
+            assert disk_bytes <= max_size
+            assert mgr_a._tracked_ssd_size() == disk_bytes
+            assert mgr_b._tracked_ssd_size() == disk_bytes
+        finally:
+            mgr_a.close()
+            mgr_b.close()
