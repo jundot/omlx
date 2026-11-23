@@ -2,8 +2,8 @@
 """Map the published Inkling 2 checkpoint to the runtime layout.
 
 Attention projections that share an input are stacked, the attention-residual
-queries move onto their layers, and the expert codes are viewed as MLX
-``uint32`` carriers without re-rounding.
+and loop message queries move onto their layers, and the expert codes are
+viewed as MLX ``uint32`` carriers without re-rounding.
 """
 
 from __future__ import annotations
@@ -13,6 +13,12 @@ import mlx.core as mx
 _PREFIX = "model.llm."
 _VISUAL_PREFIX = "model.visual."
 _NVFP4_DENOMINATOR = 448.0 * 6.0
+_LOOP_QUERIES = (
+    "middle_cycle_cross_pass_queries",
+    "middle_cycle_cross_pass_kv_queries",
+)
+# Runtime order of the loop message inputs (see ``Inkling2Layer``).
+_LOOP_INPUTS = ("attn", "k", "v", "mlp")
 
 
 def _vision_name(key: str) -> str:
@@ -43,6 +49,36 @@ def _expert_tensors(d: dict, which: str, out: dict, pre: str) -> str:
     return "nvfp4"
 
 
+def _loop_controllers(d: dict, out: dict, pre: str) -> None:
+    """``down`` [r, 2H] -> [2, H, r] halves; ``gain`` and ``forget`` [H, r]
+    -> one [r, 2H] projection. Both are widened to FP32.
+
+    Each part is cast and transposed before the final stack, because oQ's
+    streaming plan replays only a stack or concatenate as the last step."""
+    downs, gates = [], []
+    for m in _LOOP_INPUTS:
+        down = d.pop(f"controllers.{m}.down_weight").astype(mx.float32)
+        rank = down.shape[0]
+        downs.append(down.reshape(rank, 2, -1).transpose(1, 2, 0))
+        gain = d.pop(f"controllers.{m}.gain_weight").astype(mx.float32)
+        forget = d.pop(f"controllers.{m}.forget_weight").astype(mx.float32)
+        gates.append(mx.concatenate([gain.T, forget.T], axis=1))
+    out[pre + "loop_down"] = mx.stack(downs)
+    out[pre + "loop_gain_forget"] = mx.stack(gates)
+
+
+def _loop_message_queries(queries: dict, core: range, out: dict) -> None:
+    """Row ``2 * i`` of each table serves core layer ``i``'s q (or k) input
+    and row ``2 * i + 1`` its MLP (or v) input."""
+    q = queries["middle_cycle_cross_pass_queries"]
+    kv = queries["middle_cycle_cross_pass_kv_queries"]
+    for i, idx in enumerate(core):
+        rows = [q[2 * i], kv[2 * i], kv[2 * i + 1], q[2 * i + 1]]
+        out[f"model.layers.{idx}.loop_message.query"] = mx.stack(
+            [row.astype(mx.float32) for row in rows]
+        )
+
+
 def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
     """Returns the mapped weights and the routed-expert format per layer."""
     if not is_original_layout(weights):
@@ -54,6 +90,7 @@ def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
     out: dict = {}
     formats: dict[int, str] = {}
     per_layer: dict[int, dict] = {}
+    loop_queries: dict = {}
     for key, value in weights.items():
         if key.startswith(_VISUAL_PREFIX):
             if has_vision:
@@ -85,6 +122,8 @@ def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
             out["model.final_input.query"] = value.reshape(-1, hidden).astype(
                 mx.float32
             )
+        elif name in _LOOP_QUERIES:
+            loop_queries[name] = value
         elif name.startswith("layers."):
             _, idx, rest = name.split(".", 2)
             per_layer.setdefault(int(idx), {})[rest] = value
@@ -140,6 +179,10 @@ def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
         formats[idx] = _expert_tensors(d, "w13", out, pre)
         if _expert_tensors(d, "w2", out, pre) != formats[idx]:
             raise ValueError(f"Inkling 2 layer {idx} mixes expert formats")
+        if "controllers.attn.down_weight" in d:
+            _loop_controllers(d, out, pre)
         if d:
             raise ValueError(f"Unmapped Inkling 2 tensors in layer {idx}: {sorted(d)}")
+    if loop_queries:
+        _loop_message_queries(loop_queries, args.loop_core, out)
     return out, formats

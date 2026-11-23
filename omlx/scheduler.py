@@ -57,13 +57,21 @@ from .cache.deepseek_v41_delta import is_delta as is_deepseek_v41_delta
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
-from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
+from .cache.prefix_cache import (
+    _RESTORE_POOL_FLUSH_BYTES,
+    BlockAwarePrefixCache,
+    cachelist_pm_member_plan,
+)
 from .decode_activity import get_decode_activity
 from .exceptions import (
     InvalidRequestError,
     PrefillMemoryExceededError,
     describe_ceiling_binding,
     is_cache_corruption_error,
+)
+from .patches.inkling2 import INKLING2_MODEL_TYPES
+from .patches.inkling2.kernels import (
+    prefill_mask_elements as inkling2_prefill_mask_elements,
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
@@ -1143,7 +1151,33 @@ def _patched_merge_caches(caches):
                     f"{type(layer_cache)} does not yet support batching with history"
                 )
         return merged
-    return _original_merge_caches(caches)
+    # Merge layer by layer and drop each donor layer once merged; the stock
+    # loop keeps every request's cache alive until the last layer.
+    merged = []
+    # Indexed: zip/enumerate would keep the last donor tuple alive.
+    for i in range(len(caches[0])):
+        if not hasattr(caches[0][i], "merge"):
+            raise ValueError(
+                f"{type(caches[0][i])} does not yet support batching with history"
+            )
+        layer = caches[0][i].merge([c[i] for c in caches])
+        for c in caches:
+            if isinstance(c, list):
+                c[i] = None
+        _eval_cache_layer(layer)
+        merged.append(layer)
+    return merged
+
+
+def _eval_cache_layer(layer: Any) -> None:
+    """Materialize a merged or joined layer and flush the pool of its donors."""
+    try:
+        state = layer.state
+    except (AttributeError, NotImplementedError):
+        state = None
+    if state is not None:
+        mx.eval(state)
+    BlockAwarePrefixCache._flush_restore_pool_if_over(_RESTORE_POOL_FLUSH_BYTES)
 
 
 def _patched_extend_cache(cache_a, cache_b):
@@ -1154,17 +1188,17 @@ def _patched_extend_cache(cache_a, cache_b):
     # Materialize one layer before joining the next; otherwise all old,
     # padded and joined banks coexist in the lazy graph. The donor is consumed.
     extended = []
-    for i, (ca, cb) in enumerate(zip(cache_a, cache_b)):
+    # Indexed: zip/enumerate would keep the last donor tuple alive.
+    for i in range(min(len(cache_a), len(cache_b))):
+        ca, cb = cache_a[i], cache_b[i]
         layer = _extend_cache_layer(ca, cb)
         if isinstance(cache_b, list):
             cache_b[i] = None
+        # A singleton converted to a new batch layer is a donor too.
+        if isinstance(cache_a, list) and layer is not ca:
+            cache_a[i] = None
         del ca, cb
-        try:
-            state = layer.state
-        except (AttributeError, NotImplementedError):
-            state = None
-        if state is not None:
-            mx.eval(state)
+        _eval_cache_layer(layer)
         extended.append(layer)
     return extended
 
@@ -1903,6 +1937,9 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
     return max(1, next_n)
 
 
+_HY_V4_PREFILL_FLOOR = 4096
+
+
 def _glm5_next_prefill_floor() -> int:
     """Return the wide-prefill floor for GLM-5.3 (0 when the host cannot use it).
 
@@ -2523,6 +2560,7 @@ class Scheduler:
         self._specprefill_draft_model: Any | None = None
         self._specprefill_default_keep_pct: float | None = None
         self._specprefill_default_threshold: int | None = None
+        self._specprefill_default_enabled = False
         self._draft_paged_ssd_cache_manager: Any | None = None
         self._draft_prefix_cache: Any | None = None
         # Track active specprefill request for RoPE cleanup
@@ -3368,6 +3406,9 @@ class Scheduler:
             floor = int(getattr(self, "_qwen35_prefill_floor", 0) or 0)
             if floor > hi and floor % window_size == 0:
                 lo = hi = floor
+        elif getattr(self.model, "model_type", None) == "hy_v4_flash":
+            # Top-16-of-512 routing leaves ~16 rows per expert at 512 tokens.
+            lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
@@ -3413,6 +3454,16 @@ class Scheduler:
                     return 0
             if model_type.startswith("glm5_next"):
                 return _glm5_next_prefill_floor()
+            if model_type.startswith("hy_v4"):
+                from .settings import get_system_memory
+
+                # Top-16-of-512 (Hy4-flash) and top-8-of-256 (Hy4) routing
+                # leave ~64 rows per expert at a 2048-token chunk. Attention per
+                # query does not grow with the chunk: sparse layers read 2048
+                # slots and sliding ones 512.
+                if get_system_memory() >= 64 * 1024**3:
+                    return _HY_V4_PREFILL_FLOOR
+                return 0
             if model_type == "deepseek_v41":
                 # Top-6-of-384 routing leaves ~32 rows per expert at 2048 tokens;
                 # 8192 fills the gather_qmm tiles better.
@@ -4075,6 +4126,9 @@ class Scheduler:
         from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
         if self._model_uses_mla():
+            return False
+        if getattr(getattr(self, "model", None), "dense_kv_attention", False) is True:
+            # The model's own attention kernels read dense keys and values.
             return False
         if (
             getattr(self, "_turboquant_kv_scheme", "turboquant")
@@ -6189,6 +6243,34 @@ class Scheduler:
         self._prefill_chunk_pool = None
         if track:
             tracker.record_flat_reclaim(max(0, pooled))
+
+    # Matches ProcessMemoryEnforcer._POOL_RECLAIM_FLOOR.
+    _PRE_STORE_POOL_CLEAR_FLOOR_BYTES = 2 * 1024**3
+
+    def _clear_pool_before_store(self) -> None:
+        """Clear a large pool under pressure before a cache store starts.
+
+        The store worker holds _mx_buffer_access_lock for the whole store, so
+        any pool clear requested during the store waits until it ends.
+        """
+        if not self._prefill_memory_guard or self._memory_limit_bytes <= 0:
+            return
+        pooled = int(mx.get_cache_memory())
+        if pooled <= self._PRE_STORE_POOL_CLEAR_FLOOR_BYTES:
+            return
+        if self._current_usage_bytes() < self._memory_limit_bytes:
+            return
+        # Do not wait behind a store that already holds the lock.
+        if not _mx_buffer_access_lock.acquire(blocking=False):
+            return
+        try:
+            Scheduler._clear_cache(self)
+        finally:
+            _mx_buffer_access_lock.release()
+        logger.info(
+            "Cleared %.2fGB of pooled Metal buffers before cache store",
+            pooled / 1024**3,
+        )
 
     # A chunk always gets this much room above live MLX memory, so a tight
     # headroom makes MLX run the chunk slower instead of one op at a time.
@@ -9377,7 +9459,9 @@ class Scheduler:
             if not isinstance(layer, dict):
                 continue
             class_name = str(layer.get("class_name") or "")
-            if class_name in _KNOWN_SLICEABLE_CACHE_TYPES:
+            if class_name in _KNOWN_SLICEABLE_CACHE_TYPES or (
+                Scheduler._is_kv_cachelist(layer)
+            ):
                 # Completion supplies a full cache. KV comes from paged
                 # blocks; serializing it here duplicates the entire prefix.
                 layer["state"] = ()
@@ -10073,9 +10157,23 @@ class Scheduler:
         return str(layer_state.get("cache_type") or "")
 
     @staticmethod
+    def _is_kv_cachelist(layer_state: dict[str, Any]) -> bool:
+        if layer_state.get("class_name") != "CacheList":
+            return False
+        meta = layer_state.get("meta_state")
+        names = meta[0] if isinstance(meta, (list, tuple)) and meta else None
+        return (
+            isinstance(names, (list, tuple))
+            and bool(names)
+            and all(name in ("KVCache", "BatchKVCache") for name in names)
+        )
+
+    @staticmethod
     def _is_sliceable_extracted_layer(layer_state: dict[str, Any]) -> bool:
         type_name = Scheduler._extracted_layer_type_name(layer_state)
         if type_name in _KNOWN_SLICEABLE_CACHE_TYPES:
+            return True
+        if Scheduler._is_kv_cachelist(layer_state):
             return True
 
         if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None and type_name:
@@ -11538,6 +11636,7 @@ class Scheduler:
         draft_model_name: str | None = None,
         keep_pct: float | None = None,
         threshold: int | None = None,
+        default_enabled: bool = True,
     ) -> None:
         """Set the draft model for SpecPrefill scoring.
 
@@ -11551,6 +11650,7 @@ class Scheduler:
         self._specprefill_draft_model = draft_model
         self._specprefill_default_keep_pct = keep_pct
         self._specprefill_default_threshold = threshold
+        self._specprefill_default_enabled = default_enabled
         self._draft_prefix_cache = None
         if not draft_model_name:
             logger.info(
@@ -14944,6 +15044,7 @@ class Scheduler:
                                     request_id,
                                 )
 
+                            self._clear_pool_before_store()
                             if self._store_cache_executor is not None:
                                 # Hand host memcpy and disk write to the
                                 # background executor after the owner thread
@@ -16846,23 +16947,16 @@ class Scheduler:
                 self._fixed_state_measure_armed = arrays_cache_layers > 0
 
                 # Inkling builds its banded relative-position bias as a full
-                # [H, LQ, S] tensor before SDPA; register the transient so
-                # prefill admission prices it (cleared for other models —
-                # the registry is process-wide across model swaps).
-                try:
-                    from .memory_monitor import register_attention_bias_transient
-
-                    model_type = str(getattr(self.model, "model_type", "") or "")
-                    register_attention_bias_transient(
-                        base_dtype_size
-                        if model_type in ("inkling", "inkling_mm_model")
-                        else None
-                    )
-                except Exception:
-                    logger.debug(
-                        "attention-bias transient registration failed",
-                        exc_info=True,
-                    )
+                # [H, LQ, S] tensor before SDPA, Inkling 2 in bounded blocks.
+                model_type = str(getattr(self.model, "model_type", "") or "")
+                mask_elements = None
+                if model_type in INKLING2_MODEL_TYPES:
+                    mask_elements = inkling2_prefill_mask_elements()
+                full_bias = model_type in ("inkling", "inkling_mm_model")
+                self.memory_monitor.set_attention_bias_transient(
+                    base_dtype_size if full_bias or mask_elements else None,
+                    mask_elements,
+                )
                 logger.debug(
                     f"Model info for memory estimation: "
                     f"layers={num_layers} ({num_kv_cache_layers} KVCache, "

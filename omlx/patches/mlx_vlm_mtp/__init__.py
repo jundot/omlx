@@ -109,6 +109,10 @@ _RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
     "minimax_m3_vl": (),
     # Inkling 2 drafts with its bundled DSpark model.
     "inkling2": (),
+    "inkling2_loop": (),
+    # Hy4 hosts its DFly2 drafter itself.
+    "hy_v4_vl": (),
+    "hy_v4_flash": (),
 }
 
 

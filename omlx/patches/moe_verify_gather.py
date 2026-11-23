@@ -33,10 +33,10 @@ constant constexpr int BITS = __BITS__;
 constant constexpr int GS = __GS__;
 constant constexpr int FAST = __FAST__;
 constant constexpr int PACK_FACTOR =
-    (BITS == 5) ? 8 : (BITS == 6 ? 4 : 32 / BITS);
+    (BITS == 3 || BITS == 5) ? 8 : (BITS == 6 ? 4 : 32 / BITS);
 constant constexpr int BYTES_PER_PACK =
     ((BITS & (BITS - 1)) == 0) ? 4 : (BITS == 5 ? 5 : 3);
-constant constexpr int PACKS_PER_THREAD = FAST ? 2 : 1;
+constant constexpr int PACKS_PER_THREAD = (FAST && BITS > 2) ? 2 : 1;
 constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
 constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
 constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
@@ -46,7 +46,28 @@ constant constexpr int BN = 8;
 template <typename T>
 inline float load_vector(const device T* x, thread float* x_thread) {
   float sum = 0;
-  if (BITS == 4) {
+  if (BITS == 2) {
+    for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 4.0f;
+      x_thread[i + 2] = x[i + 2] / 16.0f;
+      x_thread[i + 3] = x[i + 3] / 64.0f;
+    }
+  } else if (BITS == 3) {
+    for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 8.0f;
+      x_thread[i + 2] = x[i + 2] / 64.0f;
+      x_thread[i + 3] = x[i + 3] / 2.0f;
+      x_thread[i + 4] = x[i + 4] / 16.0f;
+      x_thread[i + 5] = x[i + 5] / 128.0f;
+      x_thread[i + 6] = x[i + 6] / 4.0f;
+      x_thread[i + 7] = x[i + 7] / 32.0f;
+    }
+  } else if (BITS == 4) {
     for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
       sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
@@ -87,7 +108,28 @@ inline float load_vector(const device T* x, thread float* x_thread) {
 template <typename T>
 inline float load_vector_safe(const device T* x, thread float* x_thread, int N) {
   float sum = 0;
-  if (BITS == 4) {
+  if (BITS == 2) {
+    for (int i = 0; i < N; i += 4) {
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 4.0f;
+      x_thread[i + 2] = x[i + 2] / 16.0f;
+      x_thread[i + 3] = x[i + 3] / 64.0f;
+    }
+  } else if (BITS == 3) {
+    for (int i = 0; i < N; i += 8) {
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 8.0f;
+      x_thread[i + 2] = x[i + 2] / 64.0f;
+      x_thread[i + 3] = x[i + 3] / 2.0f;
+      x_thread[i + 4] = x[i + 4] / 16.0f;
+      x_thread[i + 5] = x[i + 5] / 128.0f;
+      x_thread[i + 6] = x[i + 6] / 4.0f;
+      x_thread[i + 7] = x[i + 7] / 32.0f;
+    }
+  } else if (BITS == 4) {
     for (int i = 0; i < N; i += 4) {
       sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
@@ -136,7 +178,33 @@ inline float qdot_n(
     float sum,
     int N) {
   float accum = 0;
-  if (BITS == 4) {
+  if (BITS == 2) {
+    for (int i = 0; i < (N / 4); i++) {
+      accum +=
+          (x_thread[4 * i] * (w[i] & 0x03) +
+           x_thread[4 * i + 1] * (w[i] & 0x0c) +
+           x_thread[4 * i + 2] * (w[i] & 0x30) +
+           x_thread[4 * i + 3] * (w[i] & 0xc0));
+    }
+  } else if (BITS == 3) {
+    for (int i = 0; i < (N / 8); i++) {
+      x_thread += 8 * i;
+      w += 3 * i;
+
+      accum += (w[0] & 0x07) * x_thread[0];
+      accum += (w[0] & 0x38) * x_thread[1];
+      accum += (w[0] & 0xc0) * x_thread[2];
+      accum += (w[1] & 0x01) * (x_thread[2] * 256.0f);
+
+      accum += (w[1] & 0x0e) * x_thread[3];
+      accum += (w[1] & 0x70) * x_thread[4];
+      accum += (w[1] & 0x80) * x_thread[5];
+      accum += (w[2] & 0x03) * (x_thread[5] * 256.0f);
+
+      accum += (w[2] & 0x1c) * x_thread[6];
+      accum += (w[2] & 0xe0) * x_thread[7];
+    }
+  } else if (BITS == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (N / 4); i++) {
       accum +=

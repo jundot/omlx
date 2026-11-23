@@ -836,6 +836,115 @@ def test_glm5_next_fused_decode_kernels_read_oqh_experts(group_size):
     assert _rel(verify, reference(rows)) < 0.03
 
 
+def _tiny_hy_v4(tmp_path, monkeypatch, kind):
+    """A tiny Hy4 or Hy4-flash source whose routed experts oQh can serve.
+
+    All experts are routed per token so tiny rounding differences cannot flip
+    a selection, and the index top-k exceeds the prompt.
+    """
+    from mlx.utils import tree_flatten
+
+    from omlx import oq
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches.hy_v4 import apply_patch
+    from tests import test_hy_v4
+
+    apply_patch()
+    # oQ's calibration loader leaves the process-wide MTP flag as the
+    # pre-load patches set it; keep that out of later tests.
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", mlx_lm_mtp.is_mtp_active())
+    cfg = test_hy_v4._hy4_config() if kind == "hy4" else test_hy_v4._flash_config()
+    text = cfg["text_config"]
+    text.update(
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=256,
+        n_routed_experts=4,
+        num_experts_per_tok=4,
+        index_topk=64,
+    )
+    if kind == "flash":
+        # Latent experts narrower than the norm in front of them.
+        text.update(hidden_size=512, routed_expert_hidden_size=256)
+    cfg = test_hy_v4._with_dfly(cfg)
+    model = test_hy_v4._model(cfg)
+    weights = {
+        k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v
+        for k, v in tree_flatten(model.parameters())
+    }
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps(cfg))
+    mx.save_safetensors(str(source / "model.safetensors"), weights)
+    tokens = mx.array([[10 + (7 * i) % 250 for i in range(32)]], dtype=mx.int32)
+    monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+    monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: object())
+    return source, tokens
+
+
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_hy_v4_experts_round_trip(tmp_path, monkeypatch, kind):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.utils import load_model
+
+    from omlx import oq
+    from omlx.oqh import runtime
+
+    source, tokens = _tiny_hy_v4(tmp_path, monkeypatch, kind)
+    out = tmp_path / "oqh"
+    oq.quantize_oq_streaming(
+        str(source),
+        str(out),
+        4,
+        hadamard=True,
+        imatrix_num_samples=1,
+        imatrix_seq_length=32,
+        sensitivity_map_override={i: 1 for i in range(6)},
+        preserve_mtp=True,
+    )
+    config = json.loads((out / "config.json").read_text())
+    entries = config[fmt.CONFIG_KEY]["tensors"]
+    assert {p.split(".mlp.")[-1] for p in entries} == {
+        "switch_mlp.gate_proj",
+        "switch_mlp.up_proj",
+        "switch_mlp.down_proj",
+    }
+    assert config["dfly_num_hidden_layers"] == 2
+
+    twin = tmp_path / "twin"
+    twin.mkdir()
+    weights = {}
+    for f in out.glob("*.safetensors"):
+        weights.update(mx.load(str(f)))
+    for path, e in entries.items():
+        signs = weights.pop(f"{path}.oqh_signs").reshape(-1).astype(mx.float32)
+        w = quantize.dequantize_affine(
+            weights[f"{path}.weight"],
+            weights.pop(f"{path}.oqh_scales"),
+            weights.pop(f"{path}.oqh_biases"),
+            e["bits"],
+            signs,
+            e["block"],
+        )
+        weights[f"{path}.weight"] = w.astype(mx.bfloat16)
+    mx.save_safetensors(str(twin / "model.safetensors"), weights)
+    del config[fmt.CONFIG_KEY]
+    (twin / "config.json").write_text(json.dumps(config))
+
+    install_load_hook()
+    oqh_model = load_model(out, lazy=False, strict=True)
+    twin_model = load_model(twin, lazy=False, strict=True)
+    switches = [m for _, m in oqh_model.named_modules() if hasattr(m, "oqh_experts")]
+    assert len(switches) == 5
+    assert not any("rscale" in k for k, _ in tree_flatten(twin_model.parameters()))
+    # The flash experts read a latent projection, so no norm may rotate for them.
+    norms = [layer.post_attention_layernorm for layer in oqh_model.layers]
+    fused = any(isinstance(n, runtime._DualNorm) for n in norms)
+    assert fused == (kind == "hy4")
+    want = twin_model(tokens).logits.astype(mx.float32)
+    assert _rel(oqh_model(tokens).logits, want) < 0.03
+
+
 def test_deepseek_v41_oqh_experts_export_and_load(tmp_path, monkeypatch):
     from omlx import oq
     from omlx.oqh.modules import OqhSwitchLinear

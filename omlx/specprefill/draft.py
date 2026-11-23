@@ -11,9 +11,19 @@ from typing import Any, Protocol
 import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
 
+from ..model_settings import specprefill_draft
+from ..patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
 from ..prefill_progress import get_prefill_tracker
 from ..request import Request
+from ..utils.model_loading import (
+    lm_load_compat,
+    materialize_lazy_state,
+    maybe_load_custom_quantization,
+)
+from ..utils.tokenizer import get_tokenizer_config
 from .policy import SpecPrefillScoringPlan
+
+logger = logging.getLogger(__name__)
 
 
 class DraftPrefixCache(Protocol):
@@ -297,3 +307,48 @@ def run_specprefill_draft_scoring(
         log.error(f"SpecPrefill scoring failed, falling back to normal path: {error}")
         request.specprefill_indices = None
         tracker.remove(request.request_id)
+
+
+def _load_draft(draft_path: str, trust_remote_code: bool) -> Any:
+    was_mtp = is_mtp_active()
+    set_mtp_active(False)
+    try:
+        loaded = maybe_load_custom_quantization(draft_path, is_vlm=False)
+        if loaded is None:
+            loaded = lm_load_compat(
+                draft_path,
+                tokenizer_config=get_tokenizer_config(
+                    draft_path, trust_remote_code=trust_remote_code
+                ),
+                trust_remote_code=trust_remote_code,
+            )
+        draft_model = loaded[0]
+        # The engine scores on its own thread, which cannot evaluate this thread's lazy arrays.
+        materialize_lazy_state(draft_model)
+        return draft_model
+    finally:
+        set_mtp_active(was_mtp)
+
+
+def attach_specprefill_draft(engine: Any, draft_path: str) -> None:
+    """Load a draft next to the engine's model; run on the MLX loader thread."""
+    settings = engine._model_settings
+    try:
+        scheduler = engine._engine.engine.scheduler
+        draft_model = _load_draft(draft_path, engine._trust_remote_code)
+        # The engine can stop during the load.
+        if engine._engine is None:
+            return
+        scheduler.set_specprefill_draft_model(
+            draft_model,
+            draft_model_name=draft_path,
+            keep_pct=getattr(settings, "specprefill_keep_pct", None),
+            threshold=getattr(settings, "specprefill_threshold", None),
+            default_enabled=specprefill_draft(settings) is not None,
+        )
+        engine.specprefill_draft_path = draft_path
+        logger.info(f"SpecPrefill: draft model loaded ({draft_path})")
+    except Exception as e:
+        # Remembered so that each request does not try the load again.
+        engine.specprefill_failed_draft = draft_path
+        logger.error(f"SpecPrefill: draft model load failed: {e}")

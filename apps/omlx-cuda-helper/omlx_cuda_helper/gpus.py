@@ -64,6 +64,11 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
     return found
 
 
+# What MLX does not count on a card: CUDA's context and the cuBLAS and cuDNN
+# work buffers, which grow with a long prompt.
+UNCOUNTED_BYTES = 2 << 30
+
+
 def memory_limit(gpu: dict[str, Any]) -> int:
     """Bytes a stage on *gpu* may hold before it hands a prompt back.
 
@@ -71,7 +76,8 @@ def memory_limit(gpu: dict[str, Any]) -> int:
     """
     if gpu.get("integrated"):
         return gpu["free"]
-    return int(gpu["total"] * 0.95)
+    total = int(gpu["total"])
+    return total - max(int(total * 0.05), UNCOUNTED_BYTES)
 
 
 def wsl() -> bool:

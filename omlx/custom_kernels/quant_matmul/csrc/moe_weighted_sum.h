@@ -9,7 +9,7 @@ namespace mx = mlx::core;
 namespace omlx::quant_matmul {
 
 // Top-k values the weighted sum kernels are instantiated for.
-inline constexpr int kMoeWeightedSumTopKs[] = {4, 6, 8, 10};
+inline constexpr int kMoeWeightedSumTopKs[] = {4, 6, 8, 10, 16};
 
 mx::array moe_weighted_sum(
     const mx::array& x_sorted,

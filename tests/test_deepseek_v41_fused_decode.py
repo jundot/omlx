@@ -473,6 +473,31 @@ def test_small_batches_keep_rows_kernels(monkeypatch, shared_build):
     assert names == ["gemv_fp8_nb"]
 
 
+@pytest.mark.parametrize("bits", [2, 4])
+def test_affine_codes_read_in_place_are_exact(bits):
+    """affine_codes_lane leaves 2- and 4-bit codes masked in place (code j * 2^(bits j)); times
+    aff_unit(j) = 2^-(bits j) each is its code exactly, at every lane position, so the rows
+    kernels' products q * (x * unit) equal code * x bit for bit."""
+    from omlx.patches.deepseek_v41 import decode_moe
+
+    n = 16 if bits == 2 else 8
+    source = f"""
+        const uint i = thread_position_in_grid.x;
+        float q[{n}];
+        affine_codes_lane<{bits}>(reinterpret_cast<const device uchar*>(words + i), q);
+        for (int j = 0; j < {n}; ++j) out[i * {n} + j] = q[j] * aff_unit<{bits}>(j);
+    """
+    kernel = mx.fast.metal_kernel(name=f"v41_test_affine_in_place_{bits}", input_names=["words"],
+                                  output_names=["out"], source=source, header=decode_moe._HEADER)
+    rng = np.random.default_rng(bits)
+    codes = rng.integers(0, 1 << bits, (64, n))
+    codes[0], codes[1] = 0, (1 << bits) - 1   # all-zero and all-max words
+    words = np.array([sum(int(c) << (bits * j) for j, c in enumerate(row)) for row in codes], np.uint32)
+    out = kernel(inputs=[mx.array(words)], grid=(64, 1, 1), threadgroup=(64, 1, 1),
+                 output_shapes=[(64 * n,)], output_dtypes=[mx.float32])[0]
+    np.testing.assert_array_equal(np.asarray(out).reshape(64, n), codes.astype(np.float32))
+
+
 def test_paired_weight_decoders_are_exact():
     """fp8_decode4 / fp4_decode8 give every E4M3 / E2M1 code its value times 2^-8 / 2^-14
     (E4M3FN NaN codes 0x7F / 0xFF read as 480, like the e4m3() helper; weights never hold them)."""

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for omlx/websearch.py and omlx/api/websearch_routes.py.
+"""Tests for omlx/websearch.py, omlx/api/websearch_routes.py and the Claude
+Code WebSearch handler in omlx/api/anthropic_web_search.py.
 
 Covers result sanitization, provider adapters (ddgs is monkeypatched,
 brave/searxng use httpx.MockTransport), backend selection for the ddgs
@@ -10,6 +11,7 @@ guard, and the /v1/web HTTP layer.
 
 from __future__ import annotations
 
+import json
 
 import httpx
 import pytest
@@ -17,7 +19,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import omlx.websearch as websearch
-from omlx.api import websearch_routes
+from omlx.api import anthropic_web_search, websearch_routes
+from omlx.api.anthropic_models import MessagesRequest
 from omlx.settings import IntegrationSettings
 from omlx.websearch import (
     BraveProvider,
@@ -464,6 +467,13 @@ class TestSsrfGuard:
         monkeypatch.setattr(websearch, "_resolve_host", resolve)
         await websearch._assert_public_host("example.com")
 
+    async def test_fake_ip_address_allowed(self, monkeypatch):
+        async def resolve(host):
+            return ["198.19.255.1"]
+
+        monkeypatch.setattr(websearch, "_resolve_host", resolve)
+        await websearch._assert_public_host("example.com")
+
     async def test_unresolvable_host_is_request_failed(self, monkeypatch):
         import socket
 
@@ -775,3 +785,100 @@ class TestAdminWebSearchTest:
         payload = response.json()
         assert payload["ok"] is False
         assert payload["error"]["code"] == "missing_api_key"
+
+
+class TestClaudeCodeWebSearch:
+    PREFIX = anthropic_web_search.SEARCH_PROMPT_PREFIX
+
+    @pytest.fixture
+    def searches(self, monkeypatch):
+        queries = []
+
+        async def fake_search(query, integrations):
+            queries.append(query)
+            return {
+                "ok": True,
+                "provider": "ddgs",
+                "results": [
+                    {"title": "A", "url": "https://docs.example.com/a", "snippet": "S"},
+                    {"title": "B", "url": "https://example.com/blog/b", "snippet": "S"},
+                    {"title": "C", "url": "https://other.net/c", "snippet": "S"},
+                ],
+            }
+
+        monkeypatch.setattr(anthropic_web_search, "run_web_search", fake_search)
+        return queries
+
+    @staticmethod
+    async def answer(messages, stream=False, **tool):
+        request = MessagesRequest(
+            model="m",
+            max_tokens=64,
+            stream=stream,
+            messages=messages,
+            tools=[{"type": "web_search_20250305", "name": "web_search", **tool}],
+        )
+        return await anthropic_web_search.maybe_handle_anthropic_web_search(
+            request, None
+        )
+
+    async def test_only_the_search_call_is_answered(self, searches):
+        quoted = [{"role": "user", "content": f"Why is '{self.PREFIX} x' logged?"}]
+        replayed = [
+            {"role": "user", "content": "Latest mlx release?"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "mlx release"},
+                    }
+                ],
+            },
+            {"role": "user", "content": "Translate that to Korean."},
+        ]
+        assert await self.answer(quoted) is None
+        assert await self.answer(replayed) is None
+        assert searches == []
+
+    async def test_domain_filters(self, searches):
+        messages = [{"role": "user", "content": f"{self.PREFIX} q"}]
+
+        response = await self.answer(messages, allowed_domains=["example.com"])
+        results = json.loads(response.body)["content"][1]["content"]
+        assert searches[-1] == "q site:example.com"
+        assert [r["title"] for r in results] == ["A", "B"]
+
+        response = await self.answer(messages, blocked_domains=["example.com/blog"])
+        results = json.loads(response.body)["content"][1]["content"]
+        assert searches[-1] == "q"
+        assert [r["title"] for r in results] == ["A", "C"]
+
+    async def test_stream_events(self, searches):
+        text_block = {"type": "text", "text": f"{self.PREFIX} q"}
+        response = await self.answer(
+            [{"role": "user", "content": [text_block]}], stream=True
+        )
+        events = [
+            json.loads(chunk.split("data: ", 1)[1])
+            async for chunk in response.body_iterator
+        ]
+        assert [(e["type"], e.get("index")) for e in events] == [
+            ("message_start", None),
+            ("content_block_start", 0),
+            ("content_block_delta", 0),
+            ("content_block_stop", 0),
+            ("content_block_start", 1),
+            ("content_block_stop", 1),
+            ("content_block_start", 2),
+            ("content_block_delta", 2),
+            ("content_block_stop", 2),
+            ("message_delta", None),
+            ("message_stop", None),
+        ]
+        assert searches == ["q"]
+        assert events[1]["content_block"]["type"] == "server_tool_use"
+        assert json.loads(events[2]["delta"]["partial_json"]) == {"query": "q"}
+        assert events[4]["content_block"]["type"] == "web_search_tool_result"

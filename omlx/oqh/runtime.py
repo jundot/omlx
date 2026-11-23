@@ -267,6 +267,8 @@ def _bind_readers(norm, readers) -> None:
     if (
         first is None
         or not isinstance(norm, nn.RMSNorm)
+        # Hy4-flash's experts read a latent projection of the norm output.
+        or norm["weight"].shape[-1] != width
         or width % 256
         or width > 8192
         or first.block != 256

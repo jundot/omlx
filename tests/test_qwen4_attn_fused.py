@@ -366,7 +366,12 @@ def test_prep_matches_norms_and_mrope(rows, pos_ndim, config, dtype):
     q_proj = (mx.random.normal((rows, 24 * 512)) * 4).astype(dtype)
     k_proj = (mx.random.normal((rows, 2 * 256)) * 4).astype(dtype)
     start = 40000 + rows
-    positions = _positions(start, rows) if pos_ndim == 3 else _positions(start, rows)[0]
+    if pos_ndim == 3:
+        # Vision-token planes: one t position and an h/w grid.
+        index = mx.arange(rows, dtype=mx.int32)
+        positions = (start + mx.stack([0 * index, index // 4, index % 4]))[:, None]
+    else:
+        positions = _positions(start, rows)[0]
     rotary = attn.rotary_emb
 
     queries = attn.q_norm(q_proj.reshape(1, rows, 24, 2, 256)[:, :, :, 0]).transpose(0, 2, 1, 3)

@@ -5380,6 +5380,60 @@ def test_context_copy_width_follows_the_targets_verify_window(family, width):
     assert copied == source[107 : 107 + width]
 
 
+@pytest.mark.parametrize("cap, width", [(16, 15), (None, 7)])
+def test_block_drafter_copy_runs_past_the_block_only_verbatim(cap, width):
+    """A block drafter's copy must fill its block, except a verbatim run on a
+    target that declares 16-row windows (Inkling 2), which copies 15 tokens."""
+    source = list(range(1000, 1200))
+    history = source + source[:100]
+    gen_batch = SimpleNamespace(
+        model=SimpleNamespace(_omlx_mtp_max_verify_rows=cap),
+        tokens=[history],
+        max_tokens=[1000],
+        _num_tokens=[0],
+    )
+    state = SimpleNamespace(context_copy=None)
+    assert bg._context_copy_drafts(gen_batch, state, [], block=7) == source[100:107]
+    state.context_copy.observe(7, 7)
+    gen_batch.tokens = [history + source[100:107]]
+    copied = bg._context_copy_drafts(gen_batch, state, [], block=7)
+    assert copied == source[107 : 107 + width]
+    # Four tokens of room left: a copy that cannot fill the block is dropped.
+    gen_batch.max_tokens = [5]
+    assert bg._context_copy_drafts(gen_batch, state, [], block=7) == []
+
+
+def test_block_drafter_verifies_a_copy_past_its_block(monkeypatch):
+    """On a target with 16-row windows a 15-token copy is verified whole past a
+    block drafter's block of 5, and wrong copied tokens never change greedy
+    output."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    prompts, limits = [[1, 2]], [48]
+    standard = CapturingCountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, prompts, limits)
+    model = _drafted_counting_model(5)
+    model._omlx_mtp_max_verify_rows = 16
+    model._omlx_drafter.context_copy = True
+    flips = [15, 0, 6, 14]  # 15 flips nothing
+    proposed = []
+
+    def propose(self, limit, wide_limit=None):
+        done = len(self._ids) - len(prompts[0])
+        copied = list(expected[0][done : done + min(wide_limit or limit, 15)])
+        wrong = flips[len(proposed) % len(flips)]
+        proposed.append(wrong)
+        if wrong < len(copied):
+            copied[wrong] = (copied[wrong] + 7) % 64
+        return copied if len(copied) >= 2 else []
+
+    monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
+    output, _ = generate(model, prompts, limits)
+    assert output == expected
+    assert (1, 16) in _verify_widths(model)
+
+
 @pytest.mark.parametrize("size", [2, 4])
 @pytest.mark.parametrize("late_join", [False, True])
 def test_initialization_uses_one_forward_without_cache_extraction(

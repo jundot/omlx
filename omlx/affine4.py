@@ -18,7 +18,7 @@ from mlx_vlm.turboquant import (
     _unpack_lowbit,
 )
 
-from .turboquant_kv import BatchTurboQuantKVCache
+from .turboquant_kv import BatchTurboQuantKVCache, _growth_step
 from .utils.fatal import is_command_buffer_error
 
 logger = logging.getLogger(__name__)
@@ -884,7 +884,12 @@ def _native_attention(
         mask = mx.array(True)
     else:
         return None
-    valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
+    # After trim_rows each row stops at its own end, also for a mask-less decode.
+    row_ends = getattr(cache, "_row_ends", None) if is_batch else None
+    if row_ends is not None and len(row_ends) == batch:
+        valid_ends = mx.array([min(int(e), tokens) for e in row_ends], dtype=mx.int32)
+    else:
+        valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
 
     blocks = _attention_blocks(tokens, kv_heads, dim)
     partition_tiles = ((tokens + 63) // 64 + blocks - 1) // blocks
@@ -1041,6 +1046,10 @@ class Affine4KVCache(TurboQuantKVCache):
         super().__init__(bits=self.bits, seed=int(seed))
         self._key_dim = self._value_dim = 0
 
+    @property
+    def cache_step(self):
+        return _growth_step(_state_length(self.keys) if self.keys is not None else 0)
+
     @classmethod
     def _contiguous_packed_state(cls, state):
         state = cls._unwrap(state)
@@ -1160,6 +1169,7 @@ class Affine4KVCache(TurboQuantKVCache):
         self.key_codec = self.codec_class(key_dim, seed) if key_dim else None
         self.value_codec = self.codec_class(value_dim, seed + 1) if value_dim else None
         if hasattr(self, "left_padding"):
+            self._row_ends = None
             self._phys_end = offset
             self.offset = offset - self.left_padding
         else:
@@ -1486,6 +1496,7 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
     @BatchTurboQuantKVCache.state.setter
     def state(self, value):
         Affine4KVCache.state.fset(self, value)
+        self._row_ends = None
         self._phys_end = self.offset
         self.offset = self._phys_end - self.left_padding
 
@@ -1522,16 +1533,30 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
             raise ValueError(
                 f"Unsupported {self.quantization_scheme} attention mask: {mask}"
             )
+        # After trim_rows the routes below need each row's end in the mask.
+        row_ends = getattr(self, "_row_ends", None)
+        ends = None
+        if row_ends is not None and len(row_ends) == self.left_padding.shape[0]:
+            if min(int(e) for e in row_ends) < tokens:
+                ends = mx.array([min(int(e), tokens) for e in row_ends])
         # Without left padding the plain mask is exact; keeping it a string lets the
         # bf16 prefill use the fused kernel instead of a (query x cache) mask array.
-        if (mask is None or causal) and not self._has_left_padding():
+        if (
+            (mask is None or causal)
+            and ends is None
+            and not self._has_left_padding()
+        ):
             return mask
         columns = mx.arange(tokens)
         allowed = columns[None, None, None, :] >= self.left_padding[:, None, None, None]
         if causal:
-            allowed = allowed & (
-                columns[None, :] <= mx.arange(tokens - query_length, tokens)[:, None]
-            )
+            if ends is None:
+                last = mx.arange(tokens - query_length, tokens)[None, :]
+            else:
+                last = ends[:, None] - query_length + mx.arange(query_length)[None, :]
+            allowed = allowed & (columns[None, None, None, :] <= last[:, None, :, None])
+        elif ends is not None:
+            allowed = allowed & (columns[None, None, None, :] < ends[:, None, None, None])
         if mask is None or isinstance(mask, str):
             return allowed
         if mask.dtype == mx.bool_:
@@ -1545,5 +1570,6 @@ class BatchAffine8KVCache(BatchAffine4KVCache, Affine8KVCache):
     @BatchTurboQuantKVCache.state.setter
     def state(self, value):
         Affine8KVCache.state.fset(self, value)
+        self._row_ends = None
         self._phys_end = self.offset
         self.offset = self._phys_end - self.left_padding

@@ -230,7 +230,12 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
         if cache is not None and hasattr(cache, _ROWS_ATTR):
             delattr(cache, _ROWS_ATTR)
         length = h.shape[1]
-        if t and length == 1:
+        # Without left padding mlx-vlm gives a decode no mask, which would read
+        # the dropped columns after a ragged rollback, so take the per-row seam.
+        ragged = getattr(type(cache), "_omlx_ragged_trim", False) and (
+            getattr(cache, "_row_ends", None) is not None
+        )
+        if (t or ragged) and length == 1:
             # Rows end before _idx, so every layer must take the per-row seam.
             cache._qwen3_5_decode_left_padding = [
                 int(p) for p in cache.left_padding.tolist()

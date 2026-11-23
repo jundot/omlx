@@ -4,7 +4,8 @@
 ``sanitizer`` uses only ops oQ's streaming plan can replay; ``oq_virtual``
 exposes the routed experts before it runs. Calibration runs on the packed
 source model (no proxy would be smaller), and the walk helpers carry the
-completed attention-residual blocks between layers.
+completed attention-residual blocks between layers. A looped checkpoint walks
+its layer visits in run order, as the runtime does.
 """
 
 from __future__ import annotations
@@ -15,7 +16,10 @@ from pathlib import Path
 
 import mlx.core as mx
 
-MODEL_TYPE = "inkling2"
+from . import INKLING2_MODEL_TYPES
+from .loader import _LOOP_QUERIES, _loop_controllers, _loop_message_queries
+from .model import _unit_rms
+
 SOURCE_PREFIX = "model.llm."
 VISUAL_PREFIX = "model.visual."
 # ModelOpt stores the NVFP4 tensor scale as amax / (E4M3 max x E2M1 max). MLX
@@ -36,7 +40,11 @@ _RENAMES = {
 
 
 def is_inkling2(config: dict) -> bool:
-    return str(config.get("model_type", "")).lower() == MODEL_TYPE
+    return str(config.get("model_type", "")).lower() in INKLING2_MODEL_TYPES
+
+
+def is_inkling2_model(model) -> bool:
+    return str(getattr(model, "model_type", "")) in INKLING2_MODEL_TYPES
 
 
 def text_config(config: dict) -> dict:
@@ -62,8 +70,18 @@ def is_expert_carrier(module) -> bool:
 
 
 def cast_predicate(key: str) -> bool:
-    """Keep the attention-residual queries, router and NVFP4 scales in FP32."""
-    return not key.endswith((".query", "router_weight", "router_bias", ".global_scale"))
+    """Keep the attention-residual and loop queries, loop controllers, router and
+    NVFP4 scales in FP32."""
+    return not key.endswith(
+        (
+            ".query",
+            "loop_down",
+            "loop_gain_forget",
+            "router_weight",
+            "router_bias",
+            ".global_scale",
+        )
+    )
 
 
 def sanitizer(config: dict, *, text_only: bool = False):
@@ -76,10 +94,13 @@ def sanitizer(config: dict, *, text_only: bool = False):
     keep_vision = bool(config.get("vision_config")) and not text_only
     hidden = int(text["hidden_size"])
     kernel = int(text.get("sconv_kernel_size") or text.get("conv_kernel_size") or 4)
+    loop = text.get("loop_config")
+    loop_core = range(loop["core_start"], loop["core_end"]) if loop else range(0)
 
     def sanitize(weights: dict) -> dict:
         out: dict = {}
         per_layer: dict[int, dict] = {}
+        loop_queries: dict = {}
         for key, value in weights.items():
             if key.startswith(VISUAL_PREFIX):
                 if keep_vision:
@@ -105,6 +126,8 @@ def sanitizer(config: dict, *, text_only: bool = False):
                 out[f"model.layers.{idx}.mlp_input.query"] = value.reshape(
                     -1, hidden
                 ).astype(mx.float32)
+            elif name in _LOOP_QUERIES:
+                loop_queries[name] = value
             elif name.startswith("layers."):
                 _, idx, rest = name.split(".", 2)
                 per_layer.setdefault(int(idx), {})[rest] = value
@@ -113,6 +136,8 @@ def sanitizer(config: dict, *, text_only: bool = False):
 
         for idx, d in per_layer.items():
             _map_layer(out, d, idx, hidden, kernel)
+        if loop_queries:
+            _loop_message_queries(loop_queries, loop_core, out)
         return out
 
     sanitize._omlx_cast_predicate = cast_predicate
@@ -173,6 +198,8 @@ def _map_layer(out: dict, d: dict, idx: int, hidden: int, kernel: int) -> None:
         scale = d.pop(f"mlp.experts.{which}.global_scale", None)
         if scale is not None:
             out[f"{pre}mlp.experts.{which}.global_scale"] = scale
+    if "controllers.attn.down_weight" in d:
+        _loop_controllers(d, out, pre)
     if d:
         raise ValueError(f"Unmapped Inkling 2 tensors in layer {idx}: {sorted(d)}")
 
@@ -195,6 +222,57 @@ def embed_fn(model):
     """Token ids to the first layer's input, as ``Inkling2TextModel`` computes it."""
     core = model.model
     return lambda tokens: core.embed_norm(core.embed(tokens))
+
+
+def walk_layers(model):
+    """The decoder layers in run order: a looped layer once per pass."""
+    args = model.model.args
+    if not args.loop_config:
+        return model.layers
+    return [model.layers[idx] for idx, _ in args.layer_schedule()]
+
+
+def walk_state(model) -> dict:
+    """The completed blocks, plus the loop bookkeeping of a looped model."""
+    args = model.model.args
+    if not args.loop_config:
+        return {"blocks": []}
+    return {
+        "blocks": [],
+        "schedule": tuple(args.layer_schedule()),
+        "core_start": args.loop_core.start,
+        "prelude": None,
+        "bank": None,
+    }
+
+
+def walk_step(layer, state: dict, step: int, h):
+    """Run walk step ``step`` as ``Inkling2TextModel`` runs that layer visit.
+
+    Returns the output and the state after the step. ``state`` stays as is,
+    because the sensitivity walk runs each step twice on the same inputs.
+    """
+    blocks = list(state["blocks"])
+    schedule = state.get("schedule")
+    if schedule is None:
+        return layer(h, blocks, cache=None), {**state, "blocks": blocks}
+    idx, loop_pass = schedule[step]
+    prelude, bank = state["prelude"], state["bank"]
+    if idx == state["core_start"] and loop_pass == 0:
+        prelude = (h, list(blocks))
+    elif idx == state["core_start"]:
+        # The next pass restarts from the prelude output; the blocks the last
+        # pass wrote become its message bank.
+        bank = (blocks[len(prelude[1]) + 1 :], _unit_rms(h.astype(mx.float32)))
+        h, blocks = prelude[0], list(prelude[1])
+    out = layer(h, blocks, cache=None, bank=bank if loop_pass else None)
+    return out, {**state, "blocks": blocks, "prelude": prelude, "bank": bank}
+
+
+def walk_layer_index(state: dict, step: int) -> int:
+    """The decoder layer that walk step ``step`` runs."""
+    schedule = state.get("schedule")
+    return step if schedule is None else schedule[step][0]
 
 
 def head_input(model, hidden, blocks: list):

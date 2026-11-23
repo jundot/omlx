@@ -3151,6 +3151,30 @@ class TestPublicCeilingBreakdown:
             breakdown = self._enforcer("aggressive").get_ceiling_breakdown()
         assert breakdown["metal_cap"] == 56 * 1024**3
 
+    def test_compressed_metal_pages_do_not_lift_the_metal_cap(self):
+        gb = 1024**3
+        with (
+            patch("omlx.settings.get_system_memory", return_value=32 * gb),
+            patch.object(pme, "get_phys_footprint", return_value=24 * gb),
+            patch.object(pme, "get_graphics_footprint", return_value=20 * gb),
+            patch.object(
+                pme, "get_graphics_footprint_compressed", return_value=int(3.5 * gb)
+            ),
+            patch.object(
+                pme.psutil_compat,
+                "get_macos_vm_stats",
+                return_value={
+                    "free": 8 * gb,
+                    "inactive": 2 * gb,
+                    "active": 2 * gb,
+                    "wired": 20 * gb,
+                },
+            ),
+            patch.object(pme, "get_effective_metal_cap_bytes", return_value=25 * gb),
+        ):
+            breakdown = self._enforcer("aggressive").get_ceiling_breakdown()
+        assert breakdown["metal_cap"] == int(25.5 * gb)
+
     def test_disabled_guard_reports_zero_components(self):
         enforcer = self._enforcer("balanced")
         enforcer._prefill_memory_guard = False

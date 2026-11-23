@@ -139,6 +139,12 @@ Run `python -m pytest -q tests/test_cluster_pairing_session.py tests/test_cluste
 
 For a two-Mac smoke test, start isolated servers with separate base paths. Request a join, restart only the joining server, then cancel and retry; the coordinator must remove the original pending request. Repeat with the coordinator offline: cancellation must return `state: idle` with `cleanup_pending: true`, and joining a different reachable Mac must work. Restore the coordinator and poll the join endpoint to verify cleanup. Keep existing approval/cancel race and token-ownership tests in the run; never relax the coordinator's token check to make a stale request disappear.
 
+# Hy4 offline tests
+
+Run `python -m pytest -q tests/test_hy_v4.py` for Hy4 and Hy4-flash. Tiny random models with no checkpoint download check incremental decode against the full forward, left-padded batch rows against single runs, the FP8 sanitize path, the tool parser and the thinking switches. DFly2 cases roll every cache back to the accepted prefix, reproduce greedy decoding with MTP on, and draft for two concurrent requests. Exact verify cases compare each verify row bit for bit with one-row decode, for plain and one-row batch caches and after a partial accept. Calibration cases check that the oQ layer walk and the streamed walk match the native forward. The vision cases compare the tower, the projector and the image processor with recorded transformers outputs, and follow image placeholders through M-RoPE positions, chunked prefill, decode and the DFly2 anchor. The NAX case runs only on an M5 GPU and compares the NAX sparse MLA, indexer and attention paths with their references.
+
+`tests/test_oqh.py::test_hy_v4_experts_round_trip` checks oQh exports of both models against their dequantized twins.
+
 # DeepSeek V4.1 offline tests
 
 CED scheduler prefill, short suffix positions, full-logit scoring, DSpark

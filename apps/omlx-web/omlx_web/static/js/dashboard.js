@@ -2288,6 +2288,8 @@
                         model?.deepseek_v41_engram_ssd_offload_supported === true,
                     deepseek_v41_engram_ssd_offload_forced:
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
+                    hy4_engram_ssd_offload: s.hy4_engram_ssd_offload === true,
+                    hy4_engram_ssd_offload_supported: model?.hy4_engram_ssd_offload_supported === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     enableGpuPowerLimit: !!(s.gpu_power_limit_w),
@@ -2345,8 +2347,8 @@
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     mtp_enabled: s.mtp_enabled || false,
-                    mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
-                        ? String(s.mtp_adaptive_max_depth) : '3',
+                    mtp_adaptive_max_depth: [3, 4, 5, 6, 7, 8].includes(s.mtp_adaptive_max_depth)
+                        ? String(s.mtp_adaptive_max_depth) : '',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -3448,6 +3450,7 @@
                 if (this.modelSettings.deepseek_v41_engram_ssd_offload_supported) {
                     return 'deepseek_v41_engram_ssd_offload';
                 }
+                if (this.modelSettings.hy4_engram_ssd_offload_supported) return 'hy4_engram_ssd_offload';
                 return null;
             },
 
@@ -3633,6 +3636,7 @@
                         ms.deepseek_v41_engram_ssd_offload_forced
                             ? !!ms.deepseek_v41_engram_ssd_offload_requested
                             : !!ms.deepseek_v41_engram_ssd_offload,
+                    hy4_engram_ssd_offload: !!ms.hy4_engram_ssd_offload,
                     thinking_budget_enabled: ms.enableThinkingBudget,
                     thinking_budget_tokens: ms.enableThinkingBudget
                         ? (ms.thinking_budget_tokens || null)
@@ -3718,8 +3722,9 @@
                         ? (ms.dflash_verify_mode || 'adaptive')
                         : null,
                     mtp_enabled: !!ms.mtp_enabled,
-                    mtp_adaptive_max_depth: ms.mtp_enabled
-                        ? parseInt(ms.mtp_adaptive_max_depth || '3')
+                    // Empty -> the model's own default ceiling.
+                    mtp_adaptive_max_depth: ms.mtp_enabled && ms.mtp_adaptive_max_depth
+                        ? parseInt(ms.mtp_adaptive_max_depth)
                         : null,
                     mtp_fixed_depth: null,
                     qwen35_ane_prefill_shared_fraction: Number(ms.qwen35_ane_prefill_shared_fraction),
@@ -4105,7 +4110,7 @@
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
-                        this.modelSettings.mtp_adaptive_max_depth = '3';
+                        this.modelSettings.mtp_adaptive_max_depth = '';
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));

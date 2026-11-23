@@ -10,6 +10,8 @@ import sys
 logger = logging.getLogger(__name__)
 
 _QUALNAME = "mlx_lm.models.inkling2"
+# Looped checkpoints have their own model_type and the same model.
+INKLING2_MODEL_TYPES = frozenset({"inkling2", "inkling2_loop"})
 
 
 def apply_inkling2_patch() -> bool:
@@ -21,7 +23,9 @@ def apply_inkling2_patch() -> bool:
         return False
     sys.modules[_QUALNAME] = model
     importlib.import_module("mlx_lm.models").inkling2 = model
+    remapping = importlib.import_module("mlx_lm.utils").MODEL_REMAPPING
+    remapping["inkling2_loop"] = "inkling2"
     return True
 
 
-__all__ = ["apply_inkling2_patch"]
+__all__ = ["INKLING2_MODEL_TYPES", "apply_inkling2_patch"]
