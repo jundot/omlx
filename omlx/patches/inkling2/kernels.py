@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import verify_attention
+
+logger = logging.getLogger(__name__)
 
 # Upper bound on one additive mask block (elements) in the general attention
 # path; queries are split into sub-blocks so the mask stays below it.
@@ -34,6 +38,11 @@ def _fits_threadgroup(key, launch) -> bool:
         except ValueError as exc:
             if "threads per threadgroup" not in str(exc):
                 raise
+            logger.info(
+                "Inkling 2 fused kernel %s exceeds this GPU's threadgroup "
+                "limit; using the MLX ops",
+                key,
+            )
             ok = False
         _launch_ok[key] = ok
     return ok
@@ -386,7 +395,7 @@ def attn_res_fused(
             mx.zeros(query.shape, dtype=mx.float32),
             scale,
             unit_eps=unit_eps,
-            norm_weight=mx.ones((hidden,), dtype=mx.float32) if norm else None,
+            norm_weight=mx.ones(norm_weight.shape, dtype=mx.float32) if norm else None,
             norm_eps=norm_eps,
             out_dtype=out_dtype,
             want_f32=want_f32,
