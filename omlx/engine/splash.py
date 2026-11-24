@@ -145,6 +145,8 @@ THINKING_BUDGET_VERSION = (1, 3, 2)
 # Splash loads Model Optimizer and compressed-tensors NVFP4/FP8 from 1.3.2 on.
 NVIDIA_QUANTIZATION_VERSION = (1, 3, 2)
 FLASH_NEXT_VERSION = (1, 4, 0)
+# Splash 1.7.2 serves Inkling 2 Mini with DFlash2 speculative decoding.
+INKLING2_VERSION = (1, 7, 2)
 SPLIT_GGUF_VERSION = (1, 4, 0)
 # Splash 1.4.1 serves MoE GGUFs pruned to a multiple of 8 routed experts.
 PRUNED_EXPERTS_VERSION = (1, 4, 1)
@@ -235,19 +237,40 @@ SPLASH_FAMILIES: dict[str, dict[str, Any]] = {
         "num_experts": 256,
         "num_experts_per_tok": 6,
     },
+    # Its release states its window as model_max_length, which the derived
+    # GGUF config carries as max_position_embeddings, so the signature holds
+    # the sizes both layouts share.
+    "Inkling-2-Mini": {
+        "model_type": "inkling2_loop_text",
+        "hidden_size": 2304,
+        "num_hidden_layers": 24,
+        "vocab_size": 201024,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "num_experts": 128,
+        "num_experts_per_tok": 8,
+    },
 }
 # The first Splash release that serves each family, where later than 1.3.0.
 _FAMILY_VERSIONS = {
     "Qwen3.8-Flash-Next": FLASH_NEXT_VERSION,
     "Qwen3.5-122B-A10B": (1, 4, 1),
     "Flint": (1, 4, 1),
+    "Inkling-2-Mini": INKLING2_VERSION,
 }
 # Families Splash loads from GGUFs only, not from MLX checkpoints.
 _GGUF_ONLY_FAMILIES = frozenset({"Qwen3.8-Flash-Next", "Flint"})
 # Families without a vision tower; Splash serves their models text only.
-_TEXT_ONLY_FAMILIES = frozenset({"Flint"})
+# Inkling 2 has one, but Splash does not serve it yet (its install/families.py
+# states vision=False for the family).
+_TEXT_ONLY_FAMILIES = frozenset({"Flint", "Inkling-2-Mini"})
 # Families without YaRN; a longer --max-context stops their startup.
 _NATIVE_CONTEXT_FAMILIES = frozenset({"Flint"})
+# Families whose native window is longer than the default one; Splash serves
+# Inkling 2 to 1,010,000 tokens with no YaRN (its install/families.py reports
+# context_tokens 1010000, Splash's serve ceiling for the family).
+_FAMILY_NATIVE_CONTEXT = {"Inkling-2-Mini": 1_010_000}
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 _SHARD_INDEX = "model.safetensors.index.json"
 # Splash serves vision only with one of these from the target repository.
@@ -261,7 +284,14 @@ SPLASH_DRAFT_REPOS = {
     "Qwen3.8-Flash-Next": "incoai/Qwen3.8-Flash-Next-DFlash2",
     "Qwen3.5-122B-A10B": "incoai/Ornith-1.5-122B-DFlash2",
     "Flint": "incoai/Flint-DFlash2",
+    "Inkling-2-Mini": "incoai/Inkling-2-Mini-DFlash2",
 }
+
+
+def splash_native_context(family: str) -> int:
+    """The largest window ``family`` serves without YaRN."""
+    return _FAMILY_NATIVE_CONTEXT.get(family, SPLASH_NATIVE_CONTEXT)
+
 
 # Splash quantizes the BF16 DFlash2 draft to 4 bits when it loads it.
 _DRAFT_LOAD_RATIO = 1 / 3
@@ -585,13 +615,36 @@ def _quantization_problem(config: dict, binary: SplashBinary) -> str:
     )
 
 
+def _draft_target_layers(text: dict) -> int | None:
+    """The layer count a DFlash2 draft targets.
+
+    Inkling 2's draft counts the loop's layer applications: its weight layers,
+    the core ones repeated once per pass.
+    """
+    layers = text.get("num_hidden_layers")
+    loop = text.get("loop_config")
+    if isinstance(loop, dict) and isinstance(layers, int):
+        start = loop.get("core_start")
+        end = loop.get("core_end")
+        passes = loop.get("num_passes")
+        if (
+            isinstance(start, int)
+            and isinstance(end, int)
+            and isinstance(passes, int)
+            and 0 <= start < end <= layers
+            and passes >= 1
+        ):
+            return layers + (passes - 1) * (end - start)
+    return layers
+
+
 def _is_splash_draft(draft: dict, text: dict) -> bool:
     architectures = draft.get("architectures") or []
     return (
         "DFlash2DraftModel" in architectures
         and draft.get("hidden_size") == text.get("hidden_size")
         and draft.get("vocab_size") == text.get("vocab_size")
-        and draft.get("num_target_layers") == text.get("num_hidden_layers")
+        and draft.get("num_target_layers") == _draft_target_layers(text)
     )
 
 

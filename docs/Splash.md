@@ -1,10 +1,10 @@
 # Splash engine
 
-[Splash](https://github.com/incoai/splash) runs Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next and Flint on its own Metal engine with DFlash2 speculative decoding. oMLX can serve a model through Splash as an external engine instead of its in-process MLX engines, including GGUF files, which only an external engine runs. The model stays in oMLX's model list, API, dashboard and usage statistics like any other; Splash does the inference in its own process.
+[Splash](https://github.com/incoai/splash) runs Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next, Flint and Inkling-2-Mini on its own Metal engine with DFlash2 speculative decoding. oMLX can serve a model through Splash as an external engine instead of its in-process MLX engines, including GGUF files, which only an external engine runs. The model stays in oMLX's model list, API, dashboard and usage statistics like any other; Splash does the inference in its own process.
 
 ## Setup
 
-1. Install Splash 1.3.0 or later (1.4.0 or later for Flash-Next, 1.4.1 or later for Ornith-1.5-122B and Flint):
+1. Install Splash 1.3.0 or later (1.4.0 or later for Flash-Next, 1.4.1 or later for Ornith-1.5-122B and Flint, 1.7.2 or later for Inkling-2-Mini):
 
    | Build | Launcher | Macs | Install |
    | --- | --- | --- | --- |
@@ -12,7 +12,7 @@
    | Splash M1 | `splash-m1` | M1 and M2 as well | `install-m1.sh` from [paperniuk/splash releases](https://github.com/paperniuk/splash/releases) |
 
 2. Open **Settings → Integrations → External engines**. oMLX looks for the launcher on `PATH`, then in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`, preferring Splash M1 on M1/M2 Macs and the official build elsewhere. When it finds one, the card shows its path and version. Otherwise, enter the launcher's path there (a source checkout's `./splash`, for example).
-3. Download the DFlash2 draft Splash pairs with the model's family into a model directory: `incoai/Qwen3.8-27B-DFlash2` (`z-lab/Qwen3.8-27B-DFlash2` holds the same weights), `incoai/Qwen3.6-35B-A3B-DFlash2`, `incoai/Ornith-1.5-122B-DFlash2` (for every Qwen3.5-122B-A10B model), `incoai/Qwen3.8-Flash-Next-DFlash2` or `incoai/Flint-DFlash2`. The model's **Model Settings → Advanced** offers a button that downloads it.
+3. Download the DFlash2 draft Splash pairs with the model's family into a model directory: `incoai/Qwen3.8-27B-DFlash2` (`z-lab/Qwen3.8-27B-DFlash2` holds the same weights), `incoai/Qwen3.6-35B-A3B-DFlash2`, `incoai/Ornith-1.5-122B-DFlash2` (for every Qwen3.5-122B-A10B model), `incoai/Qwen3.8-Flash-Next-DFlash2`, `incoai/Flint-DFlash2` or `incoai/Inkling-2-Mini-DFlash2`. The model's **Model Settings → Advanced** offers a button that downloads it.
 4. In the model's **Model Settings → Advanced**, turn on **Use external engine** and pick Splash. A GGUF model has it on already.
 
 The toggle stays off, with the reason shown, until all of this is in place. The macOS app has the same settings under Integrations and the model's Advanced tab. In the model list, a model Splash can serve carries a Splash badge.
@@ -27,6 +27,7 @@ Quantized checkpoints of the families Splash supports:
 - Qwen3.8-Flash-Next GGUFs need Splash 1.4.0 or later, for example the Q2_0 variant of `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` or an Unsloth GGUF. Flash-Next MLX checkpoints do not run on Splash. Its DFlash2 draft is `incoai/Qwen3.8-Flash-Next-DFlash2`.
 - Qwen3.5-122B-A10B models, such as Ornith-1.5-122B, need Splash 1.4.1 or later, as MLX checkpoints (`ornith-ai/Ornith-1.5-122B-MLX-4bit`, with its vision tower) or GGUFs (`unsloth/Ornith-1.5-122B-GGUF`, with a vision projector for image input). Their DFlash2 draft is `incoai/Ornith-1.5-122B-DFlash2`.
 - Flint GGUFs need Splash 1.4.1 or later, for example a variant of `unsloth/flint-GGUF`. Flint has no vision tower, so it always serves text only, and Flint MLX checkpoints do not run on Splash. Its DFlash2 draft is `incoai/Flint-DFlash2`.
+- Inkling-2-Mini GGUFs need Splash 1.7.2 or later, for example a variant of `unsloth/Inkling-2-Mini-GGUF` or `lmstudio-community/Inkling-2-Mini-GGUF`. Splash does not serve the family's vision tower yet, so it always serves text only, and its draft counts the loop's 48 layer applications. Its DFlash2 draft is `incoai/Inkling-2-Mini-DFlash2`.
 - MoE GGUFs pruned to fewer routed experts than their family need Splash 1.4.1 or later, for example `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF`, which keeps 256 of Flash-Next's 512 experts. The expert count must be a multiple of 8; Splash checks the rest when it loads the file. Pruned MLX checkpoints do not run on Splash.
 
 Prebuilt Splash packages (`incoai/*-Splash`) are not supported; Splash 1.3.1 replaced them with the MLX checkpoints above. The model downloader refuses them and names the MLX model that holds the same weights.
@@ -35,7 +36,7 @@ Prebuilt Splash packages (`incoai/*-Splash`) are not supported; Splash 1.3.1 rep
 
 In the model downloader, the **GGUF only** view lists GGUF repositories. Downloading one opens its file list: check the GGUF to download, and its vision projector (`mmproj-*.gguf`) is checked with it. Only the checked files are fetched, into `<model dir>/<owner>/<repo>/`.
 
-oMLX lists each GGUF in a model directory, an organization folder (`<owner>/<repo>/`, as the downloader and LM Studio lay them out) or the Hugging Face cache as its own model, named by its file, for example `Qwen3.8-27B-UD-Q4_K_M`. Split GGUFs can also be in a folder named for their variant, such as `Q2_0/Model-Q2_0-00001-of-00002.gguf`. All parts must be present; a vision projector at the repository root is paired with them. Vision projectors, imatrix files and draft subfolders are not models. For each GGUF oMLX generates a folder under `<base path>/gguf` with a `config.json` derived from the file's header and links to the file and its projectors; for the Qwen families and Flint the folder also holds the tokenizer the header defines. A GGUF runs only on an external engine: it never loads in oMLX's MLX engines, and `/v1/models` lists it only while an engine can serve it. Deleting a GGUF in the model manager removes its parts, and the folder goes with its last GGUF.
+oMLX lists each GGUF in a model directory, an organization folder (`<owner>/<repo>/`, as the downloader and LM Studio lay them out) or the Hugging Face cache as its own model, named by its file, for example `Qwen3.8-27B-UD-Q4_K_M`. Split GGUFs can also be in a folder named for their variant, such as `Q2_0/Model-Q2_0-00001-of-00002.gguf`. All parts must be present; a vision projector at the repository root is paired with them. Vision projectors, imatrix files and draft subfolders are not models. For each GGUF oMLX generates a folder under `<base path>/gguf` with a `config.json` derived from the file's header and links to the file and its projectors; for the Qwen families, Flint and Inkling 2 the folder also holds the tokenizer the header defines. A GGUF runs only on an external engine: it never loads in oMLX's MLX engines, and `/v1/models` lists it only while an engine can serve it. Deleting a GGUF in the model manager removes its parts, and the folder goes with its last GGUF.
 
 PLE variants such as `Q4-PLE8/` can keep their lookup table in a separately named last shard. oMLX groups the complete numbered set as one model and includes the variant name in its model ID, so `Q4-PLE4` and `Q4-PLE8` remain separate even when their body files have the same names. Pick any shard in the downloader to select the whole set and its projector.
 

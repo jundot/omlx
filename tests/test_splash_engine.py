@@ -76,6 +76,9 @@ FLASH_NEXT_TEXT = {
     "num_experts_per_tok": 10,
 }
 REPO_ID = splash_repo_id("Qwen3.8-27B-4bit")
+INKLING2_TEXT = dict(splash_mod.SPLASH_FAMILIES["Inkling-2-Mini"])
+# Its release's loop, which its DFlash2 draft counts layer applications of.
+INKLING2_TEXT["loop_config"] = {"core_start": 6, "core_end": 18, "num_passes": 3}
 MLX_4BIT = {"mode": "affine", "bits": 4, "group_size": 64}
 GIB = 1024**3
 
@@ -94,7 +97,7 @@ def _write_model(path: Path, text_config=None, quantization=None) -> Path:
     return path
 
 
-def _write_draft(path: Path, text=None) -> Path:
+def _write_draft(path: Path, text=None, target_layers=None) -> Path:
     text = QWEN38_TEXT if text is None else text
     path.mkdir(parents=True)
     config = {
@@ -102,7 +105,9 @@ def _write_draft(path: Path, text=None) -> Path:
         "model_type": "qwen3",
         "hidden_size": text["hidden_size"],
         "vocab_size": text["vocab_size"],
-        "num_target_layers": text["num_hidden_layers"],
+        "num_target_layers": (
+            text["num_hidden_layers"] if target_layers is None else target_layers
+        ),
         "dflash_config": {"block_size": 8},
     }
     (path / "config.json").write_text(json.dumps(config))
@@ -563,6 +568,71 @@ class TestCompatibility:
         target, reason = resolve_splash_target(model, None, [str(draft)])
         assert reason == ""
         assert target.draft_path == draft
+
+    def test_inkling2_checkpoint_needs_splash_1_7_2_and_its_draft(
+        self, tmp_path, launchers
+    ):
+        model = _write_model(tmp_path / "Inkling-2-Mini-oQ4e-mtp", INKLING2_TEXT)
+        # The draft targets the loop's 48 layer applications, not its 24
+        # weight layers.
+        draft = _write_draft(
+            tmp_path / "incoai" / "Inkling-2-Mini-DFlash2",
+            INKLING2_TEXT,
+            target_layers=48,
+        )
+
+        launchers("splash", version="1.7.1")
+        _, reason = resolve_splash_target(model, None, [str(draft)])
+        assert reason == "Inkling-2-Mini needs Splash 1.7.2 or later"
+
+        launchers("splash", version="1.7.2")
+        assert (
+            splash_mod.splash_draft_to_download(model, None, [])
+            == "incoai/Inkling-2-Mini-DFlash2"
+        )
+        target, reason = resolve_splash_target(model, None, [str(draft)])
+        assert reason == ""
+        assert target.family == "Inkling-2-Mini"
+        assert target.draft_path == draft
+
+    def test_inkling2_draft_counts_the_loops_layer_applications(
+        self, tmp_path, launchers
+    ):
+        launchers("splash", version="1.7.2")
+        model = _write_model(tmp_path / "Inkling-2-Mini-oQ4e-mtp", INKLING2_TEXT)
+        weight_layers = _write_draft(tmp_path / "weight-layers-draft", INKLING2_TEXT)
+        applications = _write_draft(
+            tmp_path / "applications-draft", INKLING2_TEXT, target_layers=48
+        )
+
+        _, reason = resolve_splash_target(model, None, [str(weight_layers)])
+        assert "DFlash2 draft" in reason
+
+        target, reason = resolve_splash_target(model, None, [str(applications)])
+        assert reason == ""
+        assert target.draft_path == applications
+
+    def test_inkling2_is_text_only_and_keeps_its_native_window(
+        self, tmp_path, launchers
+    ):
+        launchers("splash", version="1.7.2")
+        model = _write_model(tmp_path / "Inkling-2-Mini-oQ4e-mtp", INKLING2_TEXT)
+        # Splash does not serve the family's vision tower yet.
+        config = json.loads((model / "config.json").read_text())
+        config["vision_config"] = {"model_type": "clip"}
+        (model / "config.json").write_text(json.dumps(config))
+        draft = _write_draft(
+            tmp_path / "incoai" / "Inkling-2-Mini-DFlash2",
+            INKLING2_TEXT,
+            target_layers=48,
+        )
+
+        target, reason = resolve_splash_target(model, None, [str(draft)])
+
+        assert reason == ""
+        assert not splash_mod.splash_has_vision(config)
+        assert splash_mod.splash_native_context(target.family) == 1_010_000
+        assert target.max_context == 1_010_000
 
     def test_flint_mlx_checkpoint_explains_gguf_requirement(self, tmp_path, launchers):
         launchers("splash", version="1.4.1")

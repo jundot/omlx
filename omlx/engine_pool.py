@@ -39,7 +39,6 @@ from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.splash import (
     EXTERNAL_ENGINES,
-    SPLASH_NATIVE_CONTEXT,
     SplashEngine,
     SplashOptions,
     SplashTarget,
@@ -47,6 +46,7 @@ from .engine.splash import (
     resolve_splash_target,
     splash_draft_to_download,
     splash_memory_estimate,
+    splash_native_context,
     splash_repo_id,
 )
 from .engine.splash import (
@@ -2300,9 +2300,10 @@ class EnginePool:
 
         context = self._splash_sizing_context(entry, model_settings, target)
         wanted = estimate(context)
-        if context and context > SPLASH_NATIVE_CONTEXT and 0 < room < wanted:
+        native = splash_native_context(target.family)
+        if context and context > native and 0 < room < wanted:
             # Splash keeps the native window then and must not reserve more.
-            wanted = estimate(SPLASH_NATIVE_CONTEXT)
+            wanted = estimate(native)
         return wanted
 
     def _splash_admission_target(self) -> int:
@@ -2463,13 +2464,13 @@ class EnginePool:
                 entry.model_id,
             )
             requested_context = None
-        if requested_context and requested_context > SPLASH_NATIVE_CONTEXT:
+        if requested_context and requested_context > splash_native_context(target.family):
             logger.warning(
                 "Splash: the %d-token context of %s is past the native %d; "
                 "YaRN is on and changes answers at every length",
                 requested_context,
                 entry.model_id,
-                SPLASH_NATIVE_CONTEXT,
+                splash_native_context(target.family),
             )
         return SplashEngine(
             model_name=entry.model_path,

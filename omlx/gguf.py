@@ -73,6 +73,19 @@ _HF_MODEL_TYPES = {
     "qwen35": "qwen3_5",
     "qwen35moe": "qwen3_5_moe",
     "qwen4exp": "qwen4_exp",
+    # Inkling 2's two GGUF layouts (llama.cpp's inkling2_loop, Unsloth's
+    # inkling2) state the same Hugging Face text model type.
+    "inkling2_loop": "inkling2_loop",
+    "inkling2": "inkling2_loop",
+}
+# Inkling 2's loop, as each GGUF layout keys it: its first layer, the layer
+# past its last and its passes. llama.cpp's converter writes inkling2_loop,
+# whose layer count is its weight layers; Unsloth's own layout (inkling2, the
+# root files of unsloth/Inkling-2-Mini-GGUF) states its layer counts per
+# layer application, the loop's core layers once a pass.
+_INKLING2_LOOP_KEYS = {
+    "inkling2_loop": ("loop.start", "loop.end", "loop.count"),
+    "inkling2": ("loop.core_start", "loop.core_end", "num_loops"),
 }
 
 # The generated folder's files besides the links to the source files.
@@ -103,9 +116,25 @@ _FLINT_PATTERNS = (
 # The GGUF tokenizer profiles (tokenizer.ggml.pre) oMLX derives a tokenizer
 # for, as Splash does: the patterns that split text, in order, and whether
 # text is NFC-normalized first.
-_TOKENIZER_PROFILES: dict[str, tuple[tuple[str, ...], bool]] = {
-    "qwen35": ((_QWEN35_PATTERN,), True),
-    "flint": (_FLINT_PATTERNS, False),
+# The inkling2 profile, as Inkling 2's own tokenizer.json splits text before
+# its byte-level BPE, without a normalizer: o200k's pattern alone, digits in
+# runs of up to three.
+_INKLING2_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+# Each tokenizer profile (tokenizer.ggml.pre) oMLX derives a tokenizer for:
+# the patterns that split text, each isolating its matches, in order; whether
+# text is NFC-normalized before them; and whether its BPE takes a piece its
+# vocabulary holds whole as that token before any merge (ignore_merges), as
+# o200k's does and Inkling 2's tokenizer.json states.
+_TOKENIZER_PROFILES: dict[str, tuple[tuple[str, ...], bool, bool]] = {
+    "qwen35": ((_QWEN35_PATTERN,), True, False),
+    "flint": (_FLINT_PATTERNS, False, False),
+    "inkling2": ((_INKLING2_PATTERN,), False, True),
 }
 # GGUF token types: control tokens are special added tokens, user-defined
 # ones added tokens that are not special.
@@ -115,8 +144,17 @@ _TOKENIZER_ARRAYS = frozenset(
     {"tokenizer.ggml.tokens", "tokenizer.ggml.token_type", "tokenizer.ggml.merges"}
 )
 # Per-layer arrays the derived config reads: which layers attend through a
-# sliding window (one boolean per layer, so cheap to keep).
-_LAYER_ARRAYS = frozenset({"flint.attention.sliding_window_pattern"})
+# sliding window (one boolean per layer, so cheap to keep), and Inkling 2's
+# head counts, which its layouts state per layer application.
+_LAYER_ARRAYS = frozenset(
+    {
+        "flint.attention.sliding_window_pattern",
+        "inkling2_loop.attention.head_count",
+        "inkling2_loop.attention.head_count_kv",
+        "inkling2.attention.head_count",
+        "inkling2.attention.head_count_kv",
+    }
+)
 
 
 class GgufError(ValueError):
@@ -420,6 +458,51 @@ def _int(value) -> int | None:
     return value
 
 
+def _shared_layer_size(
+    metadata: dict[str, Any], arch: str, name: str, applications: int | None
+) -> int | None:
+    """The size at the header's ``name``, which llama.cpp states once or as
+    one value per layer application (Inkling 2's head counts): the one value
+    every application shares."""
+    values = metadata.get(f"{arch}.{name}")
+    if not isinstance(values, list):
+        return _int(values)
+    if applications is None or len(values) != applications:
+        return None
+    shared = set(values)
+    if len(shared) != 1:
+        return None
+    value = shared.pop()
+    return value if _int(value) is not None else None
+
+
+def _inkling2_loop(metadata: dict[str, Any], arch: str) -> dict[str, int] | None:
+    """Inkling 2's loop, as its release states it: the core layers that run
+    once per pass."""
+    start_key, end_key, passes_key = _INKLING2_LOOP_KEYS[arch]
+    start = _int(metadata.get(f"{arch}.{start_key}"))
+    end = _int(metadata.get(f"{arch}.{end_key}"))
+    passes = _int(metadata.get(f"{arch}.{passes_key}"))
+    if start is None or end is None or passes is None:
+        return None
+    if not 0 <= start < end or passes < 1:
+        return None
+    return {"core_start": start, "core_end": end, "num_passes": passes}
+
+
+def _inkling2_weight_layers(
+    arch: str, applications: int, loop: dict[str, int] | None
+) -> int:
+    """Inkling 2's weight layers: fewer than the header's applications when
+    its layout counts the loop's core layers once per pass (inkling2)."""
+    if arch != "inkling2" or loop is None:
+        return applications
+    repeated = (loop["num_passes"] - 1) * (loop["core_end"] - loop["core_start"])
+    if repeated <= 0 or repeated >= applications:
+        return applications
+    return applications - repeated
+
+
 def derive_config(
     metadata: dict[str, Any], projector: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -435,17 +518,37 @@ def derive_config(
     if layers is not None:
         # MTP layers are not part of the model the engines run.
         layers -= field("nextn_predict_layers") or 0
+    applications = layers
+    loop_config = None
+    if layers is not None and arch in _INKLING2_LOOP_KEYS:
+        loop_config = _inkling2_loop(metadata, arch)
+        if loop_config is not None:
+            layers = _inkling2_weight_layers(arch, layers, loop_config)
     tokens = metadata.get("tokenizer.ggml.tokens")
     if isinstance(tokens, ArrayInfo):
         vocab_size = tokens.length
     else:
         vocab_size = len(tokens) if isinstance(tokens, list) else None
+    padded = field("vocab_size")
+    if (
+        arch in _INKLING2_LOOP_KEYS
+        and padded is not None
+        and vocab_size is not None
+        and padded >= vocab_size
+    ):
+        # Inkling 2 pads its vocabulary to the model's rows; the token table
+        # holds the tokens its tokenizer emits.
+        vocab_size = padded
     sizes = {
         "hidden_size": field("embedding_length"),
         "num_hidden_layers": layers,
         "max_position_embeddings": field("context_length"),
-        "num_attention_heads": field("attention.head_count"),
-        "num_key_value_heads": field("attention.head_count_kv"),
+        "num_attention_heads": _shared_layer_size(
+            metadata, arch, "attention.head_count", applications
+        ),
+        "num_key_value_heads": _shared_layer_size(
+            metadata, arch, "attention.head_count_kv", applications
+        ),
         "head_dim": field("attention.key_length"),
         "full_attention_interval": field("full_attention_interval"),
         "num_experts": field("expert_count"),
@@ -462,15 +565,27 @@ def derive_config(
         window
         and isinstance(pattern, list)
         and layers is not None
-        and len(pattern) >= layers
+        and applications is not None
+        and len(pattern) >= applications
         and all(isinstance(slides, bool) for slides in pattern)
     ):
-        # Only the full layers' KV grows with the context (Flint).
+        # Only the full layers' KV grows with the context (Flint, Inkling 2).
         text["sliding_window"] = window
+        order = list(range(layers))
+        if arch == "inkling2" and loop_config is not None and applications > layers:
+            # The trailing layers follow the loop's repeated applications.
+            repeated = applications - layers
+            shift_at = loop_config["core_end"]
+            order = [
+                layer if layer < shift_at else layer + repeated
+                for layer in range(layers)
+            ]
         text["layer_types"] = [
-            "sliding_attention" if slides else "full_attention"
-            for slides in pattern[:layers]
+            "sliding_attention" if pattern[application] else "full_attention"
+            for application in order
         ]
+    if loop_config is not None:
+        text["loop_config"] = loop_config
     text["model_type"] = f"{hf_type}_text" if hf_type else arch
     config: dict[str, Any] = {"model_type": hf_type or arch, "text_config": text}
     if projector is not None:
@@ -481,7 +596,9 @@ def derive_config(
     return config
 
 
-def _tokenizer_profile(metadata: dict[str, Any]) -> tuple[tuple[str, ...], bool] | None:
+def _tokenizer_profile(
+    metadata: dict[str, Any],
+) -> tuple[tuple[str, ...], bool, bool] | None:
     """The tokenizer profile oMLX derives a tokenizer for, or None."""
     if metadata.get("tokenizer.ggml.model") != "gpt2":
         return None
@@ -497,7 +614,7 @@ def tokenizer_files(metadata: dict[str, Any]) -> dict[str, str]:
     profile = _tokenizer_profile(metadata)
     if profile is None:
         raise GgufError("unsupported GGUF tokenizer profile")
-    patterns, nfc = profile
+    patterns, nfc, ignore_merges = profile
     tokens = metadata["tokenizer.ggml.tokens"]
     types = metadata["tokenizer.ggml.token_type"]
     merges = metadata["tokenizer.ggml.merges"]
@@ -507,7 +624,11 @@ def tokenizer_files(metadata: dict[str, Any]) -> dict[str, str]:
     if any(len(pair) != 2 for pair in pairs):
         raise GgufError("invalid GGUF BPE merge")
     backend = Tokenizer(
-        token_models.BPE({token: i for i, token in enumerate(tokens)}, pairs)
+        token_models.BPE(
+            {token: i for i, token in enumerate(tokens)},
+            pairs,
+            ignore_merges=ignore_merges,
+        )
     )
     if nfc:
         backend.normalizer = normalizers.NFC()
