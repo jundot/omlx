@@ -2266,6 +2266,8 @@ class PagedSSDCacheManager(CacheManager):
                 file_path,
                 source="inline-fallback",
             )
+            if ok:
+                self._mark_hot_cache_clean(block_hash)
             self._clear_pending_write(block_hash)
             return ok
 
