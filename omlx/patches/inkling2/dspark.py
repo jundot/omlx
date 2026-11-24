@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -109,23 +108,16 @@ class Inkling2DSparkConfig:
         )
 
 
-@mx.compile
-def _mix_rmsnorm_compiled(
-    context: mx.array, alpha: mx.array, weight: mx.array, eps: float
-):
-    b, n, width = context.shape
-    taps = alpha.shape[0]
-    x = context.reshape(b, n, taps, width // taps).astype(mx.float32)
-    mixed = mx.sum(x * alpha.astype(mx.float32)[:, None], axis=2)
-    return mx.fast.rms_norm(mixed, weight.astype(mx.float32), eps).astype(context.dtype)
-
-
 def mix_rmsnorm(context: mx.array, alpha: mx.array, weight: mx.array, eps: float):
     """Softmax-weighted sum of the context taps, RMS-normalized.
 
     ``context`` is ``[B, n, T * H]`` (taps concatenated in feature order).
     """
-    return _mix_rmsnorm_compiled(context, alpha, weight, eps)
+    b, n, width = context.shape
+    taps = alpha.shape[0]
+    x = context.reshape(b, n, taps, width // taps).astype(mx.float32)
+    mixed = mx.sum(x * alpha.astype(mx.float32)[:, None], axis=2)
+    return mx.fast.rms_norm(mixed, weight.astype(mx.float32), eps).astype(context.dtype)
 
 
 class DraftAttention(nn.Module):
@@ -158,11 +150,6 @@ class DraftAttention(nn.Module):
         return self.k_proj_ctx(mixed), self.v_proj_ctx(mixed)
 
 
-@mx.compile
-def _draft_swiglu(gate: mx.array, up: mx.array) -> mx.array:
-    return nn.silu(gate) * up
-
-
 class DraftMLP(nn.Module):
     def __init__(self, hidden: int, inter: int):
         super().__init__()
@@ -171,7 +158,7 @@ class DraftMLP(nn.Module):
         self.down_proj = nn.Linear(inter, hidden, bias=False)
 
     def __call__(self, x):
-        return self.down_proj(_draft_swiglu(self.gate_proj(x), self.up_proj(x)))
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class DraftLayer(nn.Module):
@@ -183,23 +170,6 @@ class DraftLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(h, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(h, eps=config.rms_norm_eps)
         self.dflare_norm = nn.RMSNorm(h, eps=config.rms_norm_eps)
-
-
-def _markov_logit_tail(
-    base_logits: mx.array,
-    bias: mx.array,
-    cap: float,
-    vocab_bias: mx.array | None,
-) -> mx.array:
-    logits = base_logits.astype(mx.float32) + bias.astype(mx.float32)
-    if cap:
-        logits = mx.tanh(logits / cap) * cap
-    if vocab_bias is not None:
-        logits = logits + vocab_bias
-    return logits
-
-
-_markov_logit_tail_compiled = mx.compile(_markov_logit_tail)
 
 
 class Inkling2MarkovHead(nn.Module):
@@ -228,7 +198,6 @@ class Inkling2MarkovHead(nn.Module):
                 -mx.inf,
             ).astype(mx.float32)
         self._fold_weight = None
-        self._fold_quant = None
         self._fold_bias = None
         self._alpha = None
         self._f_rnn: dict[Any, mx.array] = {}
@@ -258,24 +227,9 @@ class Inkling2MarkovHead(nn.Module):
             rows.append((head @ proj).astype(mx.bfloat16))
             biases.append((head @ bias).astype(mx.bfloat16))
             mx.eval(rows[-1], biases[-1])
-        fold_weight = mx.concatenate(rows, axis=0)
+        self._fold_weight = mx.concatenate(rows, axis=0)
         self._fold_bias = mx.concatenate(biases, axis=0)
-        markov_bits = int(os.environ.get("OMLX_INKLING2_MARKOV_BITS", "16"))
-        if markov_bits in (2, 3, 4, 6, 8) and fold_weight.shape[-1] % 64 == 0:
-            wq, sc, bi = mx.quantize(
-                fold_weight, group_size=64, bits=markov_bits, mode="affine"
-            )
-            mx.eval(wq, sc, bi, self._fold_bias)
-            self._fold_quant = (wq, sc, bi, 64, markov_bits)
-            self._fold_weight = None
-            logger.info(
-                "Inkling 2 DSpark Markov fold quantized to %d-bit affine (g64)",
-                markov_bits,
-            )
-        else:
-            self._fold_weight = fold_weight
-            self._fold_quant = None
-            mx.eval(self._fold_weight, self._fold_bias)
+        mx.eval(self._fold_weight, self._fold_bias)
 
     def prepare_block(self, draft_hidden, context, lengths, uids) -> None:
         """Reset the RNN for a new block; refresh each row's committed taps."""
@@ -315,27 +269,14 @@ class Inkling2MarkovHead(nn.Module):
         blend = ((1.0 - gate) * mx.tanh(proj[:, r : 2 * r]).astype(dtype)).astype(dtype)
         self._state = kept + blend
         latent = mx.tanh(proj[:, 2 * r :]).astype(dtype)
-        if self._fold_quant is not None:
-            wq, sc, bi, gs, bits = self._fold_quant
-            bias = (
-                mx.quantized_matmul(
-                    latent,
-                    wq,
-                    scales=sc,
-                    biases=bi,
-                    transpose=True,
-                    group_size=gs,
-                    bits=bits,
-                    mode="affine",
-                )
-                + self._fold_bias
-            )
-        else:
-            bias = latent @ self._fold_weight.T + self._fold_bias
+        bias = latent @ self._fold_weight.T + self._fold_bias
         self._step += 1
-        return _markov_logit_tail_compiled(
-            base_logits, bias, self._softcap, self._vocab_bias
-        )
+        logits = base_logits.astype(mx.float32) + bias.astype(mx.float32)
+        if self._softcap:
+            logits = mx.tanh(logits / self._softcap) * self._softcap
+        if self._vocab_bias is not None:
+            logits = logits + self._vocab_bias
+        return logits
 
 
 class Inkling2DSparkModel(nn.Module):
@@ -362,50 +303,7 @@ class Inkling2DSparkModel(nn.Module):
         text = target.model
         self._embed_fn = lambda tokens: text.embed_norm(text.embed(tokens))
         lm_head = target.lm_head
-        draft_lm_bits = int(os.environ.get("OMLX_INKLING2_DRAFT_LM_HEAD_BITS", "0"))
-        if (
-            draft_lm_bits in (2, 3, 4, 6)
-            and isinstance(lm_head, nn.QuantizedLinear)
-            and lm_head.bits > draft_lm_bits
-        ):
-            w_chunks, s_chunks, b_chunks = [], [], []
-            total_rows = int(lm_head.weight.shape[0])
-            gs = 64
-            sub_b = lm_head.get("biases")
-            for start in range(0, total_rows, 16384):
-                end = min(start + 16384, total_rows)
-                deq = mx.dequantize(
-                    lm_head.weight[start:end],
-                    lm_head.scales[start:end],
-                    sub_b[start:end] if sub_b is not None else None,
-                    lm_head.group_size,
-                    lm_head.bits,
-                    mode=getattr(lm_head, "mode", "affine"),
-                ).astype(mx.bfloat16)
-                wq, sc, bi = mx.quantize(
-                    deq, group_size=gs, bits=draft_lm_bits, mode="affine"
-                )
-                mx.eval(wq, sc, bi)
-                w_chunks.append(wq)
-                s_chunks.append(sc)
-                b_chunks.append(bi)
-            draft_head = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
-            nn.Module.__init__(draft_head)
-            draft_head.group_size = gs
-            draft_head.bits = draft_lm_bits
-            draft_head.mode = "affine"
-            draft_head.weight = mx.concatenate(w_chunks, axis=0)
-            draft_head.scales = mx.concatenate(s_chunks, axis=0)
-            draft_head.biases = mx.concatenate(b_chunks, axis=0)
-            mx.eval(draft_head.weight, draft_head.scales, draft_head.biases)
-            self._draft_lm_head = draft_head
-            self._lm_head_fn = lambda hidden: draft_head(hidden)
-            logger.info(
-                "Inkling 2 DSpark draft-only LM head quantized to %d-bit affine (g64)",
-                draft_lm_bits,
-            )
-        else:
-            self._lm_head_fn = lambda hidden: lm_head(hidden)
+        self._lm_head_fn = lambda hidden: lm_head(hidden)
         alpha = mx.softmax(self.fuse_weight.astype(mx.float32), axis=-1).astype(
             mx.bfloat16
         )
@@ -442,15 +340,9 @@ def load_inkling2_dspark_model(model_path: str | Path) -> Inkling2DSparkModel:
     model = Inkling2DSparkModel(config)
     weights = mx.load(str(path / DRAFT_FILENAME))
     model.load_weights(list(weights.items()), strict=True)
-    draft_bits = int(os.environ.get("OMLX_INKLING2_DRAFT_BITS", "8"))
-    quant_cfg = (
-        {"group_size": 64, "bits": draft_bits}
-        if draft_bits in (2, 3, 4, 6, 8)
-        else _DRAFT_QUANT
-    )
     nn.quantize(
         model,
-        **quant_cfg,
+        **_DRAFT_QUANT,
         class_predicate=lambda p, m: isinstance(m, nn.Linear)
         and p.startswith("layers."),
     )
