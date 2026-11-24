@@ -30,6 +30,9 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     elif kind == "deepseek_v4":
         # text-only flat config, experts under ffn.switch_mlp
         raw.update(text, n_routed_experts=16)
+    elif kind == "bailing_hybrid":
+        # Ling: flat text config, num_experts, leading dense layers
+        raw.update(text, num_experts=16, first_k_dense_replace=1)
     elif kind == "glm5_next":
         # VLM text tower with the per-layer sparse selection
         raw["text_config"] = dict(
@@ -43,9 +46,9 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     (path / "config.json").write_text(json.dumps(raw))
     tensors = {}
     for layer in range(2):
-        if kind in ("glm_moe_dsa", "glm5_next") and layer == 0:
+        if kind in ("glm_moe_dsa", "glm5_next", "bailing_hybrid") and layer == 0:
             continue  # dense layer: no experts to cover
-        if kind in ("olmoe", "glm_moe_dsa"):
+        if kind in ("olmoe", "glm_moe_dsa", "bailing_hybrid"):
             prefix = f"model.layers.{layer}.mlp.switch_mlp"
         elif kind == "gemma4":
             prefix = f"language_model.model.layers.{layer}.experts.switch_glu"
@@ -81,12 +84,39 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
         ("glm_moe_dsa", False),
         ("deepseek_v4", False),
         ("glm5_next", False),
+        ("bailing_hybrid", False),
     ],
 )
 def test_supported_layouts_use_headers_only(tmp_path, monkeypatch, kind, per_expert):
     _checkpoint(tmp_path, kind, per_expert)
     monkeypatch.setattr(mx, "load", lambda *a, **kw: pytest.fail("Loaded tensor data"))
     assert moe_offload_compatibility(tmp_path) == (True, "")
+
+
+def test_bailing_hybrid_skips_leading_dense_layers(tmp_path, monkeypatch):
+    """Ling's first_k_dense_replace layers carry no routed experts."""
+    _checkpoint(tmp_path, "bailing_hybrid")
+    monkeypatch.setattr(mx, "load", lambda *a, **kw: pytest.fail("Loaded tensor data"))
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+
+
+def test_bailing_hybrid_rejects_per_expert_layout(tmp_path):
+    """Ling adapters read stacked slabs positionally; per-expert wraps nothing."""
+    _checkpoint(tmp_path, "bailing_hybrid", per_expert=True)
+    ok, reason = moe_offload_compatibility(tmp_path)
+    assert ok is False
+    assert "gate_proj.weight" in reason
+
+
+def test_bailing_hybrid_offload_passes_the_admin_gate(tmp_path):
+    """The settings/API gate must accept Ling now that eligibility holds."""
+    from omlx.admin.routes import _validate_model_settings
+
+    _checkpoint(tmp_path, "bailing_hybrid")
+    _validate_model_settings(
+        SimpleNamespace(model_path=str(tmp_path), config_model_type="bailing_hybrid"),
+        {"moe_expert_offload_enabled": True},
+    )
 
 
 @pytest.mark.parametrize(
