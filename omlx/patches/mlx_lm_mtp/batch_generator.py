@@ -3188,8 +3188,12 @@ def _dspark_next_drafts(
     committed: Any,
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
+    logits: Optional[Any] = None,
 ) -> None:
     """Append committed target taps and sample one DSpark block.
+
+    ``logits`` ([1, depth, V]): the block was already proposed by ``_dspark_draft_jobs``
+    (context appended, ``hist_offset`` advanced); only the sampling loop runs.
 
     The expensive three-stage decoder runs once over anchor+noise positions.
     A rank-R Markov head then samples left-to-right, preserving DSpark's
@@ -3204,6 +3208,8 @@ def _dspark_next_drafts(
     if depth is None:
         depth = state.controller.cur if state.controller is not None else state.depth
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+    if logits is not None:
+        depth = int(logits.shape[1])
     n = int(committed.shape[0])
     if depth <= 0:
         host.dspark_append_context(hidden_rows, state.mtp_cache)
@@ -3214,13 +3220,14 @@ def _dspark_next_drafts(
         return
 
     anchor = committed[-1:].reshape(1, 1)
-    logits, _ = host.dspark_forward(
-        hidden_rows,
-        anchor,
-        state.mtp_cache,
-        draft_length=depth,
-    )
-    state.hist_offset += n
+    if logits is None:
+        logits, _ = host.dspark_forward(
+            hidden_rows,
+            anchor,
+            state.mtp_cache,
+            draft_length=depth,
+        )
+        state.hist_offset += n
 
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
@@ -3271,9 +3278,11 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
     """``draft_next`` for several requests' chain jobs (``_run_verify_cycle_chain`` with
     ``draft_jobs``) on an embedded DSpark host.
 
-    The requests are greedy without logits processors. Each keeps its own context-copy
-    proposal and DSpark stages; requests at one depth share the vocabulary head and the
-    Markov steps, whose per-row arithmetic does not depend on the other rows.
+    Each request keeps its own context-copy proposal. Requests at one depth share the
+    vocabulary head, and on a host with ``dspark_hidden_rows`` the DSpark stages too (one pass
+    with every request's block as a batch row). Greedy requests without logits processors
+    also share the Markov steps, whose per-row arithmetic does not depend on the other rows;
+    a sampling request, or one with processors, runs its own loop on its block's logits.
     """
     import mlx.core as mx
 
@@ -3289,10 +3298,17 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
             if copied:
                 state.drafts = mx.array(copied, dtype=mx.uint32)
                 state.draft_lps = []
-                state.draft_accept_lps = []
+                # A sampling request accepts a copy against its one-hot proposal.
+                state.draft_accept_lps = (
+                    []
+                    if _is_greedy(gen_batch)
+                    else _copy_draft_q(
+                        copied, int(_dspark_host(gen_batch.model).args.vocab_size)
+                    )
+                )
                 state.copy_drafts = True
             continue
-        shared.append((gen_batch, state, hidden_rows, committed))
+        shared.append((gen_batch, state, hidden_rows, committed, prev_buf))
     if not shared:
         return
     host = _dspark_host(shared[0][0].model)
@@ -3302,15 +3318,34 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
         depth = state.controller.cur if state.controller is not None else state.depth
         depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
         depths.setdefault(depth, []).append(job)
+    hidden_rows_fn = getattr(host, "dspark_hidden_rows", None)
     for depth, group in depths.items():
-        hidden, anchors = [], []
-        for gen_batch, state, hidden_rows, committed in group:
-            anchor = committed[-1:].reshape(1, 1)
-            hidden.append(host.dspark_hidden(hidden_rows, anchor, state.mtp_cache, draft_length=depth))
+        anchors = [committed[-1:].reshape(1, 1) for _, _, _, committed, _ in group]
+        if hidden_rows_fn is not None and len(group) > 1:
+            hidden = hidden_rows_fn(
+                [hidden_rows for _, _, hidden_rows, _, _ in group],
+                anchors,
+                [state.mtp_cache for _, state, _, _, _ in group],
+                draft_length=depth,
+            )
+        else:
+            hidden = mx.concatenate(
+                [
+                    host.dspark_hidden(hidden_rows, anchor, state.mtp_cache, draft_length=depth)
+                    for (_, state, hidden_rows, _, _), anchor in zip(group, anchors)
+                ],
+                0,
+            )
+        for _, state, _, committed, _ in group:
             state.hist_offset += int(committed.shape[0])
-            anchors.append(anchor.reshape(1))
-        logits = host.dspark_logits(mx.concatenate(hidden, 0))
-        previous = mx.concatenate(anchors)
+        logits = host.dspark_logits(hidden)
+        if not all(_is_greedy(job[0]) and _proc_list(job[0]) is None for job in group):
+            for r, (gen_batch, state, _, committed, prev_buf) in enumerate(group):
+                _dspark_next_drafts(
+                    gen_batch, state, None, committed, prev_buf, depth=depth, logits=logits[r : r + 1]
+                )
+            continue
+        previous = mx.concatenate([anchor.reshape(1) for anchor in anchors])
         tokens, lps = [], []
         for idx in range(depth):
             bias, _ = host.dspark_markov(previous)
@@ -3320,7 +3355,7 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
             lps.append(lp)
             previous = token
         drafts = mx.stack(tokens, axis=1)
-        for r, (gen_batch, state, _, _) in enumerate(group):
+        for r, (gen_batch, state, _, _, _) in enumerate(group):
             sampler = _resolve_sampler(gen_batch)
             state.drafts = drafts[r]
             state.draft_lps = [lp[r] for lp in lps]

@@ -317,7 +317,11 @@ def _verify_rows_together(batch, batch_state, host, indices, replacements):
     jobs = (
         []
         if bg._dspark_host(batch.model) is not None
-        and all(bg._is_greedy(row) and bg._proc_list(row) is None for _, row in rows)
+        and (
+            # A host that batches its stages across requests also proposes for sampling rows.
+            getattr(bg._dspark_host(batch.model), "dspark_hidden_rows", None) is not None
+            or all(bg._is_greedy(row) and bg._proc_list(row) is None for _, row in rows)
+        )
         else None
     )
     for i, ((index, row), state, cache) in enumerate(zip(rows, states, caches)):

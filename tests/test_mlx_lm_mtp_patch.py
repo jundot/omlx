@@ -6825,3 +6825,21 @@ def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
     actual, _ = generate(model, prompts, limits)
     assert fired
     assert actual == expected
+
+
+def test_batch_policy_learns_acceptance_quickly_from_an_optimistic_prior():
+    """A new cohort assumes drafts are mostly accepted, and its first cycles move the estimate
+    by a running mean before the slow EMA takes over; a position no cycle reached keeps the prior."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
+
+    policy = BatchPolicy(("a", "b"), 3)
+    assert policy.acceptance == [0.8, 0.8, 0.8]
+    policy.observe_mtp(3, [0, 0], None, stable=True)
+    assert policy.acceptance == pytest.approx([0.4, 0.8, 0.8])
+    policy.observe_mtp(3, [0, 0], None, stable=True)
+    assert policy.acceptance[0] == pytest.approx(0.4 * (1 - 1 / 3))
+    for _ in range(40):
+        policy.observe_mtp(3, [3, 3], None, stable=True)
+    before = policy.acceptance[0]
+    policy.observe_mtp(3, [0, 0], None, stable=True)
+    assert policy.acceptance[0] == pytest.approx(before * (1 - 0.08))
