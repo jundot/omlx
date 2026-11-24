@@ -276,6 +276,17 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         kwargs.pop("n_confirmed", None)
+        if return_hidden and kwargs.get("skip_logits", False):
+            return original_call(
+                self,
+                inputs,
+                inputs_embeds,
+                mask,
+                cache,
+                return_hidden=return_hidden,
+                return_shared_kv=return_shared_kv,
+                **kwargs,
+            )
         if not return_hidden:
             drafter = getattr(self, "_omlx_drafter", None)
             scope = getattr(drafter, "scope_uids", None)
@@ -559,6 +570,12 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
                 # called with a ``_TrackedTensor`` placeholder. The instance
                 # method on _TrackedTensor doesn't exist.
                 value = mx.moveaxis(value, 2, 1)
+            if key.endswith("patch_embed.proj.weight") and value.ndim == 5:
+                in_ch = getattr(
+                    getattr(self.config, "vision_config", None), "in_channels", 3
+                )
+                if value.shape[-1] != in_ch and value.shape[1] == in_ch:
+                    value = value.transpose(0, 2, 3, 4, 1)
             # Head norms follow the backbone: raw-HF shifts every gamma by
             # +1, MLX-format is loaded as stored. Legacy mixed heads are
             # repaired in ``norm_repair`` at load_weights time (see #3742).

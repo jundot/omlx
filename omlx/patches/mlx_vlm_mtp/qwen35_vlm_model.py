@@ -49,6 +49,8 @@ def apply() -> bool:
 
     def sanitize(self, weights):
         weights = dequantize_fp8_weights(weights)
+        if hasattr(self, "score"):
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         # Detect raw-HF input via unsanitized conv1d shape (matches
         # mlx_lm_mtp/qwen35_model.py). Already-sanitized checkpoints
@@ -101,6 +103,15 @@ def apply() -> bool:
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
+            # Conv3d patch embed ships in PyTorch NCDHW order while MLX
+            # convolutions expect NDHWC. Guard on the trailing axis so
+            # re-sanitizing already-converted weights is a no-op.
+            if key.endswith("patch_embed.proj.weight") and value.ndim == 5:
+                in_ch = getattr(
+                    getattr(self.config, "vision_config", None), "in_channels", 3
+                )
+                if value.shape[-1] != in_ch and value.shape[1] == in_ch:
+                    value = value.transpose(0, 2, 3, 4, 1)
             # Head norms follow the backbone: raw-HF shifts every gamma by
             # +1, MLX-format is loaded as stored. Legacy mixed heads are
             # repaired in ``norm_repair`` at load_weights time (see #3742).
