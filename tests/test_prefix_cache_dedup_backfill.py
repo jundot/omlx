@@ -55,7 +55,7 @@ class MockModel:
         return a
 
 
-def _make_cache(tmp_path, num_layers=2, hot_cache_only=True):
+def _make_cache(tmp_path, num_layers=2):
     paged_cache = PagedCacheManager(
         block_size=BLOCK_SIZE,
         max_blocks=100,
@@ -66,7 +66,7 @@ def _make_cache(tmp_path, num_layers=2, hot_cache_only=True):
         cache_dir=tmp_path / "ssd_cache",
         max_size_bytes=100 * 1024**2,
         hot_cache_max_bytes=10 * 1024**2,
-        hot_cache_only=hot_cache_only,
+        hot_cache_only=True,
     )
     cache = BlockAwarePrefixCache(
         model=MockModel(num_layers=num_layers),
@@ -221,9 +221,7 @@ def test_dedup_placeholder_rotating_block_backfilled(tmp_path):
 
     assert _rotating_layer_shape(ssd, b0) == REAL_ROTATING_SHAPE
     assert _rotating_layer_shape(ssd, b1) == REAL_ROTATING_SHAPE
-    # The forget+save rewrite keeps each block's place in the chain.
-    assert ssd.get_block_lineage(b0) == (None, False)
-    assert ssd.get_block_lineage(b1) == (b0, False)
+    assert ssd.load_block_with_metadata(b1)[1]["parent_hash"] == b0
     # The rotating meta now carries the boundary offset, not the relic
     # end-of-sequence offset.
     assert _rotating_meta(ssd, b0)[2] == str(BLOCK_SIZE)
@@ -377,39 +375,3 @@ def test_backfill_inspects_each_hash_once_per_session(tmp_path):
         "third", tokens, _hybrid_cache_data(len(tokens)), boundary_snapshots=snapshots
     )
     assert calls["n"] == 0
-
-
-@pytest.mark.parametrize("hot_cache_only", [True, False], ids=["hot-only", "ssd-on"])
-@pytest.mark.parametrize("tail_terminal", [False, True], ids=["full", "tail"])
-@pytest.mark.parametrize("has_parent", [True, False], ids=["parent", "root"])
-def test_backfill_rewrite_keeps_lineage(
-    tmp_path, hot_cache_only, tail_terminal, has_parent
-):
-    """_maybe_backfill_dedup_block_payload re-saves with both lineage fields."""
-    cache, ssd = _make_cache(tmp_path, hot_cache_only=hot_cache_only)
-    block_hash = b"\x33" * 32
-    parent_hash = b"\x44" * 32 if has_parent else None
-    assert ssd.save_block(
-        block_hash=block_hash,
-        cache_data=[
-            (mx.ones((1, 2, BLOCK_SIZE, 8)), mx.ones((1, 2, BLOCK_SIZE, 8))),
-            (mx.zeros(PLACEHOLDER_SHAPE), mx.zeros(PLACEHOLDER_SHAPE)),
-        ],
-        token_count=BLOCK_SIZE,
-        model_name="test-model",
-        layer_cache_types=["KVCache", "RotatingKVCache"],
-        layer_meta_states=[
-            (str(BLOCK_SIZE),),
-            ("0", str(WINDOW), str(BLOCK_SIZE), str(WINDOW)),
-        ],
-        parent_hash=parent_hash,
-        tail_terminal=tail_terminal,
-    )
-    assert ssd.get_block_lineage(block_hash) == (parent_hash, tail_terminal)
-
-    assert cache._maybe_backfill_dedup_block_payload(
-        block_hash, BLOCK_SIZE, _hybrid_snapshot(BLOCK_SIZE)
-    )
-
-    assert _rotating_layer_shape(ssd, block_hash) == REAL_ROTATING_SHAPE
-    assert ssd.get_block_lineage(block_hash) == (parent_hash, tail_terminal)

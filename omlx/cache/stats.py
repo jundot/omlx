@@ -229,9 +229,6 @@ class PagedSSDCacheStats(BaseCacheStats):
     hot_cache_max_bytes: int = 0
     hot_cache_hits: int = 0
     hot_cache_evictions: int = 0
-    # chain_aware_lru only: new blocks the hot tier turned away rather than
-    # break a cached chain. Each one is also counted in hot_cache_evictions.
-    hot_cache_admission_refusals: int = 0
     hot_cache_promotions: int = 0
     hot_cache_promotion_failures: int = 0
 

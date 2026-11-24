@@ -224,6 +224,8 @@ def test_grandparent_tip_stripped_prev_tip_kept(tmp_path):
     tip3 = _block_hash(cache, t3, -1)
     # tip1 is two generations back: rotating payload stripped.
     assert _rotating_layer_shape(ssd, tip1) == PLACEHOLDER_SHAPE
+    _, meta = ssd.load_block_with_metadata(tip1)
+    assert meta["parent_hash"] == _block_hash(cache, t1, -2)
     assert _rotating_layer_shape(ssd, tip2) == REAL_ROTATING_SHAPE
     assert _rotating_layer_shape(ssd, tip3) == REAL_ROTATING_SHAPE
 
@@ -616,56 +618,3 @@ def test_shared_tail_is_not_deleted_while_referenced(tmp_path):
     assert ssd.has_block(tail1)
     held = cache.paged_cache.cached_block_hash_to_block.get_block(tail1)
     assert held is not None and held.ref_count == 1
-
-
-def test_stripped_block_keeps_parent_hash(tmp_path):
-    """The forget+save rewrite must keep the block's lineage: chain-aware
-    eviction and SSD prefix-closure rely on parent_hash."""
-    cache, ssd = _make_cache(tmp_path)
-    tables = [_store_turn(cache, t, num_blocks=t + 1) for t in (1, 2, 3)]
-    tip1 = _block_hash(cache, tables[0], -1)
-    parent_of_tip1 = _block_hash(cache, tables[0], -2)
-    assert _rotating_layer_shape(ssd, tip1) == PLACEHOLDER_SHAPE  # stripped
-    parent, _tail = ssd.get_block_lineage(tip1)
-    assert parent == parent_of_tip1
-
-
-def _save_block_with_lineage(ssd, block_hash, parent_hash, tail_terminal, real):
-    """Save one hybrid block with a known lineage, bypassing store_cache."""
-    if real:
-        rotating = (mx.ones((1, 2, WINDOW, 8)), mx.ones((1, 2, WINDOW, 8)))
-    else:
-        rotating = (mx.zeros((1,)), mx.zeros((1,)))
-    assert ssd.save_block(
-        block_hash=block_hash,
-        cache_data=[
-            (mx.ones((1, 2, BLOCK_SIZE, 8)), mx.ones((1, 2, BLOCK_SIZE, 8))),
-            rotating,
-        ],
-        token_count=BLOCK_SIZE,
-        model_name="test-model",
-        layer_cache_types=["KVCache", "RotatingKVCache"],
-        layer_meta_states=[
-            (str(BLOCK_SIZE),),
-            ("0", str(WINDOW), str(BLOCK_SIZE), str(WINDOW)),
-        ],
-        parent_hash=parent_hash,
-        tail_terminal=tail_terminal,
-    )
-
-
-@pytest.mark.parametrize("hot_cache_only", [True, False], ids=["hot-only", "ssd-on"])
-@pytest.mark.parametrize("tail_terminal", [False, True], ids=["full", "tail"])
-@pytest.mark.parametrize("has_parent", [True, False], ids=["parent", "root"])
-def test_strip_rewrite_keeps_lineage(tmp_path, hot_cache_only, tail_terminal, has_parent):
-    """_strip_rotating_payload re-saves the block with both lineage fields."""
-    cache, ssd = _make_cache(tmp_path, hot_cache_only=hot_cache_only)
-    block_hash = b"\x11" * 32
-    parent_hash = b"\x22" * 32 if has_parent else None
-    _save_block_with_lineage(ssd, block_hash, parent_hash, tail_terminal, real=True)
-    assert ssd.get_block_lineage(block_hash) == (parent_hash, tail_terminal)
-
-    assert cache._strip_rotating_payload(block_hash)
-
-    assert _rotating_layer_shape(ssd, block_hash) == (1,)
-    assert ssd.get_block_lineage(block_hash) == (parent_hash, tail_terminal)

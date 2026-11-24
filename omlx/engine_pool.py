@@ -1129,20 +1129,13 @@ class EnginePool:
             self._scheduler_config.hot_cache_budget = None
             return
 
-        policy = getattr(self._scheduler_config, "hot_cache_eviction_policy", "lru")
         current = getattr(self._scheduler_config, "hot_cache_budget", None)
-        if (
-            current is not None
-            and getattr(current, "max_bytes", None) == hot_max
-            and getattr(current, "eviction_policy", "lru") == policy
-        ):
+        if current is not None and getattr(current, "max_bytes", None) == hot_max:
             return
 
         from .cache.paged_ssd_cache import SharedHotCacheBudget
 
-        self._scheduler_config.hot_cache_budget = SharedHotCacheBudget(
-            hot_max, eviction_policy=policy
-        )
+        self._scheduler_config.hot_cache_budget = SharedHotCacheBudget(hot_max)
 
     def _current_ceiling(self) -> int:
         """Resolve the current memory ceiling via the enforcer callback.
