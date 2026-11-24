@@ -1719,6 +1719,40 @@ class TestPrepareVisionInputs:
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
+    def test_gemma3_prompt_carries_boi_token(self, mock_prepare, monkeypatch):
+        from mlx_vlm.models.gemma3.processing_gemma3 import Gemma3Processor
+        from PIL import Image
+
+        monkeypatch.setattr(
+            ProcessorMixin,
+            "check_argument_for_proper_class",
+            lambda self, name, arg: None,
+        )
+        engine = _make_loaded_engine(model_type="gemma3")
+        engine._processor = Gemma3Processor(
+            image_processor=SimpleNamespace(),
+            tokenizer=SimpleNamespace(
+                image_token="<image_soft_token>",
+                image_token_id=262144,
+                boi_token="<start_of_image>",
+                eoi_token="<end_of_image>",
+                apply_chat_template=lambda msgs, **kwargs: "".join(
+                    m["content"] for m in msgs
+                ),
+            ),
+        )
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        messages = [{"role": "user", "content": "Describe"}]
+
+        engine._prepare_vision_inputs(messages, [Image.new("RGB", (4, 4), "red")])
+
+        assert "<start_of_image>" in mock_prepare.call_args.kwargs["prompts"][0]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_bytesio_audio_survives_missing_resample_export(
         self, mock_vlm_act, mock_prepare, monkeypatch
