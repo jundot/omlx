@@ -17,6 +17,7 @@ import gc
 import importlib
 import inspect
 import logging
+import os
 import threading
 import time
 from array import array
@@ -9391,7 +9392,13 @@ class Scheduler:
                 )
                 self._boundary_cache_snapshots[request_id][token_count] = (
                     _compact_boundary_snapshot_value(
-                        self._prefill_snapshot_value(snapshot_cache),
+                        self._swa_lean_snapshot(
+                            self._prefill_snapshot_value(snapshot_cache),
+                            request_id,
+                            token_count,
+                            snapshot_block_size,
+                            source,
+                        ),
                         token_count,
                         snapshot_block_size,
                         self._stream,
@@ -9401,7 +9408,13 @@ class Scheduler:
         else:
             self._boundary_cache_snapshots[request_id][token_count] = (
                 _compact_boundary_snapshot_value(
-                    self._prefill_snapshot_value(snapshot_cache),
+                    self._swa_lean_snapshot(
+                            self._prefill_snapshot_value(snapshot_cache),
+                            request_id,
+                            token_count,
+                            snapshot_block_size,
+                            source,
+                        ),
                     token_count,
                     snapshot_block_size,
                     self._stream,
@@ -9428,6 +9441,55 @@ class Scheduler:
         )
 
     _PREFILL_SNAPSHOT_MARKER = "__prefill_extracted__"
+
+    def _swa_lean_snapshot(
+        self,
+        value: Any,
+        request_id: str,
+        token_count: int,
+        block_size: int,
+        source: str,
+    ) -> Any:
+        """Drop sliding-window K/V from snapshots the store will not keep.
+
+        With OMLX_SWA_TAIL_ONLY, store_cache keeps window state only at the
+        turn end and the store's last full block, and writes a placeholder
+        elsewhere. Holding the window for the other boundaries until the store
+        costs one window copy each (~170 MB on Inkling 2 Mini), so a long fresh
+        prompt holds GBs it throws away. Keep the tail snapshot and the last
+        two boundaries before the prompt end; give the rest the placeholder
+        the store would write anyway.
+        """
+        if (
+            os.environ.get("OMLX_SWA_TAIL_ONLY") != "1"
+            or source == _TAIL_SNAPSHOT_SOURCE
+            or CacheTypeRegistry is None
+            or not (
+                isinstance(value, tuple)
+                and len(value) == 2
+                and value[0] == self._PREFILL_SNAPSHOT_MARKER
+            )
+        ):
+            return value
+        request = self.requests.get(request_id)
+        prompt = getattr(request, "prompt_token_ids", None) if request else None
+        if not prompt or block_size <= 0:
+            return value
+        keep_from = ((len(prompt) - 1) // block_size - 1) * block_size
+        if token_count >= keep_from:
+            return value
+        from .cache.paged_cache import is_window_kv_state
+
+        for layer in value[1]:
+            if (
+                isinstance(layer, dict)
+                and CacheTypeRegistry.is_arrays_family(
+                    str(layer.get("class_name") or layer.get("cache_type") or "")
+                )
+                and is_window_kv_state(layer.get("state"))
+            ):
+                layer["state"] = (mx.zeros((1,)), mx.zeros((1,)))
+        return value
 
     def _prefill_snapshot_value(self, snapshot_cache: list[Any]) -> Any:
         """In-memory snapshot value: pre-extracted states when possible.

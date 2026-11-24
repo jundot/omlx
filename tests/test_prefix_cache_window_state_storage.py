@@ -23,6 +23,9 @@ Tests:
   in-memory markers cleared (as after a restart).
 - test_only_newest_full_blocks_keep_window — older full blocks are stripped
   beyond the cap; turn-end tails are not counted.
+- test_lean_snapshot_* — mid-prefill boundary snapshots far from the prompt
+  end drop the window K/V (the store would strip it anyway); the last two
+  boundaries, the tail snapshot and recurrent states are kept.
 """
 
 from __future__ import annotations
@@ -209,3 +212,54 @@ def test_only_newest_full_blocks_keep_window(tmp_path, tail_only):
     assert full[-keep:] == [True] * keep
     assert not any(full[: turns - keep])
     assert _sliding_has_window(ssd, _hash(cache, table, turns))  # turn-end tail
+
+
+# --- Lean boundary snapshots (scheduler side) ---------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+from omlx.scheduler import _TAIL_SNAPSHOT_SOURCE, Scheduler  # noqa: E402
+
+
+def _snapshot(seq_len, window="window"):
+    layers = _layers(seq_len, window=window if window != "window" else True)
+    return (Scheduler._PREFILL_SNAPSHOT_MARKER, layers)
+
+
+def _lean(token_count, prompt_len, source="prefill", window="window"):
+    stub = SimpleNamespace(
+        requests={"r": SimpleNamespace(prompt_token_ids=list(range(prompt_len)))},
+        _PREFILL_SNAPSHOT_MARKER=Scheduler._PREFILL_SNAPSHOT_MARKER,
+    )
+    value = _snapshot(token_count, window)
+    out = Scheduler._swa_lean_snapshot(
+        stub, value, "r", token_count, BLOCK_SIZE, source
+    )
+    return out[1][0]["state"]  # the sliding layer
+
+
+def _is_placeholder(state):
+    return isinstance(state, tuple) and tuple(state[0].shape) == (1,)
+
+
+def test_lean_snapshot_drops_window_far_from_prompt_end(tail_only):
+    # 10 blocks of prompt: boundaries before the last two keep nothing.
+    prompt = 10 * BLOCK_SIZE + 3
+    assert _is_placeholder(_lean(2 * BLOCK_SIZE, prompt))
+
+
+def test_lean_snapshot_keeps_last_two_boundaries(tail_only):
+    prompt = 10 * BLOCK_SIZE + 3
+    for boundary in (9 * BLOCK_SIZE, 10 * BLOCK_SIZE):
+        assert not _is_placeholder(_lean(boundary, prompt))
+
+
+def test_lean_snapshot_keeps_tail_and_recurrent_state(tail_only):
+    prompt = 10 * BLOCK_SIZE + 3
+    assert not _is_placeholder(_lean(2 * BLOCK_SIZE, prompt, _TAIL_SNAPSHOT_SOURCE))
+    assert not _is_placeholder(_lean(2 * BLOCK_SIZE, prompt, window="gdn"))
+
+
+def test_lean_snapshot_flag_off_keeps_window(monkeypatch):
+    monkeypatch.delenv("OMLX_SWA_TAIL_ONLY", raising=False)
+    assert not _is_placeholder(_lean(2 * BLOCK_SIZE, 10 * BLOCK_SIZE + 3))
