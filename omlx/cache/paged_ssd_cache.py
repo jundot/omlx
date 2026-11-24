@@ -2034,8 +2034,15 @@ class PagedSSDCacheManager(CacheManager):
         # Set by bounded_pending_writes(): save_block waits for the writer
         # before serializing another block once this many are queued.
         self._pending_write_limit: int | None = None
-        # When nested, take _lock, then _hot_cache_lock, then the pending lock.
+        # Lock ordering invariant: _hot_cache_lock -> _pending_write_hashes_lock.
+        # Never acquire in reverse. Load path: _hot_cache_get (holds _hot_cache_lock,
+        # releases), then _pending_write_buffer_get (holds _pending_write_hashes_lock).
+        # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
+        # _enqueue_ssd_write (holds _pending_write_hashes_lock).
         self._pending_write_buffers: dict[bytes, dict] = {}
+        # A write commits only while its entry is the pending one. Held from that
+        # check to the end of the commit, and while a pending write is cancelled.
+        self._write_commit_lock = threading.Lock()
 
         # Initialize directory structure and scan existing files
         # Skip in hot_cache_only mode: no SSD I/O, so no directories needed.
@@ -2112,7 +2119,10 @@ class PagedSSDCacheManager(CacheManager):
         Entries from save_block() use 'tensors_raw' (raw bytes).
         Entries from _promote_to_hot_cache() may use 'arrays' (mx.array objects
         loaded from SSD, not from active inference — safe to retain).
+        Staging buffers for queued SSD writes are not hot cache and count as 0.
         """
+        if entry.get("staging"):
+            return 0
         if "arrays" in entry:
             return sum(arr.nbytes for arr in entry["arrays"].values())
         if "tensors_raw" in entry:
@@ -2131,6 +2141,8 @@ class PagedSSDCacheManager(CacheManager):
 
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
+        if entry.get("staging"):
+            return  # Its SSD write is already queued.
         if not entry.get("dirty", True):
             logger.debug(
                 "Evicted clean hot cache block %s; SSD copy already exists",
@@ -2139,45 +2151,22 @@ class PagedSSDCacheManager(CacheManager):
             return
         self._enqueue_ssd_write(block_hash, entry)
 
-    def _hot_cache_put(
-        self,
-        block_hash: bytes,
-        entry: dict,
-        *,
-        pending_entry: dict | None = None,
-        disk_metadata: PagedSSDBlockMetadata | None = None,
-    ) -> bool:
-        """Add a current entry to the hot cache and flush any LRU victims."""
+    def _hot_cache_put(self, block_hash: bytes, entry: dict) -> None:
+        """Add entry to hot cache, evicting LRU entries if capacity exceeded.
+
+        Evicted entries are flushed to SSD via the background writer thread.
+        """
         entry_size = self._hot_cache_entry_size(entry)
-        evicted_entries: list[tuple[bytes, dict]] = []
-        with self._lock, self._hot_cache_lock:
-            if (
-                pending_entry is not None
-                and self._pending_write_buffer_get(block_hash) is not pending_entry
-            ):
-                return False
-            if (
-                disk_metadata is not None
-                and self._index.get(block_hash) is not disk_metadata
-            ):
-                return False
-            old = self._hot_cache.pop(block_hash, None)
-            if old is not None:
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
-
-            if self._hot_cache_budget is None:
-                while (
-                    self._hot_cache_total_bytes + entry_size > self._hot_cache_max_bytes
-                    and self._hot_cache
-                ):
-                    evicted_hash, evicted = self._hot_cache.popitem(last=False)
-                    self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
-                    evicted_entries.append((evicted_hash, evicted))
-
-            self._hot_cache[block_hash] = entry
-            self._hot_cache_total_bytes += entry_size
+        evicted_entries: list = []
 
         if self._hot_cache_budget is not None:
+            with self._hot_cache_lock:
+                old = self._hot_cache.pop(block_hash, None)
+                if old is not None:
+                    self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
+                self._hot_cache[block_hash] = entry
+                self._hot_cache_total_bytes += entry_size
+
             metadata = entry.get("block_metadata")
             victims = self._hot_cache_budget.put(
                 self, block_hash, entry_size, getattr(metadata, "parent_hash", None)
@@ -2186,61 +2175,98 @@ class PagedSSDCacheManager(CacheManager):
                 evicted = owner._hot_cache_remove(victim_hash, update_budget=False)
                 if evicted is not None:
                     owner._handle_hot_cache_eviction(victim_hash, evicted)
+            return
+
+        with self._hot_cache_lock:
+            # Remove old entry if updating
+            if block_hash in self._hot_cache:
+                old = self._hot_cache.pop(block_hash)
+                self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
+
+            # Evict LRU entries until we have room
+            while (
+                self._hot_cache_total_bytes + entry_size > self._hot_cache_max_bytes
+                and self._hot_cache
+            ):
+                evicted_hash, evicted = self._hot_cache.popitem(last=False)
+                self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
+                evicted_entries.append((evicted_hash, evicted))
+
+            self._hot_cache[block_hash] = entry
+            self._hot_cache_total_bytes += entry_size
+
+        # Flush evicted entries to SSD outside the hot cache lock
         for evicted_hash, evicted in evicted_entries:
             self._handle_hot_cache_eviction(evicted_hash, evicted)
-        return True
 
     def _enqueue_ssd_write(
         self,
         block_hash: bytes,
         entry: dict,
         *,
-        replace_existing: bool = False,
+        blocking: bool = False,
     ) -> bool:
-        """Publish a block for immediate reads and queue its SSD write."""
+        """Enqueue a hot cache entry for SSD background write.
+
+        Used when evicting from hot cache or flushing on shutdown.
+        Adds block to SSD index before enqueueing write.
+
+        All callers wait briefly for queue space. If saturation persists, the
+        caller writes inline so dirty hot-cache blocks are never dropped just
+        because the background writer is behind.
+        """
         if self._hot_cache_only:
             return False
         if not entry.get("dirty", True):
             return True
 
-        block_metadata = entry.get("block_metadata")
-        if block_metadata is None or not entry.get("tensors_raw"):
+        blk_meta = entry.get("block_metadata")
+        if blk_meta is None:
+            return False
+        if not entry.get("tensors_raw"):
             return False
 
-        if not self._index.contains(block_hash):
-            self._enforce_size_limit_for_new_block(block_metadata.file_size)
-
-        # Publish the read buffer and index together with respect to other
-        # saves and write completions. The entry identifies this write.
-        with self._lock, self._hot_cache_lock, self._pending_write_hashes_lock:
-            current = self._pending_write_buffers.get(block_hash)
-            if current is entry or (current is not None and not replace_existing):
-                return True
-            indexed = self._index.get(block_hash)
-            hot = self._hot_cache.get(block_hash)
-            if not replace_existing and (
-                (indexed is not None and indexed is not block_metadata)
-                or (hot is not None and hot.get("block_metadata") is not block_metadata)
+        # 1. Buffer first — instant read-back for concurrent loads (CPD K1).
+        #    Must precede _index.add so load_block never sees an index hit
+        #    for a block that has no file and no buffer entry yet.
+        with self._pending_write_hashes_lock:
+            pending = self._pending_write_buffers.get(block_hash)
+            # An eviction can arrive after a newer save of the same block.
+            if (
+                pending is not None
+                and pending["block_metadata"].created_at >= blk_meta.created_at
             ):
                 return True
             self._pending_write_buffers[block_hash] = entry
             self._pending_write_hashes.add(block_hash)
-            self._index.add(block_metadata)
 
+        # 2. Index second — makes the block discoverable in has_block/contains.
+        if not self._index.contains(block_hash):
+            self._enforce_size_limit_for_new_block(blk_meta.file_size)
+            self._index.add(blk_meta)
+
+        # 3. Queue third — enqueue for background writer.
         try:
+            item = (block_hash, entry)
+            # Non-blocking callers (hot-cache LRU spill) also wait so a
+            # transient writer backlog doesn't silently drop blocks. Blocking
+            # callers (shutdown flush) use the same bounded wait.
             with self._persistence_io():
-                self._write_queue.put(
-                    (block_hash, entry), timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS
-                )
+                self._write_queue.put(item, timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS)
+            logger.debug(
+                f"Evicted hot cache block to SSD write queue: "
+                f"{block_hash.hex()[:16]}..."
+            )
             return True
         except queue.Full:
             self._stats["ssd_inline_write_fallbacks"] += 1
             logger.warning(
-                "SSD write queue saturated (cap=%d); writing block %s inline",
-                self._max_pending_writes,
-                block_hash.hex()[:16],
+                f"SSD write queue saturated (cap={self._max_pending_writes}); "
+                f"writing evicted block {block_hash.hex()[:16]} inline"
             )
-            return self._write_block_file(block_hash, entry, source="inline-fallback")
+            ok = self._write_block_file(block_hash, entry, source="inline-fallback")
+            self._finish_write(block_hash, entry, ok)
+            return ok
 
     def _hot_cache_get(self, block_hash: bytes) -> dict | None:
         """Get entry from hot cache, updating LRU order. Returns None on miss."""
@@ -2260,16 +2286,10 @@ class PagedSSDCacheManager(CacheManager):
             return self._pending_write_buffers.get(block_hash)
 
     def _hot_cache_remove(
-        self,
-        block_hash: bytes,
-        *,
-        update_budget: bool = True,
-        expected: dict | None = None,
+        self, block_hash: bytes, *, update_budget: bool = True
     ) -> dict | None:
         """Remove entry from hot cache if present."""
         with self._hot_cache_lock:
-            if expected is not None and self._hot_cache.get(block_hash) is not expected:
-                return None
             old = self._hot_cache.pop(block_hash, None)
             if old:
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
@@ -2302,8 +2322,7 @@ class PagedSSDCacheManager(CacheManager):
                 "block_metadata": metadata,
                 "dirty": False,
             }
-            if not self._hot_cache_put(block_hash, entry, disk_metadata=metadata):
-                return False
+            self._hot_cache_put(block_hash, entry)
             self._stats["hot_cache_promotions"] += 1
             return True
         except Exception as e:
@@ -2330,8 +2349,12 @@ class PagedSSDCacheManager(CacheManager):
             return False
         try:
             promoted_entry = dict(entry)
-            if not self._hot_cache_put(block_hash, promoted_entry, pending_entry=entry):
-                return False
+            block_metadata = promoted_entry.get("block_metadata")
+            file_path = getattr(block_metadata, "file_path", None)
+            promoted_entry["dirty"] = not (
+                isinstance(file_path, Path) and file_path.exists()
+            )
+            self._hot_cache_put(block_hash, promoted_entry)
             self._stats["hot_cache_promotions"] += 1
             return True
         except Exception as e:
@@ -3361,82 +3384,88 @@ class PagedSSDCacheManager(CacheManager):
         *,
         source: str,
     ) -> bool:
-        """Write one serialized block to disk from raw tensor bytes."""
-        block_metadata = entry["block_metadata"]
-        file_path = block_metadata.file_path
-        temp_path = None
-        persisted = False
+        """Write one serialized block to disk from raw tensor bytes.
+
+        A write that a newer save or a removal superseded leaves no file.
+        """
+        file_path = entry["block_metadata"].file_path
         with self._persistence_io():
+            temp_path = None
             try:
-                if self._pending_write_buffer_get(block_hash) is not entry:
-                    return True
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path = _unique_tmp_path(file_path)
                 actual_size = _write_safetensors_no_mx(
                     str(temp_path), entry["tensors_raw"], entry["file_metadata"]
                 )
 
-                with self._lock:
-                    if (
-                        self._pending_write_buffer_get(block_hash) is not entry
-                        or self._index.get(block_hash) is not block_metadata
-                    ):
+                with self._write_commit_lock:
+                    if self._pending_write_buffer_get(block_hash) is not entry:
+                        temp_path.unlink(missing_ok=True)
                         return True
                     os.rename(str(temp_path), str(file_path))
                     self._index.update_file_size(block_hash, actual_size)
+                    # Check if block was evicted while write was pending.
+                    if not self._index.contains(block_hash):
+                        logger.debug(
+                            "Block %s evicted during %s write, cleaning up file",
+                            block_hash.hex()[:16],
+                            source,
+                        )
+                        with contextlib.suppress(Exception):
+                            file_path.unlink()
+                        self._directory_index.remove(block_hash)
                 _fsync_parent_dir(file_path)
-                persisted = True
+
+                # Count the rename even if the block was evicted meanwhile.
                 self._stats["saves_persisted"] += 1
                 with self._persistence_progress_lock:
                     self._persistence_last_success = time.monotonic()
                     self._persistence_failed = False
                 return True
             except Exception as e:
-                with self._lock:
-                    if self._pending_write_buffer_get(block_hash) is not entry:
-                        return True
-                    if isinstance(e, OSError) and e.errno in (
-                        errno.ENOSPC,
-                        errno.EDQUOT,
-                    ):
-                        logger.error(
-                            "SSD cache disk full, cannot write block %s via %s: %s "
-                            "(subsequent saves will recompute disk pressure)",
-                            block_hash.hex()[:16],
-                            source,
-                            e,
-                        )
+                if isinstance(e, OSError) and e.errno in (
+                    errno.ENOSPC,
+                    errno.EDQUOT,
+                ):
+                    # Background writes may fail after save_block already returned
+                    # True, while inline fallbacks can still report False to the
+                    # caller. In both cases, surface disk pressure at ERROR level
+                    # and force the next save to recompute available space.
+                    logger.error(
+                        "SSD cache disk full, cannot write block %s via %s: %s "
+                        "(subsequent saves will recompute disk pressure)",
+                        block_hash.hex()[:16],
+                        source,
+                        e,
+                    )
+                    # Invalidate the 30s disk-usage snapshot so the next
+                    # save sees the true (now-critical) free space and evicts
+                    # aggressively rather than trusting a stale inflated limit.
+                    # In-flight saves that already passed
+                    # _enforce_size_limit_for_new_block are still queued and may
+                    # ENOSPC again; invalidation only protects the next round of
+                    # save_block calls.
+                    with self._lock:
                         self._disk_usage_cache = None
-                    else:
-                        logger.error(
-                            "SSD cache %s write failed for %s: %s",
-                            source,
-                            block_hash.hex()[:16],
-                            e,
-                        )
-                    self._stats["errors"] += 1
-                    with self._persistence_progress_lock:
-                        self._persistence_failed = True
-                    if self._index.get(block_hash) is block_metadata:
+                else:
+                    logger.error(
+                        "SSD cache %s write failed for %s: %s",
+                        source,
+                        block_hash.hex()[:16],
+                        e,
+                    )
+                self._stats["errors"] += 1
+                with self._persistence_progress_lock:
+                    self._persistence_failed = True
+                if temp_path is not None:
+                    with contextlib.suppress(Exception):
+                        temp_path.unlink(missing_ok=True)
+                with self._write_commit_lock:
+                    if self._pending_write_buffer_get(block_hash) is entry:
                         self._index.remove(block_hash)
-                        with contextlib.suppress(OSError):
+                        with contextlib.suppress(Exception):
                             file_path.unlink(missing_ok=True)
                 return False
-            finally:
-                with self._lock, self._hot_cache_lock, self._pending_write_hashes_lock:
-                    if self._pending_write_buffers.get(block_hash) is entry:
-                        hot = self._hot_cache.get(block_hash)
-                        if (
-                            persisted
-                            and hot is not None
-                            and hot.get("block_metadata") is block_metadata
-                        ):
-                            hot["dirty"] = False
-                        self._pending_write_buffers.pop(block_hash)
-                        self._pending_write_hashes.discard(block_hash)
-                if temp_path is not None:
-                    with contextlib.suppress(OSError):
-                        temp_path.unlink(missing_ok=True)
 
     @contextlib.contextmanager
     def bounded_pending_writes(self, max_pending: int):
@@ -3474,6 +3503,20 @@ class PagedSSDCacheManager(CacheManager):
                 return False
             time.sleep(0.02)
 
+    def _finish_write(self, block_hash: bytes, entry: dict, persisted: bool) -> None:
+        """Clear this write's bookkeeping, but not that of a newer write."""
+        with self._hot_cache_lock:
+            hot = self._hot_cache.get(block_hash)
+            if hot is not None and hot.get("block_metadata") is entry["block_metadata"]:
+                if persisted:
+                    hot["dirty"] = False
+                if hot.get("staging"):
+                    self._hot_cache.pop(block_hash)
+        with self._pending_write_hashes_lock:
+            if self._pending_write_buffers.get(block_hash) is entry:
+                self._pending_write_buffers.pop(block_hash)
+                self._pending_write_hashes.discard(block_hash)
+
     def _writer_loop(self) -> None:
         """Background writer that drains the write queue.
 
@@ -3502,10 +3545,12 @@ class PagedSSDCacheManager(CacheManager):
 
             block_hash, entry = item
             try:
-                self._write_block_file(block_hash, entry, source="background")
+                ok = self._write_block_file(block_hash, entry, source="background")
+                self._finish_write(block_hash, entry, ok)
             finally:
-                # Release the tensor bytes before blocking on the next item.
-                item = entry = None
+                # Avoid pinning the last raw tensor-byte batch while the
+                # writer thread blocks waiting for more work.
+                item = block_hash = entry = None
 
     def save_block(
         self,
@@ -3674,7 +3719,7 @@ class PagedSSDCacheManager(CacheManager):
             # use the same pending-buffer / SSD-writer path as hot-cache
             # eviction, then drop the long-lived hot-cache reference.
             if self._enqueue_ssd_write(block_hash, hot_entry):
-                self._hot_cache_remove(block_hash, expected=hot_entry)
+                self._hot_cache_remove(block_hash)
                 self._stats["hits"] += 1
                 return True
             return False
@@ -3960,12 +4005,67 @@ class PagedSSDCacheManager(CacheManager):
                 # Hot cache disabled but hot_cache_only set: block is not retained.
                 return False
 
-            ok = self._enqueue_ssd_write(
-                block_hash, cache_entry, replace_existing=replace_existing
-            )
-            if ok:
+            if self._hot_cache_enabled and not hot_cache_write_back:
+                # Pressure write-through: keep the dirty-block durability path
+                # but avoid retaining this block as a hot-cache entry.
+                ok = self._enqueue_ssd_write(block_hash, cache_entry)
+                if ok:
+                    self._stats["saves"] += 1
+                    logger.debug(
+                        f"Enqueued block for SSD write-through: "
+                        f"{block_hash.hex()[:16]}..., "
+                        f"size={format_bytes(estimated_size)}"
+                    )
+                return ok
+
+            # Evict LRU blocks to make room for the new block. Done here
+            # (post-tensor-build) so the actual block size is known and the
+            # cache doesn't oscillate around the configured limit.
+            self._enforce_size_limit_for_new_block(estimated_size)
+
+            # SSD path: add to index for SSD file tracking
+            self._index.add(block_metadata)
+
+            # Hot cache disabled: use temporary buffer + immediate SSD write
+            cache_entry["staging"] = True
+            with self._hot_cache_lock:
+                self._hot_cache[block_hash] = cache_entry
+
+            # Track pending write
+            with self._pending_write_hashes_lock:
+                self._pending_write_hashes.add(block_hash)
+                self._pending_write_buffers[block_hash] = cache_entry
+
+            # Enqueue full file write for background thread. Wait on Full so
+            # transient bursts (faster than the writer can drain) don't
+            # immediately punch holes in the cache chain.
+            try:
+                with self._persistence_io():
+                    self._write_queue.put(
+                        (block_hash, cache_entry),
+                        timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
+                    )
+            except queue.Full:
+                self._stats["ssd_inline_write_fallbacks"] += 1
+                logger.warning(
+                    f"SSD cache write queue saturated (cap={self._max_pending_writes}); "
+                    f"writing {block_hash.hex()[:16]} inline"
+                )
+                ok = self._write_block_file(
+                    block_hash, cache_entry, source="inline-fallback"
+                )
+                self._finish_write(block_hash, cache_entry, ok)
+                if not ok:
+                    return False
                 self._stats["saves"] += 1
-            return ok
+                return True
+
+            self._stats["saves"] += 1
+            logger.debug(
+                f"Enqueued block for SSD cache write: {block_hash.hex()[:16]}..., "
+                f"size={format_bytes(estimated_size)}"
+            )
+            return True
 
         except Exception as e:
             logger.error(f"Failed to prepare block for SSD cache: {e}")
@@ -4929,16 +5029,21 @@ class PagedSSDCacheManager(CacheManager):
         with self._lock:
             removed = self._hot_cache_remove(block_hash) is not None
 
-            with self._pending_write_hashes_lock:
-                if block_hash in self._pending_write_buffers:
-                    removed = True
-                self._pending_write_buffers.pop(block_hash, None)
+            with self._write_commit_lock, self._pending_write_hashes_lock:
+                pending = self._pending_write_buffers.pop(block_hash, None)
                 self._pending_write_hashes.discard(block_hash)
 
             metadata = self._index.remove(block_hash)
+            if pending is not None or metadata is not None:
+                removed = True
+            if pending is not None and metadata is not None:
+                # The cancelled write leaves only an older file, if any.
+                try:
+                    metadata.file_size = metadata.file_path.stat().st_size
+                except OSError:
+                    metadata = None
             if metadata is not None:
                 self._directory_index.add(metadata)
-                removed = True
 
             return removed
 
@@ -4957,7 +5062,7 @@ class PagedSSDCacheManager(CacheManager):
             self._hot_cache_remove(block_hash)
 
             # Also remove from pending write buffer
-            with self._pending_write_hashes_lock:
+            with self._write_commit_lock, self._pending_write_hashes_lock:
                 self._pending_write_buffers.pop(block_hash, None)
                 self._pending_write_hashes.discard(block_hash)
 
@@ -5266,6 +5371,8 @@ class PagedSSDCacheManager(CacheManager):
                 for block_hash in self._hot_cache:
                     if block_hash in protected_hashes:
                         continue
+                    if self._hot_cache[block_hash].get("staging"):
+                        continue
                     victim_hash = block_hash
                     break
                 if victim_hash is None:
@@ -5544,7 +5651,7 @@ class PagedSSDCacheManager(CacheManager):
                     continue
                 # A file at the same hash may contain an older, incompatible
                 # payload. Only the dirty flag proves this entry is persisted.
-                if self._enqueue_ssd_write(block_hash, entry):
+                if self._enqueue_ssd_write(block_hash, entry, blocking=True):
                     flushed += 1
                 else:
                     failed += 1
@@ -5582,9 +5689,11 @@ class PagedSSDCacheManager(CacheManager):
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
         self._ssd_directory = None
-        with self._pending_write_hashes_lock:
-            self._pending_write_buffers.clear()
-            self._pending_write_hashes.clear()
+        # A writer that outlived the join still has to commit its queue.
+        if not (self._writer_thread and self._writer_thread.is_alive()):
+            with self._pending_write_hashes_lock:
+                self._pending_write_buffers.clear()
+                self._pending_write_hashes.clear()
 
         logger.debug("PagedSSDCacheManager closed")
 
