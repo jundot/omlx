@@ -75,6 +75,25 @@ def masked_min(dtype) -> mx.array:
     return mx.array(mx.finfo(dtype).min, dtype)
 
 
+def _sliding_shared_values(q, kv, mask, sinks, scale):
+    """Apply the stock masked D512 softmax, then multiply the shared V once.
+
+    MLX's D512 fallback treats the value product as one matmul per query
+    head. Here every head uses the same single KV bank, so the value product
+    can use the flattened head and query rows of one matmul.
+    """
+    _, heads, rows, channels = q.shape
+    width = kv.shape[2]
+    logits = (q * scale) @ kv.swapaxes(-1, -2) + mask
+    sink_column = mx.broadcast_to(sinks[None, :, None, None], (1, heads, rows, 1))
+    weights = mx.softmax(
+        mx.concatenate((sink_column, logits), axis=-1), axis=-1, precise=True
+    )[..., 1:]
+    return (weights.reshape(1, heads * rows, width) @ kv[0]).reshape(
+        1, heads, rows, channels
+    )
+
+
 def rope_offset(cache) -> Any:
     if cache is None:
         return 0
@@ -751,6 +770,20 @@ class Attention(nn.Module):
                 keep = keep & mask
             scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
             scores = mx.where(keep, scores, masked_min(scores.dtype))
+            if (
+                self.kind == "sliding"
+                and b == 1
+                and heads == 64
+                and 512 <= total < 512 + length
+                and q_latent.shape[-1] == 512
+                and latent.shape == (1, 1, total, 512)
+                and q_latent.dtype == latent.dtype == scores.dtype == sinks.dtype
+                and latent.dtype == mx.bfloat16
+                and verify_dispatch.eligible(length)
+            ):
+                return self.unembed_out(
+                    _sliding_shared_values(q_latent, latent, scores, sinks, self.scale)
+                )
             out = mx.fast.scaled_dot_product_attention(
                 q_latent, latent, latent, scale=self.scale, mask=scores, sinks=sinks
             )
