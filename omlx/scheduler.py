@@ -61,6 +61,7 @@ from .cache.prefix_cache import (
     _RESTORE_POOL_FLUSH_BYTES,
     BlockAwarePrefixCache,
     cachelist_pm_member_plan,
+    gdn_snapshot_interval_for,
 )
 from .decode_activity import get_decode_activity
 from .exceptions import (
@@ -1423,6 +1424,21 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
 _TAIL_SNAPSHOT_SOURCE = "prefill_tail"
 
 
+def _prefill_boundary_kept(
+    token_count: int, interval: int, block_size: int, prompt_tokens: int
+) -> bool:
+    """Whether a store keeps the prefill boundary snapshot at ``token_count``.
+
+    A store keeps recurrent state only on the ``interval``-block grid, at
+    the prompt's last full block and at the tail, so other full-block
+    boundaries need not be captured (tails have their own capture path).
+    """
+    if interval <= 1 or token_count % (interval * block_size) == 0:
+        return True
+    last_full_block_end = (prompt_tokens // block_size) * block_size
+    return prompt_tokens <= 0 or token_count >= last_full_block_end
+
+
 def _is_turboquant_kv_cache(cache_obj: Any) -> bool:
     return type(cache_obj).__name__ in _TURBOQUANT_KV_CACHE_TYPES
 
@@ -2038,6 +2054,8 @@ class SchedulerConfig:
     # RAM *and* persisted to SSD immediately, instead of deferring the SSD
     # write to hot-cache eviction or shutdown.
     hot_cache_write_through: bool = False
+    # Keep recurrent (GDN) state every N-th block; see settings.CacheSettings.
+    gdn_snapshot_interval: int = 1
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     paged_ssd_cache_auto_size: bool = False
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
@@ -2700,6 +2718,7 @@ class Scheduler:
                 model=model,
                 paged_cache_manager=self.paged_cache_manager,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
+                gdn_snapshot_interval=self.config.gdn_snapshot_interval,
             )
 
             # Initialize paged SSD cache. If the backing directory is not
@@ -9331,6 +9350,30 @@ class Scheduler:
             self._boundary_snapshot_diagnostics.record(
                 "capture_skipped",
                 reason="no_stateful_cache",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source=source,
+            )
+            return
+
+        interval = gdn_snapshot_interval_for(
+            getattr(self.config, "gdn_snapshot_interval", 1),
+            [type(c).__name__ for c in snapshot_cache if c is not None],
+        )
+        if (
+            interval > 1
+            and source != _TAIL_SNAPSHOT_SOURCE
+            and not _prefill_boundary_kept(
+                token_count,
+                interval,
+                block_size,
+                getattr(self.requests.get(request_id), "num_prompt_tokens", 0) or 0,
+            )
+        ):
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="off_snapshot_grid",
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,

@@ -209,6 +209,28 @@ _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 _NO_POOLING_DELTA = object()
 
 
+def gdn_snapshot_interval_for(
+    interval: int, layer_cache_types: list[str] | tuple[str, ...] | None
+) -> int:
+    """Return ``interval`` (gdn_snapshot_interval) if it applies to this layout, else 1.
+
+    It applies only when every non-sliceable layer is top-level
+    ArraysCache-family state. Composite CacheList layers (per-member and
+    pooling) need a snapshot at every block, and rotating layers have their
+    own tip-strip lifecycle.
+    """
+    if interval <= 1 or not layer_cache_types:
+        return 1
+    has_arrays = False
+    for type_name in layer_cache_types:
+        if CacheTypeRegistry.get_handler_by_class_name(type_name).supports_block_slicing:
+            continue
+        if not CacheTypeRegistry.is_arrays_family(type_name):
+            return 1
+        has_arrays = True
+    return interval if has_arrays else 1
+
+
 def _contains_pooling_cache_state(cache_data: list[Any]) -> bool:
     """Return whether extracted cache data contains a pooling CacheList sub-cache."""
     for layer_state in cache_data:
@@ -280,6 +302,7 @@ class BlockAwarePrefixCache(CacheManager):
         paged_cache_manager: PagedCacheManager,
         paged_ssd_cache_manager: PagedSSDCacheManager | None = None,
         gdn_ssd_split_enabled: bool = False,
+        gdn_snapshot_interval: int = 1,
     ):
         """
         Initialize block-aware prefix cache.
@@ -288,7 +311,17 @@ class BlockAwarePrefixCache(CacheManager):
             model: The MLX model (used for identification)
             paged_cache_manager: The PagedCacheManager instance for block management
             paged_ssd_cache_manager: The PagedSSDCacheManager for SSD storage (required for paged SSD-only mode)
+            gdn_snapshot_interval: Keep recurrent (GDN) state only in every
+                N-th full block plus each store's last full block and tail.
+                1 (default) keeps it in every block. See
+                gdn_snapshot_interval_for().
         """
+        if type(gdn_snapshot_interval) is not int or gdn_snapshot_interval < 1:
+            raise ValueError(
+                "gdn_snapshot_interval must be a positive integer "
+                f"(got {gdn_snapshot_interval!r})"
+            )
+        self._gdn_snapshot_interval = gdn_snapshot_interval
         self.model = model
         self.model_key = id(model)
         self.paged_cache = paged_cache_manager
@@ -1187,6 +1220,9 @@ class BlockAwarePrefixCache(CacheManager):
                     # A full snapshot can follow an indivisible image prefix.
                     snapshot_base_tokens = first_boundary
 
+        snapshot_interval = self.snapshot_interval_for(layer_cache_types)
+        store_end_tokens = existing_tokens + len(new_tokens)
+
         # Supersede-on-extend tracking (rotating models only, see below).
         first_new_block_idx: int | None = None
         tip_block_saved = False
@@ -1319,8 +1355,14 @@ class BlockAwarePrefixCache(CacheManager):
                         ),
                     )
                 if existing_block:
-                    if split_gdn_layout and not self._has_split_gdn_checkpoint(
-                        existing_block.block_hash, layer_cache_types
+                    if (
+                        split_gdn_layout
+                        and self._keeps_snapshot(
+                            snapshot_interval, global_end, store_end_tokens
+                        )
+                        and not self._has_split_gdn_checkpoint(
+                            existing_block.block_hash, layer_cache_types
+                        )
                     ):
                         checkpoint_committed = self._commit_split_gdn_checkpoint(
                             boundary_snapshots,
@@ -1353,6 +1395,9 @@ class BlockAwarePrefixCache(CacheManager):
                         and HAS_MLX
                         and self.paged_ssd_cache is not None
                         and has_boundary_snapshot
+                        and self._keeps_snapshot(
+                            snapshot_interval, global_end, store_end_tokens
+                        )
                         and existing_block.block_hash is not None
                         and existing_block.block_hash
                         not in self._backfill_checked_hashes
@@ -1471,7 +1516,12 @@ class BlockAwarePrefixCache(CacheManager):
                     and boundary_snapshots
                     and block_boundary_tc in boundary_snapshots
                 ):
-                    snapshot_cache_data = boundary_snapshots[block_boundary_tc]
+                    if self._keeps_snapshot(
+                        snapshot_interval, block_boundary_tc, store_end_tokens
+                    ):
+                        snapshot_cache_data = boundary_snapshots[block_boundary_tc]
+                    # Otherwise the block stores KV with placeholder recurrent
+                    # state, and restores walk back past it.
 
                 # True (not just "last") for the last block only when
                 # nothing beyond it was skipped: exact-terminal mode
@@ -1602,6 +1652,11 @@ class BlockAwarePrefixCache(CacheManager):
                                         layer_meta_states,
                                     )
                                 )
+                            elif not self._keeps_snapshot(
+                                snapshot_interval, block_boundary_tc, store_end_tokens
+                            ):
+                                # KV only, no sidecar; restores walk back past it.
+                                checkpoint_committed = True
                             else:
                                 checkpoint_committed = (
                                     self._commit_split_gdn_checkpoint(
@@ -2194,6 +2249,27 @@ class BlockAwarePrefixCache(CacheManager):
                 )
         self._tail_hashes.discard(block_hash)
         return True
+
+    def snapshot_interval_for(
+        self, layer_cache_types: list[str] | tuple[str, ...] | None
+    ) -> int:
+        """Return the snapshot interval that applies to this layout."""
+        return gdn_snapshot_interval_for(self._gdn_snapshot_interval, layer_cache_types)
+
+    def _keeps_snapshot(
+        self, interval: int, block_end_tokens: int, store_end_tokens: int
+    ) -> bool:
+        """Whether the block ending at ``block_end_tokens`` keeps recurrent state.
+
+        True for every block whose absolute index is a multiple of
+        ``interval``, and for the last full block and the tail (if any) of a
+        store ending at ``store_end_tokens``.
+        """
+        return (
+            interval <= 1
+            or block_end_tokens % (interval * self.block_size) == 0
+            or block_end_tokens > store_end_tokens - self.block_size
+        )
 
     def _strip_rotating_payload(
         self, block_hash: bytes, hot_cache_write_back: bool = True

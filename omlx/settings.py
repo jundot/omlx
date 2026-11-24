@@ -431,6 +431,11 @@ class CacheSettings:
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
     gdn_sidecar_state_dtype: str = "fp32"
+    # Keep recurrent (GDN) state only in every N-th full block of a cached
+    # chain plus each prompt's last full block and tail. Other blocks store
+    # KV only, and a restore walks back to the nearest block with state and
+    # re-prefills the rest (at most N-1 blocks). 1 = every block (default).
+    gdn_snapshot_interval: int = 1
     # Runtime-only: the configured dir that GlobalSettings.ensure_directories()
     # could not create, e.g. on a disconnected external drive.
     unavailable_ssd_cache_dir: Path | None = field(
@@ -528,6 +533,7 @@ class CacheSettings:
             # every existing install to the exact fp32 default; reduced
             # precision is retained only after an explicit new-key selection.
             "gdn_sidecar_precision": self.gdn_sidecar_state_dtype,
+            "gdn_snapshot_interval": self.gdn_snapshot_interval,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -576,6 +582,8 @@ class CacheSettings:
             gdn_sidecar_state_dtype=str(
                 data.get("gdn_sidecar_precision", "fp32")
             ).lower(),
+            # Kept as-is (no coercion) so validate() can reject non-integers.
+            gdn_snapshot_interval=data.get("gdn_snapshot_interval", 1),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
@@ -585,6 +593,11 @@ class CacheSettings:
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
+
+
+def is_valid_gdn_snapshot_interval(value: Any) -> bool:
+    """gdn_snapshot_interval must be a positive int (bool and floats rejected)."""
+    return type(value) is int and value >= 1
 
 
 MemoryGuardTier = Literal["safe", "balanced", "aggressive", "custom"]
@@ -1886,6 +1899,9 @@ class GlobalSettings:
                 "auto, ssd_sidecar, embedded"
             )
 
+        if not is_valid_gdn_snapshot_interval(self.cache.gdn_snapshot_interval):
+            errors.append("gdn_snapshot_interval must be a positive integer")
+
         if self.cache.ssd_cache_max_size.lower() != "auto":
             try:
                 size = parse_size(self.cache.ssd_cache_max_size)
@@ -2049,6 +2065,7 @@ class GlobalSettings:
             paged_ssd_cache_auto_size=self.cache.ssd_cache_max_size.lower() == "auto",
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
+            gdn_snapshot_interval=self.cache.gdn_snapshot_interval,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size
