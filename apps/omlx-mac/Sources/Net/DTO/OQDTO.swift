@@ -71,6 +71,7 @@ struct OQStartRequest: Encodable, Sendable {
     let textOnly: Bool
     let dtype: String
     let preserveMtp: Bool
+    let preserveNgramTable: Bool
     let enhanced: Bool
     let hadamard: Bool
     let imatrixCachePath: String

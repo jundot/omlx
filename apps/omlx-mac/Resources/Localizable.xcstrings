@@ -26529,6 +26529,78 @@
         }
       }
     },
+    "quant.advanced.preserve_ngram.label" : {
+      "comment" : "Toggle row label: keep DeepSeek V4.1 Engram tables in FP8",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Originale Engram-Tabellen beibehalten"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep original Engram tables"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantieni le tabelle Engram originali"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сохранять исходные таблицы Engram"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保留原始 Engram 表"
+          }
+        }
+      }
+    },
+    "quant.advanced.preserve_ngram.sub" : {
+      "comment" : "Toggle row sublabel: effect of keeping the original Engram tables",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Engram-Tabellen in FP8 statt in 4 Bit behalten (mehr Speicherplatz auf dem Datenträger)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep the Engram tables in FP8 instead of 4-bit (larger on disk)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantiene le tabelle Engram in FP8 anziché a 4 bit (più spazio su disco)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Оставить таблицы Engram в FP8 вместо 4 бит (больше места на диске)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Engram 表保持 FP8，不量化为 4 位（占用更多磁盘空间）"
+          }
+        }
+      }
+    },
     "quant.advanced.text_only.label" : {
       "comment" : "Toggle row label: drop vision encoder weights when quantizing a VLM",
       "extractionState" : "manual",
