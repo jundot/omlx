@@ -463,6 +463,33 @@ def normalize_inkling2_modelopt_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_inkling2_mlx_vlm_quant(cfg: dict) -> dict:
+    """Move an mlx-vlm-layout Inkling 2 quantization onto runtime paths.
+
+    Checkpoints quantized through mlx-vlm key ``quantization`` by mlx-vlm's
+    module names (``language_model.model.layers.N.self_attn.q_proj``). The
+    runtime fuses some of those modules, and mlx-lm applies the per-path specs
+    to the runtime module tree, so the keys are rewritten before it does.
+    """
+    if cfg.get("model_type") not in INKLING2_MODEL_TYPES:
+        return cfg
+    from ..patches.inkling2.loader import (
+        is_mlx_vlm_quantization,
+        mlx_vlm_quantization,
+    )
+
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict) or not is_mlx_vlm_quantization(quant):
+        return cfg
+    from ..patches.inkling2.model import TextArgs
+
+    text = TextArgs.from_dict(cfg.get("text_config") or {})
+    cfg["quantization"] = mlx_vlm_quantization(quant, text)
+    if isinstance(cfg.get("quantization_config"), dict):
+        cfg["quantization_config"] = cfg["quantization"]
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -482,6 +509,8 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_hy_v3_rope_config(cfg)
         # Cluster ranks load MiniMax through mlx-lm, not the patched mlx-vlm.
         adopt_expert_global_scales(cfg)
+        # Before the key variants below, which it would otherwise misread.
+        normalize_inkling2_mlx_vlm_quant(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
