@@ -93,6 +93,7 @@ VLM_MODEL_TYPES = {
 # models and adapts their language model to oMLX's scheduler.
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
+    "ernie5_5_moe",
     "flint",
     # Same mlx-vlm text tower as LFM3-VL, LFM3-Audio and LFM3-Omni.
     "lfm3",

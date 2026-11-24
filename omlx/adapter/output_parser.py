@@ -1372,6 +1372,71 @@ def _k2_horizon_marker_ids(tokenizer: Any) -> dict[str, int]:
     return marker_ids
 
 
+_ERNIE_THINK = "<ernie:think>"
+_ERNIE_THINK_END = "</ernie:think>"
+_ERNIE_CALL = "<ernie:tool_call>"
+_ERNIE_CALL_END = "</ernie:tool_call>"
+
+
+class Ernie55OutputParserSession:
+    """Normalize reasoning markers and parse tool calls from their token IDs."""
+
+    def __init__(self, tokenizer, marker_ids, model_path, tools=None):
+        self._tokenizer = tokenizer
+        self._markers = marker_ids
+        self._tools = tools
+        self._in_tool_call = False
+        self._call_ids = []
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
+        if self._detokenizer is not None:
+            self._detokenizer.reset()
+
+    def process_token(self, token_id):
+        text = ""
+        if token_id == self._markers[_ERNIE_CALL]:
+            self._in_tool_call = True
+        if self._in_tool_call:
+            self._call_ids.append(token_id)
+            if token_id == self._markers[_ERNIE_CALL_END]:
+                self._in_tool_call = False
+        elif token_id == self._markers[_ERNIE_THINK]:
+            text = "<think>"
+        elif token_id == self._markers[_ERNIE_THINK_END]:
+            text = "</think>"
+        else:
+            text = _decode_output_token(self._tokenizer, self._detokenizer, token_id)
+        return OutputParserTokenResult(
+            stream_text=text, visible_text=text, record_token=True
+        )
+
+    def finalize(self):
+        text = ""
+        if self._detokenizer is not None:
+            self._detokenizer.finalize()
+            text = self._detokenizer.last_segment
+        calls = []
+        if self._call_ids:
+            try:
+                parsed = self._tokenizer.parse_completion(
+                    self._call_ids, tools=self._tools, allow_incomplete=True
+                )
+                calls = [
+                    {
+                        "name": call["function"]["name"],
+                        "arguments": call["function"]["arguments"],
+                    }
+                    for call in parsed["tool_calls"]
+                ]
+            except (TypeError, ValueError, KeyError) as exc:
+                logger.debug("ERNIE tool-call parse failed: %s", exc)
+        return OutputParserFinalizeResult(
+            stream_text=text,
+            visible_text=text,
+            tool_calls=calls,
+            finish_reason="tool_calls" if calls else None,
+        )
+
+
 def detect_output_parser(
     model_name: str,
     tokenizer: Any,
@@ -1389,6 +1454,25 @@ def detect_output_parser(
     session_model_path = model_path or model_name
 
     model_type = model_config.get("model_type") if model_config else None
+    if model_type == "ernie5_5_moe" and callable(
+        getattr(tokenizer, "parse_completion", None)
+    ):
+        markers = (_ERNIE_THINK, _ERNIE_THINK_END, _ERNIE_CALL, _ERNIE_CALL_END)
+        marker_ids = {marker: _token_id_for_text(tokenizer, marker) for marker in markers}
+        if None not in marker_ids.values():
+            return OutputParserFactory(
+                kind="ernie5_5_moe",
+                create_session=lambda t: Ernie55OutputParserSession(
+                    t, marker_ids, session_model_path
+                ),
+                create_session_with_tools=lambda t, tools: Ernie55OutputParserSession(
+                    t, marker_ids, session_model_path, tools
+                ),
+                thinking_start_text=_ERNIE_THINK,
+                thinking_start_output_text="<think>\n",
+                thinking_end_text=_ERNIE_THINK_END,
+                protocol_marker_texts=markers,
+            )
     if model_type == _BAILING_HYBRID_MODEL_TYPE:
         marker_token_ids = {
             token_id
