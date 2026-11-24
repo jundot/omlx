@@ -126,7 +126,7 @@ grammar = [
     # build. xgrammar 0.2.3 crashes at import with apache-tvm-ffi 0.1.13
     # on macOS arm64, so an open-ended resolver can break Homebrew installs
     # without any oMLX source change (#2428).
-    "xgrammar==0.2.8",
+    "xgrammar==0.2.9",
     "apache-tvm-ffi==0.1.11",
 ]
 mcp = [
@@ -215,7 +215,7 @@ dev = [
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
     # importable, which silently hides regressions — install no-deps
     # in the dev environment so the test actually runs.
-    "xgrammar==0.2.8",
+    "xgrammar==0.2.9",
     "apache-tvm-ffi==0.1.11",
 ]
 

@@ -492,6 +492,28 @@ class TestCompileBareGrammar:
         assert result == "compiled_ebnf"
         compiler.compile_grammar.assert_called_once_with(ebnf)
 
+    @requires_xgrammar
+    def test_json_schema_pattern_repeat_over_128(self):
+        """A caching compiler must build a `{0,240}` pattern (#5371)."""
+        vocab = [chr(i) for i in range(32, 127)] + ["</s>"]
+        stop = len(vocab) - 1
+        compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(vocab, stop_token_ids=[stop]))
+        schema = {
+            "type": "object",
+            "properties": {"z": {"type": "string", "pattern": "^[^#]{0,240}$"}},
+            "required": ["z"],
+        }
+        compiled = self._call(compiler, {"type": "json_schema", "json_schema": schema})
+
+        matcher = xgr.GrammarMatcher(compiled)
+        for ch in '{"z":"' + "a" * 240:
+            assert matcher.accept_token(vocab.index(ch)), ch
+        assert not matcher.accept_token(vocab.index("a"))
+        for ch in '"}':
+            assert matcher.accept_token(vocab.index(ch)), ch
+        assert matcher.accept_token(stop)
+        assert matcher.is_terminated()
+
 
 # =========================================================================
 # _compile_grammar_for_request
