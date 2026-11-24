@@ -116,11 +116,22 @@ def _target_float_dtype(target_model: Any):
     """Float dtype of the target's token embedding (its scales when quantized)."""
     language_model = getattr(target_model, "language_model", target_model)
     inner = getattr(language_model, "model", language_model)
-    embed = getattr(inner, "embed_tokens", None)
-    for name in ("scales", "weight"):
-        value = getattr(embed, name, None)
-        if isinstance(value, mx.array) and mx.issubdtype(value.dtype, mx.floating):
-            return value.dtype
+    backbone = getattr(language_model, "backbone", None)
+    # mlx-lm / mlx-vlm language models keep ``embed_tokens`` on the inner
+    # model; Nemotron-H's backbone calls it ``embeddings``.
+    candidates = (
+        getattr(inner, "embed_tokens", None),
+        getattr(inner, "embeddings", None),
+        getattr(backbone, "embeddings", None),
+        getattr(backbone, "embed_tokens", None),
+    )
+    for embed in candidates:
+        if embed is None:
+            continue
+        for name in ("scales", "weight"):
+            value = getattr(embed, name, None)
+            if isinstance(value, mx.array) and mx.issubdtype(value.dtype, mx.floating):
+                return value.dtype
     return None
 
 
@@ -134,7 +145,8 @@ def match_target_dtype(model: nn.Module, target_model: Any) -> int:
     narrower mantissa than the target produced them. Parameters that do not
     fit fp16 leave the drafter unchanged. Returns the number of cast arrays.
     """
-    if _target_float_dtype(target_model) != mx.float16:
+    target_dtype = _target_float_dtype(target_model)
+    if target_dtype is None or target_dtype != mx.float16:
         return 0
     params = [
         p for _, p in tree_flatten(model.parameters()) if p.dtype == mx.bfloat16
