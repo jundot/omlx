@@ -198,7 +198,9 @@ def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
 # fused tensors (``Model.sanitize`` in mlx_vlm/models/inkling2/inkling2.py).
 # Quantized builds made with mlx-vlm, such as orcarouter's abliterated MLX
 # release, ship in that layout. The maps below undo mlx-vlm's sanitize so the
-# same files load on this runtime, with their quantized codes left as they are.
+# same files load on this runtime with the same quantized weights: codes are
+# kept, or re-packed at a wider bit width where the runtime fuses rows that
+# were quantized at different widths.
 
 _VLM_TEXT = "language_model."
 _VLM_LAYER = "language_model.model.layers."
@@ -290,9 +292,10 @@ def _vlm_module_path(path: str, args) -> str | None:
 def mlx_vlm_quantization(quantization: dict, args) -> dict:
     """Rewrite mlx-vlm per-module quantization onto runtime module paths.
 
-    Modules the runtime fuses must agree on their spec; the unquantized rows
-    of a fused module (the attention sink, the dynamic conv projections) are
-    quantized to that spec by ``sanitize_mlx_vlm_weights``.
+    A fused module takes the widest of its modules' affine specs when they
+    share a group size; ``sanitize_mlx_vlm_weights`` re-encodes the narrower
+    rows losslessly and quantizes the unquantized rows (the attention sink, the
+    dynamic conv projections) to that spec. Other mixes raise.
     """
     out = {k: v for k, v in quantization.items() if not isinstance(v, dict)}
     for path, spec in quantization.items():
@@ -301,13 +304,65 @@ def mlx_vlm_quantization(quantization: dict, args) -> dict:
         target = _vlm_module_path(path, args)
         if target is None:
             raise ValueError(f"Unmapped quantized Inkling 2 module: {path}")
-        if target in out and out[target] != spec:
-            raise ValueError(
-                f"Inkling 2 {target} fuses modules with different quantization: "
-                f"{out[target]} and {spec}"
-            )
-        out[target] = dict(spec)
+        out[target] = _merge_spec(target, out.get(target), dict(spec))
     return out
+
+
+def _merge_spec(target: str, old: dict | None, new: dict) -> dict:
+    if old is None or old == new:
+        return new
+    if (
+        old.get("mode", "affine") == new.get("mode", "affine") == "affine"
+        and old["group_size"] == new["group_size"]
+    ):
+        return max(old, new, key=lambda spec: spec["bits"])
+    raise ValueError(
+        f"Inkling 2 {target} fuses modules with different quantization: "
+        f"{old} and {new}"
+    )
+
+
+def _pack_codes(codes: mx.array, bits: int) -> mx.array:
+    """Pack unsigned codes the way MLX does: a little-endian bit stream per row."""
+    *lead, n = codes.shape
+    q = codes.reshape(*lead, n // 32, 32)
+    words = [mx.zeros(q.shape[:-1], dtype=mx.uint32) for _ in range(bits)]
+    for j in range(32):
+        word, shift = divmod(j * bits, 32)
+        code = q[..., j].astype(mx.uint32)
+        words[word] = words[word] | (code << shift)
+        if shift + bits > 32:
+            words[word + 1] = words[word + 1] | (code >> (32 - shift))
+    return mx.stack(words, axis=-1).reshape(*lead, n * bits // 32)
+
+
+def _widen(part: dict, spec: dict) -> dict:
+    """Re-encode a narrower affine Linear at ``spec``'s bits, losslessly.
+
+    An affine code ``q`` stands for ``scale * q + bias``. The same scales and
+    biases with ``q`` stored in more bits give the same weights.
+    """
+    if "biases" not in part or spec.get("mode", "affine") != "affine":
+        return part
+    group_size, bits = spec["group_size"], spec["bits"]
+    in_dims = part["scales"].shape[-1] * group_size
+    have = part["weight"].shape[-1] * 32 // in_dims
+    if have == bits:
+        return part
+    if have > bits:
+        raise ValueError(f"Cannot narrow Inkling 2 {have}-bit rows to {bits} bits")
+    scales = part["scales"]
+    codes = mx.dequantize(
+        part["weight"],
+        mx.ones_like(scales),
+        mx.zeros_like(scales),
+        group_size=group_size,
+        bits=have,
+    ).astype(mx.uint8)
+    weight = _pack_codes(codes, bits)
+    # Bound the transient codes to one projection at a time.
+    mx.eval(weight)
+    return {**part, "weight": weight}
 
 
 def _pop_linear(d: dict, name: str) -> dict:
@@ -317,8 +372,9 @@ def _pop_linear(d: dict, name: str) -> dict:
 def _fuse_rows(parts: list, spec, path: str, out: dict) -> None:
     """Concatenate Linear weights along their output rows.
 
-    Quantized codes are row-local, so quantized parts keep their codes; any
-    unquantized part is quantized to the fused module's spec first.
+    Quantized codes are row-local, so quantized parts keep their codes,
+    widened to the fused module's bits if narrower; any unquantized part is
+    quantized to the fused module's spec first.
     """
     if not any("scales" in p for p in parts):
         out[path + ".weight"] = mx.concatenate([p["weight"] for p in parts], axis=0)
@@ -335,6 +391,8 @@ def _fuse_rows(parts: list, spec, path: str, out: dict) -> None:
                 mode=spec.get("mode", "affine"),
             )
             part = dict(zip(_QUANT_SUFFIXES, q))
+        else:
+            part = _widen(part, spec)
         for suffix, value in part.items():
             columns.setdefault(suffix, []).append(value)
     if len({len(v) for v in columns.values()}) != 1:
@@ -343,15 +401,19 @@ def _fuse_rows(parts: list, spec, path: str, out: dict) -> None:
         out[f"{path}.{suffix}"] = mx.concatenate(values, axis=0)
 
 
-def _vlm_experts(d: dict, out: dict, pre: str) -> None:
+def _vlm_experts(d: dict, out: dict, pre: str, spec) -> None:
     """``switch_mlp.{gate,up,down}_proj`` -> runtime ``w13`` and ``w2``.
 
     mlx-vlm de-interleaves the published ``w13`` rows into gate (even rows)
     and up (odd rows), and stores the NVFP4 outer scale as
     ``amax / denominator``; the runtime keeps ``amax`` in MLX's convention.
+    Builds that quantize gate and up at different affine bits get the
+    narrower one widened to ``spec``, the fused ``w13`` spec.
     """
     names = ("gate_proj", "up_proj", "down_proj")
     gate, up, down = (_pop_linear(d, "mlp.switch_mlp." + n) for n in names)
+    if isinstance(spec, dict):
+        gate, up = _widen(gate, spec), _widen(up, spec)
     scale2 = {n: d.pop(f"mlp.switch_mlp.{n}.weight_scale_2", None) for n in names}
     w13 = pre + "mlp.experts.w13."
     for suffix in gate:
@@ -414,7 +476,7 @@ def _vlm_layer(d: dict, idx: int, args, quant: dict, out: dict) -> None:
             out[pre + f"{dst}.query"] = (
                 d.pop(f"{src}.query").reshape(-1, hidden).astype(mx.float32)
             )
-    _vlm_experts(d, out, pre)
+    _vlm_experts(d, out, pre, quant.get(pre + "mlp.experts.w13"))
     if "controllers.attn.down_weight" in d:
         _loop_controllers(d, out, pre)
     if d:

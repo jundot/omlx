@@ -162,8 +162,14 @@ def _mlx_vlm_tensors(source: dict, hidden: int) -> tuple[dict, dict]:
     return out, specs
 
 
-def _mlx_vlm_checkpoint(source_dir, dest, *, quantize_attention=False):
-    """Write ``source_dir`` the way an mlx-vlm quantized build ships it."""
+def _mlx_vlm_checkpoint(
+    source_dir, dest, *, quantize_attention=False, expert_bits=None
+):
+    """Write ``source_dir`` the way an mlx-vlm quantized build ships it.
+
+    ``expert_bits`` maps gate/up/down to affine bits, replacing the source's
+    NVFP4/MXFP8 experts the way mixed-precision builds quantize them.
+    """
     shutil.copytree(
         source_dir,
         dest,
@@ -187,6 +193,24 @@ def _mlx_vlm_checkpoint(source_dir, dest, *, quantize_attention=False):
                     {path + ".weight": w, path + ".scales": s, path + ".biases": b}
                 )
                 quant[path] = dict(_Q8)
+    if expert_bits:
+        rng = mx.random.key(0)
+        for layer in range(_INK2_LAYERS):
+            base = f"language_model.model.layers.{layer}.mlp.switch_mlp."
+            for proj, bits in expert_bits.items():
+                path = base + f"{proj}_proj"
+                text = config["text_config"]
+                in_dims = text["intermediate_size" if proj == "down" else "hidden_size"]
+                shape = tensors[path + ".weight"].shape[:-1] + (in_dims,)
+                rng, key = mx.random.split(rng)
+                w = (mx.random.normal(shape, key=key) * 0.05).astype(mx.bfloat16)
+                q, sc, b = mx.quantize(w, group_size=32, bits=bits)
+                for suffix in ("weight", "scales", "weight_scale_2"):
+                    tensors.pop(f"{path}.{suffix}", None)
+                tensors.update(
+                    {path + ".weight": q, path + ".scales": sc, path + ".biases": b}
+                )
+                quant[path] = {"group_size": 32, "bits": bits, "mode": "affine"}
     config["quantization"] = config["quantization_config"] = quant
     (dest / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(dest / "model.safetensors"), tensors, {"format": "mlx"})
@@ -248,17 +272,61 @@ def test_quantized_attention_keeps_its_codes(tmp_path, patched_load_config):
                 assert mx.array_equal(want, have).item(), f"layer {layer} {name}"
 
 
-def test_fused_modules_must_share_a_spec():
+@pytest.mark.parametrize("bits", [(2, 3, 4), (4, 2, 8), (3, 6, 3)], ids=str)
+def test_mixed_bit_experts_widen_losslessly(tmp_path, bits, patched_load_config):
+    # Mixed-precision builds can quantize gate and up at different bits; the
+    # runtime fuses them into w13, so the narrower rows are widened.
+    source = tmp_path / "source"
+    _inkling2_source(source, looped=True)
+    gate, up, down = bits
+    vlm = _mlx_vlm_checkpoint(
+        source,
+        tmp_path / "mlx_vlm",
+        expert_bits={"gate": gate, "up": up, "down": down},
+    )
+    tensors = mx.load(str(vlm / "model.safetensors"))
+    loaded = _inkling2_model(vlm)
+
+    def dequant(path, b):
+        return mx.dequantize(
+            tensors[path + ".weight"],
+            tensors[path + ".scales"],
+            tensors[path + ".biases"],
+            group_size=32,
+            bits=b,
+        )
+
+    for layer, block in enumerate(loaded.model.layers):
+        experts = block.mlp.experts
+        base = f"language_model.model.layers.{layer}.mlp.switch_mlp."
+        g, u = dequant(base + "gate_proj", gate), dequant(base + "up_proj", up)
+        w13 = mx.stack([g, u], axis=-2).reshape(*g.shape[:-2], -1, g.shape[-1])
+        assert experts.w13.bits == max(gate, up)
+        for proj, want in (
+            (experts.w13, w13),
+            (experts.w2, dequant(base + "down_proj", down)),
+        ):
+            got = mx.dequantize(
+                proj.weight, proj.scales, proj.biases, group_size=32, bits=proj.bits
+            )
+            assert mx.array_equal(got, want).item(), f"layer {layer}"
+
+
+def test_fused_specs_take_the_widest_affine_bits():
     from omlx.patches.inkling2.loader import mlx_vlm_quantization
 
     args = TextArgs.from_dict(
         {"num_hidden_layers": 2, "local_layer_ids": [0], "hidden_size": 64}
     )
     base = "language_model.model.layers.0.self_attn."
-    with pytest.raises(ValueError, match="different quantization"):
-        mlx_vlm_quantization(
-            {base + "q_proj": _Q8, base + "k_proj": dict(_Q8, bits=4)}, args
-        )
+    quant = mlx_vlm_quantization(
+        {base + "q_proj": dict(_Q8, bits=4), base + "k_proj": _Q8}, args
+    )
+    assert quant["model.layers.0.attn.in_proj"] == _Q8
+    # Rows with another group size or mode cannot be re-encoded losslessly.
+    for other in (dict(_Q8, group_size=32), _NVFP4):
+        with pytest.raises(ValueError, match="different quantization"):
+            mlx_vlm_quantization({base + "q_proj": _Q8, base + "k_proj": other}, args)
 
 
 def test_rewritten_quantization_is_left_alone(tmp_path):
