@@ -62,6 +62,67 @@ def cyclic_gc_disabled():
             gc.enable()
 
 
+@pytest.mark.parametrize("older_write_fails", [False, True])
+@pytest.mark.parametrize("mode", ["ssd", "hot_write_through", "hot_write_back"])
+def test_superseded_ssd_write_preserves_replacement(
+    tmp_path, monkeypatch, mode, older_write_fails
+):
+    mx = pytest.importorskip("mlx.core")
+    from omlx.cache import paged_ssd_cache
+
+    monkeypatch.setattr(paged_ssd_cache, "_PENDING_WRITE_PUT_TIMEOUT_SECONDS", 0.05)
+    block_hash = b"replacement_test"
+    started, release = threading.Event(), threading.Event()
+    write_safetensors = paged_ssd_cache._write_safetensors_no_mx
+
+    def hold_first_write(path, tensors_raw, metadata):
+        if metadata["block_hash"] == block_hash.hex() and not started.is_set():
+            started.set()
+            assert release.wait(5)
+            if older_write_fails:
+                raise OSError(errno.EIO, "simulated write failure")
+        return write_safetensors(path, tensors_raw, metadata)
+
+    monkeypatch.setattr(paged_ssd_cache, "_write_safetensors_no_mx", hold_first_write)
+    manager = PagedSSDCacheManager(
+        cache_dir=tmp_path,
+        max_size_bytes=100 * 1024**2,
+        expected_block_size_tokens=2048,
+        expected_kv_bytes_per_token=10**12,  # One queue slot.
+        hot_cache_max_bytes=0 if mode == "ssd" else 1024**2,
+    )
+
+    def save(key, value, write_back=False):
+        kv = mx.full((1, 2, 16, 16), value)
+        assert manager.save_block(
+            key,
+            [(kv, kv)],
+            token_count=16,
+            layer_cache_types=["KVCache"],
+            hot_cache_write_back=write_back,
+        )
+
+    try:
+        save(block_hash, 1.0)
+        assert started.wait(5)
+        save(b"fill_write_queue", 0.0)
+        manager.forget_block(block_hash)
+        save(block_hash, 2.0, write_back=mode == "hot_write_back")
+        release.set()
+        assert manager.wait_for_pending_writes(5)
+    finally:
+        release.set()
+        manager.close()
+
+    reopened = PagedSSDCacheManager(cache_dir=tmp_path, max_size_bytes=100 * 1024**2)
+    try:
+        restored = reopened.load_block(block_hash)
+        assert restored is not None
+        assert mx.all(restored[0][0] == 2.0).item()
+    finally:
+        reopened.close()
+
+
 class TestParseSize:
     """Tests for parse_size utility function."""
 
