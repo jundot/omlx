@@ -354,10 +354,7 @@ template <int BITS>
 constexpr int aff_lane_codes() { return BITS == 2 ? 16 : 8; }
 // 2- and 4-bit codes are masked in place, as MLX's qdot does: q[j] = code j * 2^e(j), against x
 // pre-scaled by aff_unit<BITS>(j) = 2^-e(j). Power-of-two scaling is exact, so q[j] * x[j] = code * x.
-// 4 bits: e(j) = 4j. 2 bits: two codes per step, j (bits 2p) and j + 8 (bits 16 + 2p), p = j % 8,
-// are OR-ed into the mantissas of a half2 biased by 1024 (0x6400) and the bias subtracted once:
-// (code * 4^e', ...) exactly, e' = p, or p - 5 after a 10-bit shift for the codes at bits 10..15
-// (a half has 10 mantissa bits). Three operations per two codes instead of a mask and a convert each.
+// At 2 bits one half2 takes codes j and j + 8 in its 10-bit mantissas; codes 5..7 are shifted down first.
 template <int BITS>
 inline int aff_exp(int j) { const int p = j % 8; return BITS == 2 ? 2 * (p < 5 ? p : p - 5) : BITS * j; }
 template <int BITS>
