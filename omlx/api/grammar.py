@@ -82,6 +82,39 @@ def mark_grammar_thinking_phase(
     return compiled_grammar
 
 
+def model_structural_tag(model_type: str | None) -> str | None:
+    """Return oMLX's own structural tag for a model type, or ``None``.
+
+    Covers models that write protocol markers before their answer and have
+    no xgrammar builtin tag.
+    """
+    from ..patches.inkling2 import INKLING2_MODEL_TYPES
+
+    return "inkling2" if model_type in INKLING2_MODEL_TYPES else None
+
+
+def compile_model_structural_tag(
+    compiler,
+    tag: str,
+    fmt: dict,
+    chat_template_kwargs: dict,
+    *,
+    max_whitespace_cnt: int,
+):
+    """Compile ``fmt`` inside one of oMLX's own structural tags.
+
+    Returns ``None`` when ``tag`` is not one of them, so the caller can try
+    xgrammar's builtin tags.
+    """
+    if tag != "inkling2":
+        return None
+    from ..patches.inkling2.grammar import compile_answer_grammar
+
+    return compile_answer_grammar(
+        compiler, fmt, chat_template_kwargs, max_whitespace_cnt=max_whitespace_cnt
+    )
+
+
 class GrammarConstraintProcessor:
     """Logits processor that enforces grammar constraints via xgrammar bitmask.
 

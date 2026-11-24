@@ -5834,7 +5834,9 @@ def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | Non
     # channel headers that a bare grammar would mask.
     if reasoning_parser is None and engine.model_type == "gpt_oss":
         return "harmony"
-    return reasoning_parser
+    from .api.grammar import model_structural_tag
+
+    return reasoning_parser or model_structural_tag(engine.model_type)
 
 
 def _compile_with_structural_tag(
@@ -5851,7 +5853,18 @@ def _compile_with_structural_tag(
     _install_torch_stub()
     import xgrammar as xgr
 
+    from .api.grammar import compile_model_structural_tag
+
     ct_kwargs = chat_template_kwargs or {}
+    compiled = compile_model_structural_tag(
+        compiler,
+        reasoning_parser,
+        fmt,
+        ct_kwargs,
+        max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT,
+    )
+    if compiled is not None:
+        return compiled
     if reasoning_parser == "minimax_m3":
         reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
     else:
