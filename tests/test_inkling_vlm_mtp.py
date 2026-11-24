@@ -502,7 +502,7 @@ _TINY_VISION = dict(
 # that bf16 noise into chunking-dependent logits.
 _TINY_LOOP = dict(
     formats=("mxfp8",) * 18,
-    loop_config=dict(core_start=6, core_end=12, num_passes=3, gate_rank=8),
+    loop_config=dict(core_start=6, core_end=12, num_passes=3, gate_rank=64),
 )
 
 
@@ -549,6 +549,9 @@ def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None, **dims)
             weights.append((name, value))
         else:
             noise = mx.random.normal(value.shape) * 0.05
+            if name.endswith(("loop_down", "loop_gain_forget")):
+                # Checkpoints ship the controllers as BF16 values.
+                noise = noise.astype(mx.bfloat16)
             weights.append((name, noise.astype(value.dtype)))
     model.load_weights(weights)
     return model
@@ -608,6 +611,48 @@ def test_inkling2_loop_controller_ignores_prefill_chunking():
         full = _mix_messages(x, msg, down, gates)
         part = _mix_messages(x[:, :, :1000], msg[:, :, :1000], down, gates)
         assert mx.array_equal(part, full[:, :, :1000])
+
+
+def test_inkling2_bf16_loop_kernels_match_the_fp32_path():
+    import mlx.nn as nn
+
+    from omlx.patches.inkling2.model import _bf16_loop_weights, _mix_messages_normed
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernels")
+    hidden, rank = 2304, 64
+    mx.random.seed(5)
+    layer = nn.Module()
+    layer.loop_down = mx.random.normal((4, 2, hidden, rank)) * 0.05
+    layer.loop_gain_forget = mx.random.normal((4, rank, 2 * hidden)) * 0.05
+    # Weights that BF16 cannot hold exactly keep the FP32 path.
+    assert _bf16_loop_weights(layer) is None
+    for name in ("loop_down", "loop_gain_forget"):
+        value = getattr(layer, name).astype(mx.bfloat16).astype(mx.float32)
+        setattr(layer, name, value)
+    packed = _bf16_loop_weights(layer)
+    messages = mx.random.normal((2, 4, 4, hidden))
+    # Full and sliding attention inputs, then the MLP input.
+    for m0, n, qx, bf16 in (
+        (0, 3, 3, packed[0]),
+        (0, 3, 1, packed[0]),
+        (3, 1, 1, packed[1]),
+    ):
+        args = (
+            mx.random.normal((2, 4, qx, hidden)),
+            messages,
+            m0,
+            n,
+            layer.loop_down[m0 : m0 + n],
+            layer.loop_gain_forget[m0 : m0 + n],
+            mx.ones((qx, hidden)),
+            1e-6,
+            mx.bfloat16,
+        )
+        want = _mix_messages_normed(*args, want_f32=True)[1]
+        got = _mix_messages_normed(*args, want_f32=True, bf16_weights=bf16)[1]
+        # The paths sum in different orders, so low can round one BF16 ULP apart.
+        assert mx.allclose(got, want, rtol=1e-2, atol=1e-2)
 
 
 def test_inkling2_loop_model_type_uses_inkling2(tmp_path):
@@ -872,6 +917,9 @@ def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width):
         set_verify_qmm_armed(False)
     for row, expected in enumerate(serial):
         assert mx.array_equal(block[row], expected)
+    if dims:
+        # The looped rows ran the BF16 controller kernels.
+        assert model.model.layers[6].__dict__["_omlx_loop_bf16"][2] is not None
 
 
 def test_inkling2_fused_kernels_match_reference():
@@ -1033,6 +1081,8 @@ def test_inkling2_fused_layer_kernels_keep_the_mlx_bits(dims, monkeypatch):
         pytest.skip("fused kernels are GPU-only")
     from omlx.patches.inkling2 import kernels
 
+    # The BF16 controller kernels keep row-exactness only, not these bits.
+    monkeypatch.setattr(kernels, "loop_bf16_supported", lambda *a: False)
     # 128-wide heads: the projection epilogue covers that width only.
     wide = dict(
         head_dim=128,

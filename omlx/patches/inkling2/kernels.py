@@ -553,6 +553,9 @@ _LOOP_OUT_SOURCE = """
 # separate loop_message_inputs launch and intermediate z buffer, while running
 # one 128-thread threadgroup per (rank, controlled input, row) keeps all GPU
 # cores busy even when n == 1.
+# Unlike the kernels above, these two do not repeat MLX's reduction order, so
+# their bits differ from the FP32 matmul path. Each row runs on its own, so
+# verify rows keep the bits of serial decode.
 _LOOP_DOWN_BF16_SOURCE = """
     constexpr uint VECS = H / 4;
     constexpr uint STEPS = (VECS + 127) / 128;
@@ -720,16 +723,6 @@ def loop_message_down_bf16(
     b, length, qx, hidden = mixed.shape
     rows = b * length
     n, rank = down_t.shape[0], down_t.shape[2]
-    if (
-        mixed.dtype != mx.float32
-        or messages.dtype != mx.float32
-        or down_t.dtype != mx.bfloat16
-        or not loop_bf16_supported(hidden, rank)
-    ):
-        raise ValueError(
-            f"loop_message_down_bf16 requires GPU, FP32 inputs, BF16 weights, H <= 4096, H % 128 == 0, R % 64 == 0 "
-            f"(got x={mixed.dtype}, m={messages.dtype}, w={down_t.dtype}, H={hidden}, R={rank})"
-        )
     return _loop_kernel("down_bf16")(
         inputs=[mixed, messages, down_t],
         template=[("H", hidden), ("R", rank), ("M0", m0), ("XQ", qx > 1)],
@@ -745,15 +738,6 @@ def loop_message_gates_bf16(low: mx.array, gf_t: mx.array) -> mx.array:
     [n, H, 2, r] to FP32 ``gates`` [n, rows, 2H]."""
     n, rows, rank = low.shape
     hidden = gf_t.shape[1]
-    if (
-        low.dtype != mx.float32
-        or gf_t.dtype != mx.bfloat16
-        or not loop_bf16_supported(hidden, rank)
-    ):
-        raise ValueError(
-            f"loop_message_gates_bf16 requires GPU, FP32 inputs, BF16 weights, H <= 4096, H % 128 == 0, R % 64 == 0 "
-            f"(got low={low.dtype}, w={gf_t.dtype}, H={hidden}, R={rank})"
-        )
     return _loop_kernel("gates_bf16")(
         inputs=[low, gf_t],
         template=[("H", hidden), ("R", rank)],
