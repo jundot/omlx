@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import numpy as np
 import pytest
@@ -1263,9 +1264,222 @@ def test_inkling2_flash_attention_matches_masked_sdpa(
     assert diff.item() < 1e-2
 
 
+def _nax_banded_or_skip():
+    from omlx.custom_kernels.nax import is_nax_available
+    from omlx.utils import nax_attention
+
+    if mx.default_device() != mx.gpu or not is_nax_available():
+        pytest.skip("NAX GPU")
+    return nax_attention
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_nax_banded_attention_self_check_passes(dtype):
+    nax_attention = _nax_banded_or_skip()
+    assert nax_attention.banded_check_passed(getattr(mx, dtype))
+
+
+@pytest.mark.parametrize(
+    "batch, heads, kv_heads, length, keys, extent, left_padding",
+    [
+        (1, 6, 2, 64, 64, 16, None),  # no cached keys, aligned tiles
+        (1, 6, 2, 33, 300, 32, None),  # ragged query and key tails
+        (1, 4, 4, 100, 100, 256, None),  # band longer than the keys
+        (1, 6, 2, 200, 12301, 48, None),  # three key-range passes
+        (2, 4, 1, 70, 190, 32, None),
+        (2, 4, 1, 70, 190, 32, [0, 53]),
+        (3, 6, 2, 40, 300, 48, [0, 31, 260]),
+    ],
+)
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_nax_banded_attention_matches_fp32(
+    batch, heads, kv_heads, length, keys, extent, left_padding, dtype
+):
+    nax_attention = _nax_banded_or_skip()
+    q, k, v, rel, sink = _decode_attention_case(
+        batch, heads, kv_heads, length, keys, extent, getattr(mx, dtype), dim=128
+    )
+    # Peaked: without the band, the sinks or the padding the result is far off.
+    rel, sink = rel * 6, sink * 4
+    lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
+    scale = 128**-0.5
+    if keys > 4096:
+        edges = nax_attention._pass_edges(
+            batch * heads, (keys + 31) // 32, nax_attention._BANDED_PASS_KEYS, 0
+        )
+        assert len(edges) == 4
+    got = nax_attention.nax_banded_sink_attention(
+        q, k, v, rel, sink, scale=scale, left_padding=lp
+    )
+    assert got.shape == q.shape and got.dtype == q.dtype
+    ref = nax_attention._banded_reference(q, k, v, rel, sink, scale, lp)
+    assert mx.abs(got.astype(mx.float32) - ref).max().item() < 2e-2
+    others = [
+        nax_attention._banded_reference(q, k, v, rel * 0, sink, scale, lp),
+        nax_attention._banded_reference(q, k, v, rel, sink - 40, scale, lp),
+    ]
+    for other in others:
+        assert mx.abs(other - ref).max().item() > 0.2
+    if left_padding:
+        unpadded = nax_attention._banded_reference(q, k, v, rel, sink, scale)
+        assert mx.abs(unpadded - ref).max().item() > 0.05
+
+
+def test_nax_banded_attention_band_edge():
+    # One query row, value 1 on a single key: the output is that key's
+    # attention weight. Keys at distance R - 1 carry the last bias entry and
+    # keys at distance R none.
+    nax_attention = _nax_banded_or_skip()
+    heads, keys, length, extent = 4, 200, 40, 16
+    q = mx.zeros((1, heads, length, 128), dtype=mx.bfloat16)
+    k = mx.zeros((1, 1, keys, 128), dtype=mx.bfloat16)
+    rel = mx.zeros((1, length, heads, extent))
+    rel[..., extent - 1] = 5.0
+    rel = rel.astype(mx.bfloat16)
+    sink = mx.full((1, length, heads), -30.0).astype(mx.bfloat16)
+    row = length - 1
+    pos = keys - 1  # key position of the last query row
+    for dist, biased in ((extent - 1, True), (extent, False), (0, False)):
+        v = mx.zeros((1, 1, keys, 128))
+        v[:, :, pos - dist] = 1.0
+        out = nax_attention.nax_banded_sink_attention(
+            q, k, v.astype(mx.bfloat16), rel, sink, scale=1.0
+        )
+        got = out[0, 0, row, 0].item()
+        # Scores are 0 for every visible key, plus 5 on the biased one.
+        weight = math.exp(5.0) if biased else 1.0
+        expected = weight / (pos + math.exp(5.0))
+        assert got == pytest.approx(expected, rel=2e-2)
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_nax_banded_attention_passes_repeat_one_dispatch(dtype):
+    # Key-range passes hand the fp32 row state on: same bits as one dispatch.
+    # 32 keys per pass queues more passes than one evaluation covers.
+    nax_attention = _nax_banded_or_skip()
+    q, k, v, rel, sink = _decode_attention_case(
+        2, 6, 2, 77, 1000, 48, getattr(mx, dtype), 128
+    )
+    lp = mx.array([0, 100], dtype=mx.int32)
+    scale = 128**-0.5
+    one = nax_attention._run_banded(q, k, v, rel, sink, scale, 0, lp)
+    assert len(nax_attention._pass_edges(12, 32, 32, 0)) - 1 > (
+        nax_attention._BANDED_EVAL_PASSES
+    )
+    for pass_keys in (32, 64, 96, 512):
+        many = nax_attention._run_banded(q, k, v, rel, sink, scale, pass_keys, lp)
+        assert mx.array_equal(one, many).item()
+
+
+def test_nax_banded_attention_rows_do_not_depend_on_the_block():
+    # A query row's output depends on its own keys only: the same rows come
+    # out of a shorter block and of a block cut in two, and of the model's
+    # strided [B, L, H, D] query layout.
+    nax_attention = _nax_banded_or_skip()
+    q, k, v, rel, sink = _decode_attention_case(1, 6, 2, 96, 700, 48, mx.bfloat16, 128)
+    scale = 128**-0.5
+    whole = nax_attention.nax_banded_sink_attention(q, k, v, rel, sink, scale=scale)
+    head = nax_attention.nax_banded_sink_attention(
+        q[:, :, :64],
+        k[:, :, :-32],
+        v[:, :, :-32],
+        rel[:, :64],
+        sink[:, :64],
+        scale=scale,
+    )
+    tail = nax_attention.nax_banded_sink_attention(
+        q[:, :, 64:], k, v, rel[:, 64:], sink[:, 64:], scale=scale
+    )
+    assert mx.array_equal(whole, mx.concatenate([head, tail], axis=2)).item()
+    strided = mx.contiguous(q.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+    again = nax_attention.nax_banded_sink_attention(
+        strided, k, v, rel, sink, scale=scale
+    )
+    assert mx.array_equal(whole, again).item()
+
+
+def test_nax_banded_attention_declines_unsupported_inputs():
+    nax_attention = _nax_banded_or_skip()
+    scale = 128**-0.5
+    case = _decode_attention_case(1, 6, 2, 40, 300, 32, mx.bfloat16, 128)
+    assert nax_attention.nax_banded_sink_attention(*case, scale=scale) is not None
+    narrow = _decode_attention_case(1, 6, 2, 40, 300, 32, mx.bfloat16, 64)
+    assert nax_attention.nax_banded_sink_attention(*narrow, scale=64**-0.5) is None
+    fp32 = _decode_attention_case(1, 6, 2, 40, 300, 32, mx.float32, 128)
+    assert nax_attention.nax_banded_sink_attention(*fp32, scale=scale) is None
+    q, k, v, rel, sink = case
+    banded = nax_attention.nax_banded_sink_attention
+    assert banded(q, k, v, rel[:, :-1], sink, scale=scale) is None
+    assert banded(q, k, v, rel, sink[:, :, :-1], scale=scale) is None
+    two = mx.array([0, 3], dtype=mx.int32)
+    assert banded(q, k, v, rel, sink, scale=scale, left_padding=two) is None
+
+
+def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
+    """Full-attention prefill blocks build no mask on NAX hosts, lone or in a
+    left-padded batch; sliding layers, FP32 and short blocks keep their routes."""
+    from omlx.patches.inkling2 import kernels
+
+    nax_attention = _nax_banded_or_skip()
+    scale = 128**-0.5
+    args = _decode_attention_case(1, 6, 2, 70, 300, 32, mx.bfloat16, 128)
+    pair = _decode_attention_case(2, 6, 2, 70, 300, 32, mx.bfloat16, 128)
+    lp = mx.array([0, 13], dtype=mx.int32)
+    expected = kernels._masked_attention(*args, scale, 0, None)
+    expected_pair = kernels._masked_attention(*pair, scale, 0, lp)
+    mx.eval(expected, expected_pair)
+
+    calls = []
+    banded = nax_attention.nax_banded_sink_attention
+
+    def counting(*a, **kw):
+        calls.append(a[0].shape)
+        return banded(*a, **kw)
+
+    monkeypatch.setattr(nax_attention, "nax_banded_sink_attention", counting)
+    masked = kernels._masked_attention
+
+    def no_masked(*a, **kw):
+        raise AssertionError("a full-attention prefill block took the masked path")
+
+    monkeypatch.setattr(kernels, "_masked_attention", no_masked)
+    got = kernels.banded_sink_attention(*args, scale=scale)
+    got_pair = kernels.banded_sink_attention(*pair, scale=scale, left_padding=lp)
+    assert calls == [args[0].shape, pair[0].shape]
+    for out, ref in ((got, expected), (got_pair, expected_pair)):
+        diff = mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max()
+        assert diff.item() < 1e-2
+
+    monkeypatch.setattr(kernels, "_masked_attention", masked)
+    # Sliding layer, FP32 and a short block: not this kernel.
+    mx.eval(kernels.banded_sink_attention(*args, scale=scale, window=32))
+    wide = _decode_attention_case(1, 6, 2, 70, 300, 32, mx.float32, 128)
+    mx.eval(kernels.banded_sink_attention(*wide, scale=scale))
+    short = _decode_attention_case(1, 6, 2, 8, 300, 32, mx.bfloat16, 128)
+    mx.eval(kernels.banded_sink_attention(*short, scale=scale))
+    assert len(calls) == 2
+
+
+def test_inkling2_full_attention_prefill_falls_back_when_check_fails(monkeypatch):
+    # A failed self-check keeps the masked path, whose mask the memory
+    # estimate still covers on NAX hosts.
+    from omlx.patches.inkling2 import kernels
+
+    nax_attention = _nax_banded_or_skip()
+    monkeypatch.setattr(nax_attention, "banded_check_passed", lambda dtype: False)
+    assert not kernels._use_flash(70, 0)
+    assert kernels.prefill_mask_elements() == kernels._MASK_BUDGET
+    args = _decode_attention_case(1, 6, 2, 70, 300, 32, mx.bfloat16, 128)
+    scale = 128**-0.5
+    expected = kernels._masked_attention(*args, scale, 0, None)
+    got = kernels.banded_sink_attention(*args, scale=scale)
+    assert mx.array_equal(got, expected).item()
+
+
 def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
-    # NAX hosts run full-attention prefill through the masked path; at 64K
-    # keys the masks of all query blocks once took 12 GiB together.
+    # The masked path (FP32, and BF16/FP16 where the NAX banded kernel is not
+    # used): at 64K keys the masks of all query blocks once took 12 GiB
+    # together.
     from omlx.patches.inkling2 import kernels
 
     if mx.default_device() != mx.gpu:
