@@ -1435,9 +1435,9 @@ class TestServeCommandFunctions:
 
     def test_serve_sets_timeout_graceful_shutdown(self, tmp_path, monkeypatch):
         """serve should pass the configured graceful-shutdown timeout to uvicorn."""
-        import omlx
         import uvicorn
 
+        import omlx
         from omlx.cli import serve_command
 
         settings = self._make_settings(tmp_path)
