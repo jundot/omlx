@@ -408,11 +408,12 @@ class Inkling2Experts(nn.Module):
             xe, idx, inv = _gather_sort(xe, inds)
         # A row-exact verify block runs its pairs in expert order, so rows
         # that share an expert read its weights once (same bits per pair).
+        # A one-row decode step takes the same kernel, also with its bits.
         order = None
         if (
             not do_sort
-            and 1 < inds.shape[0] <= verify_experts.MAX_ROWS
-            and is_row_exact_armed()
+            and inds.shape[0] <= verify_experts.MAX_ROWS
+            and (inds.shape[0] == 1 or is_row_exact_armed())
             and verify_experts.supported(self.w13, x.dtype)
             and verify_experts.supported(self.w2, x.dtype)
         ):

@@ -15,6 +15,11 @@ for one-row NVFP4 pairs whose K is not a multiple of 512), so each output
 equals the ``gather_qmm`` output bit for bit. The match depends on the
 kernel repeating that arithmetic, so rerun
 tests/test_inkling2_verify_experts.py after an MLX pin change.
+
+A one-row decode step takes it too: with no shared experts it still beats
+``gather_qmm``'s launch for the same pairs, and the bits do not change. With
+float16 activations the NVFP4 tensor scale is applied in the epilogue, as
+``gather_qmm`` does when it is passed ``global_scale``.
 """
 
 from __future__ import annotations
@@ -36,6 +41,8 @@ constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
 constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
 constant constexpr int RESULTS_PER_SIMDGROUP = 4;
 constant constexpr int BN = 8;
+// 1 when the NVFP4 tensor scale is applied in the kernel (float16).
+constant constexpr int GLOBAL = __GLOBAL__;
 
 // fp4_e2m1 -> float, as fp4.h converts it (through half).
 inline float fp4_value(uint8_t bits) {
@@ -70,8 +77,9 @@ inline float qdot_n(
 """
 
 # Each threadgroup takes the pair at sorted position ``y`` and output tile
-# ``z``. Per pair this is the full-tile branch of fp_qmv_impl without a
-# global scale (N is a multiple of 8, so no tile is moved back).
+# ``z``. Per pair this is the full-tile branch of fp_qmv_impl (N is a
+# multiple of 8, so no tile is moved back), with its ``has_global_scale``
+# epilogue when GLOBAL is set.
 _SOURCE = r"""
     const uint simd_gid = simdgroup_index_in_threadgroup;
     const uint simd_lid = thread_index_in_simdgroup;
@@ -128,22 +136,30 @@ _SOURCE = r"""
       }
     }
 
+    float inv_scale_enc = 1.0f;
+    if (GLOBAL) {
+      inv_scale_enc = gscale[expert] / (448.0f * 6.0f);
+    }
     for (int row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
       float v = simd_sum(result[row]);
       if (simd_lid == 0) {
-        y[pair * N_SIZE + out_row + row] = static_cast<T>(v);
+        if (GLOBAL) {
+          y[pair * N_SIZE + out_row + row] = static_cast<T>(v * inv_scale_enc);
+        } else {
+          y[pair * N_SIZE + out_row + row] = static_cast<T>(v);
+        }
       }
     }
 """
 
 
 @cache
-def _kernel():
+def _kernel(global_scale: bool):
     return mx.fast.metal_kernel(
-        name="omlx_inkling2_verify_experts_nvfp4",
-        input_names=["x", "w", "scales", "rhs", "order"],
+        name=f"omlx_inkling2_verify_experts_nvfp4_g{int(global_scale)}",
+        input_names=["x", "w", "scales", "gscale", "rhs", "order"],
         output_names=["y"],
-        header=_HEADER,
+        header=_HEADER.replace("__GLOBAL__", str(int(global_scale))),
         source=_SOURCE,
     )
 
@@ -151,14 +167,15 @@ def _kernel():
 def supported(proj, dtype) -> bool:
     """True when ``proj`` is an NVFP4 expert stack this kernel matches.
 
-    BF16 activations only (FP16 takes the tensor scale inside ``gather_qmm``),
-    whole 8-column output tiles, and a K that MLX sends to ``fp_qmv`` and not
-    to ``fp_qmv_fast`` (multiples of 512).
+    BF16 or FP16 activations (FP16 applies the tensor scale in the kernel, as
+    ``gather_qmm`` does with ``global_scale``), whole 8-column output tiles,
+    and a K that MLX sends to ``fp_qmv`` and not to ``fp_qmv_fast``
+    (multiples of 512).
     """
     if mx.default_device() != mx.gpu or proj.mode != "nvfp4":
         return False
     n, k = proj.weight.shape[-2], proj.weight.shape[-1] * 8
-    return dtype == mx.bfloat16 and n % 8 == 0 and k % 512 != 0
+    return dtype in (mx.bfloat16, mx.float16) and n % 8 == 0 and k % 512 != 0
 
 
 def gather(proj, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array):
@@ -171,8 +188,11 @@ def gather(proj, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array
     k = int(x.shape[-1])
     n = int(proj.weight.shape[-2])
     pairs = int(rhs.shape[0])
-    return _kernel()(
-        inputs=[x, proj.weight, proj.scales, rhs, order],
+    in_kernel = proj.scales_in_kernel(x.dtype)
+    # Unused without the in-kernel tensor scale.
+    gscale = proj.global_scale if in_kernel else proj.scales
+    return _kernel(in_kernel)(
+        inputs=[x, proj.weight, proj.scales, gscale, rhs, order],
         template=[
             ("T", x.dtype),
             ("K_SIZE", k),
