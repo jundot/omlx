@@ -5440,6 +5440,7 @@ async def create_chat_completion(
                 start_in_thinking=_chat_prompt_opens_thinking(
                     engine, messages, chat_kwargs
                 ),
+                report_unclosed=True,
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -8252,6 +8253,7 @@ async def create_anthropic_message(
                 start_in_thinking=_chat_prompt_opens_thinking(
                     engine, messages, chat_kwargs
                 ),
+                report_unclosed=True,
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -9080,6 +9082,7 @@ async def create_response(
                 start_in_thinking=_chat_prompt_opens_thinking(
                     engine, messages, chat_kwargs
                 ),
+                report_unclosed=True,
             )
 
             # Parse tool calls

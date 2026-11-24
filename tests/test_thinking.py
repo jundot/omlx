@@ -526,14 +526,22 @@ def test_extract_prompt_opened_thinking(text, truncated, expected):
     )
 
 
+@pytest.mark.parametrize("leading_only", [False, True])
 @pytest.mark.parametrize(
     "text, truncated",
-    [("unfinished", True), ("done</think>answer", False)],
+    [("unfinished", True), ("done</think>answer", False), ("never closed", False)],
 )
-def test_prompt_opened_complete_text_matches_stream(text, truncated):
-    parser = ThinkingParser(start_in_thinking=True)
+def test_prompt_opened_complete_text_matches_stream(text, truncated, leading_only):
+    parser = ThinkingParser(start_in_thinking=True, leading_only=leading_only)
     parts = [parser.feed(text), parser.finish(truncated=truncated)]
     streamed = ("".join(p[0] for p in parts), "".join(p[1] for p in parts))
     assert (
-        extract_thinking(text, truncated=truncated, start_in_thinking=True) == streamed
+        extract_thinking(
+            text,
+            truncated=truncated,
+            start_in_thinking=True,
+            leading_only=leading_only,
+            report_unclosed=True,
+        )
+        == streamed
     )

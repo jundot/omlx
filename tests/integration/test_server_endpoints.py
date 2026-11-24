@@ -3463,6 +3463,10 @@ class _PromptOpensThinkingTokenizer(MockTokenizer):
             "stop",
             ("answermore", "first\nsecond"),
         ),
+        # A block still open at a normal stop is reasoning, and also the
+        # answer, as the stream reports it (#4233).
+        (True, "never closed", "stop", ("never closed", "never closed")),
+        (False, "<think>never closed", "stop", ("never closed", "never closed")),
         # An opener the engine already emitted is not doubled.
         (True, "<think>echoed</think>answer", "stop", ("answer", "echoed")),
         # A template that leaves no block open keeps tag-free text as content.

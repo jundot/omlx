@@ -159,6 +159,7 @@ def extract_thinking(
     truncated: bool = False,
     start_in_thinking: bool = False,
     leading_only: bool = False,
+    report_unclosed: bool = False,
 ) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
@@ -176,6 +177,12 @@ def extract_thinking(
 
     With ``truncated=True``, unfinished thinking stays in the thinking channel,
     including a block the prompt opened (``start_in_thinking``).
+
+    With ``report_unclosed=True`` a block that is still open when the output
+    ends is also returned as thinking, while content keeps the recovery
+    above. This is what a stream reports for the same output: the parser
+    sends the block as thinking, then ``ThinkingParser.finish()`` sends it
+    once more as content.
 
     With ``start_in_thinking=True`` the prompt already opened the thinking
     block, so text before the first tag is thinking, exactly as
@@ -199,6 +206,7 @@ def extract_thinking(
         truncated: Keep unfinished thinking in its channel on length termination.
         start_in_thinking: The prompt opened a think block before ``text``.
         leading_only: Only a block at the start of ``text`` is thinking.
+        report_unclosed: Also return an unclosed block as thinking.
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -217,7 +225,9 @@ def extract_thinking(
         text = _OPEN_TAG + text
 
     if leading_only:
-        return _extract_leading_thinking(text, truncated, start_in_thinking)
+        return _extract_leading_thinking(
+            text, truncated, start_in_thinking, report_unclosed
+        )
 
     thinking_parts = []
     remaining = text
@@ -253,13 +263,13 @@ def extract_thinking(
         idx = text.index('<think>')
         before = text[:idx]
         after = text[idx + _OPEN_LEN:]
-        return ("", (before + after).strip())
+        return (after.strip() if report_unclosed else "", (before + after).strip())
 
     return ("", text)
 
 
 def _extract_leading_thinking(
-    text: str, truncated: bool, start_in_thinking: bool
+    text: str, truncated: bool, start_in_thinking: bool, report_unclosed: bool
 ) -> Tuple[str, str]:
     body = text.lstrip()
     if body.startswith(_OPEN_TAG):
@@ -274,7 +284,9 @@ def _extract_leading_thinking(
     if end < 0:
         # Unclosed: thinking when cut off by the length limit, otherwise the
         # same recovery as extract_thinking (the body is the answer).
-        return (body.strip(), "") if truncated else ("", body.strip())
+        if truncated:
+            return (body.strip(), "")
+        return (body.strip() if report_unclosed else "", body.strip())
     return (body[:end].strip(), body[end + _CLOSE_LEN :].strip())
 
 
