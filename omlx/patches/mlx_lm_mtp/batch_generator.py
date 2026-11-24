@@ -200,6 +200,8 @@ def apply() -> bool:
                     )
                 _drop_mtp_batch_state(self, "batch-ineligible")
 
+            sent_uid = self.__dict__.pop("_omlx_first_token_sent", None)
+            first_sent = tuple(self.uids) == (sent_uid,)
             if _is_mtp_eligible(self):
                 handed_off = False
                 if _singleton_mtp_handoff_ready(self):
@@ -207,10 +209,18 @@ def apply() -> bool:
                     # singleton back to the standard step at the drained-queue
                     # boundary so the late join merges this very call (#2515).
                     handed_off = _handoff_mtp_for_late_join(self, self._omlx_mtp_state)
+                if not handed_off and not first_sent:
+                    first = _emit_first_token(self)
+                    if first is not None:
+                        return first
                 if not handed_off:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
+                            if first_sent:
+                                state.queue.popleft()
+                                _bump_emit_stat(state, "init")
+                                first_sent = False
                             with _spec_command_buffers(model):
                                 return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
@@ -229,6 +239,11 @@ def apply() -> bool:
                         _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
+            if first_sent:
+                # The standard step would emit the sent token again.
+                emitted = len(self.tokens[0])
+                self._step()
+                del self.tokens[0][emitted:]
             _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
             tax_probe = getattr(self, "_omlx_mtp_tax_probe", None)
@@ -1544,6 +1559,28 @@ def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
     except Exception as exc:
         logger.warning("MTP batch reconcile failed: %s", exc)
         return False
+
+
+def _emit_first_token(gen_batch: Any) -> Optional[List[Any]]:
+    """Stream the token sampled from the prompt; the next call starts drafting."""
+    if (
+        getattr(gen_batch, "_omlx_mtp_state", None) is not None
+        or gen_batch._num_tokens[0] != 0
+        # Only MTP init publishes the prefix snapshot.
+        or gen_batch.max_tokens[0] <= 1
+        or _cluster_mtp(gen_batch.model) is not None
+    ):
+        return None
+    # A boundary snapshot needs this token in the cache.
+    align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+    if align > 0 and (len(gen_batch.tokens[0]) + 1) % align == 0:
+        return None
+    result = _emit_response(
+        gen_batch, int(gen_batch._next_tokens.item()), gen_batch._next_logprobs[0]
+    )
+    if result[0].finish_reason is None:
+        gen_batch._omlx_first_token_sent = gen_batch.uids[0]
+    return result
 
 
 def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
@@ -3199,9 +3236,16 @@ def _dspark_next_drafts(
     draft_procs = _live_processors(procs, depth)
     snap = _snap_snapshotable(draft_procs)
 
+    # Hosts whose next slot depends on the previous draft beyond an additive
+    # bias (DFly2 re-projects a corrected hidden) supply dspark_step_logits;
+    # dspark_forward's first result is then their opaque block state.
+    step_logits = getattr(host, "dspark_step_logits", None)
     for idx in range(depth):
-        bias, _ = host.dspark_markov(previous)
-        logits_2d = logits[:, idx, :] + bias
+        if step_logits is not None:
+            logits_2d = step_logits(logits, idx, previous)
+        else:
+            bias, _ = host.dspark_markov(previous)
+            logits_2d = logits[:, idx, :] + bias
         if draft_procs is not None and prev_buf is not None:
             prefix = mx.concatenate(
                 [prev_buf.astype(mx.int32), anchor.reshape(1).astype(mx.int32)]
@@ -4497,15 +4541,20 @@ def _context_copy_drafts(
     so the Leviathan/Chen rule keeps the sampled distribution exact. Either
     way any draft source leaves the output distribution unchanged. Returns
     ``[]`` when the MTP head should draft instead. With ``block``, only a copy
-    of exactly that many tokens replaces the drafter's block.
+    of exactly that many tokens replaces the drafter's block, except a
+    verbatim copy on a target with 16-row windows, which may run past it.
     """
     if state.context_copy is None:
-        # A wide copy verifies MAX_COPY + 1 rows, so it must fit the target's
-        # verify cap (GLM-5.3's indexer pool rolls back at most 8 rows).
+        # A wide copy verifies MAX_COPY + 1 rows. A declared verify cap decides
+        # (GLM-5.3's indexer pool rolls back at most 8 rows, Inkling 2 verifies
+        # 16); without one only row-exact targets cover 16-row windows.
         cap = _max_verify_rows(gen_batch.model)
         state.context_copy = _context_copy.ContextCopy(
-            wide_window=_row_exact_verify(gen_batch.model)
-            and (cap is None or cap > _context_copy.MAX_COPY)
+            wide_window=(
+                cap > _context_copy.MAX_COPY
+                if cap is not None
+                else _row_exact_verify(gen_batch.model)
+            )
         )
     copier = state.context_copy
     state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
@@ -4519,7 +4568,12 @@ def _context_copy_drafts(
         block = state.depth
     if block is None:
         return copier.propose(room)
-    copied = copier.propose(min(room, block))
+    if copier.wide_window:
+        copied = copier.propose(min(room, block), wide_limit=room)
+        if len(copied) > block:
+            return copied
+    else:
+        copied = copier.propose(min(room, block))
     return copied if len(copied) == block else []
 
 
@@ -4591,8 +4645,13 @@ def _run_verify_cycle_chain(
     procs = _proc_list(gen_batch)
     is_greedy = _is_greedy(gen_batch)
     drafter = _drafter_for(gen_batch.model)
-    if drafter is not None and verify_result is None:
-        # A shared verify was already built from the drafts it was given.
+    if (
+        drafter is not None
+        and verify_result is None
+        and not (state.copy_drafts and int(state.drafts.shape[0]) > drafter.depth)
+    ):
+        # A shared verify was already built from the drafts it was given. A
+        # copy longer than the block is not the drafter's block to clip.
         _clip_block_drafts(
             state,
             state.controller.cur if state.controller is not None else state.depth,

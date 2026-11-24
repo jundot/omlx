@@ -3766,6 +3766,31 @@ def test_block_drafter_matches_standard_and_feeds_committed_context(
     assert sorted(drafter.released) == sorted(terminal)
 
 
+@pytest.mark.parametrize(
+    ("limit", "align", "fail", "sent"),
+    [(8, 0, False, 1), (8, 0, True, 1), (8, 3, False, 0), (1, 0, False, 0)],
+)
+def test_first_token_streams_before_mtp_init(monkeypatch, limit, align, fail, sent):
+    standard = CountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, [[1, 2]], [limit])
+    model = CountingModel()
+    model._omlx_mtp_commit_align = align
+    init, seen = bg._post_init_mtp, []
+
+    def spy(gen_batch, **kwargs):
+        seen.append(gen_batch._num_tokens[0])
+        if fail:
+            raise bg._MtpStepFallback("no draft")
+        return init(gen_batch, **kwargs)
+
+    monkeypatch.setattr(bg, "_post_init_mtp", spy)
+    actual, _ = generate(model, [[1, 2]], [limit])
+
+    assert seen[0] == sent
+    assert actual == expected
+
+
 @pytest.mark.parametrize("wrong", [None, 0, 3])
 def test_block_drafter_copies_keep_output_and_context(monkeypatch, wrong):
     from omlx.patches.mlx_lm_mtp import context_copy
@@ -5378,6 +5403,60 @@ def test_context_copy_width_follows_the_targets_verify_window(family, width):
     gen_batch.tokens = [history + source[100:107]]
     copied = bg._context_copy_drafts(gen_batch, state, [])
     assert copied == source[107 : 107 + width]
+
+
+@pytest.mark.parametrize("cap, width", [(16, 15), (None, 7)])
+def test_block_drafter_copy_runs_past_the_block_only_verbatim(cap, width):
+    """A block drafter's copy must fill its block, except a verbatim run on a
+    target that declares 16-row windows (Inkling 2), which copies 15 tokens."""
+    source = list(range(1000, 1200))
+    history = source + source[:100]
+    gen_batch = SimpleNamespace(
+        model=SimpleNamespace(_omlx_mtp_max_verify_rows=cap),
+        tokens=[history],
+        max_tokens=[1000],
+        _num_tokens=[0],
+    )
+    state = SimpleNamespace(context_copy=None)
+    assert bg._context_copy_drafts(gen_batch, state, [], block=7) == source[100:107]
+    state.context_copy.observe(7, 7)
+    gen_batch.tokens = [history + source[100:107]]
+    copied = bg._context_copy_drafts(gen_batch, state, [], block=7)
+    assert copied == source[107 : 107 + width]
+    # Four tokens of room left: a copy that cannot fill the block is dropped.
+    gen_batch.max_tokens = [5]
+    assert bg._context_copy_drafts(gen_batch, state, [], block=7) == []
+
+
+def test_block_drafter_verifies_a_copy_past_its_block(monkeypatch):
+    """On a target with 16-row windows a 15-token copy is verified whole past a
+    block drafter's block of 5, and wrong copied tokens never change greedy
+    output."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    prompts, limits = [[1, 2]], [48]
+    standard = CapturingCountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, prompts, limits)
+    model = _drafted_counting_model(5)
+    model._omlx_mtp_max_verify_rows = 16
+    model._omlx_drafter.context_copy = True
+    flips = [15, 0, 6, 14]  # 15 flips nothing
+    proposed = []
+
+    def propose(self, limit, wide_limit=None):
+        done = len(self._ids) - len(prompts[0])
+        copied = list(expected[0][done : done + min(wide_limit or limit, 15)])
+        wrong = flips[len(proposed) % len(flips)]
+        proposed.append(wrong)
+        if wrong < len(copied):
+            copied[wrong] = (copied[wrong] + 7) % 64
+        return copied if len(copied) >= 2 else []
+
+    monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
+    output, _ = generate(model, prompts, limits)
+    assert output == expected
+    assert (1, 16) in _verify_widths(model)
 
 
 @pytest.mark.parametrize("size", [2, 4])

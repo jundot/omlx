@@ -32,11 +32,11 @@ omlx/custom_kernels/
 
 | Package | What goes here | Used by |
 |---|---|---|
-| `attention` | attention over KV (sparse, block-mask, FA-256, decode SDPA) | GLM, DeepSeek V4/V4.1, Qwen3.5/3.6, Qwen4 |
-| `sparse_index` | choosing which KV blocks to attend to (indexer scores, top-k) | GLM, DeepSeek V4, Qwen4, MiniMax M3 |
-| `quant_matmul` | matmuls on quantized weights, MoE combine, ANE offload | Qwen3.5/3.6, GLM, DeepSeek V4/V4.1, MiMo, K2, MiniMax M3 |
+| `attention` | attention over KV (sparse, block-mask, FA-256, decode SDPA) | GLM, DeepSeek V4/V4.1, Qwen3.5/3.6, Qwen4, Hy4 |
+| `sparse_index` | choosing which KV blocks to attend to (indexer scores, top-k) | GLM, DeepSeek V4, Qwen4, MiniMax M3, Hy4 |
+| `quant_matmul` | matmuls on quantized weights, MoE combine, ANE offload | Qwen3.5/3.6, GLM, DeepSeek V4/V4.1, MiMo, K2, MiniMax M3, Hy4 |
 | `lowbit` | T5 (base-3 ternary) weights; 1-bit and 2-bit affine run on stock MLX | Bonsai T5 checkpoints |
-| `oqh` | oQh weights: row-scale GEMV and gather GEMV, and the norm / activation kernels that also write the Hadamard-rotated input | oQh checkpoints (Qwen3.5/3.6/3.8, Flash-Next, GLM-5.3, DeepSeek V4.1) |
+| `oqh` | oQh weights: row-scale GEMV and gather GEMV, and the norm / activation kernels that also write the Hadamard-rotated input | oQh checkpoints (Qwen3.5/3.6/3.8, Flash-Next, GLM-5.3, DeepSeek V4.1, Hy4) |
 
 Each package has:
 

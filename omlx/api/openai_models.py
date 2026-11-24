@@ -62,6 +62,7 @@ class ContentPart(BaseModel):
     Supports:
     - text: Plain text content
     - image_url: Image input for vision models
+    - image: Hugging Face style image input (``{"type": "image", "image": url}``)
     - input_audio: Audio input for multimodal audio models
     - video_url: Video input for supported multimodal models
     - file: Document or text input for attachment preprocessing
@@ -70,6 +71,7 @@ class ContentPart(BaseModel):
     type: str  # "text", "image_url", "video_url", "input_audio", or "file"
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
+    image: Optional[str] = None
     video_url: Optional[ImageURL] = None
     input_video: Optional[Union[ImageURL, str]] = None
     input_audio: Optional[InputAudio] = None

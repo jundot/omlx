@@ -20,6 +20,7 @@ _NATIVE_REASONING_MODEL_TYPES = {
     "inkling",
     "inkling_mm_model",
     "inkling2",
+    "inkling2_loop",
     # Muse Glimmer's chat template renders history reasoning_content into
     # <|start|>assistant to=self<|message|> blocks.
     "muse_glimmer",
@@ -28,6 +29,9 @@ _NATIVE_REASONING_MODEL_TYPES = {
     "k2_horizon",
     # GLM-5.3's chat template renders history reasoning_content into <think> blocks.
     "glm5_next",
+    # Hy4 templates apply their own native markers and history-retention policy.
+    "hy_v4_vl",
+    "hy_v4_flash",
 }
 
 
@@ -282,9 +286,18 @@ def _extract_multimodal_content_list(content: list) -> list:
                         }
                     )
             elif item_type == "image":
-                # Anthropic format: convert to OpenAI image_url format
+                image_value = item.get("image")
                 source = item.get("source", {})
-                if source.get("type") == "base64":
+                if isinstance(image_value, str) and image_value:
+                    # Hugging Face / mlx-vlm format: {"type": "image", "image": url}
+                    parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_value},
+                        }
+                    )
+                elif source.get("type") == "base64":
+                    # Anthropic format: convert to OpenAI image_url format
                     media_type = source.get("media_type", "image/jpeg")
                     data = source.get("data", "")
                     parts.append(

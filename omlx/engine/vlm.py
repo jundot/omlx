@@ -56,11 +56,13 @@ from ..model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
     ced_prefill_on,
+    specprefill_draft,
 )
 from ..models.vlm import VLMModelAdapter
 from ..oqh.format import is_oqh_checkpoint
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
+from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
@@ -69,6 +71,7 @@ from ..patches.muse_spark import model as muse_spark_model
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..specprefill.draft import attach_specprefill_draft
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
     compute_per_image_hashes,
@@ -279,6 +282,56 @@ def _apply_minimax_m3_thinking_mode(
         template_kwargs["thinking_mode"] = "disabled"
 
 
+_HY_V4_THINKING_OFF = {"none", "off", "no_think"}
+
+
+def _apply_hy_v4_reasoning_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Map oMLX thinking switches to Hy4's reasoning_effort (no_think / high).
+
+    The Hy4 template raises on any other effort value, and the generic
+    fallback would then render its default ``high``, so an explicit "off"
+    must become ``no_think`` here.
+    """
+    if model_type not in ("hy_v4_vl", "hy_v4_flash"):
+        return
+    enable_thinking = template_kwargs.pop("enable_thinking", None)
+    effort = template_kwargs.get("reasoning_effort")
+    off = isinstance(effort, str) and effort.strip().lower() in _HY_V4_THINKING_OFF
+    if off or (effort is None and enable_thinking is False):
+        template_kwargs["reasoning_effort"] = "no_think"
+
+
+def _apply_inkling2_reasoning_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Map oMLX thinking switches to Inkling 2's reasoning_effort.
+
+    The template reads only the effort. Without this ``enable_thinking=False``
+    thinks at the default effort, and ``"off"`` raises in the template and is
+    retried as ``"low"``.
+    """
+    if model_type not in INKLING2_MODEL_TYPES:
+        return
+    effort = template_kwargs.get("reasoning_effort")
+    off = isinstance(effort, str) and effort.strip().lower() in ("off", "no_think")
+    if off or (effort is None and template_kwargs.get("enable_thinking") is False):
+        template_kwargs["reasoning_effort"] = "none"
+
+
+def _apply_template_thinking_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Translate oMLX thinking switches into model-specific template kwargs."""
+    _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+    _apply_hy_v4_reasoning_mode(model_type, template_kwargs)
+    _apply_inkling2_reasoning_mode(model_type, template_kwargs)
+
+
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
     from mlx_vlm.tokenizer_utils import load_tokenizer
     from mlx_vlm.utils import StoppingCriteria
@@ -298,12 +351,16 @@ def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id
     return tokenizer
 
 
-def _load_cohere2_moe_text_model(
+def _load_text_model_with_tokenizer_fallback(
     model_name: str,
     *,
     trust_remote_code: bool = False,
 ):
-    """Load Cohere2 MoE through mlx-vlm with a tokenizer-only fallback."""
+    """Load a text-only mlx-vlm family with a tokenizer-only fallback.
+
+    Used when the checkpoint's processor class is missing from the installed
+    transformers (Cohere2 MoE).
+    """
     from mlx_vlm.utils import get_model_path, load_model, load_processor
     from transformers import AutoTokenizer
 
@@ -325,7 +382,7 @@ def _load_cohere2_moe_text_model(
         )
     except Exception as exc:
         logger.debug(
-            "mlx-vlm processor load failed for Cohere2 MoE %s; "
+            "mlx-vlm processor load failed for %s; "
             "falling back to AutoTokenizer: %s",
             model_name,
             exc,
@@ -1592,6 +1649,8 @@ def _count_image_tokens_real(
     minp = getattr(ip, "min_pixels", None)
     maxp = getattr(ip, "max_pixels", None)
     qwen_ok = all(isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp))
+    # Processors with extra placeholder tokens (Hy4's row newlines) count exactly.
+    token_counter = getattr(ip, "count_image_tokens", None)
     patch_counter = getattr(ip, "get_number_of_image_patches", None)
     glm_ok = (
         callable(patch_counter)
@@ -1617,8 +1676,13 @@ def _count_image_tokens_real(
 
     total = 0
     for wh in dimensions:
-        if wh is None or not (qwen_ok or glm_ok):
+        if wh is None or not (qwen_ok or glm_ok or callable(token_counter)):
             total += upper_bound
+        elif callable(token_counter):
+            try:
+                total += int(token_counter(wh[1], wh[0]))
+            except Exception:
+                total += upper_bound
         elif glm_ok:
             try:
                 total += int(patch_counter(wh[1], wh[0]) // (ms**2))
@@ -1779,6 +1843,8 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the DFlash block drafter attached to Lightning MTP when
         # dflash_enabled.
         self._dflash_drafter: Any | None = None
+        self.specprefill_draft_path: str | None = None
+        self.specprefill_failed_draft: str | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
@@ -2083,6 +2149,19 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
+                if model_type == "hy_v4_flash" and getattr(
+                    self._model_settings, "hy4_engram_ssd_offload", False
+                ):
+                    from ..patches.hy_v4.engram_ssd import load
+
+                    return load(
+                        self._model_name,
+                        trust_remote_code=self._trust_remote_code,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
+                    )
+
                 if model_type == "deepseek_v41":
                     from ..patches.deepseek_v41.loading import load
 
@@ -2110,7 +2189,7 @@ class VLMBatchedEngine(BaseEngine):
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
                     )
-                if model_type == "inkling2":
+                if model_type in INKLING2_MODEL_TYPES:
                     return inkling2_vlm.load(self._model_name)
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
@@ -2120,7 +2199,7 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
-                    return _load_cohere2_moe_text_model(
+                    return _load_text_model_with_tokenizer_fallback(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
@@ -2850,85 +2929,11 @@ class VLMBatchedEngine(BaseEngine):
             logger.debug("qwen3_5 padded-row attention patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
-        # SpecPrefill: load draft model and pass to scheduler
-        if self._model_settings is not None:
-            specprefill_draft = getattr(
-                self._model_settings, "specprefill_draft_model", None
+        draft_path = specprefill_draft(self._model_settings)
+        if draft_path:
+            await loop.run_in_executor(
+                get_mlx_executor(), attach_specprefill_draft, self, draft_path
             )
-            specprefill_enabled = getattr(
-                self._model_settings, "specprefill_enabled", False
-            )
-            if specprefill_enabled and specprefill_draft:
-                try:
-                    from ..utils.model_loading import (
-                        lm_load_compat as mlx_lm_load,
-                    )
-                    from ..utils.model_loading import (
-                        maybe_load_custom_quantization,
-                    )
-                    from ..utils.tokenizer import get_tokenizer_config
-
-                    def _load_draft():
-                        from ..patches.mlx_lm_mtp import set_mtp_active
-                        from ..utils.model_loading import materialize_lazy_state
-
-                        was_mtp = False
-                        try:
-                            from ..patches.mlx_lm_mtp import is_mtp_active
-
-                            was_mtp = is_mtp_active()
-                        except Exception:
-                            pass
-                        set_mtp_active(False)
-                        try:
-                            custom_loaded = maybe_load_custom_quantization(
-                                specprefill_draft,
-                                is_vlm=False,
-                            )
-                            if custom_loaded is not None:
-                                draft_model, _ = custom_loaded
-                            else:
-                                draft_tokenizer_config = get_tokenizer_config(
-                                    specprefill_draft,
-                                    trust_remote_code=self._trust_remote_code,
-                                )
-                                draft_model, _ = mlx_lm_load(
-                                    specprefill_draft,
-                                    tokenizer_config=draft_tokenizer_config,
-                                    trust_remote_code=self._trust_remote_code,
-                                )
-                            # Materialize frozen buffers (RoPE freqs, etc.)
-                            # on the loader thread. mlx_lm.load only does
-                            # mx.eval(model.parameters()) and leaves siblings
-                            # lazy bound to this thread's stream. Without
-                            # this, the first score_tokens() call from
-                            # Scheduler.step on the per-engine executor
-                            # thread raises "no Stream(gpu, X) in current
-                            # thread". Same root cause and fix as e93c408
-                            # for the VLM MTP drafter.
-                            materialize_lazy_state(draft_model)
-                            return draft_model
-                        finally:
-                            set_mtp_active(was_mtp)
-
-                    draft_model = await loop.run_in_executor(
-                        get_mlx_executor(), _load_draft
-                    )
-                    self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model,
-                        draft_model_name=specprefill_draft,
-                        keep_pct=getattr(
-                            self._model_settings, "specprefill_keep_pct", None
-                        ),
-                        threshold=getattr(
-                            self._model_settings, "specprefill_threshold", None
-                        ),
-                    )
-                    logger.info(
-                        f"SpecPrefill: draft model loaded ({specprefill_draft})"
-                    )
-                except Exception as e:
-                    logger.error(f"SpecPrefill: draft model load failed: {e}")
 
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)
@@ -3032,6 +3037,10 @@ class VLMBatchedEngine(BaseEngine):
         if engine:
             await engine.stop()
 
+        engram = getattr(self._vlm_model, "_omlx_engram_ssd", None)
+        if engram is not None:
+            engram.close()
+
         if self._vision_cache is not None:
             try:
                 self._vision_cache.close()
@@ -3059,6 +3068,8 @@ class VLMBatchedEngine(BaseEngine):
                 "_grammar_compiler",
                 "_vlm_mtp_drafter",
                 "_dflash_drafter",
+                "specprefill_draft_path",
+                "specprefill_failed_draft",
                 "_diffusion_family",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
@@ -4215,6 +4226,10 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         cumulative_hashes = image_hash_prefixes(images)
+        if model_type == QWEN4_EXP_MODEL_TYPE:
+            # 0.8.0 and 0.8.1 stored Qwen4 image KV without the h/w MRoPE axes.
+            # A new image key keeps those cached blocks from being restored.
+            cumulative_hashes = [f"{h}:mrope-hw" for h in cumulative_hashes]
 
         # Normalize audio to numpy float32 arrays expected by processor.
         # Request-facing string paths are rejected before this point; remaining
@@ -4312,7 +4327,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+        _apply_template_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
         if prompt_only:
@@ -4376,7 +4391,12 @@ class VLMBatchedEngine(BaseEngine):
             prompts = [prompt] if isinstance(prompt, str) else prompt
             # A text-only chat template renders images as prose, and the
             # processor then fails with a misleading image-count error.
-            image_token = getattr(self._processor, "image_token", None)
+            # Gemma 3 expands boi_token into image tokens in its processor.
+            image_token = getattr(
+                self._processor,
+                "boi_token" if model_type == "gemma3" else "image_token",
+                None,
+            )
             texts = [item for item in prompts if isinstance(item, str)]
             if (
                 num_images
@@ -4440,7 +4460,7 @@ class VLMBatchedEngine(BaseEngine):
                     prefix_template_kwargs["tools"] = tools
                 if chat_template_kwargs:
                     prefix_template_kwargs.update(chat_template_kwargs)
-                _apply_minimax_m3_thinking_mode(model_type, prefix_template_kwargs)
+                _apply_template_thinking_mode(model_type, prefix_template_kwargs)
 
                 images_consumed = 0
                 for msg_idx, msg_num_images in image_message_ranges:
@@ -4851,7 +4871,7 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs["enable_thinking"] = self._enable_thinking
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
-            _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
+            _apply_template_thinking_mode(self.model_type, template_kwargs)
 
             try:
                 return apply_chat_template_with_reasoning_effort_fallback(
@@ -4928,18 +4948,16 @@ class VLMBatchedEngine(BaseEngine):
         from the full prompt token count (system-only messages usually can't be
         templated on their own). Shared by ``chat`` and ``stream_chat`` so the
         non-streaming path protects the system prompt identically. No-op unless
-        the model has SpecPrefill enabled and the request has a system prompt.
+        SpecPrefill applies to the request and the request has a system prompt.
 
         ``prompt`` is the already-tokenized VLM prompt (a list of token IDs,
         per ``_process_chat_messages``), so the full-prompt count is just its
         length rather than a re-encode.
         """
-        specprefill_model_enabled = (
-            getattr(self._model_settings, "specprefill_enabled", False)
-            if self._model_settings
-            else False
-        )
-        if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
+        enabled = kwargs.get("specprefill")
+        if enabled is None:
+            enabled = getattr(self._model_settings, "specprefill_enabled", False)
+        if not enabled:
             return
         non_system = [
             m for m in messages if m.get("role") not in ("system", "developer")
@@ -5868,7 +5886,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+        _apply_template_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
         try:

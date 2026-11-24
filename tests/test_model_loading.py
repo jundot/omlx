@@ -619,6 +619,27 @@ class TestVlmMtpPreLoadDispatch:
         stub = sys.modules["omlx.patches.mlx_lm_mtp"]
         stub.set_mtp_depth.assert_called_once_with(expected)
 
+    @pytest.mark.parametrize(("depth", "expected"), [(None, 5), (3, 3)])
+    def test_deepseek_v41_default_depth_is_the_dspark_block(
+        self, tmp_path, monkeypatch, depth, expected
+    ):
+        self._stub_patches(monkeypatch)
+        monkeypatch.setitem(
+            sys.modules, "omlx.patches.deepseek_v41", MagicMock(apply_patch=MagicMock())
+        )
+        text = {"num_nextn_predict_layers": 3, "dspark_block_size": 5}
+        path = _write_config(
+            tmp_path,
+            json.dumps({"model_type": "deepseek_v41", "vision_config": {}, "text_config": text}),
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=depth)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(expected)
+
     @pytest.mark.parametrize("nax", [True, False])
     @pytest.mark.parametrize("for_vlm", [True, False])
     @pytest.mark.parametrize("depth", [None, 3, 4, 5, 6])

@@ -14,7 +14,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from omlx.patches import qwen35_verify_qmm, row_exact_qmv
+from omlx.patches import qwen35_verify_qmm, row_exact_gemv, row_exact_qmv
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -61,6 +61,12 @@ SHAPES = [
     (2560, 1024, 5, 32),
     (768, 1024, 8, 64),
     (1280, 1024, 6, 64),
+    # oQ2/oQ3 layers: 2-bit qmv_fast reads one pack per thread, 3-bit packs
+    # eight values in three bytes; K = 768 takes 3-bit's non-fast arm.
+    (3072, 8192, 2, 64),
+    (640, 2560, 2, 128),
+    (1536, 3072, 3, 64),
+    (768, 520, 3, 32),
 ]
 
 
@@ -71,6 +77,21 @@ def test_rows_equal_one_row_quantized_matmul(shape, rows):
     linear = _linear(k, n, bits, group_size, seed=k + n + rows)
     x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
     assert _bit_equal(row_exact_qmv.quantized_linear(linear, x), _serial(linear, x))
+
+
+# Inkling 2 dense projections: in_proj (N >= 4096), k_proj, o_proj (K = 3072)
+# and a partial last column tile (N % 4).
+@pytest.mark.parametrize("n,k", [(8600, 2304), (1056, 2304), (2304, 3072), (4098, 2304)])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_dense_rows_equal_one_row_matmul(n, k, dtype):
+    mx.random.seed(n)
+    weight = (mx.random.normal((n, k)) * 0.02).astype(dtype)
+    # A row slice, as the looped in_proj passes project it.
+    for w in (weight, weight[n // 4 : n // 2]):
+        for rows in range(2, row_exact_gemv.MAX_ROWS + 1):
+            x = mx.random.normal((1, rows, k)).astype(dtype)
+            serial = mx.concatenate([x[:, r : r + 1] @ w.T for r in range(rows)], axis=1)
+            assert _bit_equal(row_exact_gemv.linear(w, x), serial)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
@@ -172,6 +193,8 @@ def _quantized(k, n, bits, group_size, dtype, seed):
         (2560, 1024, 4, 64),
         (1024, 520, 8, 32),
         (768, 1024, 8, 64),  # 8-bit qmv_fast block is 256 wide
+        (2560, 1024, 2, 64),
+        (3072, 2048, 3, 64),
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
@@ -230,6 +253,8 @@ def test_one_row_qmv_partial_outputs_equal_quantized_matmul(dtype, rps):
         (2560, 16480, 6, 64),  # DeltaNet stacked qkv/z/b/a in-projection
         (6144, 2560, 5, 128),  # DeltaNet out-projection
         (2560, 1024, 8, 64),
+        (2560, 1024, 2, 64),
+        (3072, 2048, 3, 64),
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])

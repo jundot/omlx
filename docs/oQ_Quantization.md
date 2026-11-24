@@ -50,7 +50,7 @@ The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix`
 
 ## oQh
 
-oQh is a variant of oQe for the Qwen3.5, Qwen3.6 and Qwen3.8 dense and MoE models, Qwen3.8-Flash-Next, GLM-5.3 and DeepSeek V4.1. It gives the same file size as oQe at the same level with lower error. In Qwen3.8-Flash-Next, GLM-5.3 and DeepSeek V4.1 only the routed experts change; the other layers keep their current format and their fast kernels. DeepSeek V4.1 takes oQh below oQ4 only, because oQ4 keeps the original FP4 experts. Turn on **Rotated codes (oQh)** in the oQe section; the output name ends in `h`, for example `Qwen3.5-9B-oQ2.5h`.
+oQh is a variant of oQe for the Qwen3.5, Qwen3.6 and Qwen3.8 dense and MoE models, Qwen3.8-Flash-Next, GLM-5.3, DeepSeek V4.1, Hy4 and Hy4-flash. It gives the same file size as oQe at the same level with lower error. In Qwen3.8-Flash-Next, GLM-5.3, DeepSeek V4.1, Hy4 and Hy4-flash only the routed experts change; the other layers keep their current format and their fast kernels. DeepSeek V4.1 takes oQh below oQ4 only, because oQ4 keeps the original FP4 experts. Turn on **Rotated codes (oQh)** in the oQe section; the output name ends in `h`, for example `Qwen3.5-9B-oQ2.5h`.
 
 oQh is an oMLX format. It needs the oQh kernels, which `make install`, `make dev` and the app build include. mlx-lm, mlx-vlm and other MLX apps cannot load it, and Splash, A8 prefill, ANE prefill and MoE expert offload do not run it. The Prefill Accelerator runs oQh models on Mac helpers and on CUDA helpers that list the model's family as oQh capable (Qwen3.5 / 3.6 / 3.8 dense, Qwen3.8 Flash-Next, GLM-5.3 and DeepSeek V4.1). In a cluster, GLM-5.3 and DeepSeek V4.1 oQh models run tensor parallel on up to two nodes; other oQh models do not run tensor parallel.
 
@@ -58,7 +58,7 @@ How it differs from oQe:
 
 - Affine quantization stores a scale and an offset for every group of 64 weights, about 0.5 bits per weight. oQh rotates the input of each decoder linear layer with a signed Walsh-Hadamard transform and stores the weights in that rotated basis as integer codes with one scale per output row.
 - At the same bit width, one scale per row rounds less accurately than group scales. The bytes oQh saves buy one more bit, first for the tensors with the fewest bits, until the file is the size of the oQe plan.
-- From oQ4 up, the Qwen models and GLM-5.3 keep a scale and an offset for every 128 rotated weights instead of the row scale, and run on the regular affine kernels. At 4 bits that measured about 9% lower KL than the row scale at the same size; at 2 and 3 bits the row scale is better. DeepSeek V4.1 takes oQh below oQ4 only, so it always keeps the row scale.
+- From oQ4 up, the Qwen models, GLM-5.3 and Hy4 keep a scale and an offset for every 128 rotated weights instead of the row scale, and run on the regular affine kernels. At 4 bits that measured about 9% lower KL than the row scale at the same size; at 2 and 3 bits the row scale is better. DeepSeek V4.1 takes oQh below oQ4 only, so it always keeps the row scale.
 - The rounded values are then re-picked against each layer's output error, as in oQe.
 - The norm and activation kernels write the rotated input next to their normal output, so the rotation adds almost no work at run time.
 

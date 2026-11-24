@@ -23,7 +23,7 @@ from omlx_cuda_helper.control import ControlServer
 from omlx_cuda_helper.files import ModelStore
 from omlx_cuda_helper.pairing import Joiner, PairingError
 from omlx_cuda_helper.state import State
-from omlx_cuda_helper.supervisor import Supervisor
+from omlx_cuda_helper.supervisor import RESERVE_BYTES, Supervisor
 from omlx_cuda_helper.worker import Upstream
 
 CAPS = {"chip": "2x NVIDIA RTX A6000", "ram_gb": 96.0, "control": "agent"}
@@ -223,6 +223,7 @@ def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
     try:
         info = agent.remote_info(target)
         assert info["budgets"] == [48 << 30, 48 << 30]
+        assert info["reserve"] == RESERVE_BYTES
         assert info["contracts"] == {"fake": 7} and info["lending"] is None
         assert info["device"] == "2x NVIDIA RTX A6000"
         assert info["links"] == [cable]
@@ -290,6 +291,13 @@ def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
         assert [copy["name"] for copy in copies] == ["Model"]
         agent.delete_copies(target, ["Model", "Mine"])
         assert not copied.exists() and mine.is_dir()
+
+        # A lost GPU reaches the host with what nvidia-smi says.
+        smi = "Failed to initialize NVML: Unknown Error"
+        monkeypatch.setattr(gpus, "gpus", lambda only=None: [])
+        monkeypatch.setattr(gpus, "_run", lambda *command: smi + "\n")
+        info = agent.remote_info(target)
+        assert (info["budgets"], info["gpu_error"]) == ([], smi)
 
         stranger = agent.AgentTarget(
             state.node_id, "nvidia1", "127.0.0.1", "ethernet", control.port, bytes(32)

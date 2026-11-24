@@ -16,7 +16,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ... import checkpoint, oqh
+from ... import checkpoint, oqh, tensors
 from ...tensors import Linear
 from . import kernels
 
@@ -37,9 +37,16 @@ class Weights:
         return self.arrays[self.root + name]
 
     def linear(self, name: str) -> Linear:
-        """A dense linear layer in the dtype the checkpoint computes in."""
+        """A linear layer in the dtype the checkpoint computes in, packed when
+        the stage keeps its affine weights packed."""
         path = self.root + name
-        return Linear(self.arrays, path, checkpoint.quantization(self.config, path))
+        quant = checkpoint.quantization(self.config, path)
+        packed = (
+            tensors.packed_weights
+            and f"{path}.scales" in self.arrays
+            and checkpoint.packable(quant)
+        )
+        return Linear(self.arrays, path, quant, dense=not packed)
 
 
 def causal_conv(x: mx.array, taps: mx.array) -> mx.array:
@@ -79,7 +86,7 @@ class GatedDeltaNet:
         """Use the conv kernel if it equals ``causal_conv`` on these taps."""
         rows = 64 + self.taps.shape[1] - 1
         x = mx.random.normal((1, rows, self.taps.shape[0]))
-        x = x.astype(self.qkv.weight.dtype)
+        x = x.astype(self.qkv.dtype)
         got = kernels.causal_conv(x, self.taps)
         if mx.array_equal(got, causal_conv(x, self.taps)).item():
             self.conv = kernels.causal_conv
@@ -219,7 +226,7 @@ class Attention:
 
     def enable_kernels(self) -> None:
         """Use fused attention if it matches ``attend`` on plain ops."""
-        dtype = self.q_proj.weight.dtype
+        dtype = self.q_proj.dtype
         rows, total = 40, 104
         keys = mx.random.normal((1, self.kv_heads, total, self.head_dim)).astype(dtype)
         values = mx.random.normal(keys.shape).astype(dtype)

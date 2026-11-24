@@ -2125,21 +2125,9 @@ class BlockAwarePrefixCache(CacheManager):
             except Exception:
                 continue
 
-        if max_seq_len > 0:
-            # Normal result for all-non-sliceable-KVCache models
-            # (e.g. DeepSeek V4 with RotatingKVCache + PoolingCache).
-            # Returns the sliding-window length, not a sequence length —
-            # callers that depend on full prefill length (continuity
-            # check, reconstruction concat) bypass this layer's
-            # contribution via the snapshot / is_last_block paths.
-            logger.debug(
-                f"Cache seq_len resolved from non-sliceable layer "
-                f"(window={max_seq_len})"
-            )
-            return max_seq_len
-
         # Step 3: CacheList fallback — check sub-states for seq_len
-        # This handles all-CacheList models (e.g., deepseek_v32)
+        # This handles all-CacheList models (e.g., deepseek_v32) and Hy4 Flash,
+        # whose CacheList layers hold the whole sequence next to a window.
         for layer_state in cache_data:
             if (
                 layer_state.get("cache_type") == "CacheList"
@@ -2152,7 +2140,20 @@ class BlockAwarePrefixCache(CacheManager):
                         if hasattr(sub_keys, "shape") and len(sub_keys.shape) == 4:
                             seq_len = sub_keys.shape[2]
                             logger.debug(f"Using CacheList sub-cache seq_len={seq_len}")
-                            return seq_len
+                            return max(seq_len, max_seq_len)
+
+        if max_seq_len > 0:
+            # Normal result for all-non-sliceable-KVCache models
+            # (e.g. DeepSeek V4 with RotatingKVCache + PoolingCache).
+            # Returns the sliding-window length, not a sequence length —
+            # callers that depend on full prefill length (continuity
+            # check, reconstruction concat) bypass this layer's
+            # contribution via the snapshot / is_last_block paths.
+            logger.debug(
+                f"Cache seq_len resolved from non-sliceable layer "
+                f"(window={max_seq_len})"
+            )
+            return max_seq_len
 
         return 0
 
@@ -2266,6 +2267,7 @@ class BlockAwarePrefixCache(CacheManager):
                 layer_cache_types=types or None,
                 layer_meta_states=meta.get("layer_meta_states"),
                 hot_cache_write_back=hot_cache_write_back,
+                parent_hash=meta.get("parent_hash"),
             )
             if saved:
                 logger.debug(
@@ -2452,6 +2454,7 @@ class BlockAwarePrefixCache(CacheManager):
                 layer_cache_types=types or None,
                 layer_meta_states=new_meta,
                 hot_cache_write_back=hot_cache_write_back,
+                parent_hash=meta.get("parent_hash"),
             )
             if not saved:
                 return False

@@ -152,24 +152,6 @@ def register_tiled_prefill_head_dim(
         _SDPA_TILED_PREFILL_HEAD_DIMS[head_dim] = (*routes, route)
 
 
-# Bytes/elem of a model-built additive attention bias materialized as a
-# full [n_q_heads, query_tokens, kv_len] tensor per attention call (e.g.
-# inkling's banded relative-position mask). None when the loaded model
-# builds no such tensor. The fused-SDPA head_dim check cannot see this
-# allocation — it happens in model code before SDPA — so admission would
-# otherwise under-count exactly the long-context prefills that OOM.
-_ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE: float | None = None
-
-
-def register_attention_bias_transient(dtype_size: float | None) -> None:
-    """Register (or clear with ``None``) a per-call additive attention-bias
-    materialization so prefill admission prices it. Call in lockstep with
-    model load/swap: the setting is process-wide, like the tiled head_dim
-    registry above."""
-    global _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE
-    _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE = float(dtype_size) if dtype_size else None
-
-
 def estimate_unfused_sdpa_call_bytes(
     n_q_heads: int,
     query_tokens: int,
@@ -230,6 +212,11 @@ class MemoryMonitor:
         >>> monitor = MemoryMonitor(max_kv_cache_memory=2 * 1024**3)
         >>> block_mem = monitor.estimate_block_memory(64)  # 64 tokens
     """
+
+    # Additive attention bias the model builds before SDPA, where the fused-SDPA
+    # check cannot see it: bytes per element and, if built in blocks, the cap.
+    _attention_bias_dtype_size: float | None = None
+    _attention_bias_max_elements: int | None = None
 
     def __init__(
         self,
@@ -481,6 +468,12 @@ class MemoryMonitor:
     def set_ane_prefill_transient_bytes(self, value: int) -> None:
         """Refresh the reservation after VLM ANE compilation."""
         self._ane_prefill_transient_bytes = max(int(value), 0)
+
+    def set_attention_bias_transient(
+        self, dtype_size: float | None, max_elements: int | None = None
+    ) -> None:
+        self._attention_bias_dtype_size = float(dtype_size) if dtype_size else None
+        self._attention_bias_max_elements = max_elements
 
     def set_model_info(
         self,
@@ -806,10 +799,11 @@ class MemoryMonitor:
         # Model-built additive bias (e.g. inkling's banded mask) is
         # materialized regardless of which SDPA route runs.
         bias = 0
-        if _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE is not None:
-            bias = int(
-                n_q * query_tokens * kv_len * _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE
-            )
+        if self._attention_bias_dtype_size is not None:
+            elements = n_q * query_tokens * kv_len
+            if self._attention_bias_max_elements:
+                elements = min(elements, self._attention_bias_max_elements)
+            bias = int(elements * self._attention_bias_dtype_size)
 
         output = n_q * query_tokens * hd * 4
         if self._uses_fused_sdpa(query_tokens, kv_len):

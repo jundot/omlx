@@ -80,6 +80,7 @@ VLM_MODEL_TYPES = {
     "inkling_mm_model",  # config model_type of Inkling Small checkpoints
     # mlx-lm's Inkling 2 module served through the VLM engine adapter.
     "inkling2",
+    "inkling2_loop",
     "muse_glimmer",
     "muse_spark",
     "glm5_next",
@@ -87,8 +88,8 @@ VLM_MODEL_TYPES = {
     "qwen3_omni_moe",
 }
 
-# Text-only model families that are implemented in mlx-vlm rather than
-# mlx-lm. They still use the VLM engine because that path loads mlx-vlm
+# Model families that are implemented in mlx-vlm rather than mlx-lm, mostly
+# text-only ones. They use the VLM engine because that path loads mlx-vlm
 # models and adapts their language model to oMLX's scheduler.
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
@@ -98,6 +99,9 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     # mlx-lm ships its own deepseek_v41 without the oMLX cache and kernels.
     "deepseek_v41",
     "glm5_next",
+    # Hy4 and Hy4-flash: text-only conversions have no mlx-lm module either.
+    "hy_v4_vl",
+    "hy_v4_flash",
     "minimax_m3",
     # The VLM engine's loader also reads the earlier oMLX layout of text-only
     # Muse Spark conversions.

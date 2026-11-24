@@ -85,6 +85,7 @@ from ..model_settings import (
     resolve_lora_conflicts,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
+    specprefill_draft,
     validate_ane_prefill,
     validate_moe_expert_offload,
     MOE_OFFLOAD_MTP_MODEL_TYPES,
@@ -95,6 +96,7 @@ from ..model_settings import (
 from ..oqh.format import is_oqh_checkpoint
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
+from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
@@ -105,6 +107,7 @@ from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_ACTIVATIONS,
     SPLASH_KV_FORMATS,
+    SPLASH_MAX_CONCURRENT_REQUESTS,
     ConcurrentPriority,
     SubKeyEntry,
     burst_decode_env,
@@ -452,6 +455,7 @@ class ModelSettingsRequest(BaseModel):
     qwen4_ple_ssd_offload: bool | None = None
     qwen4_gdn_decode_wide_proj: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
+    hy4_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
     prefill_helper_node_id: str | None = None
     prefill_helper_layers: int | None = None
@@ -891,6 +895,7 @@ class GlobalSettingsRequest(BaseModel):
     markitdown_max_file_size_mb: int | None = None
     markitdown_max_files_per_request: int | None = None
     markitdown_pdf_processing_engine: str | None = None
+    macos_say_enabled: bool | None = None
     web_search_provider: str | None = None
     web_search_brave_api_key: str | None = None
     web_search_searxng_url: str | None = None
@@ -906,6 +911,7 @@ class GlobalSettingsRequest(BaseModel):
     splash_max_memory_gb: float | None = None
     splash_ssd_cache_gb: float | None = None
     splash_ane_prefill: bool | None = None
+    splash_max_concurrent_requests: int | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -1319,7 +1325,7 @@ def _mtp_compat_for_model(
         if bundled_dspark_path(model_path) is not None:
             return True, ""
         return False, "MiniMax checkpoint has no bundled dspark/ draft"
-    if model_type == "inkling2":
+    if model_type in INKLING2_MODEL_TYPES:
         from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
 
         if bundled_inkling2_dspark_path(model_path) is not None:
@@ -2611,6 +2617,15 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 )
 
         deepseek_v41_engram_ssd_offload_supported = False
+        hy4_engram_ssd_offload_supported = False
+        if model_info.get("config_model_type") == "hy_v4_flash":
+            from ..patches.hy_v4.engram_ssd import plan_engram_ssd
+
+            try:
+                plan_engram_ssd(model_info["model_path"])
+                hy4_engram_ssd_offload_supported = True
+            except (KeyError, OSError, TypeError, ValueError):
+                logger.debug("Could not inspect Hy4 Engram tables for %s", model_id)
         deepseek_v41_engram_ssd_offload_forced = False
         v41_resident_bytes = 0
         v41_mmap_bytes = 0
@@ -2715,6 +2730,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "deepseek_v41_engram_ssd_offload_forced": deepseek_v41_engram_ssd_offload_forced,
             "deepseek_v41_engram_resident_bytes": v41_resident_bytes,
             "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
+            "hy4_engram_ssd_offload_supported": hy4_engram_ssd_offload_supported,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
             "activation_fp16_supported": activation_fp16_supported,
@@ -3110,6 +3126,7 @@ async def update_model_settings(
     prev_load_signature = engine_pool._engine_runtime_signature(
         model_id, current_settings
     )
+    prev_specprefill_draft = specprefill_draft(current_settings)
     is_diffusion_model = _entry_is_diffusion_model(entry)
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
@@ -3250,6 +3267,11 @@ async def update_model_settings(
         ).lower() == "deepseek_v41"
         current_settings.deepseek_v41_engram_ssd_offload = bool(
             request.deepseek_v41_engram_ssd_offload and is_deepseek_v41
+        )
+    if "hy4_engram_ssd_offload" in sent:
+        current_settings.hy4_engram_ssd_offload = bool(
+            request.hy4_engram_ssd_offload
+            and entry.config_model_type == "hy_v4_flash"
         )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
@@ -3745,6 +3767,13 @@ async def update_model_settings(
         # catches Qwen ANE controls (and future signature additions) without
         # requiring a second hand-maintained field list here.
         or prev_load_signature != current_load_signature
+        # Only an unload releases a SpecPrefill draft that is no longer used.
+        or (
+            prev_specprefill_draft
+            and prev_specprefill_draft != specprefill_draft(current_settings)
+            and prev_specprefill_draft
+            == getattr(entry.engine, "specprefill_draft_path", None)
+        )
         or "index_cache_freq" in sent
         or "dflash_enabled" in sent
         or "dflash_draft_model" in sent
@@ -5082,6 +5111,7 @@ def _global_settings_response(global_settings):
             "markitdown_max_file_size_mb": global_settings.integrations.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": global_settings.integrations.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": global_settings.integrations.markitdown_pdf_processing_engine,
+            "macos_say_enabled": global_settings.integrations.macos_say_enabled,
             "web_search_provider": global_settings.integrations.web_search_provider,
             "web_search_brave_api_key": global_settings.integrations.web_search_brave_api_key,
             "web_search_searxng_url": global_settings.integrations.web_search_searxng_url,
@@ -5096,6 +5126,7 @@ def _global_settings_response(global_settings):
             "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
+            "splash_max_concurrent_requests": global_settings.integrations.splash_max_concurrent_requests,
         },
         "external_engines": {"splash": _splash_status(global_settings)},
         "system": {
@@ -6054,9 +6085,26 @@ async def update_global_settings(
             request.splash_ane_prefill
         )
         integrations_changed = True
+    if "splash_max_concurrent_requests" in request.model_fields_set:
+        concurrent = request.splash_max_concurrent_requests
+        if concurrent is not None and not (
+            1 <= concurrent <= SPLASH_MAX_CONCURRENT_REQUESTS
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="splash_max_concurrent_requests must be between 1 and "
+                f"{SPLASH_MAX_CONCURRENT_REQUESTS}",
+            )
+        global_settings.integrations.splash_max_concurrent_requests = concurrent
+        integrations_changed = True
     if "markitdown_enabled" in request.model_fields_set:
         global_settings.integrations.markitdown_enabled = bool(
             request.markitdown_enabled
+        )
+        integrations_changed = True
+    if "macos_say_enabled" in request.model_fields_set:
+        global_settings.integrations.macos_say_enabled = bool(
+            request.macos_say_enabled
         )
         integrations_changed = True
     if "markitdown_expose_model" in request.model_fields_set:

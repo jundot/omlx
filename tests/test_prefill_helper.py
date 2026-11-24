@@ -1093,6 +1093,19 @@ def test_manager_retries_a_helper_that_does_not_answer(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_manager_retries_a_helper_that_lost_its_gpu(tmp_path, monkeypatch):
+    monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
+    fake = _FakeLauncher(None)
+    info = {"version": launcher_version(), "budgets": [], "gpu_error": "NVML failed"}
+    monkeypatch.setattr(fake, "remote_info", lambda target, host=None: info)
+    manager = _manager(fake, [], tmp_path / "speeds.json")
+    manager.configure("node-1", 2)
+    _wait_state(manager, "offline", reason="lost its GPU, restart its helper: NVML")
+    info["budgets"] = [60 << 30]
+    assert _wait_state(manager, "ready")["held"] == 2
+    manager.close()
+
+
 def test_manager_retries_an_offline_helper_on_use(tmp_path, monkeypatch):
     monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (600.0,))
     monkeypatch.setattr(manager_module, "_RETRY_ON_USE_S", 0.0)
@@ -1676,6 +1689,31 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
     info["version"] = agent.MIN_HELPER_VERSION
     version = helper_routes._check("n")["rows"][2]
     assert (version["status"], version["fix"]) == ("pass", "")
+    info.update(budgets=[], gpu_error="NVML failed")
+    memory = helper_routes._check("n")["rows"][3]
+    assert (memory["status"], memory["bytes"]) == ("fail", 0)
+    assert "NVML failed" in memory["fix"]
+
+
+def test_a_helper_daemon_is_planned_with_the_room_it_keeps(monkeypatch):
+    gib = 1 << 30
+    adapter = SimpleNamespace(
+        memory_plan=lambda path: (2 * gib, [gib] * 40), split_limit=lambda n: n - 1
+    )
+    info = {"budgets": [24 * gib], "reserve": 6 * gib}
+    daemon = SimpleNamespace(
+        resolve_target=lambda node: SimpleNamespace(link="ethernet"),
+        remote_info=lambda target: info,
+        incompatible=lambda *args: None,
+    )
+    monkeypatch.setattr(helper_routes, "transport_for", lambda node: daemon)
+    device = {"node_id": "n", "friendly_name": "nvidia1"}
+    assert helper_routes._candidate(device, "/m", adapter)["layers_fit"] == 16
+    assert manager_module.held_layers(adapter, "/m", info, "nvidia1") == 16
+    # An older helper does not say, so this Mac keeps its own 8 GiB.
+    del info["reserve"]
+    assert helper_routes._candidate(device, "/m", adapter)["layers_fit"] == 14
+    assert manager_module.held_layers(adapter, "/m", info, "nvidia1") == 14
 
 
 # ---------------------------------------------------------------------------
@@ -2025,9 +2063,10 @@ def _inkling2_contract():
 def _inkling2_state(cache):
     out = []
     for item in cache:
-        kv = item[0]
-        rows = [a[..., : kv.offset, :] for a in (kv.keys, kv.values)]
-        out += [*rows, *[a for a in item[1].cache if a is not None]]
+        if hasattr(item, "offset"):
+            out += [a[..., : item.offset, :] for a in (item.keys, item.values)]
+        else:
+            out += [a for a in item.cache if a is not None]
     return [np.asarray(a) for a in out]
 
 

@@ -30,6 +30,8 @@ from .manager import (
     file_prep,
     fit_layers,
     helper_budget,
+    helper_reserve,
+    no_gpu,
     prepare,
     this_host,
     transport_for,
@@ -109,7 +111,9 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         return {**row, "online": False, "reason": str(error)}
     shared, per_layer = adapter.memory_plan(model_path)
     limit = adapter.split_limit(len(per_layer))
-    held = fit_layers(shared, per_layer, helper_budget(info), limit)
+    held = fit_layers(
+        shared, per_layer, helper_budget(info), limit, helper_reserve(info)
+    )
     lending = info.get("lending")
     if lending:
         lending = {
@@ -214,9 +218,15 @@ def _check(node_id: str) -> dict:
         version["expected"] = __version__
     rows.append(version)
     budgets = helper_budget(info)
-    memory = {"key": "memory", "status": "pass", "bytes": sum(budgets)}
+    memory = {
+        "key": "memory",
+        "status": "pass" if sum(budgets) > 0 else "fail",
+        "bytes": sum(budgets),
+    }
     if "budgets" in info:
         memory["gpus"] = len(budgets)
+        if not budgets:
+            memory["fix"] = no_gpu(info, target.name)
     rows.append(memory)
     rows.append({"key": "disk", "status": "pass", "bytes": info.get("disk_free")})
     if "on_battery" in info:

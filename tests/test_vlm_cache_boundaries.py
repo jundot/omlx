@@ -169,6 +169,19 @@ def test_grid_boundaries_at_block_edges(text_prefix, patch_grid):
     assert calls == 1
 
 
+def test_qwen4_exp_image_keys_skip_kv_without_hw_mrope():
+    """0.8.0/0.8.1 keyed Qwen4 image KV (no h/w MRoPE axes) by the plain image
+    hash: only the text before the image may be reused."""
+    full = [1] * 4 + [99] * 4 + [2] * 8
+    result, images, _ = prepare_case(
+        full, {1: [7] * 100}, counts=(1,), grid=[[1, 4, 4]], model_type="qwen4_exp"
+    )
+    tokens, _, _, whole_hash, _, ranges = result
+    old_hash = compute_image_hash(images)
+    old = [(start, old_hash) for start, _ in ranges]
+    assert reused_tokens(tokens, old, ranges, old_hash, whole_hash) == 4
+
+
 def test_generic_receding_boundary_salts_with_all_images():
     result, images, _ = prepare_case(
         [1] * 4 + [99] * 4 + [2] * 4 + [99] * 4,

@@ -14,6 +14,7 @@ import pytest
 try:
     import mlx.core as mx
     import mlx.nn as nn
+    import mlx_lm.utils as mlx_lm_utils
     from mlx.utils import tree_flatten
 
     from omlx.patches.inkling2.vision import VisionArgs, VisionTower
@@ -95,6 +96,7 @@ from omlx.oq import (
     universal_quant_predicate,
     validate_quantizable,
 )
+from omlx.utils import model_loading
 
 # =============================================================================
 # Test universal_quant_predicate
@@ -9512,6 +9514,9 @@ class TestStreamedCalibration:
 _INK2_LAYERS = 6
 _INK2_NVFP4_LAYERS = 4
 _INK2_DIMS = {"hidden": 64, "experts": 8, "inter": 64, "vocab": 128}
+# Layers 2 and 3 run three times. The core must sit on block boundaries, so
+# the looped source closes an attention-residual block every two layers.
+_INK2_LOOP = {"core_start": 2, "core_end": 4, "num_passes": 3, "gate_rank": 4}
 _INK2_ATTN = {"heads": 4, "kv": 2, "head_dim": 16, "d_rel": 4, "window": 8, "k": 4}
 _INK2_VISION = {
     "hidden_size": 32,
@@ -9525,7 +9530,7 @@ _INK2_VISION = {
 }
 
 
-def _inkling2_source(path, *, seed=0):
+def _inkling2_source(path, *, seed=0, looped=False):
     path.mkdir(parents=True)
     rng = np.random.default_rng(seed)
     h, e, inter, vocab = (
@@ -9588,6 +9593,12 @@ def _inkling2_source(path, *, seed=0):
         t[q + "mlp_norm.weight"] = bf16(h, scale=1.0)
         t[q + "mlp.gate.weight"] = bf16(e, h)
         t[q + "mlp.gate.bias"] = f32(e)
+        if looped and _INK2_LOOP["core_start"] <= i < _INK2_LOOP["core_end"]:
+            rank = _INK2_LOOP["gate_rank"]
+            for m in ("attn", "k", "v", "mlp"):
+                t[q + f"controllers.{m}.down_weight"] = bf16(rank, 2 * h)
+                t[q + f"controllers.{m}.gain_weight"] = bf16(h, rank)
+                t[q + f"controllers.{m}.forget_weight"] = bf16(h, rank)
         for proj, (rows, cols) in (("w13", (2 * inter, h)), ("w2", (h, inter))):
             ex = q + f"mlp.experts.{proj}_weight"
             if i < _INK2_NVFP4_LAYERS:
@@ -9604,6 +9615,10 @@ def _inkling2_source(path, *, seed=0):
                 scale = rng.integers(118, 121, (e, rows, cols // 32), dtype=np.uint8)
                 t[ex] = raw(body, "F8_E4M3")
                 t[ex + "_scale"] = raw(scale, "U8")
+    if looped:
+        core = _INK2_LOOP["core_end"] - _INK2_LOOP["core_start"]
+        t[root + "middle_cycle_cross_pass_queries"] = f32(2 * core, h)
+        t[root + "middle_cycle_cross_pass_kv_queries"] = f32(2 * core, h)
     tower = VisionTower(VisionArgs.from_dict(_INK2_VISION), h)
     for name, value in tree_flatten(tower.parameters()):
         t["model.visual." + name] = bf16(*value.shape)
@@ -9634,6 +9649,10 @@ def _inkling2_source(path, *, seed=0):
         "vision_config": _INK2_VISION,
         "mtp_config": {"num_hidden_layers": 1},
     }
+    if looped:
+        config["model_type"] = "inkling2_loop"
+        config["text_config"]["n_layers_per_attn_res_block"] = 2
+        config["text_config"]["loop_config"] = dict(_INK2_LOOP)
     (path / "config.json").write_text(json.dumps(config))
     (path / "mtp.safetensors").write_bytes(b"draft")
     (path / "tiktoken").mkdir()
@@ -9647,6 +9666,13 @@ def _inkling2_source(path, *, seed=0):
 def inkling2_source(tmp_path_factory):
     source = tmp_path_factory.mktemp("inkling2") / "source"
     _inkling2_source(source)
+    return source
+
+
+@pytest.fixture(scope="module")
+def inkling2_loop_source(tmp_path_factory):
+    source = tmp_path_factory.mktemp("inkling2_loop") / "source"
+    _inkling2_source(source, looped=True)
     return source
 
 
@@ -9674,10 +9700,13 @@ class TestInkling2OQ:
     MXFP8 = {"bits": 8, "group_size": 32, "mode": "mxfp8"}
 
     @pytest.mark.parametrize("text_only", [True, False])
-    def test_sanitizer_matches_runtime_loader(self, inkling2_source, text_only):
+    @pytest.mark.parametrize("looped", [False, True], ids=["plain", "looped"])
+    def test_sanitizer_matches_runtime_loader(self, request, looped, text_only):
         from omlx.patches.inkling2.loader import sanitize_weights
         from omlx.patches.inkling2.model import ModelArgs
 
+        name = "inkling2_loop_source" if looped else "inkling2_source"
+        inkling2_source = request.getfixturevalue(name)
         config = json.loads((inkling2_source / "config.json").read_text())
         files = _source_weight_files(inkling2_source)
         idx = _LazyTensorIndex(files, config=config)
@@ -9711,6 +9740,29 @@ class TestInkling2OQ:
                 base = key[: -len("weight")]
                 assert mx.array_equal(weight, loaded[base + "weight"]).item()
                 assert mx.array_equal(scales, loaded[base + "scales"]).item()
+
+    def test_release_modelopt_config_loads_as_before(
+        self, inkling2_source, tmp_path, monkeypatch
+    ):
+        # The releases declare their native experts as ModelOpt NVFP4.
+        release = tmp_path / "release"
+        _inkling2_source(release)
+        config = json.loads((release / "config.json").read_text())
+        config["quantization_config"] = {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+        }
+        (release / "config.json").write_text(json.dumps(config))
+        assert validate_quantizable(config)
+
+        monkeypatch.setattr(model_loading, "_MLX_LM_LOAD_CONFIG_PATCHED", False)
+        monkeypatch.setattr(mlx_lm_utils, "load_config", mlx_lm_utils.load_config)
+        model_loading._patch_mlx_lm_load_config()
+        expected = tree_flatten(_inkling2_model(inkling2_source).parameters())
+        loaded = dict(tree_flatten(_inkling2_model(release).parameters()))
+        assert loaded.keys() == dict(expected).keys()
+        for key, value in expected:
+            assert mx.array_equal(loaded[key], value, equal_nan=True).item(), key
 
     def test_oq4_passes_native_experts_through(self, inkling2_source, tmp_path):
         output = tmp_path / "oq4"
@@ -9818,10 +9870,12 @@ class TestInkling2OQ:
         # Without the tensor scale the weights would be off by about 2688 / amax.
         assert (mx.linalg.norm(got - real) / mx.linalg.norm(real)).item() < 0.5
 
-    def test_layer_walk_reproduces_the_forward(self, inkling2_source):
+    @pytest.mark.parametrize("looped", [False, True], ids=["plain", "looped"])
+    def test_layer_walk_reproduces_the_forward(self, request, looped):
         from omlx.patches.inkling2 import oq_layout
 
-        model = _inkling2_model(inkling2_source)
+        name = "inkling2_loop_source" if looped else "inkling2_source"
+        model = _inkling2_model(request.getfixturevalue(name))
         tokens = mx.arange(1, 25)[None]
         embed_fn, layers = _find_model_layers(model)
         inputs = embed_fn(tokens)
@@ -9829,8 +9883,14 @@ class TestInkling2OQ:
         for i, block in enumerate(layers):
             inputs, aux = _forward_layer_result(block, inputs, masks[i], state, i)
             _commit_layer_forward_aux(state, i, aux)
-        # Layer 0 completes the first block; the last block closes at the end.
-        assert len(state["blocks"]) == 1
+        if looped:
+            # Layers 2 and 3 run once per pass, and every pass after the first
+            # restarts from the blocks of layers 0 and 1.
+            assert len(layers) == _INK2_LAYERS + 2 * 2
+            assert len(state["blocks"]) == 3
+        else:
+            # Layer 0 completes the first block; the last closes at the end.
+            assert len(state["blocks"]) == 1
         logits = model.logits_from_hidden(
             oq_layout.head_input(model, inputs, state["blocks"])
         )
@@ -9838,6 +9898,53 @@ class TestInkling2OQ:
         assert mx.allclose(
             logits[..., :120], expected[..., :120], rtol=1e-4, atol=1e-4
         ).item()
+
+    def test_looped_sensitivity_is_per_layer(self, inkling2_loop_source, monkeypatch):
+        tokens = mx.array(np.random.default_rng(1).integers(1, 120, (2, 24)), mx.int32)
+        monkeypatch.setattr("omlx.oq._load_calibration_data", lambda *a, **kw: tokens)
+        model = _inkling2_model(inkling2_loop_source)
+        config = json.loads((inkling2_loop_source / "config.json").read_text())
+        sensitivity = _measure_sensitivity_from_model(model, None, config, 4)
+        # Ten layer visits score six layers; a looped layer keeps its worst pass.
+        assert sorted(sensitivity) == list(range(_INK2_LAYERS))
+
+    def test_looped_oqe_output_keeps_the_loop(
+        self, inkling2_loop_source, tmp_path, monkeypatch
+    ):
+        tokens = mx.array(np.random.default_rng(1).integers(1, 120, (3, 24)), mx.int32)
+        monkeypatch.setattr("omlx.oq._load_calibration_data", lambda *a, **kw: tokens)
+        monkeypatch.setattr(
+            "omlx.utils.model_loading.lm_load_compat",
+            lambda path, **kw: (_inkling2_model(path), object()),
+        )
+        monkeypatch.setattr(
+            "omlx.utils.model_loading.maybe_apply_pre_load_patches",
+            lambda *a, **kw: None,
+        )
+        output = tmp_path / "oqe4"
+        config, tensors = _quantize_inkling2(
+            inkling2_loop_source,
+            output,
+            4,
+            enhanced=True,
+            imatrix_cache_path=str(tmp_path / "imatrix.npz"),
+            imatrix_num_samples=3,
+            imatrix_seq_length=24,
+        )
+        report = json.loads((output / "oq_imatrix_report.json").read_text())
+        assert not report["missing"] and not report["mismatched"]
+        assert config["model_type"] == "inkling2_loop"
+        assert config["text_config"]["loop_config"] == _INK2_LOOP
+        assert (output / "mtp.safetensors").read_bytes() == b"draft"
+        # The loop controllers and queries keep the runtime loader's FP32 values.
+        source = dict(tree_flatten(_inkling2_model(inkling2_loop_source).parameters()))
+        for i in range(_INK2_LOOP["core_start"], _INK2_LOOP["core_end"]):
+            for name in ("loop_down", "loop_gain_forget", "loop_message.query"):
+                key = f"model.layers.{i}.{name}"
+                assert tensors[key].dtype == mx.float32, key
+                assert mx.array_equal(tensors[key], source[key]).item(), key
+        logits = _inkling2_model(output)(mx.arange(1, 21)[None])[..., :120]
+        assert mx.isfinite(logits).all().item()
 
     def test_oqe_weights_requantized_experts_and_skips_passthrough(
         self, inkling2_source, tmp_path, monkeypatch

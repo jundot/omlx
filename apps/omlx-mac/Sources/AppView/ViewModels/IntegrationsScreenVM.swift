@@ -10,7 +10,7 @@ final class IntegrationsScreenVM {
         case hermesModel, copilotModel, dshModel, vibeModel
         case mcpConfig
         case splashPath, splashLimits, splashKvFormat, splashActivations
-        case splashAnePrefill
+        case splashAnePrefill, splashMaxConcurrentRequests
         case markitdownEnabled, markitdownExposeModel, markitdownMaxFileSize
         case markitdownMaxFiles, markitdownPdfProcessingEngine
     }
@@ -46,6 +46,7 @@ final class IntegrationsScreenVM {
     var splashMaxMemoryGb: String = ""
     var splashSsdCacheGb: String = ""
     private var splashLimitsLoaded = ("", "")
+    var splashMaxConcurrentRequests: String = ""
 
     // MarkItDown
     var markitdownEnabled = true
@@ -306,6 +307,7 @@ final class IntegrationsScreenVM {
                 self.splashMaxMemoryGb    = Self.gigabytesText(it.splashMaxMemoryGb)
                 self.splashSsdCacheGb     = Self.gigabytesText(it.splashSsdCacheGb)
                 self.splashLimitsLoaded   = (self.splashMaxMemoryGb, self.splashSsdCacheGb)
+                self.splashMaxConcurrentRequests = it.splashMaxConcurrentRequests.map(String.init) ?? ""
             }
             self.markitdownEnabled = settings.integrations?.markitdownEnabled ?? true
             self.markitdownExposeModel = settings.integrations?.markitdownExposeModel ?? false
@@ -379,6 +381,8 @@ final class IntegrationsScreenVM {
         case .splashKvFormat:       patch.splashKvFormat = splashKvFormat
         case .splashActivations:    patch.splashActivations = splashActivations
         case .splashAnePrefill:     patch.splashAnePrefill = splashAnePrefill
+        case .splashMaxConcurrentRequests:
+            patch.splashMaxConcurrentRequests = Int(splashMaxConcurrentRequests).map(PatchOptionalInt.value) ?? PatchOptionalInt.null
         case .splashLimits:
             guard let memory = Self.gigabytesPatch(splashMaxMemoryGb, minimum: 1),
                   let ssd = Self.gigabytesPatch(splashSsdCacheGb, minimum: 0) else {
