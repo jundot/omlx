@@ -4459,27 +4459,19 @@ class VLMBatchedEngine(BaseEngine):
             prompts = [prompt] if isinstance(prompt, str) else prompt
             # A text-only chat template renders images as prose, and the
             # processor then fails with a misleading image-count error.
-            # Some processors (e.g. gemma3) expect a begin-of-image marker
-            # (boi_token) in the prompt and expand it into image_token
-            # themselves, so accept either marker.
-            image_markers = tuple(
-                dict.fromkeys(
-                    token
-                    for token in (
-                        getattr(self._processor, "image_token", None),
-                        getattr(self._processor, "boi_token", None),
-                    )
-                    if isinstance(token, str) and token
-                )
+            # Gemma 3 expands boi_token into image tokens in its processor.
+            image_token = getattr(
+                self._processor,
+                "boi_token" if model_type == "gemma3" else "image_token",
+                None,
             )
             texts = [item for item in prompts if isinstance(item, str)]
             if (
                 num_images
-                and image_markers
+                and isinstance(image_token, str)
+                and image_token
                 and texts
-                and not any(
-                    marker in text for text in texts for marker in image_markers
-                )
+                and not any(image_token in text for text in texts)
             ):
                 raise InvalidRequestError(
                     "The chat template did not emit image tokens for the "
