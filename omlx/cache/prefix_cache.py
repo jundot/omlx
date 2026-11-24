@@ -52,6 +52,7 @@ from .paged_ssd_cache import (
 )
 from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
+from .paged_cache import is_window_kv_state
 from .type_registry import CacheTypeRegistry
 
 # Shared with class-level signature eligibility.
@@ -1560,7 +1561,11 @@ class BlockAwarePrefixCache(CacheManager):
                     if len(block_tokens) == self.block_size and not is_last_block:
                         self._swa_track_full_block(block.block_hash, hot_cache_write_back)
                     else:
+                        self.paged_cache._swa_no_window.discard(block.block_hash)
                         self.paged_cache._swa_full_hashes.add(block.block_hash)
+                elif swa_active:
+                    # Stored with a window placeholder: no payload read needed later.
+                    self.paged_cache._swa_no_window.add(block.block_hash)
 
                 if block_kv_data and not self._block_token_count_matches_slices(
                     block_kv_data, block.token_count, layer_cache_types
@@ -2236,15 +2241,7 @@ class BlockAwarePrefixCache(CacheManager):
     # OMLX_SWA_TAIL_ONLY: newest full (non-tail) blocks that keep window state.
     _SWA_KEEP_FULL_BLOCKS = 4
 
-    @staticmethod
-    def _is_window_state(state) -> bool:
-        """A non-sliceable state that carries attention K/V (4D), e.g. Inkling 2's
-        sliding-window ArraysCache, as opposed to conv/SSM-only state."""
-        if isinstance(state, tuple) and len(state) == 3 and state[0] == "__nstate__":
-            state = state[2]
-        return isinstance(state, (list, tuple)) and any(
-            getattr(e, "ndim", 0) == 4 for e in state
-        )
+    _is_window_state = staticmethod(is_window_kv_state)
 
     @classmethod
     def _swa_store_active(cls, cache_data) -> bool:
@@ -2270,10 +2267,12 @@ class BlockAwarePrefixCache(CacheManager):
         if block_hash in fifo:
             return
         fifo.append(block_hash)
+        self.paged_cache._swa_no_window.discard(block_hash)
         self.paged_cache._swa_full_hashes.add(block_hash)
         while len(fifo) > self._SWA_KEEP_FULL_BLOCKS:
             old = fifo.popleft()
             self.paged_cache._swa_full_hashes.discard(old)
+            self.paged_cache._swa_no_window.add(old)
             self._strip_rotating_payload(
                 old, hot_cache_write_back, strip_window_arrays=True
             )

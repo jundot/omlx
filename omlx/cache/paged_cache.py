@@ -488,6 +488,26 @@ class BlockTable:
 # PagedCacheManager - Main manager (vLLM BlockPool style)
 # =============================================================================
 
+def is_window_kv_state(state) -> bool:
+    """True for a non-sliceable state that holds a sliding-window K/V pair.
+
+    Inkling 2's sliding ArraysCache stores keys and values in slots 0 and 1
+    (two 4D arrays of the same shape), next to its conv windows. Recurrent
+    states (GDN, Mamba) start with a 3D conv state and do not match.
+    Accepts a raw state list/tuple or a loaded ``("__nstate__", cls, elems)``.
+    """
+    if isinstance(state, tuple) and len(state) == 3 and state[0] == "__nstate__":
+        state = state[2]
+    if not isinstance(state, (list, tuple)) or len(state) < 2:
+        return False
+    k, v = state[0], state[1]
+    return (
+        getattr(k, "ndim", 0) == 4
+        and getattr(v, "ndim", 0) == 4
+        and tuple(k.shape) == tuple(v.shape)
+    )
+
+
 class PagedCacheManager(CacheManager):
     """
     Paged KV cache manager following vLLM's BlockPool architecture.
@@ -580,9 +600,12 @@ class PagedCacheManager(CacheManager):
         # Tail blocks by chain parent (None for a root). A tail is shorter
         # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
-        # Full-size blocks stored with sliding-window state (OMLX_SWA_TAIL_ONLY),
-        # and whether this model stores window state at all.
+        # OMLX_SWA_TAIL_ONLY: known answers to "does this full block hold
+        # sliding-window state" (filled at store time, or read once from the
+        # block payload, e.g. after a restart), and whether this model stores
+        # window state at all.
         self._swa_full_hashes: set = set()
+        self._swa_no_window: set = set()
         self._swa_active = False
         # Tails shared across conversations, capped apart from ordinary tails.
         self._shared_tails: set[BlockHash] = set()
@@ -1091,7 +1114,7 @@ class PagedCacheManager(CacheManager):
             if (
                 self._swa_active
                 and cached_blocks
-                and cached_blocks[-1].block_hash not in self._swa_full_hashes
+                and not self._swa_has_window(cached_blocks[-1].block_hash)
             ):
                 # Window state is stored only at turn ends (tails) and each
                 # store's last full block. Restore from the longest such point
@@ -1110,9 +1133,8 @@ class PagedCacheManager(CacheManager):
                             cached_blocks[:level] + [tail],
                             level * self.block_size + tail.token_count,
                         )
-                    if (
-                        level > 0
-                        and cached_blocks[level - 1].block_hash in self._swa_full_hashes
+                    if level > 0 and self._swa_has_window(
+                        cached_blocks[level - 1].block_hash
                     ):
                         return cached_blocks[:level], level * self.block_size
                 return [], 0
@@ -1233,6 +1255,43 @@ class PagedCacheManager(CacheManager):
             self.register_tail_block(parent_hash, tail_hash, token_count)
             seeded += 1
         return seeded
+
+    def _swa_has_window(self, block_hash: Optional[BlockHash]) -> bool:
+        """Whether a full block holds real sliding-window state.
+
+        Answered from what store_cache recorded, else read once from the
+        block's payload (a block stored before a restart) and remembered.
+        Called with ``self._lock`` held.
+        """
+        if block_hash is None:
+            return False
+        if block_hash in self._swa_full_hashes:
+            return True
+        if block_hash in self._swa_no_window:
+            return False
+        has_window = False
+        ssd = self._paged_ssd_cache_manager
+        if ssd is not None:
+            from .type_registry import CacheTypeRegistry
+
+            try:
+                data, meta = ssd.load_block_with_metadata(
+                    block_hash, promote_to_hot_cache=False
+                )
+            except Exception:  # unreadable block: treat as no window
+                data, meta = None, None
+            types = (meta or {}).get("layer_cache_types") or []
+            has_window = any(
+                i < len(types)
+                and CacheTypeRegistry.is_arrays_family(types[i])
+                and is_window_kv_state(layer)
+                for i, layer in enumerate(data or ())
+            )
+        known = self._swa_full_hashes if has_window else self._swa_no_window
+        if len(known) > 200_000:
+            known.clear()
+        known.add(block_hash)
+        return has_window
 
     def _match_tail_block(
         self,
