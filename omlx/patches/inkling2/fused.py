@@ -19,33 +19,45 @@ import mlx.core as mx
 KEYS_PER_SPLIT = 256
 # Simdgroups per threadgroup (one split each).
 _NSG = 8
-# Query positions per pass over the keys; more spill registers.
+# Query positions one simdgroup holds; more spill registers.
 _ROWS = 4
+# Blocks of up to _HALVES_MAX * _ROWS positions share one pass over the keys:
+# two simdgroups take each split, one per half of the positions.
+_HALVES_MAX = 2
 # Lanes x dims per lane of the V sum.
 HEAD_DIM = 128
 
-# Stage 1. grid: (32 * NSG, ceil(nsplit / NSG), HKV). Each simdgroup owns one
-# key split and writes one partial (acc, m, l) for the GROUP * L query rows of
-# its kv head. Lanes own keys for the scores (q of the GROUP heads sharing the
-# kv head sits in threadgroup memory), then 4 dims each for the V sum, with
-# one online-softmax update per 32-key tile. Query t of L sits at key S - L + t
+# Stage 1. grid: (32 * NSG, ceil(nsplit / (NSG / HALVES)), HKV). Each
+# simdgroup owns one key split (with HALVES == 2, one half of the query
+# positions of it) and writes one partial (acc, m, l) per query row of its kv
+# head. Lanes own keys for the scores (q of the GROUP heads sharing the kv head
+# sits in threadgroup memory), then 4 dims each for the V sum, with one
+# online-softmax update per 32-key tile; the tile's weights reach the V sum
+# through threadgroup memory. Query t of L sits at key S - L + t
 # and sees keys j in [lp, S - L + t], with the relative bias rel[t, h, d] for
 # the distance d < R. Masked keys give exactly zero weight, so a tile or split
 # with no visible key leaves the partial unchanged.
 _ATTN_SOURCE = """
     constexpr float LOG2E = 1.4426950408889634f;
-    constexpr int ROWS = GROUP * L;
+    // HALVES == 2: the simdgroup pair of a split holds positions [0, RG) and
+    // [RG, L); each row's arithmetic is the same as in a one-row block.
+    constexpr int RG = HALVES == 1 ? L : (L + 1) / 2;
+    constexpr int ROWS = GROUP * RG;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint tid = thread_position_in_threadgroup.x;
     const int nsplit = dims[0];
     const int lp = dims[1];   // left padding: keys before it are not real
-    const int split = int(threadgroup_position_in_grid.y) * NSG + int(sg);
+    const int hh = HALVES == 1 ? 0 : int(sg % 2);
+    const int split = int(threadgroup_position_in_grid.y) * (NSG / HALVES) + int(sg / HALVES);
+    const int t0 = hh * RG;
     const uint hk = threadgroup_position_in_grid.z;
     const int S = k_shape[2];
     const float qscale = scale[0] * LOG2E;
-    threadgroup float4 qs[ROWS][D / 4];
-    for (uint i = tid; i < ROWS * D / 4; i += 32 * NSG) {
+    threadgroup float4 qs[GROUP * L][D / 4];
+    // Each simdgroup's tile weights for the V sum (cheaper than shuffling them).
+    threadgroup float ps[NSG][ROWS][32];
+    for (uint i = tid; i < GROUP * L * D / 4; i += 32 * NSG) {
         const uint row = i / (D / 4), c = i % (D / 4);
         const uint g = row / L, t = row % L;
         const device T* qp = q + (hk * GROUP + g) * q_strides[1] + t * q_strides[2]
@@ -74,12 +86,15 @@ _ATTN_SOURCE = """
             for (int c = 0; c < D / 4; ++c) {
                 const float4 kv = float4(float(kp[4 * c]), float(kp[4 * c + 1]),
                                          float(kp[4 * c + 2]), float(kp[4 * c + 3]));
-                for (int r = 0; r < ROWS; ++r) kd[r] += dot(qs[r][c], kv);
+                for (int r = 0; r < ROWS; ++r) {
+                    const int t = min(t0 + r % RG, L - 1);
+                    kd[r] += dot(qs[(r / RG) * L + t][c], kv);
+                }
             }
             for (int r = 0; r < ROWS; ++r) {
-                const int g = r / L, t = r % L;
+                const int g = r / RG, t = t0 + r % RG;
                 const int d = S - L + t - j;
-                float s = d < 0 ? -INFINITY : kd[r];
+                float s = (d < 0 || t >= L) ? -INFINITY : kd[r];
                 if (d >= 0 && d < R) s += float(rel[(t * HQ + hk * GROUP + g) * R + d]) * LOG2E;
                 sc[r] = s;
             }
@@ -97,19 +112,23 @@ _ATTN_SOURCE = """
             m[r] = mn;
         }
         const int nk = min(32, s1 - tile);
+        for (int r = 0; r < ROWS; ++r) ps[sg][r][lane] = p[r];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
         for (int kk = 0; kk < nk; ++kk) {
             const device T* vp = vb + (size_t)(tile + kk) * v_strides[2] + lane * 4;
             const float4 vv = float4(float(vp[0]), float(vp[1]), float(vp[2]), float(vp[3]));
             for (int r = 0; r < ROWS; ++r) {
-                const float pk = simd_shuffle(p[r], ushort(kk));
+                const float pk = ps[sg][r][kk];
                 if (pk != 0.0f) {
                     for (int i = 0; i < 4; ++i) acc[r][i] += pk * vv[i];
                 }
             }
         }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (int r = 0; r < ROWS; ++r) {
-        const int g = r / L, t = r % L;
+        const int g = r / RG, t = t0 + r % RG;
+        if (t >= L) continue;
         // partial layout: [1, HQ, L, nsplit, D + 2]
         device float* pp = part + (((size_t)(hk * GROUP + g) * L + t) * nsplit + split) * (D + 2);
         for (int i = 0; i < 4; ++i) pp[lane * 4 + i] = acc[r][i];
@@ -185,11 +204,12 @@ def long_decode_attention(q, k, v, rel, sink, *, scale, left_padding=None):
     array or None. Query t sits at key S - L + t. Returns [1, Hq, L, D].
     """
     length, s = q.shape[2], k.shape[2]
-    if length <= _ROWS:
+    if length <= _ROWS * _HALVES_MAX:
         return _attention_block(q, k, v, rel, sink, scale, left_padding)
     outs = []
-    for t0 in range(0, length, _ROWS):
-        t1 = min(length, t0 + _ROWS)
+    step = _ROWS * _HALVES_MAX
+    for t0 in range(0, length, step):
+        t1 = min(length, t0 + step)
         # Later keys are causally masked for these queries.
         end = s - length + t1
         outs.append(
@@ -211,6 +231,7 @@ def _attention_block(q, k, v, rel, sink, scale, left_padding):
     hkv, s = k.shape[1], k.shape[2]
     r = rel.shape[-1]
     nsplit = -(-s // KEYS_PER_SPLIT)
+    halves = 1 if length <= _ROWS else 2
     lp = (
         left_padding.reshape(1).astype(mx.int32)
         if left_padding is not None
@@ -238,11 +259,12 @@ def _attention_block(q, k, v, rel, sink, scale, left_padding):
             ("NSG", _NSG),
             ("SPLIT", KEYS_PER_SPLIT),
             ("L", length),
+            ("HALVES", halves),
             ("HQ", hq),
             # Part of the kernel name, so another rel dtype gets its own build.
             ("RT", rel.dtype),
         ],
-        grid=(32 * _NSG, -(-nsplit // _NSG), hkv),
+        grid=(32 * _NSG, -(-nsplit // (_NSG // halves)), hkv),
         threadgroup=(32 * _NSG, 1, 1),
         output_shapes=[(1, hq, length, nsplit, d + 2)],
         output_dtypes=[mx.float32],

@@ -2010,7 +2010,7 @@ def _attention_inputs(length, keys, hq=8, hkv=2, d=128, r=16):
 
 
 @pytest.mark.parametrize("padding", [0, 700])
-@pytest.mark.parametrize("length", [1, 3, 8, 16])
+@pytest.mark.parametrize("length", [1, 3, 5, 7, 8, 16])
 def test_inkling2_long_attention_matches_reference(length, padding):
     from omlx.patches.inkling2 import fused
 
@@ -2036,6 +2036,26 @@ def test_inkling2_long_attention_matches_reference(length, padding):
             left_padding=lp,
         )
         assert mx.array_equal(got[:, :, t : t + 1], alone)
+
+
+@pytest.mark.parametrize("length,passes", [(4, 1), (5, 1), (8, 1), (9, 2), (16, 2)])
+def test_inkling2_long_attention_shares_one_pass_up_to_8_rows(length, passes, monkeypatch):
+    """Blocks of up to 8 query positions read the keys once (two simdgroups
+    per split past 4); longer blocks take one pass per 8."""
+    from omlx.patches.inkling2 import fused
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("the long-context attention kernel runs on the GPU")
+    calls = []
+    block = fused._attention_block
+    monkeypatch.setattr(
+        fused,
+        "_attention_block",
+        lambda q, *a: calls.append(q.shape[2]) or block(q, *a),
+    )
+    q, k, v, rel, sink, scale = _attention_inputs(length, 1300)
+    mx.eval(fused.long_decode_attention(q, k, v, rel, sink, scale=scale))
+    assert len(calls) == passes
 
 
 @pytest.mark.parametrize("padding", [None, 40])
