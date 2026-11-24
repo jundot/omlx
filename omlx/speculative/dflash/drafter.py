@@ -102,8 +102,16 @@ def _activation_dtype(model: nn.Module) -> mx.Dtype:
     model's own floating parameters instead, preferring the drafter's
     projection norms over the borrowed target embedding table.
     """
-    for name in ("hidden_norm", "norm", "fc", "embed_tokens"):
-        module = getattr(model, name, None)
+    encoder = getattr(model, "encoder", None)
+    candidates = (
+        getattr(model, "hidden_norm", None),
+        getattr(model, "norm", None),
+        getattr(model, "fc", None),
+        # Muse Glimmer's context projection hangs off ``encoder``.
+        getattr(encoder, "fc", None),
+        getattr(model, "embed_tokens", None),
+    )
+    for module in candidates:
         if module is None:
             continue
         for attribute in ("weight", "scales"):
