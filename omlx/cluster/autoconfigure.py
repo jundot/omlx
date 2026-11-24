@@ -217,9 +217,12 @@ def choose_parallelism(
         candidates = tuple(size for size in candidates if size > 1)
         if not candidates:
             raise PlanningError(
-                "this model cannot use more than one Mac: its architecture "
-                "implements neither MLX-LM pipeline nor a compatible "
-                "tensor-parallel split"
+                "this model cannot use more than one Mac: "
+                + (
+                    model.unsupported_reason
+                    or "its architecture implements neither MLX-LM pipeline nor "
+                    "a compatible tensor-parallel split"
+                )
             )
 
     measured_choice = False
