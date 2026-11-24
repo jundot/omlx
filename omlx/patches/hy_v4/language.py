@@ -13,7 +13,7 @@ from mlx_vlm.models.base import LanguageModelOutput, create_attention_mask
 
 from ..deepseek_v4.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from ..deepseek_v41.mtp import AcceptanceDepthController
-from . import exact, verify_dispatch
+from . import exact, kernels as hc_kernels, verify_dispatch
 from .config import TextConfig
 from .flash import Engram
 from .layers import (
@@ -42,35 +42,63 @@ class DecoderLayer(nn.Module):
         self.hc_attn_layer = HyperConnection(args)
         self.hc_mlp_layer = HyperConnection(args)
         self._verify_moe_graph = None
+        self._verify_tail_graph = None
         if args.engram_layer_ids and layer + 1 in args.engram_layer_ids:
             self.engram_layer = Engram(args, layer + 1)
 
-    def _mlp_forward(self, x):
+    def _can_compile_moe(self, x):
         mlp = self.mlp
-        if (
-            type(mlp) is MoE
-            and not mlp.training
-            and x.ndim == 3
+        if not (
+            x.ndim == 3
             and x.shape[0] == 1
             and x.dtype == mx.bfloat16
+            and type(mlp) is MoE
+            and not mlp.training
             and verify_dispatch.eligible(x.shape[1])
         ):
-            switch = mlp.switch_mlp
-            if type(switch) is SwitchGLU and "gate_up_proj" not in switch and all(
-                type(proj) is QuantizedSwitchLinear
-                and proj.mode == "affine"
-                and proj.bits == 4
-                and proj.group_size == 64
-                for proj in switch.projections()
-            ):
-                graph = self._verify_moe_graph
-                if graph is None or graph[0] is not mlp:
-                    graph = (mlp, mx.compile(mlp.__call__, inputs=mlp.state))
-                    # The parent owns the graph. The graph references its child,
-                    # so the child must not own the graph or it cannot unload.
-                    object.__setattr__(self, "_verify_moe_graph", graph)
-                return graph[1](x)
+            return False
+        switch = mlp.switch_mlp
+        return type(switch) is SwitchGLU and "gate_up_proj" not in switch and all(
+            type(proj) is QuantizedSwitchLinear
+            and proj.mode == "affine"
+            and proj.bits == 4
+            and proj.group_size == 64
+            for proj in switch.projections()
+        )
+
+    def _mlp_forward(self, x):
+        mlp = self.mlp
+        if self._can_compile_moe(x):
+            graph = self._verify_moe_graph
+            if graph is None or graph[0] is not mlp:
+                graph = (mlp, mx.compile(mlp.__call__, inputs=mlp.state))
+                # Capture the MLP, leaving ownership with the decoder layer.
+                object.__setattr__(self, "_verify_moe_graph", graph)
+            return graph[1](x)
         return mlp(x)
+
+    def _verify_tail(self, values, gate, streams, post):
+        attention = self.self_attn
+        pre = self.hc_mlp_layer.hc_pre
+        norm = self.post_attention_layernorm
+        mlp = self.mlp
+        modules = (attention.o_proj, pre, norm, mlp)
+        if "post_proj_norm" in attention:
+            modules += (attention.post_proj_norm,)
+        owners = (attention, *modules)
+        graph = self._verify_tail_graph
+        if graph is None or len(graph[0]) != len(owners) or any(
+            current is not saved for current, saved in zip(owners, graph[0])
+        ):
+            def tail(values, gate, streams, post, transposed):
+                updated = hc_expand(attention._project_output(values, gate), streams, post)
+                x, post = pre._mix(updated, transposed)
+                return hc_expand(mlp(norm(x)), updated, post)
+
+            graph = (owners, mx.compile(tail, inputs=[m.state for m in modules]))
+            object.__setattr__(self, "_verify_tail_graph", graph)
+        transposed = pre._fused.get(pre.hc_fn)
+        return graph[1](values, gate, streams, post, transposed)
 
     def __call__(
         self,
@@ -84,9 +112,19 @@ class DecoderLayer(nn.Module):
         if "engram_layer" in self and engram_inputs is not None:
             streams = streams + self.engram_layer(streams, *engram_inputs)
         x, post = self.hc_attn_layer(streams)
-        x, topk = self.self_attn(
-            self.input_layernorm(x), mask, cache, prev_topk, positions
-        )
+        x = self.input_layernorm(x)
+        if (
+            cache is not None
+            and x.shape[1] > 1
+            and self._can_compile_moe(x)
+            and hc_kernels.available()
+        ):
+            (values, gate), topk = self.self_attn(
+                x, mask, cache, prev_topk, positions, return_values=True
+            )
+            return self._verify_tail(values, gate, streams, post), topk
+
+        x, topk = self.self_attn(x, mask, cache, prev_topk, positions)
         streams = hc_expand(x, streams, post)
         x, post = self.hc_mlp_layer(streams)
         x = self._mlp_forward(self.post_attention_layernorm(x))

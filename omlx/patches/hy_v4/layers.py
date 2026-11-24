@@ -135,9 +135,12 @@ class HyperConnectionPre(nn.Module):
     def __call__(self, streams: mx.array) -> tuple[mx.array, mx.array]:
         if not hc_kernels.available():
             return self.reference(streams)
+        return self._mix(streams, self._fused.get(self.hc_fn))
+
+    def _mix(self, streams, transposed):
         return hc_kernels.hc_pre(
             streams,
-            self._fused.get(self.hc_fn),
+            transposed,
             self.hc_base.astype(mx.float32),
             self.hc_scale.astype(mx.float32),
             self._norm_eps,
@@ -597,7 +600,9 @@ class Attention(nn.Module):
             return cache, None
         return cache[0], (cache[1] if len(cache.caches) > 1 else None)
 
-    def __call__(self, x, mask, cache=None, prev_topk=None, positions=None):
+    def __call__(
+        self, x, mask, cache=None, prev_topk=None, positions=None, *, return_values=False
+    ):
         b, length, _ = x.shape
         kv_cache, index_cache = self._caches(cache)
         gate = mx.sigmoid(exact.linear(self.linear_gate, x)).reshape(
@@ -631,6 +636,8 @@ class Attention(nn.Module):
             out = self._exact_rows(
                 q_nope, q_pe, latent, k_pe, topk, mask, kv_cache, sinks
             )
+            if return_values:
+                return (out, gate), topk
             out = out.swapaxes(1, 2) * gate
             out = exact.linear(self.o_proj, out.reshape(b, length, -1))
             if "post_proj_norm" in self:
@@ -645,11 +652,17 @@ class Attention(nn.Module):
             out = self._verify(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
         else:
             out = self._prefill(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
-        out = out.swapaxes(1, 2) * gate
+        if return_values:
+            return (out, gate), topk
+        return self._project_output(out, gate), topk
+
+    def _project_output(self, values, gate):
+        b, length = gate.shape[:2]
+        out = values.swapaxes(1, 2) * gate
         out = self.o_proj(out.reshape(b, length, -1))
         if "post_proj_norm" in self:
             out = self.post_proj_norm(out)
-        return out, topk
+        return out
 
     def _exact_rows(self, q_nope, q_pe, latent, k_pe, topk, mask, kv_cache, sinks):
         """One-token decode steps for the rows of an exact verify block.
