@@ -29,10 +29,10 @@ def _supported_gpu() -> bool:
     )
 
 
+def short_gpu_verify(rows: int) -> bool:
+    """Regular short verification, independent of the native kernel version."""
+    return 2 <= rows <= 6 and armed() and mx.default_device() == mx.gpu
+
+
 def eligible(rows: int) -> bool:
-    return (
-        2 <= rows <= 6
-        and armed()
-        and mx.default_device() == mx.gpu
-        and _supported_gpu()
-    )
+    return short_gpu_verify(rows) and _supported_gpu()

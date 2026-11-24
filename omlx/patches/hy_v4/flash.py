@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..deepseek_v41.storage import DiskEngramEmbedding
 from . import exact, indexing, verify_dispatch
 from .config import TextConfig
 from .engram_ssd import open_embedding
@@ -364,7 +365,15 @@ class Engram(nn.Module):
 
     def __call__(self, streams: mx.array, ngrams: mx.array, keep: mx.array) -> mx.array:
         dtype = streams.dtype
-        x = self.lookup(self.hash_rows(ngrams)).astype(dtype)
+        rows = self.hash_rows(ngrams)
+        if streams.shape[0] == 1 and verify_dispatch.short_gpu_verify(streams.shape[1]):
+            table = self.multi_head_embedding.embedding
+            if isinstance(table, DiskEngramEmbedding) and table._resident is None:
+                # Submit the IDs first so the host can read them as soon as
+                # they're ready, while the GPU starts the completed prefix.
+                mx.async_eval(rows)
+                mx.async_eval(streams)
+        x = self.lookup(rows).astype(dtype)
         if self.fp8:
             x = fp8_round_trip(x)
         gains = mx.stack([n.weight for n in self.lookup_per_head_norms]).astype(
