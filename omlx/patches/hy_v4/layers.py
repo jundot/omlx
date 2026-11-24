@@ -22,11 +22,12 @@ from ...custom_kernels.nax import is_nax_available
 from ...oqh.modules import exact_rows as oqh_exact_rows
 from ..deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
 from ..glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
-from . import exact, indexing
+from . import exact, indexing, verify_dispatch
 from . import kernels as hc_kernels
 from .config import TextConfig
 from .flash import CompressedIndexer
 from .rope import TrailingRoPE, rotate
+from .verify_moe import routed_experts
 
 _ROW_CHUNK = 256
 # Up to this many query rows, attention gathers each row's own keys instead of
@@ -320,7 +321,15 @@ class MoE(nn.Module):
         if exact.block(x):
             y = self._exact_experts(routed, inds, weights)
         else:
-            y = self.switch_mlp(routed, inds, scores=weights, weighted_sum=True)
+            y = None
+            if verify_dispatch.eligible(routed.shape[0]):
+                activation = getattr(self.switch_mlp, "activation", None)
+                if type(activation) is ClampedSwiGLU and activation.limit is not None:
+                    y = routed_experts(
+                        self.switch_mlp, routed, inds, weights, activation.limit
+                    )
+            if y is None:
+                y = self.switch_mlp(routed, inds, scores=weights, weighted_sum=True)
             if y.ndim == routed.ndim + 1:
                 y = (y * weights[..., None].astype(y.dtype)).sum(axis=-2)
         if "routed_expert_up_proj" in self:

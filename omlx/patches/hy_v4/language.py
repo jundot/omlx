@@ -12,7 +12,7 @@ from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
 from mlx_vlm.models.base import LanguageModelOutput, create_attention_mask
 
 from ..deepseek_v41.mtp import AcceptanceDepthController
-from . import exact
+from . import exact, verify_dispatch
 from .config import TextConfig
 from .flash import Engram
 from .layers import (
@@ -222,6 +222,7 @@ EXACT_VERIFY = False
 def set_dspark_verify_armed(flag: bool) -> None:
     """The MTP generator arms this around draft verify forwards."""
     exact.set_armed(flag and EXACT_VERIFY)
+    verify_dispatch.set_armed(flag)
 
 
 class LanguageModel(nn.Module):
