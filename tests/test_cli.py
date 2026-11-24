@@ -1153,11 +1153,7 @@ class TestServeCommandFunctions:
         settings = SimpleNamespace()
         settings.base_path = tmp_path
         settings.server = SimpleNamespace(
-            host=host,
-            port=port,
-            log_level="info",
-            burst_decode_mode="balanced",
-            timeout_graceful_shutdown=20,
+            host=host, port=port, log_level="info", burst_decode_mode="balanced"
         )
         settings.huggingface = SimpleNamespace(endpoint=None, hf_cache_enabled=True)
         settings.modelscope = SimpleNamespace(endpoint=None)
@@ -1421,6 +1417,7 @@ class TestServeCommandFunctions:
             events.append("run")
             captured["socket_name"] = sockets[0].getsockname()
             captured["socket_count"] = len(sockets)
+            captured["shutdown"] = self.config.timeout_graceful_shutdown
 
         monkeypatch.setattr("uvicorn.Config.bind_socket", tracking_bind_socket)
         monkeypatch.setattr("uvicorn.Server.run", fake_run)
@@ -1429,67 +1426,10 @@ class TestServeCommandFunctions:
 
         fake_server.init_server.assert_called_once()
         assert events == ["bind", "init", "1" if headless else None, "run"]
+        assert captured["shutdown"] == 5
         assert captured["socket_count"] == 1
         assert captured["socket_name"][0] == host
         assert captured["socket_name"][1] > 0
-
-    def test_serve_sets_timeout_graceful_shutdown(self, tmp_path, monkeypatch):
-        """serve should pass the configured graceful-shutdown timeout to uvicorn."""
-        import uvicorn
-
-        import omlx
-        from omlx.cli import serve_command
-
-        settings = self._make_settings(tmp_path)
-        args = self._make_serve_args(tmp_path)
-        captured = {}
-
-        fake_server = ModuleType("omlx.server")
-
-        async def app(scope, receive, send):
-            return None
-
-        fake_server.app = app
-        fake_server.init_server = MagicMock()
-        monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
-        monkeypatch.setattr(omlx, "server", fake_server, raising=False)
-
-        fake_mlx = ModuleType("mlx")
-        fake_mlx_core = ModuleType("mlx.core")
-        fake_mlx_core.device_info = lambda: {"memory_size": 0}
-        fake_mlx_core.set_cache_limit = MagicMock()
-        fake_mlx.core = fake_mlx_core
-        monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
-        monkeypatch.setitem(sys.modules, "mlx.core", fake_mlx_core)
-
-        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
-        monkeypatch.setattr(
-            "omlx.logging_config.configure_file_logging",
-            lambda **kwargs: None,
-        )
-        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
-        original_bind_socket = uvicorn.Config.bind_socket
-
-        def tracking_bind_socket(config):
-            captured["timeout_graceful_shutdown"] = config.timeout_graceful_shutdown
-            return original_bind_socket(config)
-
-        def fake_run(self, sockets=None):
-            self.config.load()
-
-        monkeypatch.setattr("uvicorn.Config.bind_socket", tracking_bind_socket)
-        monkeypatch.setattr("uvicorn.Server.run", fake_run)
-
-        serve_command(args)
-        assert captured["timeout_graceful_shutdown"] == 20
-
-        settings.server.timeout_graceful_shutdown = None
-        serve_command(args)
-        assert captured["timeout_graceful_shutdown"] is None
-
-        settings.server.timeout_graceful_shutdown = 5
-        serve_command(args)
-        assert captured["timeout_graceful_shutdown"] == 5
 
 
 class TestHasCliOverrides:

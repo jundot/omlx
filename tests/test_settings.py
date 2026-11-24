@@ -93,7 +93,6 @@ class TestServerSettings:
             "max_image_side_length": 2048,
             "gpu_keep_warm_interval": 0.5,
             "gpu_keep_warm_idle_window": 300.0,
-            "timeout_graceful_shutdown": 20,
         }
 
     def test_from_dict_distributed_inference_is_opt_in(self):
@@ -104,50 +103,6 @@ class TestServerSettings:
             ).distributed_inference_enabled
             is True
         )
-
-    @pytest.mark.parametrize(
-        ("value", "expected"),
-        [
-            (None, None),
-            (0, 0),
-            (5, 5),
-            (30.0, 30),
-            ("15", 15),
-            (" 7 ", 7),
-            ("none", None),
-            ("Off", None),
-            ("unlimited", None),
-        ],
-    )
-    def test_from_dict_timeout_graceful_shutdown_valid(self, value, expected):
-        """Valid settings.json values parse to an optional whole-second timeout."""
-        settings = ServerSettings.from_dict({"timeout_graceful_shutdown": value})
-        assert settings.timeout_graceful_shutdown == expected
-
-    def test_from_dict_timeout_graceful_shutdown_missing_uses_default(self):
-        assert ServerSettings.from_dict({}).timeout_graceful_shutdown == 20
-
-    @pytest.mark.parametrize(
-        "value", [True, False, -1, 1.5, "", "abc", "-3", "1e3", [], {}]
-    )
-    def test_from_dict_timeout_graceful_shutdown_invalid_falls_back(
-        self, value, caplog
-    ):
-        """An invalid settings.json value warns and keeps the default instead of
-        crashing startup."""
-        with caplog.at_level("WARNING", logger="omlx.settings"):
-            settings = ServerSettings.from_dict({"timeout_graceful_shutdown": value})
-        assert settings.timeout_graceful_shutdown == 20
-        assert "Invalid timeout_graceful_shutdown value in settings" in caplog.text
-
-    def test_load_invalid_timeout_graceful_shutdown_does_not_crash(self, tmp_path):
-        """A bad value in settings.json must not stop GlobalSettings.load()."""
-        (tmp_path / "settings.json").write_text(
-            json.dumps({"server": {"port": 9123, "timeout_graceful_shutdown": "abc"}})
-        )
-        settings = GlobalSettings.load(base_path=tmp_path)
-        assert settings.server.port == 9123
-        assert settings.server.timeout_graceful_shutdown == 20
 
     def test_from_dict_sse_keepalive_mode(self):
         """sse_keepalive_mode round-trips through from_dict / to_dict."""
@@ -1653,19 +1608,6 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("max_context_window_policy" in e for e in errors)
 
-    @pytest.mark.parametrize("value", [None, 0, 20])
-    def test_validate_timeout_graceful_shutdown_valid(self, value):
-        settings = GlobalSettings()
-        settings.server.timeout_graceful_shutdown = value
-        assert not any("timeout_graceful_shutdown" in e for e in settings.validate())
-
-    @pytest.mark.parametrize("value", [True, False, -1, 2.5, "20"])
-    def test_validate_timeout_graceful_shutdown_invalid(self, value):
-        """validate() rejects bools, negatives and non-integers."""
-        settings = GlobalSettings()
-        settings.server.timeout_graceful_shutdown = value
-        assert any("timeout_graceful_shutdown" in e for e in settings.validate())
-
     def test_validate_invalid_port_low(self):
         """Test validation catches port below 1."""
         settings = GlobalSettings()
@@ -1934,35 +1876,6 @@ class TestGlobalSettings:
                 assert settings.server.host == "0.0.0.0"
                 assert settings.server.port == 9999
                 assert settings.server.log_level == "debug"
-                assert settings.server.timeout_graceful_shutdown == 20
-
-    @pytest.mark.parametrize(
-        ("env_value", "expected"),
-        [
-            ("5", 5),
-            (" 0 ", 0),
-            ("none", None),
-            ("OFF", None),
-            # Empty or invalid values keep the settings.json value (7).
-            ("", 7),
-            ("   ", 7),
-            ("-1", 7),
-            ("1.5", 7),
-            ("abc", 7),
-        ],
-    )
-    def test_env_override_timeout_graceful_shutdown(
-        self, tmp_path, env_value, expected
-    ):
-        """OMLX_GRACEFUL_SHUTDOWN_TIMEOUT caps uvicorn's graceful shutdown wait."""
-        (tmp_path / "settings.json").write_text(
-            json.dumps({"server": {"timeout_graceful_shutdown": 7}})
-        )
-        with patch.dict(
-            os.environ, {"OMLX_GRACEFUL_SHUTDOWN_TIMEOUT": env_value}, clear=False
-        ):
-            settings = GlobalSettings.load(base_path=tmp_path)
-        assert settings.server.timeout_graceful_shutdown == expected
 
     def test_env_override_max_audio_upload_size(self):
         """OMLX_MAX_AUDIO_UPLOAD_SIZE overrides the default 100MB cap."""

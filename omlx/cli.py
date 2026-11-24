@@ -179,7 +179,11 @@ def serve_command(args):
     from ._version import __version__
     from . import process_title
     from .integrations.base import bracket_host
-    from .settings import burst_decode_env, init_settings
+    from .settings import (
+        GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        burst_decode_env,
+        init_settings,
+    )
     from .logging_config import (
         AdminStatsAccessFilter,
         configure_file_logging,
@@ -341,7 +345,7 @@ def serve_command(args):
         port=settings.server.port,
         log_level=uvicorn_level,
         access_log=show_access_log,
-        timeout_graceful_shutdown=settings.server.timeout_graceful_shutdown,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT_S,
     )
     # Bind a socket per host so an occupied port fails fast before model preload.
     # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
@@ -353,7 +357,6 @@ def serve_command(args):
             port=settings.server.port,
             log_level=uvicorn_level,
             access_log=show_access_log,
-            timeout_graceful_shutdown=settings.server.timeout_graceful_shutdown,
         )
         serve_sockets.append(extra_cfg.bind_socket())
 
