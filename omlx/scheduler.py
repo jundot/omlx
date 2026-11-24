@@ -17,7 +17,6 @@ import gc
 import importlib
 import inspect
 import logging
-import os
 import threading
 import time
 from array import array
@@ -2047,6 +2046,9 @@ class SchedulerConfig:
     # RAM *and* persisted to SSD immediately, instead of deferring the SSD
     # write to hot-cache eviction or shutdown.
     hot_cache_write_through: bool = False
+    # Store sliding-window state only at turn ends and the newest full blocks
+    # (BlockAwarePrefixCache); mid-prefill snapshots then drop it early.
+    window_state_at_turn_ends: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     paged_ssd_cache_auto_size: bool = False
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
@@ -2709,6 +2711,7 @@ class Scheduler:
                 model=model,
                 paged_cache_manager=self.paged_cache_manager,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
+                window_state_at_turn_ends=self.config.window_state_at_turn_ends,
             )
 
             # Initialize paged SSD cache. If the backing directory is not
@@ -9446,7 +9449,7 @@ class Scheduler:
     ) -> bool:
         """Whether a boundary snapshot can drop its sliding-window K/V.
 
-        With OMLX_SWA_TAIL_ONLY, store_cache keeps window state only at the
+        With window_state_at_turn_ends, store_cache keeps window state only at the
         turn end and the store's last full block, and writes a placeholder
         elsewhere. Holding the window for the other boundaries until the store
         costs one window copy each (~170 MB on Inkling 2 Mini), so a long fresh
@@ -9454,7 +9457,7 @@ class Scheduler:
         two boundaries before the prompt end.
         """
         if (
-            os.environ.get("OMLX_SWA_TAIL_ONLY") != "1"
+            not self.config.window_state_at_turn_ends
             or source == _TAIL_SNAPSHOT_SOURCE
             or block_size <= 0
         ):

@@ -313,7 +313,9 @@ def test_prefill_snapshot_decoupled_from_live_cache():
 
     stub = SimpleNamespace(
         block_aware_cache=object(),
-        config=SimpleNamespace(paged_cache_block_size=BLOCK_SIZE),
+        config=SimpleNamespace(
+            paged_cache_block_size=BLOCK_SIZE, window_state_at_turn_ends=False
+        ),
         model=SimpleNamespace(),
         _model_has_unreconstructible_cache=lambda: False,
         _cache_list_needs_boundary_snapshot=lambda cache: True,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression guards for turn-end-only sliding-window storage (OMLX_SWA_TAIL_ONLY).
+"""Regression guards for turn-end sliding-window storage (window_state_at_turn_ends).
 
 Inkling 2 keeps each sliding visit's window K/V in an ArraysCache. A boundary
 snapshot of that state is the whole window (~170 MB for Inkling 2 Mini), so
@@ -32,6 +32,8 @@ Tests:
   end drop the window K/V (the store would strip it anyway); the last two
   boundaries, the tail snapshot and recurrent states are kept, on both the
   in-memory and the SSD snapshot path.
+- test_setting_reaches_scheduler_config — settings.json, the env var and the
+  CLI flag all set it; old settings files default to off.
 - test_lean_snapshots_store_and_restore — store fed lean snapshots keeps the
   same layout and the lookup still restores at the turn end.
 """
@@ -71,12 +73,7 @@ class MockModel:
         return a
 
 
-@pytest.fixture
-def tail_only(monkeypatch):
-    monkeypatch.setenv("OMLX_SWA_TAIL_ONLY", "1")
-
-
-def _make_cache(tmp_path):
+def _make_cache(tmp_path, turn_ends=True):
     paged_cache = PagedCacheManager(
         block_size=BLOCK_SIZE,
         max_blocks=200,
@@ -94,6 +91,7 @@ def _make_cache(tmp_path):
         model=MockModel(num_layers=2),
         paged_cache_manager=paged_cache,
         paged_ssd_cache_manager=ssd,
+        window_state_at_turn_ends=turn_ends,
     )
     return cache, ssd
 
@@ -162,7 +160,7 @@ def _kv_len(ssd, block_hash):
     return int(data[1][0].shape[2])
 
 
-def test_window_state_kept_only_in_last_full_block(tmp_path, tail_only):
+def test_window_state_kept_only_in_last_full_block(tmp_path):
     cache, ssd = _make_cache(tmp_path)
     table = _store(cache, "a", 4 * BLOCK_SIZE)
     has_window = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(4)]
@@ -170,15 +168,14 @@ def test_window_state_kept_only_in_last_full_block(tmp_path, tail_only):
     assert all(_kv_len(ssd, _hash(cache, table, i)) == BLOCK_SIZE for i in range(4))
 
 
-def test_flag_off_keeps_stock_storage(tmp_path, monkeypatch):
-    monkeypatch.delenv("OMLX_SWA_TAIL_ONLY", raising=False)
-    cache, ssd = _make_cache(tmp_path)
+def test_flag_off_keeps_stock_storage(tmp_path):
+    cache, ssd = _make_cache(tmp_path, turn_ends=False)
     table = _store(cache, "a", 4 * BLOCK_SIZE)
     assert all(_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(4))
 
 
 @pytest.mark.parametrize("kind", [False, "gdn"], ids=["conv-only", "recurrent"])
-def test_state_without_window_is_unaffected(tmp_path, tail_only, kind):
+def test_state_without_window_is_unaffected(tmp_path, kind):
     cache, ssd = _make_cache(tmp_path)
     table = _store(cache, "a", 4 * BLOCK_SIZE, window=kind)
     for i in range(4):
@@ -194,7 +191,7 @@ def _two_turns(cache):
     return _store(cache, "turn-2", 4 * BLOCK_SIZE)
 
 
-def test_lookup_falls_back_to_block_with_window(tmp_path, tail_only):
+def test_lookup_falls_back_to_block_with_window(tmp_path):
     cache, _ = _make_cache(tmp_path)
     _two_turns(cache)
     prompt = list(range(3 * BLOCK_SIZE + 1))
@@ -203,7 +200,7 @@ def test_lookup_falls_back_to_block_with_window(tmp_path, tail_only):
     assert len(blocks) == 2
 
 
-def test_lookup_reads_payload_when_marker_is_unknown(tmp_path, tail_only):
+def test_lookup_reads_payload_when_marker_is_unknown(tmp_path):
     cache, _ = _make_cache(tmp_path)
     _two_turns(cache)
     cache.paged_cache._swa_full_hashes.clear()
@@ -213,7 +210,7 @@ def test_lookup_reads_payload_when_marker_is_unknown(tmp_path, tail_only):
     assert n == 2 * BLOCK_SIZE
 
 
-def test_only_newest_full_blocks_keep_window(tmp_path, tail_only):
+def test_only_newest_full_blocks_keep_window(tmp_path):
     cache, ssd = _make_cache(tmp_path)
     keep = BlockAwarePrefixCache._SWA_KEEP_FULL_BLOCKS
     turns = keep + 3
@@ -227,7 +224,7 @@ def test_only_newest_full_blocks_keep_window(tmp_path, tail_only):
     assert _sliding_has_window(ssd, _hash(cache, table, turns))  # turn-end tail
 
 
-def test_markers_follow_stored_payload(tmp_path, tail_only):
+def test_markers_follow_stored_payload(tmp_path):
     # The last full block's snapshot has no window (lean): it must not be
     # marked as holding one, nor take a cap slot.
     cache, ssd = _make_cache(tmp_path)
@@ -241,7 +238,7 @@ def test_markers_follow_stored_payload(tmp_path, tail_only):
     assert _sliding_has_window(ssd, _hash(cache, table, 3))  # turn-end tail
 
 
-def test_backfill_keeps_interior_blocks_lean(tmp_path, tail_only):
+def test_backfill_keeps_interior_blocks_lean(tmp_path):
     cache, ssd = _make_cache(tmp_path)
     _store(cache, "a", 4 * BLOCK_SIZE)
     # Same prefix, longer: blocks 0-3 dedup and carry boundary snapshots.
@@ -250,14 +247,14 @@ def test_backfill_keeps_interior_blocks_lean(tmp_path, tail_only):
     assert has_window == [False, False, False, True, False, True]
 
 
-def test_unknown_block_is_not_remembered(tmp_path, tail_only):
+def test_unknown_block_is_not_remembered(tmp_path):
     cache, _ = _make_cache(tmp_path)
     missing = b"\x01" * 32
     assert not cache.paged_cache._swa_has_window(missing)
     assert missing not in cache.paged_cache._swa_no_window
 
 
-def test_lean_snapshots_store_and_restore(tmp_path, tail_only):
+def test_lean_snapshots_store_and_restore(tmp_path):
     cache, ssd = _make_cache(tmp_path)
     _store(cache, "turn-1", 2 * BLOCK_SIZE + 2, tail_terminal=True)
     table = _store(
@@ -286,15 +283,16 @@ def _snapshot(seq_len, window="window"):
     return (Scheduler._PREFILL_SNAPSHOT_MARKER, layers)
 
 
-def _lean(token_count, prompt_len, source="prefill", window="window"):
-    stub = _stub(prompt_len)
+def _lean(token_count, prompt_len, source="prefill", window="window", on=True):
+    stub = _stub(prompt_len, on)
     lean = Scheduler._swa_snapshot_is_lean(stub, "r", token_count, BLOCK_SIZE, source)
     out = Scheduler._swa_lean_value(stub, _snapshot(token_count, window), lean)
     return out[1][0]["state"]  # the sliding layer
 
 
-def _stub(prompt_len):
+def _stub(prompt_len, on=True):
     return SimpleNamespace(
+        config=SimpleNamespace(window_state_at_turn_ends=on),
         requests={"r": SimpleNamespace(prompt_token_ids=list(range(prompt_len)))},
         _PREFILL_SNAPSHOT_MARKER=Scheduler._PREFILL_SNAPSHOT_MARKER,
         _swa_drop_window_states=Scheduler._swa_drop_window_states,
@@ -306,32 +304,47 @@ def _is_placeholder(state):
     return isinstance(state, tuple) and tuple(state[0].shape) == (1,)
 
 
-def test_lean_snapshot_drops_window_far_from_prompt_end(tail_only):
+def test_lean_snapshot_drops_window_far_from_prompt_end():
     # 10 blocks of prompt: boundaries before the last two keep nothing.
     prompt = 10 * BLOCK_SIZE + 3
     assert _is_placeholder(_lean(2 * BLOCK_SIZE, prompt))
 
 
-def test_lean_snapshot_keeps_last_two_boundaries(tail_only):
+def test_lean_snapshot_keeps_last_two_boundaries():
     prompt = 10 * BLOCK_SIZE + 3
     for boundary in (9 * BLOCK_SIZE, 10 * BLOCK_SIZE):
         assert not _is_placeholder(_lean(boundary, prompt))
 
 
-def test_lean_snapshot_keeps_tail_and_recurrent_state(tail_only):
+def test_lean_snapshot_keeps_tail_and_recurrent_state():
     prompt = 10 * BLOCK_SIZE + 3
     assert not _is_placeholder(_lean(2 * BLOCK_SIZE, prompt, _TAIL_SNAPSHOT_SOURCE))
     assert not _is_placeholder(_lean(2 * BLOCK_SIZE, prompt, window="gdn"))
 
 
-def test_lean_snapshot_flag_off_keeps_window(monkeypatch):
-    monkeypatch.delenv("OMLX_SWA_TAIL_ONLY", raising=False)
-    assert not _is_placeholder(_lean(2 * BLOCK_SIZE, 10 * BLOCK_SIZE + 3))
+def test_lean_snapshot_flag_off_keeps_window():
+    assert not _is_placeholder(_lean(2 * BLOCK_SIZE, 10 * BLOCK_SIZE + 3, on=False))
 
 
-def test_lean_snapshot_ssd_path_drops_window(tail_only):
+def test_lean_snapshot_ssd_path_drops_window():
     states, _ = Scheduler._extract_lean_snapshot_cache_states(
         _stub(10 * BLOCK_SIZE), []
     )
     assert _is_placeholder(states[0]["state"])
     assert tuple(states[1]["state"][0].shape)[2] == 2 * BLOCK_SIZE  # KV untouched
+
+
+def test_setting_reaches_scheduler_config(tmp_path, monkeypatch):
+    from omlx.settings import CacheSettings, GlobalSettings
+
+    on = CacheSettings(window_state_at_turn_ends=True)
+    assert CacheSettings.from_dict(on.to_dict()).window_state_at_turn_ends
+    assert not CacheSettings.from_dict({}).window_state_at_turn_ends
+
+    settings = GlobalSettings()
+    settings._apply_cli_overrides(SimpleNamespace(window_state_at_turn_ends=True))
+    assert settings.to_scheduler_config().window_state_at_turn_ends
+
+    monkeypatch.setenv("OMLX_WINDOW_STATE_AT_TURN_ENDS", "1")
+    loaded = GlobalSettings.load(base_path=tmp_path)
+    assert loaded.to_scheduler_config().window_state_at_turn_ends

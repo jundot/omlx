@@ -420,6 +420,10 @@ class CacheSettings:
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
     # sessions without losing SSD durability for old ones.
     hot_cache_write_through: bool = False
+    # Store sliding-window state (Inkling 2) only at turn ends and the newest
+    # full blocks instead of every block, so agent sessions keep their prefix
+    # chain in a small hot cache.
+    window_state_at_turn_ends: bool = False
     # Reuse Apple's AOT-compiled ANE programs across server restarts
     # (OMLX_QWEN35_ANE_COMPILE_CACHE=1). The native gate reads the env var
     # once, at the first ANE compile, so a change applies on restart.
@@ -532,6 +536,7 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "hot_cache_write_through": self.hot_cache_write_through,
+            "window_state_at_turn_ends": self.window_state_at_turn_ends,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
@@ -581,6 +586,9 @@ class CacheSettings:
             hot_cache_max_size=hot_cache_max_size,
             hot_cache_write_through=bool(
                 data.get("hot_cache_write_through", False)
+            ),
+            window_state_at_turn_ends=bool(
+                data.get("window_state_at_turn_ends", False)
             ),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
@@ -1361,6 +1369,12 @@ class GlobalSettings:
                 "1",
                 "yes",
             )
+        if window_ends := os.getenv("OMLX_WINDOW_STATE_AT_TURN_ENDS"):
+            self.cache.window_state_at_turn_ends = window_ends.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
         if gdn_storage := os.getenv("OMLX_GDN_SNAPSHOT_STORAGE"):
             try:
                 self.cache.set_gdn_snapshot_storage(gdn_storage)
@@ -1540,6 +1554,8 @@ class GlobalSettings:
             self.cache.hot_cache_max_size = args.hot_cache_max_size
         if getattr(args, "hot_cache_write_through", None) is not None:
             self.cache.hot_cache_write_through = bool(args.hot_cache_write_through)
+        if getattr(args, "window_state_at_turn_ends", None) is not None:
+            self.cache.window_state_at_turn_ends = bool(args.window_state_at_turn_ends)
         if (
             hasattr(args, "initial_cache_blocks")
             and args.initial_cache_blocks is not None
@@ -2074,6 +2090,7 @@ class GlobalSettings:
             paged_ssd_cache_auto_size=self.cache.ssd_cache_max_size.lower() == "auto",
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
+            window_state_at_turn_ends=self.cache.window_state_at_turn_ends,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size

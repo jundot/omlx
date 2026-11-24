@@ -488,7 +488,11 @@ class BlockTable:
 # =============================================================================
 
 def _is_window_kv_shapes(k_shape, v_shape) -> bool:
-    return k_shape is not None and len(k_shape) == 4 and tuple(k_shape) == tuple(v_shape or ())
+    return (
+        k_shape is not None
+        and len(k_shape) == 4
+        and tuple(k_shape) == tuple(v_shape or ())
+    )
 
 
 def is_window_kv_state(state) -> bool:
@@ -614,7 +618,7 @@ class PagedCacheManager(CacheManager):
         # Tail blocks by chain parent (None for a root). A tail is shorter
         # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
-        # OMLX_SWA_TAIL_ONLY: known answers to "does this full block hold
+        # window_state_at_turn_ends: known answers to "does this full block hold
         # sliding-window state" (filled at store time, or read once from the
         # block payload, e.g. after a restart), and whether this model stores
         # window state at all.
@@ -1270,7 +1274,7 @@ class PagedCacheManager(CacheManager):
             seeded += 1
         return seeded
 
-    def _swa_has_window(self, block_hash: Optional[BlockHash]) -> bool:
+    def _swa_has_window(self, block_hash: BlockHash | None) -> bool:
         """Whether a full block holds real sliding-window state.
 
         Answered from what store_cache recorded, else from the block's tensor

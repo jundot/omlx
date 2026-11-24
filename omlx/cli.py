@@ -67,6 +67,7 @@ def _has_cli_overrides(args) -> bool:
         "paged_ssd_cache_max_size",
         "hot_cache_max_size",
         "hot_cache_write_through",
+        "window_state_at_turn_ends",
         "initial_cache_blocks",
         "mcp_config",
         "hf_endpoint",
@@ -419,6 +420,10 @@ def serve_command(args):
         if getattr(args, "hot_cache_write_through", None) is not None:
             scheduler_config.hot_cache_write_through = bool(
                 args.hot_cache_write_through
+            )
+        if getattr(args, "window_state_at_turn_ends", None) is not None:
+            scheduler_config.window_state_at_turn_ends = bool(
+                args.window_state_at_turn_ends
             )
 
         if args.no_cache:
@@ -1305,6 +1310,13 @@ Example directory structure:
         default=None,
         help="Persist every hot-cache block to SSD immediately (write-through). "
         "Keeps RAM-speed resume while retaining SSD durability for all sessions.",
+    )
+    serve_parser.add_argument(
+        "--window-state-at-turn-ends",
+        action="store_true",
+        default=None,
+        help="Store sliding-window state (Inkling 2) only at turn ends and the "
+        "newest full blocks, so long agent sessions keep their prefix in the cache.",
     )
     serve_parser.add_argument(
         "--no-cache",

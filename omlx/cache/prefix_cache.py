@@ -8,7 +8,6 @@ with SSD persistence. oMLX only supports paged SSD-based caching.
 
 import logging
 import math
-import os
 import threading
 import time
 from collections import OrderedDict, deque
@@ -283,6 +282,7 @@ class BlockAwarePrefixCache(CacheManager):
         paged_cache_manager: PagedCacheManager,
         paged_ssd_cache_manager: PagedSSDCacheManager | None = None,
         gdn_ssd_split_enabled: bool = False,
+        window_state_at_turn_ends: bool = False,
     ):
         """
         Initialize block-aware prefix cache.
@@ -291,6 +291,8 @@ class BlockAwarePrefixCache(CacheManager):
             model: The MLX model (used for identification)
             paged_cache_manager: The PagedCacheManager instance for block management
             paged_ssd_cache_manager: The PagedSSDCacheManager for SSD storage (required for paged SSD-only mode)
+            window_state_at_turn_ends: Store sliding-window K/V state only in
+                each store's last block and newest full blocks.
         """
         self.model = model
         self.model_key = id(model)
@@ -298,6 +300,7 @@ class BlockAwarePrefixCache(CacheManager):
         self.paged_ssd_cache = paged_ssd_cache_manager
         self.block_size = paged_cache_manager.block_size
         self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
+        self._window_state_at_turn_ends = bool(window_state_at_turn_ends)
         self._gdn_split_fallback_reported = False
         self._gdn_checkpoint_loader: (
             Callable[[Any], list[dict[str, Any]] | None] | None
@@ -1360,7 +1363,7 @@ class BlockAwarePrefixCache(CacheManager):
                     # non-sliceable payloads forever. When this store carries
                     # a boundary snapshot for the block, repair the payload
                     # so partial-match walk-back can restore here again.
-                    # OMLX_SWA_TAIL_ONLY: a dedup'd turn end may hold a
+                    # window_state_at_turn_ends: a dedup'd turn end may hold a
                     # window placeholder; repair it from this store's end state.
                     swa_tail_repair = (
                         swa_active
@@ -2244,15 +2247,14 @@ class BlockAwarePrefixCache(CacheManager):
         self._tail_hashes.discard(block_hash)
         return True
 
-    # OMLX_SWA_TAIL_ONLY: newest full (non-tail) blocks that keep window state.
+    # window_state_at_turn_ends: newest full (non-tail) blocks that keep window state.
     _SWA_KEEP_FULL_BLOCKS = 4
 
     _is_window_state = staticmethod(is_window_kv_state)
 
-    @classmethod
-    def _swa_store_active(cls, cache_data) -> bool:
-        """Tail-only window storage applies to models that store window state."""
-        return os.environ.get("OMLX_SWA_TAIL_ONLY") == "1" and any(
+    def _swa_store_active(self, cache_data) -> bool:
+        """Turn-end window storage applies to models that store window state."""
+        return self._window_state_at_turn_ends and any(
             is_window_layer(layer) for layer in cache_data or ()
         )
 
@@ -2541,7 +2543,7 @@ class BlockAwarePrefixCache(CacheManager):
                     and CacheTypeRegistry.is_arrays_family(type_name)
                     and self._is_window_state(snap_state)
                 ):
-                    # Sliding-window state of a turn end (OMLX_SWA_TAIL_ONLY).
+                    # Sliding-window state of a turn end (window_state_at_turn_ends).
                     new_data.append(
                         (
                             "__nstate__",
