@@ -2138,6 +2138,8 @@ def test_inkling2_long_context_verify_rows_match_serial_decode(
         cache = model.make_cache()
         for s in range(0, prefix, 2048):
             model(ids[:, s : min(prefix, s + 2048)], cache=cache)
+            # As the server does after each prefill chunk.
+            mx.eval([c.state for c in cache])
         return cache
 
     cache = prefilled()
