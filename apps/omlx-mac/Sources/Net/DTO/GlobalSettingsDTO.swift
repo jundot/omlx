@@ -212,7 +212,6 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let splashMaxMemoryGb: Double?
         let splashSsdCacheGb: Double?
         let splashAnePrefill: Bool?
-        /// nil: Splash's default (4). Splash 1.7.1+.
         let splashMaxConcurrentRequests: Int?
     }
 

@@ -4911,24 +4911,6 @@
                 this.splashOptionsError = error;
             },
 
-            async saveSplashConcurrency(input) {
-                const field = 'splash_max_concurrent_requests';
-                const previous = this.globalSettings.integrations[field];
-                const value = this.optionalNumber(input.value);
-                let error = '';
-                if (value !== null && !(Number.isInteger(value) && value >= 1 && value <= 8)) {
-                    error = window.t('settings.integrations.splash.invalid_concurrency');
-                } else {
-                    this.globalSettings.integrations[field] = value;
-                    error = await this.saveIntegrationSettings();
-                }
-                if (error) {
-                    this.globalSettings.integrations[field] = previous;
-                    input.value = previous ?? '';
-                }
-                this.splashOptionsError = error;
-            },
-
             editSplashPath() {
                 const splash = this.globalSettings.external_engines.splash;
                 this.splashPath.draft = this.globalSettings.integrations.splash_path || splash.path || '';

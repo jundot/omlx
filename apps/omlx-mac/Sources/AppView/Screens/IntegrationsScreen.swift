@@ -188,13 +188,15 @@ private struct ExternalEnginesSection: View {
                               defaultValue: "Concurrent Requests",
                               comment: "Row label for the Splash concurrent request limit"),
                 sublabel: String(localized: "integrations.splash.max_concurrent.sub",
-                                 defaultValue: "How many requests each Splash model serves at once, 1 to 8. Empty uses Splash's default of 4. Needs Splash 1.7.1 or later.",
+                                 defaultValue: "How many requests each Splash model serves at once. Auto uses Splash's default of 4. Applies to Splash 1.7.1 and later.",
                                  comment: "Sublabel for the Splash concurrent request limit")) {
-                TextInput(text: $vm.splashMaxConcurrentRequests,
-                          placeholder: String(localized: "integrations.splash.auto",
-                                              defaultValue: "Auto",
-                                              comment: "Placeholder for an automatic Splash size"),
-                          width: .controlNarrow)
+                Popup(selection: vm.bind($vm.splashMaxConcurrentRequests, save: {
+                    Task { await vm.save(.splashMaxConcurrentRequests, client: client) }
+                }), width: .controlCompact,
+                      options: [("", String(localized: "integrations.splash.auto",
+                                            defaultValue: "Auto",
+                                            comment: "Placeholder for an automatic Splash size"))]
+                          + (1...8).map { (String($0), String($0)) })
             }
 
             let running = vm.splash?.models ?? []
