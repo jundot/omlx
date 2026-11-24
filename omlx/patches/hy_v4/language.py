@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
@@ -348,6 +349,69 @@ class LanguageModel(nn.Module):
 
     def dspark_append_context(self, hidden_rows, cache, **_):
         """DFly2 reads the target's caches directly; there is nothing to append."""
+
+    def dspark_prepare_block(self, cache, hidden, row, anchor, num_drafts, depth):
+        """Prepare the inputs for a DFly2 block before the target cache rolls back."""
+        width = num_drafts + 1
+        if (
+            cache is None
+            or cache is not self._dfly_cache
+            or hidden is None
+            or hidden.shape[:2] != (1, width)
+            or hidden.dtype != mx.bfloat16
+            or not 2 <= width <= 6
+            or not 1 <= depth <= 5
+            or self.training
+            or mx.default_device() != mx.gpu
+            or not verify_dispatch._supported_gpu()
+        ):
+            return None
+
+        extent = _latent_cache(cache[0])
+        padded_end = getattr(extent, "_idx", None)
+        left = getattr(extent, "left_padding", None)
+        if padded_end is None:
+            padded_end, left = extent.offset, None
+        if not isinstance(padded_end, int) or padded_end - num_drafts <= 2048:
+            return None
+        # The accepted row leaves the cache at the same extent as a trim of
+        # num_drafts - row. The retained keys themselves are unchanged.
+        first = left.reshape(1) if left is not None else mx.zeros((1,), dtype=mx.int32)
+        end = padded_end - num_drafts + row
+        dfly = self.dfly
+        histories = []
+        for kv_layer, index_layer in zip(dfly.cfg.kv_layers, dfly.cfg.index_layers):
+            kv = _latent_cache(cache[kv_layer])
+            if kv.keys is None or kv.values is None or kv.keys.shape[2] < padded_end:
+                return None
+            topk = self.layers[index_layer].self_attn._captured_topk
+            if isinstance(topk, list):
+                if len(topk) != width or any(entry is None for entry in topk):
+                    return None
+                topk = mx.stack([entry[0, 0, 0] for entry in topk])
+            elif topk is not None and topk.shape[:3] == (1, 1, width):
+                topk = topk[0, 0]
+            else:
+                return None
+            if topk.shape[-1] != 2048:
+                return None
+            index = mx.take(topk, row, axis=0).reshape(2048)
+            valid = (index >= first) & (index < end)
+            safe = mx.maximum(mx.minimum(index, end - 1), first)
+            histories.append((kv.keys[:, :, safe], kv.values[:, :, safe], valid))
+
+        start = end - first
+        if self._position_delta.value is not None:
+            start = start + self._position_delta.value
+        return partial(
+            dfly.block_hidden,
+            self.model.embed_tokens,
+            mx.take(hidden, row, axis=1),
+            anchor,
+            start,
+            histories,
+            depth + 1,
+        )
 
     def dspark_forward(self, hidden_rows, anchor, cache=None, *, draft_length=None):
         """Final-normed hidden of one draft block.
