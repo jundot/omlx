@@ -870,12 +870,13 @@ def test_inkling2_restored_state_decodes_and_joins_like_the_live_one():
             assert a.batch_size == 2
 
 
+@pytest.mark.parametrize("proj", ["quantized", "dense"])
 @pytest.mark.parametrize("width", [8, 16])
 @pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
-def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width):
-    """With its projections quantized, each verify row has the bits of the
-    serial decode step for its token, also when an unflagged forward of the
-    verify width traced the compiled layers first."""
+def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width, proj):
+    """With quantized projections, or BF16 dense ones as in the release, each
+    verify row has the bits of the serial decode step for its token, also when
+    an unflagged forward of the verify width traced the compiled layers first."""
     import mlx.nn as nn
 
     from omlx.patches.qwen35_verify_qmm import (
@@ -889,13 +890,15 @@ def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width):
     # Eight experts a token, so an 8-row block routes the 64 pairs that the
     # gather would otherwise sort.
     model = _inkling2_tiny(num_experts_per_tok=8, **dims)
-    assert not model._omlx_mtp_row_exact_verify
-    nn.quantize(
-        model,
-        group_size=64,
-        bits=8,
-        class_predicate=lambda _, m: isinstance(m, nn.Linear),
-    )
+    if proj == "quantized":
+        nn.quantize(
+            model,
+            group_size=64,
+            bits=8,
+            class_predicate=lambda _, m: isinstance(m, nn.Linear),
+        )
+    else:
+        model = _bf16(model)
     assert model._omlx_mtp_row_exact_verify
     ids = mx.random.randint(0, 300, (1, 40 + width))
     model(ids[:, :width], cache=model.make_cache())

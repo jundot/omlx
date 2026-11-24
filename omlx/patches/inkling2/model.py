@@ -30,6 +30,7 @@ import numpy as np
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, KVCache
 
+from .. import row_exact_gemv
 from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
@@ -611,13 +612,30 @@ def _row_matmul(x: mx.array, w: mx.array) -> mx.array:
     return x @ w
 
 
+def _dense(weight: mx.array, x: mx.array) -> mx.array:
+    """``x @ weight.T``. Row-exact verify rows take the one-row gemv of a
+    decode step each (``row_exact_gemv``, else one matmul per row)."""
+    if x.size // x.shape[-1] > 1 and is_row_exact_armed():
+        y = row_exact_gemv.linear(weight, x)
+        return y if y is not None else _row_matmul(x, weight.T)
+    return x @ weight.T
+
+
+def _linear(proj: nn.Module, x: mx.array) -> mx.array:
+    """``proj(x)`` for the bias-free projections; a plain Linear goes through
+    ``_dense`` (QuantizedLinear has its own row-exact patch)."""
+    if type(proj) is nn.Linear:
+        return _dense(proj.weight, x)
+    return proj(x)
+
+
 def _project_slice(
     proj: nn.Module, x: mx.array, start: int, end: int | None
 ) -> mx.array:
     """Output rows ``[start:end]`` of a bias-free Linear or QuantizedLinear."""
     if type(proj) is nn.QuantizedLinear:
         return _row_slice(proj, start, end)(x)
-    return x @ proj.weight[start:end].T
+    return _dense(proj.weight[start:end], x)
 
 
 def _row_slice(proj: nn.QuantizedLinear, start: int, end: int | None):
@@ -713,7 +731,9 @@ class Inkling2Attention(nn.Module):
         dkv = self.dkv
         if self.sliding:
             if xk is None:
-                q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+                q, k, v, r, gate, sink = mx.split(
+                    _linear(self.in_proj, xq), self._cuts, axis=-1
+                )
             elif type(self.in_proj) in (nn.Linear, nn.QuantizedLinear):
                 # Looped passes give q, k and v their own inputs; project only
                 # the row slices of ``in_proj`` that each input uses.
@@ -737,9 +757,9 @@ class Inkling2Attention(nn.Module):
                 v, self.v_conv, vs, self._sconv_scale, out_dtype=mx.float32
             )
         else:
-            q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
-            kp = self.k_proj(xk)
-            vp = self.v_proj(xv)
+            q, r, gate, sink = mx.split(_linear(self.q_proj, xq), self._cuts, axis=-1)
+            kp = _linear(self.k_proj, xk)
+            vp = _linear(self.v_proj, xv)
             k, ks = kernels.dynamic_conv(
                 kp[..., :dkv],
                 kp[..., dkv:],
@@ -829,7 +849,7 @@ class Inkling2Attention(nn.Module):
         out = (out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(
             gate.dtype
         )
-        return self.o_proj(out)
+        return _linear(self.o_proj, out)
 
 
 def _cumsum(xs):
@@ -1240,22 +1260,22 @@ class Model(nn.Module):
 
     @property
     def _omlx_mtp_row_exact_verify(self) -> bool:
-        """Verify rows reproduce the serial decode rows only when every
-        projection they take is a QuantizedLinear (``row_exact_qmv``); a dense
-        multi-row matmul has its own arithmetic."""
+        """Verify rows reproduce the serial decode rows when every projection
+        they take is a plain Linear (``row_exact_gemv``) or a QuantizedLinear
+        (``row_exact_qmv``); a wrapper such as LoRA has its own arithmetic."""
         linears = [self.lm_head]
         for layer in self.model.layers:
             attn = layer.attn
             names = ("in_proj",) if attn.sliding else ("q_proj", "k_proj", "v_proj")
             linears += [getattr(attn, name) for name in names] + [attn.o_proj]
-        return all(type(m) is nn.QuantizedLinear for m in linears)
+        return all(type(m) in (nn.Linear, nn.QuantizedLinear) for m in linears)
 
     def logits_from_hidden(self, h):
         # Decode and verify rows run the cast, softcap and vocab bias as one
         # kernel; longer prefill chunks stay eager, like the layers.
         compiled = h.shape[-2] <= _COMPILED_MAX_TOKENS
         tail = _logit_tail_compiled if compiled else _logit_tail
-        return tail(self.lm_head(h), self._softcap, self._vocab_bias)
+        return tail(_linear(self.lm_head, h), self._softcap, self._vocab_bias)
 
     def encode_image(self, pixel_values: mx.array, image_grid_thw) -> mx.array:
         """Image-token embeddings for the processor's pixel blocks."""
