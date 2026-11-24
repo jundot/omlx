@@ -219,6 +219,10 @@ class ServerSettings:
     # 5 minutes). A client that talks to the server less often than this pays
     # the first-command stall on every request; raise it to cover that gap.
     gpu_keep_warm_idle_window: float = 300.0
+    # Seconds uvicorn waits for open connections after SIGINT/SIGTERM before
+    # forcing a quit. None waits forever (uvicorn's default). 0 quits immediately.
+    # Default 20 so a wedged keep-alive cannot leave the process hanging.
+    timeout_graceful_shutdown: int | None = 20
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -240,6 +244,25 @@ class ServerSettings:
         if size <= 0:
             raise ValueError("max_request_body_size must be positive")
         return size
+
+    @staticmethod
+    def _parse_timeout_graceful_shutdown(value: Any) -> int | None:
+        """Parse a settings or env value into an optional non-negative timeout."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            raw = value.strip().lower()
+            if raw in {"none", "off", "unlimited", "forever"}:
+                return None
+            value = raw
+        if isinstance(value, bool):
+            raise ValueError("timeout_graceful_shutdown must be a number or None")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError("timeout_graceful_shutdown must be a whole number of seconds")
+        timeout = int(value)
+        if timeout < 0:
+            raise ValueError("timeout_graceful_shutdown must be non-negative")
+        return timeout
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -270,6 +293,11 @@ class ServerSettings:
             gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
             gpu_keep_warm_idle_window=float(
                 data.get("gpu_keep_warm_idle_window", 300.0)
+            ),
+            timeout_graceful_shutdown=cls._parse_timeout_graceful_shutdown(
+                data["timeout_graceful_shutdown"]
+                if "timeout_graceful_shutdown" in data
+                else 20
             ),
         )
 
@@ -1274,6 +1302,16 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_GPU_KEEP_WARM_INTERVAL value: {gpu_keep_warm}"
                 )
+        if (graceful := os.getenv("OMLX_GRACEFUL_SHUTDOWN_TIMEOUT")) is not None:
+            if graceful.strip():
+                try:
+                    self.server.timeout_graceful_shutdown = (
+                        ServerSettings._parse_timeout_graceful_shutdown(graceful)
+                    )
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"Invalid OMLX_GRACEFUL_SHUTDOWN_TIMEOUT value: {graceful}"
+                    )
         if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
             self.server.max_audio_upload_size = max_audio_upload_size
         if max_image_upload_size := (
@@ -1799,6 +1837,13 @@ class GlobalSettings:
             errors.append("gpu_keep_warm_interval must be finite")
         if not math.isfinite(self.server.gpu_keep_warm_idle_window):
             errors.append("gpu_keep_warm_idle_window must be finite")
+        graceful = self.server.timeout_graceful_shutdown
+        if graceful is not None and (
+            not isinstance(graceful, int) or graceful < 0
+        ):
+            errors.append(
+                "timeout_graceful_shutdown must be None or a non-negative integer"
+            )
 
         # Memory guard tier validation
         if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:

@@ -341,6 +341,7 @@ def serve_command(args):
         port=settings.server.port,
         log_level=uvicorn_level,
         access_log=show_access_log,
+        timeout_graceful_shutdown=settings.server.timeout_graceful_shutdown,
     )
     # Bind a socket per host so an occupied port fails fast before model preload.
     # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
@@ -352,6 +353,7 @@ def serve_command(args):
             port=settings.server.port,
             log_level=uvicorn_level,
             access_log=show_access_log,
+            timeout_graceful_shutdown=settings.server.timeout_graceful_shutdown,
         )
         serve_sockets.append(extra_cfg.bind_socket())
 

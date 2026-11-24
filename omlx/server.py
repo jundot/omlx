@@ -10180,7 +10180,12 @@ model and sampling defaults are managed via the admin page.
     # Start server
     import uvicorn
 
-    uvicorn.run(app, host=settings.server.host, port=args.port)
+    uvicorn.run(
+        app,
+        host=settings.server.host,
+        port=args.port,
+        timeout_graceful_shutdown=settings.server.timeout_graceful_shutdown,
+    )
 
 
 if __name__ == "__main__":

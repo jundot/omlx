@@ -93,6 +93,7 @@ class TestServerSettings:
             "max_image_side_length": 2048,
             "gpu_keep_warm_interval": 0.5,
             "gpu_keep_warm_idle_window": 300.0,
+            "timeout_graceful_shutdown": 20,
         }
 
     def test_from_dict_distributed_inference_is_opt_in(self):
@@ -1876,6 +1877,27 @@ class TestGlobalSettings:
                 assert settings.server.host == "0.0.0.0"
                 assert settings.server.port == 9999
                 assert settings.server.log_level == "debug"
+                assert settings.server.timeout_graceful_shutdown == 20
+
+    def test_env_override_timeout_graceful_shutdown(self):
+        """OMLX_GRACEFUL_SHUTDOWN_TIMEOUT caps uvicorn's graceful shutdown wait."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_GRACEFUL_SHUTDOWN_TIMEOUT": "5"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.server.timeout_graceful_shutdown == 5
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_GRACEFUL_SHUTDOWN_TIMEOUT": "none"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.server.timeout_graceful_shutdown is None
 
     def test_env_override_max_audio_upload_size(self):
         """OMLX_MAX_AUDIO_UPLOAD_SIZE overrides the default 100MB cap."""
