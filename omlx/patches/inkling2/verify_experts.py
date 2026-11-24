@@ -61,16 +61,22 @@ inline float fp8_value(uint8_t bits) {
 }
 
 // qdot / qdot_safe of fp_quantized.h at bits == 4 over the first n values.
+// ``lut[b]`` holds the two fp4 values of byte b (low nibble first), decoded
+// as fp4_value does; every fp4 value is exact in float, so reading them from
+// the table leaves each product, and the sum order, unchanged.
 inline float qdot_n(
-    const device uint8_t* w, const thread float* x_thread, float scale, int n) {
+    const device uint8_t* w,
+    const thread float* x_thread,
+    float scale,
+    int n,
+    threadgroup const float2* lut) {
   float accum = 0;
-  const device uint16_t* ws = (const device uint16_t*)w;
   for (int i = 0; i < (n / 4); i++) {
+    float2 lo = lut[w[2 * i]];
+    float2 hi = lut[w[2 * i + 1]];
     accum +=
-        (x_thread[4 * i] * fp4_value(ws[i]) +
-         x_thread[4 * i + 1] * fp4_value(ws[i] >> 4) +
-         x_thread[4 * i + 2] * fp4_value(ws[i] >> 8) +
-         x_thread[4 * i + 3] * fp4_value(ws[i] >> 12));
+        (x_thread[4 * i] * lo.x + x_thread[4 * i + 1] * lo.y +
+         x_thread[4 * i + 2] * hi.x + x_thread[4 * i + 3] * hi.y);
   }
   return scale * accum;
 }
@@ -83,6 +89,15 @@ inline float qdot_n(
 _SOURCE = r"""
     const uint simd_gid = simdgroup_index_in_threadgroup;
     const uint simd_lid = thread_index_in_simdgroup;
+
+    // Byte -> two fp4 values, shared by the threadgroup's 64 threads. On M1
+    // the per-value decode costs more than the weight reads.
+    threadgroup float2 lut[256];
+    for (uint b = simd_gid * SIMD_SIZE + simd_lid; b < 256; b += 2 * SIMD_SIZE) {
+      lut[b] = float2(fp4_value(uint8_t(b & 15)), fp4_value(uint8_t(b >> 4)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     const int pair = int(order[threadgroup_position_in_grid.y]);
     // An expert stack can pass 2 GiB, so its offsets need 64 bits.
     const size_t expert = size_t(rhs[pair]);
@@ -112,7 +127,7 @@ _SOURCE = r"""
       for (int row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
         const device uint8_t* wl = ws + row * in_vec_size_w;
         float s = fp8_value(sc[row * in_vec_size_g]);
-        result[row] += qdot_n(wl, x_thread, s, VALUES_PER_THREAD);
+        result[row] += qdot_n(wl, x_thread, s, VALUES_PER_THREAD, lut);
       }
       ws += BLOCK_SIZE / 2;
       sc += BLOCK_SIZE / GS;
@@ -132,7 +147,7 @@ _SOURCE = r"""
       for (int row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
         const device uint8_t* wl = ws + row * in_vec_size_w;
         float s = fp8_value(sc[row * in_vec_size_g]);
-        result[row] += qdot_n(wl, x_thread, s, remaining);
+        result[row] += qdot_n(wl, x_thread, s, remaining, lut);
       }
     }
 
