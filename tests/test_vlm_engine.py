@@ -2270,6 +2270,22 @@ class TestFormatMessagesForVLMTemplate:
 
         assert formatted[0]["content"] == "<|image_1|>Describe."
 
+    def test_phi3_numbers_images_across_turns(self):
+        engine = _make_loaded_engine(model_type="phi3_v")
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,a"}}
+        messages = [
+            {"role": "user", "content": [image, {"type": "text", "text": "One"}]},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": [image, {"type": "text", "text": "Two"}]},
+        ]
+
+        formatted, _ = engine._format_messages_for_vlm_template(
+            messages, num_images=2
+        )
+
+        assert formatted[0]["content"] == "<|image_1|>One"
+        assert formatted[2]["content"] == "<|image_2|>Two"
+
     def test_fallback_inserts_first_user_when_no_explicit_parts(self):
         """Legacy path: num_images without explicit image parts still injects once."""
         engine = _make_loaded_engine(model_type="qwen3_5")
