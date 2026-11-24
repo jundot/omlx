@@ -11,6 +11,7 @@ import mlx.nn as nn
 from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
 from mlx_vlm.models.base import LanguageModelOutput, create_attention_mask
 
+from ..deepseek_v4.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from ..deepseek_v41.mtp import AcceptanceDepthController
 from . import exact, verify_dispatch
 from .config import TextConfig
@@ -40,8 +41,36 @@ class DecoderLayer(nn.Module):
         )
         self.hc_attn_layer = HyperConnection(args)
         self.hc_mlp_layer = HyperConnection(args)
+        self._verify_moe_graph = None
         if args.engram_layer_ids and layer + 1 in args.engram_layer_ids:
             self.engram_layer = Engram(args, layer + 1)
+
+    def _mlp_forward(self, x):
+        mlp = self.mlp
+        if (
+            type(mlp) is MoE
+            and not mlp.training
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and x.dtype == mx.bfloat16
+            and verify_dispatch.eligible(x.shape[1])
+        ):
+            switch = mlp.switch_mlp
+            if type(switch) is SwitchGLU and "gate_up_proj" not in switch and all(
+                type(proj) is QuantizedSwitchLinear
+                and proj.mode == "affine"
+                and proj.bits == 4
+                and proj.group_size == 64
+                for proj in switch.projections()
+            ):
+                graph = self._verify_moe_graph
+                if graph is None or graph[0] is not mlp:
+                    graph = (mlp, mx.compile(mlp.__call__, inputs=mlp.state))
+                    # The parent owns the graph. The graph references its child,
+                    # so the child must not own the graph or it cannot unload.
+                    object.__setattr__(self, "_verify_moe_graph", graph)
+                return graph[1](x)
+        return mlp(x)
 
     def __call__(
         self,
@@ -60,7 +89,7 @@ class DecoderLayer(nn.Module):
         )
         streams = hc_expand(x, streams, post)
         x, post = self.hc_mlp_layer(streams)
-        x = self.mlp(self.post_attention_layernorm(x))
+        x = self._mlp_forward(self.post_attention_layernorm(x))
         return hc_expand(x, streams, post), topk
 
 
