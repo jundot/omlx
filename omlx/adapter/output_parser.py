@@ -1378,6 +1378,19 @@ _ERNIE_CALL = "<ernie:tool_call>"
 _ERNIE_CALL_END = "</ernie:tool_call>"
 
 
+def install_ernie55_tokenizer_protocol(tokenizer):
+    """Identify the native token-ID parser without reparsing decoded text."""
+    if not callable(getattr(tokenizer, "parse_completion", None)):
+        return False
+    tokenizer.has_tool_calling = True
+    tokenizer.tool_call_start = _ERNIE_CALL
+    tokenizer.tool_call_end = _ERNIE_CALL_END
+    # Marker-looking ordinary text loses its origin after detokenization.
+    # Only the scheduler's token-ID parser should interpret ERNIE calls.
+    tokenizer.tool_parser = None
+    return True
+
+
 class Ernie55OutputParserSession:
     """Normalize reasoning markers and parse tool calls from their token IDs."""
 

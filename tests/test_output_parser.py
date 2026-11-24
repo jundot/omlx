@@ -14,7 +14,17 @@ from mlx_lm.tool_parsers import json_tools, qwen3_coder
 
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
-from omlx.adapter.output_parser import detect_output_parser
+from omlx.adapter.output_parser import (
+    detect_output_parser,
+    install_ernie55_tokenizer_protocol,
+)
+from omlx.api.tool_calling import parse_tool_calls
+
+
+def test_ernie55_native_tool_parser_leaves_plain_text_intact():
+    tokenizer = SimpleNamespace(parse_completion=lambda *args, **kwargs: {})
+    assert install_ernie55_tokenizer_protocol(tokenizer)
+    assert parse_tool_calls("The answer is 4.", tokenizer) == ("The answer is 4.", None)
 
 
 class FakeDetokenizer:

@@ -3103,11 +3103,11 @@ class VLMBatchedEngine(BaseEngine):
         and loads the correct per-model parser.  Falls back to mlx_lm if the
         mlx_vlm.tools.parsers package is not present.
         """
-        if self.model_type == "ernie5_5_moe" and callable(
-            getattr(tokenizer, "parse_completion", None)
-        ):
-            tokenizer.has_tool_calling = True
-            return
+        if self.model_type == "ernie5_5_moe":
+            from ..adapter.output_parser import install_ernie55_tokenizer_protocol
+
+            if install_ernie55_tokenizer_protocol(tokenizer):
+                return
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
             return
