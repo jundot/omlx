@@ -128,6 +128,19 @@ class TestDeserializeStateLegacyContract:
         assert mx.max(mx.abs(rest_keys - orig_keys)).item() == 0.0
         assert mx.max(mx.abs(rest_values - orig_values)).item() == 0.0
 
+    def test_kvcache_round_trip_with_empty_value_channels(self):
+        import mlx.core as mx
+
+        from omlx.cache.type_handlers import KVCacheHandler
+
+        handler = KVCacheHandler()
+        keys = mx.zeros((1, 1, 8, 16), dtype=mx.bfloat16)
+        values = mx.zeros((1, 1, 8, 0), dtype=keys.dtype)
+        restored = handler.deserialize_state((keys, values))
+        assert restored.offset == 8
+        assert restored.values.shape == values.shape
+        assert handler.deserialize_state((keys, mx.zeros((1,)))) is None
+
 
 class TestSeqLenFromTuple:
     """get_state_seq_len_from_tuple recovers length from first sliceable elem."""
@@ -578,10 +591,12 @@ class TestPrefixCacheNTupleSubState:
         assert mx.max(mx.abs(rest_prev_kv - prev_win_kv)).item() == 0.0
         assert mx.max(mx.abs(rest_prev_gate - prev_win_gate)).item() == 0.0
 
-        legacy = h.deserialize_state((None, None, pooled), meta_state=ratio)
-        assert legacy is not None
-        assert legacy.prev_win_kv is None
-        assert legacy.prev_win_gate is None
+        for metadata in (ratio, [ratio]):
+            legacy = h.deserialize_state((None, None, pooled), meta_state=metadata)
+            assert legacy is not None
+            assert legacy.ratio == ratio
+            assert legacy.prev_win_kv is None
+            assert legacy.prev_win_gate is None
 
     def test_pooling_cache_deserialize_legacy_2tuple_input(self):
         """Tolerates length-2 input (e.g. coming from a legacy V2 polyfill)

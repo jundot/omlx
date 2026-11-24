@@ -88,6 +88,9 @@ class PoolingCacheHandler(CacheTypeHandler):
             logger.error("mlx_lm.models.cache.PoolingCache unavailable for reconstruct")
             return None
 
+        if isinstance(meta_state, (tuple, list)) and len(meta_state) == 1:
+            # Earlier snapshots could use the generic handler's one-item tuple.
+            (meta_state,) = meta_state
         ratio = meta_state if isinstance(meta_state, int) else 1
         cache = PoolingCache(ratio=ratio)
         cache.state = (

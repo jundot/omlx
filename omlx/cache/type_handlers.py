@@ -448,7 +448,13 @@ class KVCacheHandler(CacheTypeHandler):
         keys = state.get("keys")
         values = state.get("values")
 
-        if keys is None or values is None:
+        if (
+            keys is None
+            or values is None
+            or keys.ndim != 4
+            or values.ndim != 4
+            or keys.shape[:3] != values.shape[:3]
+        ):
             return None
 
         cache = KVCache()

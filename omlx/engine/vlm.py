@@ -2131,6 +2131,10 @@ class VLMBatchedEngine(BaseEngine):
                 ),
             ):
                 model_type = _read_config_model_type(self._model_name)
+                if model_type == "ernie5_5_moe":
+                    from ..patches.deepseek_v4 import apply_pooling_cache_support
+
+                    apply_pooling_cache_support()
                 if model_type in {"mimo_v2", "mimo_v2_flash"}:
                     from ..patches.mimo_v2.omnimodal import (
                         has_vision_sidecar,
