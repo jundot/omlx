@@ -23,6 +23,10 @@ Tests:
   in-memory markers cleared (as after a restart).
 - test_only_newest_full_blocks_keep_window — older full blocks are stripped
   beyond the cap; turn-end tails are not counted.
+- test_full_size_turn_ends_are_capped — a turn end that fills its block is
+  counted toward the cap like any full block.
+- test_lookup_reads_ssd_file_shapes — the shape check on SSD files (no hot
+  cache) finds the turn end after the in-memory markers are cleared.
 - test_markers_follow_stored_payload — a block whose snapshot had no window
   (a lean snapshot) is marked as such and does not count toward the cap.
 - test_backfill_keeps_interior_blocks_lean — a dedup'd interior block is not
@@ -73,7 +77,7 @@ class MockModel:
         return a
 
 
-def _make_cache(tmp_path, turn_ends=True):
+def _make_cache(tmp_path, turn_ends=True, ssd_only=False):
     paged_cache = PagedCacheManager(
         block_size=BLOCK_SIZE,
         max_blocks=200,
@@ -83,8 +87,8 @@ def _make_cache(tmp_path, turn_ends=True):
     ssd = PagedSSDCacheManager(
         cache_dir=tmp_path / "ssd_cache",
         max_size_bytes=100 * 1024**2,
-        hot_cache_max_bytes=20 * 1024**2,
-        hot_cache_only=True,
+        hot_cache_max_bytes=0 if ssd_only else 20 * 1024**2,
+        hot_cache_only=not ssd_only,
     )
     paged_cache.set_paged_ssd_cache_manager(ssd)  # as the scheduler does
     cache = BlockAwarePrefixCache(
@@ -222,6 +226,29 @@ def test_only_newest_full_blocks_keep_window(tmp_path):
     assert full[-keep:] == [True] * keep
     assert not any(full[: turns - keep])
     assert _sliding_has_window(ssd, _hash(cache, table, turns))  # turn-end tail
+
+
+def test_full_size_turn_ends_are_capped(tmp_path):
+    cache, ssd = _make_cache(tmp_path)
+    keep = BlockAwarePrefixCache._SWA_KEEP_FULL_BLOCKS
+    turns = keep + 3
+    # Each turn ends on a block boundary: its last block is a full turn end.
+    for t in range(1, turns + 1):
+        table = _store(cache, f"t{t}", t * BLOCK_SIZE)
+    full = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(turns)]
+    assert full[-keep:] == [True] * keep
+    assert not any(full[: turns - keep])
+
+
+def test_lookup_reads_ssd_file_shapes(tmp_path):
+    cache, ssd = _make_cache(tmp_path, ssd_only=True)
+    _two_turns(cache)
+    assert ssd.wait_for_pending_writes(timeout=30)
+    cache.paged_cache._swa_full_hashes.clear()
+    cache.paged_cache._swa_no_window.clear()
+    prompt = list(range(3 * BLOCK_SIZE + 1))
+    _, n = cache.paged_cache.get_computed_blocks(prompt)
+    assert n == 2 * BLOCK_SIZE
 
 
 def test_markers_follow_stored_payload(tmp_path):

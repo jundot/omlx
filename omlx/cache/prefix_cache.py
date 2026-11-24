@@ -1402,13 +1402,14 @@ class BlockAwarePrefixCache(CacheManager):
                         if backfilled:
                             self._backfill_checked_hashes.add(existing_block.block_hash)
                             if swa_tail_repair:
-                                # Payload may have changed: re-probe on lookup.
-                                self.paged_cache._swa_full_hashes.discard(
-                                    existing_block.block_hash
-                                )
-                                self.paged_cache._swa_no_window.discard(
-                                    existing_block.block_hash
-                                )
+                                # Payload may have changed: re-probe it, and a
+                                # full block with window joins the keep-N queue.
+                                h = existing_block.block_hash
+                                with self.paged_cache._lock:
+                                    self.paged_cache._swa_remember(h, None)
+                                    has_window = self.paged_cache._swa_has_window(h)
+                                if has_window:
+                                    self._swa_track_full_block(h, hot_cache_write_back)
                             if (
                                 len(self._backfill_checked_hashes)
                                 > _BACKFILL_CHECKED_MAX_ENTRIES
@@ -1593,7 +1594,7 @@ class BlockAwarePrefixCache(CacheManager):
                         block.block_hash,
                         block_kv_data,
                         layer_cache_types,
-                        len(block_tokens) == self.block_size and not is_last_block,
+                        len(block_tokens) == self.block_size,
                         hot_cache_write_back,
                     )
 
@@ -2247,10 +2248,12 @@ class BlockAwarePrefixCache(CacheManager):
         self._tail_hashes.discard(block_hash)
         return True
 
-    # window_state_at_turn_ends: newest full (non-tail) blocks that keep window state.
+    # window_state_at_turn_ends: newest full (non-tail) blocks that keep window
+    # state. shortcut: one queue per model, shared by all conversations; with
+    # more than 4 sessions taking turns, a session's last full block is
+    # stripped before its next turn (its tail still restores). Upgrade to a
+    # per-conversation cap (via _tip_lineage) if that shows up in practice.
     _SWA_KEEP_FULL_BLOCKS = 4
-
-    _is_window_state = staticmethod(is_window_kv_state)
 
     def _swa_store_active(self, cache_data) -> bool:
         """Turn-end window storage applies to models that store window state."""
@@ -2263,22 +2266,18 @@ class BlockAwarePrefixCache(CacheManager):
         block_hash: bytes,
         block_kv_data,
         layer_cache_types,
-        is_full_non_tail: bool,
+        is_full: bool,
         hot_cache_write_back: bool,
     ) -> None:
         """Record whether a just-stored block holds window state, from its payload."""
         has_window = any(
-            CacheTypeRegistry.is_arrays_family(t) and self._is_window_state(layer)
+            CacheTypeRegistry.is_arrays_family(t) and is_window_kv_state(layer)
             for t, layer in zip(layer_cache_types or (), block_kv_data or ())
         )
-        if not has_window:
-            self.paged_cache._swa_full_hashes.discard(block_hash)
-            self.paged_cache._swa_no_window.add(block_hash)
-        elif is_full_non_tail:
+        if has_window and is_full:
             self._swa_track_full_block(block_hash, hot_cache_write_back)
         else:
-            self.paged_cache._swa_no_window.discard(block_hash)
-            self.paged_cache._swa_full_hashes.add(block_hash)
+            self.paged_cache._swa_remember(block_hash, has_window)
 
     def _swa_track_full_block(
         self, block_hash: bytes, hot_cache_write_back: bool
@@ -2288,12 +2287,10 @@ class BlockAwarePrefixCache(CacheManager):
         if block_hash in fifo:
             return
         fifo.append(block_hash)
-        self.paged_cache._swa_no_window.discard(block_hash)
-        self.paged_cache._swa_full_hashes.add(block_hash)
+        self.paged_cache._swa_remember(block_hash, True)
         while len(fifo) > self._SWA_KEEP_FULL_BLOCKS:
             old = fifo.popleft()
-            self.paged_cache._swa_full_hashes.discard(old)
-            self.paged_cache._swa_no_window.add(old)
+            self.paged_cache._swa_remember(old, False)
             self._strip_rotating_payload(
                 old, hot_cache_write_back, strip_window_arrays=True
             )
@@ -2349,7 +2346,7 @@ class BlockAwarePrefixCache(CacheManager):
                 ) or (
                     strip_window_arrays
                     and CacheTypeRegistry.is_arrays_family(type_name)
-                    and self._is_window_state(layer)
+                    and is_window_kv_state(layer)
                 ):
                     new_data.append((mx.zeros((1,)), mx.zeros((1,))))
                     stripped += 1
@@ -2541,7 +2538,7 @@ class BlockAwarePrefixCache(CacheManager):
                 elif (
                     keep_window
                     and CacheTypeRegistry.is_arrays_family(type_name)
-                    and self._is_window_state(snap_state)
+                    and is_window_kv_state(snap_state)
                 ):
                     # Sliding-window state of a turn end (window_state_at_turn_ends).
                     new_data.append(
@@ -3086,7 +3083,7 @@ class BlockAwarePrefixCache(CacheManager):
                     if (
                         has_valid_state
                         and swa_strip_window
-                        and self._is_window_state(
+                        and is_window_kv_state(
                             snapshot_cache_data[layer_idx]["state"]
                             if has_snapshot
                             else layer_state["state"]

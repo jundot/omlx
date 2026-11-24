@@ -1301,11 +1301,19 @@ class PagedCacheManager(CacheManager):
             )
             for i, t in enumerate(types or ())
         )
+        self._swa_remember(block_hash, has_window)
+        return has_window
+
+    def _swa_remember(self, block_hash: BlockHash, has_window: bool | None) -> None:
+        """Record whether a block holds window state; None forgets it."""
+        self._swa_full_hashes.discard(block_hash)
+        self._swa_no_window.discard(block_hash)
+        if has_window is None:
+            return
         known = self._swa_full_hashes if has_window else self._swa_no_window
         if len(known) > 200_000:
             known.clear()
         known.add(block_hash)
-        return has_window
 
     def _match_tail_block(
         self,
