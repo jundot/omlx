@@ -34,7 +34,7 @@ from .. import row_exact_gemv
 from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
-from . import kernels, loopcd, verify_experts
+from . import expert_mma, kernels, loopcd, verify_experts
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -414,6 +414,19 @@ class Inkling2Experts(nn.Module):
         # Sorting regroups the pairs by expert and changes their arithmetic;
         # row-exact verify rows keep the per-pair gather of a decode step.
         do_sort = not fused and inds.size >= 64 and not armed
+        if (
+            do_sort
+            and expert_mma.applies(inds.size, experts)
+            and expert_mma.supported(self.w13, x.dtype)
+            and expert_mma.supported(self.w2, x.dtype)
+        ):
+            # The sorted gather_qmm's bits, grouped by expert on the GPU.
+            pairs = inds.reshape(-1)
+            routing = expert_mma.plan(pairs, experts)
+            y = expert_mma.gather(self.w13, x, inds.shape[-1], routing)
+            act = _softcapped_swiglu(y[:, 0::2], y[:, 1::2], self._gcap, self._ucap)
+            z = expert_mma.gather(self.w2, act, 1, routing)
+            return z.reshape(*inds.shape, -1), weights
         idx = inds
         inv = None
         if do_sort:
