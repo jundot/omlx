@@ -237,6 +237,7 @@ _INDEX_MMA = r"""
     // This query row's key count N, score width M (of the row stride MS), causal key
     // count and key buffer kp: one request's (meta), or each row its own request's.
     ROW_GEOMETRY
+    if (int(block) >= M) return;   // A shorter row's tiles past its own width.
     const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
     const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
     threadgroup float tile[D * COLS];

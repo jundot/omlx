@@ -25,7 +25,7 @@ from omlx.oqh import quantize as oqh_quantize
 from omlx.oqh.modules import OqhSwitchLinear
 from omlx.patches.deepseek_v41 import decode_fused
 from omlx.patches.deepseek_v41.config import ModelConfig
-from omlx.patches.deepseek_v41.language import Block, LanguageModel
+from omlx.patches.deepseek_v41.language import Block, Indexer, LanguageModel
 from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan, OffloadedExpert
 from omlx.patches.deepseek_v41.quantization import QuantizedProjection, pack_activation
 from tests.test_deepseek_v41 import run_two_ranks
@@ -257,39 +257,35 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
         plan.close()
 
 
-@pytest.mark.parametrize("positions", [[5, 5], [5, 5, 5], [3, 10, 4], [9, 2], [7]])
-def test_rope_table_rows_follow_explicit_positions(positions):
-    """Batched decode RoPEs one position per request: repeated and irregular positions
-    (three of them once read as arange arguments) give each row its position's angles."""
-    from omlx.patches.deepseek_v41.language import _rope_positions, _rope_table
-
-    params = (64, 10000.0, 0, 1.0, 32, 1)
-    cos, sin = _rope_table(params, _rope_positions(positions))
-    for row, pos in enumerate(positions):
-        c1, s1 = _rope_table(params, _rope_positions(range(pos, pos + 1)))
-        assert mx.array_equal(cos[row], c1[0]).item() and mx.array_equal(sin[row], s1[0]).item()
-
-
-# Prompt lengths of the B requests: positions in an arithmetic run, all equal (one RoPE
-# position repeated) and irregular (an explicit position per row).
-LENGTHS = {
-    "stepped": lambda b: [13 + 2 * r for r in range(b)],
-    "equal": lambda b: [14] * b,
-    "irregular": lambda b: [13 + (r * r * 7) % 11 for r in range(b)],
-}
+@pytest.mark.parametrize("batch", [8, 12, 16])
+def test_batched_index_queries_match_each_request_alone(batch):
+    """At the checkpoint's sizes, where MLX takes qmm from 12 rows of a quantized projection."""
+    c = replace(config(), dim=5120, q_lora_rank=1280, index_n_heads=32)
+    idx = Indexer(c, 0)
+    rng = np.random.default_rng(5)
+    for name in ("wq_b", "weights_proj"):
+        weight = mx.array(rng.normal(0, 0.03, getattr(idx, name).weight.shape), mx.bfloat16)
+        packed, scales, biases = mx.quantize(weight, group_size=64, bits=4)
+        setattr(idx, name, QuantizedProjection(packed, scales, 4, "affine", biases=biases, group_size=64, quantize_input=True))
+    x, qr = (mx.array(rng.normal(size=(1, batch, n)), mx.bfloat16) for n in (c.dim, c.q_lora_rank))
+    positions = [9 + r * r % 7 for r in range(batch)]
+    q, w = decode_fused._index_queries(idx, x, qr, positions)
+    for r, p in enumerate(positions):
+        alone = decode_fused._index_queries(idx, x[:, r : r + 1], qr[:, r : r + 1], range(p, p + 1))
+        assert mx.array_equal(q[:, r : r + 1], alone[0]).item() and mx.array_equal(w[:, r : r + 1], alone[1]).item()
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-@pytest.mark.parametrize("batch,lengths", [(3, "stepped"), (8, "stepped"), (17, "stepped"),   # odd: a tile lane holds half a vector pair
-                                           (3, "irregular"), (4, "equal"), (8, "irregular")])
-def test_batched_decode_matches_single_requests(monkeypatch, batch, lengths, fmt):
+# Irregular, equal and stepped positions; 3 and 17: a tile lane holds half a vector pair.
+@pytest.mark.parametrize("lengths", [[13, 20, 19], [14] * 4, [13 + r * r * 7 % 11 for r in range(8)], [13 + 2 * r for r in range(17)]])
+def test_batched_decode_matches_single_requests(monkeypatch, lengths, fmt):
     """On the row kernels (below decode_moe.MMA_MIN_BATCH requests without the drafter), B
     single-token requests through decode_block_nb give each request the logits it gets
-    decoding alone (per-request arithmetic is the single-request kernels'; the indexer
-    queries of the batch are one projection whose rows are those GEMVs)."""
+    decoding alone (per-request arithmetic is the single-request kernels')."""
     from omlx.patches.deepseek_v41 import decode_moe
     from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 
+    batch = len(lengths)
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
     # Affine batches always run on matrix tiles; so do MXFP8 ones once the drafter verifies.
     model = verify_exact(build(fmt=fmt)) if fmt == "affine" else build(fmt=fmt)
@@ -312,7 +308,7 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, lengths, fmt
 
     monkeypatch.setattr(decode_fused, "batched_attention", counted_attention)
     rng = np.random.default_rng(11)
-    prompts = [rng.integers(3, 60, n).tolist() for n in LENGTHS[lengths](batch)]
+    prompts = [rng.integers(3, 60, n).tolist() for n in lengths]
     singles, rows = [], []
     for p in prompts:
         for target in (singles, rows):
@@ -617,15 +613,11 @@ def test_batched_engram_projects_each_request_like_a_single_request(batch):
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
 @pytest.mark.parametrize("prompt_length", [11, 2])   # full window (batched attention) / filling
 @pytest.mark.parametrize("rows,accepted", [(2, 0), (3, 2), (6, 3)])
-# 3: every token selects index_topk keys; 12: a short context, where the block's tokens see
-# different key counts and candidate widths (each selects as its own call does).
-@pytest.mark.parametrize("index_topk", [3, 12])
-def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted, prompt_length, fmt, index_topk):
+def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted, prompt_length, fmt):
     """An MTP verify block through the fused kernels gives every token bit for bit the
     logits of decoding it alone, and after a partial rollback the cache continues exactly
     like one that decoded only the accepted tokens."""
-    # The vocab head kernel (per-row exact) needs >= 4096 rows.
-    model = verify_exact(build(fmt=fmt, vocab_size=4096, index_topk=index_topk))
+    model = verify_exact(build(fmt=fmt, vocab_size=4096))   # the vocab head kernel (per-row exact) needs >= 4096 rows
     calls = []
     real = decode_fused.decode_block_verify
 
@@ -648,7 +640,7 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
     for j in range(rows):
         assert mx.array_equal(got[0, j], expected[j]).item(), f"row {j}"
     assert len(calls) == model._config.n_layers
-    # A full window runs the compressor and indexer once per block.
+    # A full window with enough index keys runs the compressor and indexer once per block.
     assert len(blocks) == (4 if prompt_length == 11 else 0)
     assert model.mtp_partial_rollback(verified, accepted, rows - 1)
     for t in tokens[: accepted + 1]:

@@ -259,21 +259,6 @@ class Indexer(nn.Module):
             self.k_norm = RMSNorm(c.index_head_dim, c.norm_eps)
         self._config, self._layer = c, layer
 
-    def queries(self, x, qr, positions):
-        """The scoring query (RoPE'd, 4-bit act quant, [1, L, H, D]) and head weights
-        ([1, L, H] fp32) of the rows of x [1, L, dim] / qr [1, L, q_lora] at positions (a
-        range, or one position per row: B decode requests at once give each row the
-        values it gets alone)."""
-        c = self._config
-        q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
-        q = quantize_activation(rope(q, positions, c, True), bits=4)
-        # Reference: weights_proj(x) * scale is a tensor of the activation dtype (bf16).
-        weights = (
-            self.weights_proj(x)
-            * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
-        ).astype(x.dtype).astype(mx.float32)
-        return q, weights
-
     def update_keys(self, latent, cache, shared, start, end, ratio, dtype, latent_start=None):
         """A kv-source layer's index keys of the rows start..end (cache[3], shared["index_k"]);
         latent: their compressed rows (None when none completes)."""
@@ -313,7 +298,7 @@ class Indexer(nn.Module):
         )
 
     def select(self, q, weights, shared, start, ratio):
-        """The selected compressed indices of the queries() rows q / weights from start."""
+        """The selected compressed indices of the query rows q / weights from start."""
         c, layer = self._config, self._layer
         key = shared["index_k"]
         if not 0 <= c.candidate_source_layer < layer:
@@ -344,9 +329,16 @@ class Indexer(nn.Module):
         return mx.sort(mx.where(valid, idx, -1), axis=-1)
 
     def __call__(self, x, qr, latent, cache, shared, start, ratio, latent_start=None):
+        c = self._config
         end = start + x.shape[1]
         self.update_keys(latent, cache, shared, start, end, ratio, x.dtype, latent_start)
-        q, weights = self.queries(x, qr, range(start, end))
+        q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
+        q = quantize_activation(rope(q, range(start, end), c, True), bits=4)
+        # Reference: weights_proj(x) * scale is a tensor of the activation dtype (bf16).
+        weights = (
+            self.weights_proj(x)
+            * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
+        ).astype(x.dtype).astype(mx.float32)
         return self.select(q, weights, shared, start, ratio)
 
 
