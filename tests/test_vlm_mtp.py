@@ -1059,32 +1059,27 @@ class TestCallBackbone:
         assert result[2] is gdn
 
 
-def test_qwen_external_round_clears_before_replay_and_commits_before_yield(monkeypatch):
-    from mlx_vlm.speculative.mtp import _MTPVerifyResult
-
+def test_qwen_external_round_drains_the_engine_stream_before_replay(monkeypatch):
     events = []
     draft = SimpleNamespace(
         config=SimpleNamespace(model_type="qwen3_5_mtp"),
         accept_verified_tokens=lambda: events.append("replay"),
     )
-    monkeypatch.setattr(
-        vlm_mtp, "_sync_and_clear_cache", lambda stream: events.append("clear")
-    )
+    engine_stream = mx.new_stream(mx.gpu)
+
+    def clear(stream):
+        # The helper drains this stream and the default one.
+        assert stream == engine_stream
+        assert mx.default_stream(mx.gpu) != engine_stream
+        events.append("clear")
+
+    monkeypatch.setattr(vlm_mtp, "_sync_and_clear_cache", clear)
     monkeypatch.setattr(vlm_mtp, "_buffer_mtp_target_cache", lambda *args: None)
-    with mx.stream(vlm_mtp._vlm_generation_stream):
-        expected_stream = mx.default_stream(mx.gpu)
-
-    def commit(*args):
-        assert mx.default_stream(mx.gpu) == expected_stream
-        events.append("commit")
-
-    monkeypatch.setattr(_MTPVerifyResult, "commit", commit)
 
     def rounds(target, drafter, *args, **kwargs):
         try:
-            drafter.accept_verified_tokens()
-            result = _MTPVerifyResult(hidden=None, shared_kv_states={})
-            result.commit(None, [], 2, 3)
+            with mx.stream(vlm_mtp._vlm_generation_stream):
+                drafter.accept_verified_tokens()
             yield 11, None
             yield 12, None
         finally:
@@ -1101,11 +1096,48 @@ def test_qwen_external_round_clears_before_replay_and_commits_before_yield(monke
         max_tokens=4,
         sampler=lambda x: x,
     )
-    assert next(gen) == 7
-    assert events == []
-    assert next(gen) == 11
-    assert events == ["clear", "replay", "commit"]
-    assert next(gen) == 12
-    assert events == ["clear", "replay", "commit"]
-    gen.close()
+    with mx.stream(engine_stream):
+        assert next(gen) == 7
+        assert events == []
+        assert next(gen) == 11
+        assert events == ["clear", "replay"]
+        assert next(gen) == 12
+        assert events == ["clear", "replay"]
+        gen.close()
     assert events[-1] == "closed"
+
+
+@pytest.mark.parametrize("kept", [0, 1, 4])
+def test_buffered_rotating_cache_rolls_back_by_trimming(kept):
+    from mlx_vlm.models.cache import BufferedRotatingKVCache
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    from omlx.patches.mlx_vlm_mtp import apply_external_mtp_runtime_patch
+
+    apply_external_mtp_runtime_patch()
+    rows = mx.arange(40, dtype=mx.float32).reshape(1, 1, 40, 1)
+
+    def filled(count):
+        cache = BufferedRotatingKVCache(max_size=8, buffer_size=4)
+        for start in range(0, count, 3):
+            block = rows[:, :, start : min(start + 3, count)]
+            cache.update_and_fetch(block, block)
+        return cache
+
+    cache = filled(30)
+    transaction = start_speculative_cache([cache], 4)
+    assert not transaction._rotating
+    cache.update_and_fetch(rows[:, :, 30:34], rows[:, :, 30:34])
+    if kept:
+        transaction.commit([kept])
+    else:
+        transaction.abort()
+    assert not cache.is_speculating
+    assert cache.offset == 30 + kept
+    expected = rows[:, :, 30 + kept - 7 : 30 + kept]
+    assert mx.array_equal(cache.state[0][:, :, -7:], expected).item()
+    # A ring with kept rows still takes mlx-vlm's replay transaction.
+    ring = BufferedRotatingKVCache(max_size=8, keep=2)
+    ring_transaction = start_speculative_cache([ring], 4)
+    assert ring_transaction._rotating
+    ring_transaction.abort()

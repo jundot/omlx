@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from functools import partial
 
 import mlx_lm.tokenizer_utils as _tu
 
@@ -278,3 +279,32 @@ def apply_load_patch() -> bool:
         "(injects DSML chat_template + tool_parser for deepseek_v4)"
     )
     return True
+
+
+def install_vlm_tokenizer_protocol(tokenizer) -> None:
+    """Serve DeepSeek V4 Vision with the text engine's encoder and tool calls.
+
+    mlx-vlm's processor flattens images to placeholders and hands the messages
+    to this tokenizer once its template is not the processor's built-in one.
+    """
+    from . import chat_template_v4 as _ct
+    from . import tool_parser_v4 as _tp
+
+    tokenizer.chat_template = "deepseek_v4_python_reference"
+    # A partial follows the tokenizer when the engine deep-copies it.
+    tokenizer.apply_chat_template = partial(_render_vlm_chat, tokenizer)
+    tokenizer._omlx_supports_mid_system_messages = _ct.supports_mid_system_messages
+    tokenizer._omlx_relocate_mid_system_messages = _ct.relocate_mid_system_messages
+    tokenizer.has_tool_calling = True
+    tokenizer.tool_call_start = _tp.tool_call_start
+    tokenizer.tool_call_end = _tp.tool_call_end
+    tokenizer.tool_parser = _tp.parse_tool_call
+
+
+def _render_vlm_chat(tokenizer, messages, tokenize=True, **kwargs):
+    from . import chat_template_v4 as _ct
+
+    # The vision checkpoints answer without thinking unless it is requested.
+    kwargs.setdefault("enable_thinking", False)
+    prompt = _ct.apply_chat_template(messages, **kwargs)
+    return tokenizer.encode(prompt, add_special_tokens=False) if tokenize else prompt

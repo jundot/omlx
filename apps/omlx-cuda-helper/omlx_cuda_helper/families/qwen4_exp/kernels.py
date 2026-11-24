@@ -1297,7 +1297,7 @@ _EXPERT_GEMM = """
 
 # Expert banks the kernel reads as (bits, group sizes): oMLX affine banks, and
 # oQh banks with row scales (group 0) or rotated affine groups.
-_AFFINE_FORMATS = ((4, (64,)),)
+_AFFINE_FORMATS = ((2, (64,)), (3, (64,)), (4, (64,)), (5, (64,)))
 _OQH_FORMATS = ((2, (0,)), (3, (0,)), (4, (0, 128)), (5, (0, 128)))
 
 

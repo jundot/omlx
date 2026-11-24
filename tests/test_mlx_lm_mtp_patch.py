@@ -3766,6 +3766,31 @@ def test_block_drafter_matches_standard_and_feeds_committed_context(
     assert sorted(drafter.released) == sorted(terminal)
 
 
+@pytest.mark.parametrize(
+    ("limit", "align", "fail", "sent"),
+    [(8, 0, False, 1), (8, 0, True, 1), (8, 3, False, 0), (1, 0, False, 0)],
+)
+def test_first_token_streams_before_mtp_init(monkeypatch, limit, align, fail, sent):
+    standard = CountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, [[1, 2]], [limit])
+    model = CountingModel()
+    model._omlx_mtp_commit_align = align
+    init, seen = bg._post_init_mtp, []
+
+    def spy(gen_batch, **kwargs):
+        seen.append(gen_batch._num_tokens[0])
+        if fail:
+            raise bg._MtpStepFallback("no draft")
+        return init(gen_batch, **kwargs)
+
+    monkeypatch.setattr(bg, "_post_init_mtp", spy)
+    actual, _ = generate(model, [[1, 2]], [limit])
+
+    assert seen[0] == sent
+    assert actual == expected
+
+
 @pytest.mark.parametrize("wrong", [None, 0, 3])
 def test_block_drafter_copies_keep_output_and_context(monkeypatch, wrong):
     from omlx.patches.mlx_lm_mtp import context_copy

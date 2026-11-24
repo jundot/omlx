@@ -233,18 +233,22 @@ _INDEX_MMA = r"""
     constexpr uint COLS = HEAD_SPLIT ? 16 : 32;
     const uint key_group = HEAD_SPLIT ? sg % 2 : sg;
     const uint block = threadgroup_position_in_grid.x * COLS;
-    const int H = HEADS, N = meta[1], M = meta[2], start = meta[3], ratio = RATIO;
+    const int H = HEADS, MS = meta[2], ratio = RATIO;
+    // This query row's key count N, score width M (of the row stride MS), causal key
+    // count and key buffer kp: one request's (meta), or each row its own request's.
+    ROW_GEOMETRY
+    if (int(block) >= M) return;   // A shorter row's tiles past its own width.
     const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
     const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
     threadgroup float tile[D * COLS];
     for (uint i = tid; i < D * COLS; i += 128) {
         const uint d = i / COLS, col = i % COLS, pos = block + col;
-        const int row = pos < M ? (CANDIDATES ? candidates[query * M + pos] : int(pos)) : -1;
+        const int row = pos < M ? (CANDIDATES ? candidates[query * MS + pos] : int(pos)) : -1;
         float value = 0.0f;
-        if (row >= 0 && row < N && row + meta[5] < (start + int(query) + 1) / ratio) {
+        if (row >= 0 && row < N && row + meta[5] < visible) {
             const size_t base = size_t(row) * (D / 2 + D / 32);
-            const uchar code = (keys[base + d / 2] >> ((d % 2) * 4)) & 15;
-            value = ldexp(v41_fp4(code), int(keys[base + D / 2 + d / 32]) - 127);
+            const uchar code = (kp[base + d / 2] >> ((d % 2) * 4)) & 15;
+            value = ldexp(v41_fp4(code), int(kp[base + D / 2 + d / 32]) - 127);
         }
         tile[i] = value;
     }
@@ -285,17 +289,17 @@ _INDEX_MMA = r"""
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid < COLS && block + tid < M) {
             const uint pos = block + tid;
-            const int row = CANDIDATES ? candidates[query * M + pos] : int(pos);
-            const bool valid = row >= 0 && row < N && row + meta[5] < (start + int(query) + 1) / ratio;
-            scores[query * M + pos] = valid ? float(R(head_totals[tid] + head_totals[tid + COLS])) : -INFINITY;
+            const int row = CANDIDATES ? candidates[query * MS + pos] : int(pos);
+            const bool valid = row >= 0 && row < N && row + meta[5] < visible;
+            scores[query * MS + pos] = valid ? float(R(head_totals[tid] + head_totals[tid + COLS])) : -INFINITY;
         }
     } else if (fm == 0) {
         for (uint j = 0; j < 2; ++j) {
             const uint pos = block + sg * 8 + fn + j;
             if (pos >= M) continue;
-            const int row = CANDIDATES ? candidates[query * M + pos] : int(pos);
-            const bool valid = row >= 0 && row < N && row + meta[5] < (start + int(query) + 1) / ratio;
-            scores[query * M + pos] = valid ? float(R(j == 0 ? total0 : total1)) : -INFINITY;
+            const int row = CANDIDATES ? candidates[query * MS + pos] : int(pos);
+            const bool valid = row >= 0 && row < N && row + meta[5] < visible;
+            scores[query * MS + pos] = valid ? float(R(j == 0 ? total0 : total1)) : -INFINITY;
         }
     }
 """
@@ -337,9 +341,25 @@ def _kernel(kind):
     elif kind == "merge":
         inputs = ["partial", "sink", "meta"]
         outputs, source = ["out"], _MERGE
+    elif kind.startswith("index_mma_rows"):
+        # One query row per request of a decode batch, each scoring its own key buffer.
+        b_n = int(kind[len("index_mma_rows"):])
+        keys = [f"keys{r}" for r in range(b_n)]
+        chain = " : ".join(f"query == {r} ? {k}" for r, k in enumerate(keys[:-1]))
+        geometry = (
+            "const int N = rows[query * 3], M = rows[query * 3 + 1];\n"
+            "    const int visible = (rows[query * 3 + 2] + 1) / ratio;\n"
+            f"    const device uint8_t* kp = {chain + ' : ' if chain else ''}{keys[-1]};"
+        )
+        inputs = ["q", *keys, "weights", "candidates", "meta", "rows"]
+        outputs, source = ["scores"], _INDEX_MMA.replace("ROW_GEOMETRY", geometry)
     else:
         inputs = ["q", "keys", "weights", "candidates", "meta"]
-        outputs, source = ["scores"], _INDEX_MMA if kind == "index_mma" else _INDEX
+        geometry = (
+            "const int N = meta[1], M = MS, visible = (meta[3] + int(query) + 1) / ratio;\n"
+            "    const auto kp = keys;   // constant space when MLX binds an empty cache's stand-in"
+        )
+        outputs, source = ["scores"], _INDEX_MMA.replace("ROW_GEOMETRY", geometry) if kind == "index_mma" else _INDEX
     return mx.fast.metal_kernel(
         name="deepseek_v41_packed_" + kind,
         input_names=inputs,
@@ -523,6 +543,67 @@ def packed_index_scores(
         output_shapes=[(1, length, width)],
         output_dtypes=[mx.float32],
     )[0]
+
+
+def packed_index_scores_rows(q, keys, weights, positions, ratio, widths, candidates=None):
+    """packed_index_scores of B decode requests in one kernel: query row r of q
+    [1, B, H, D] / weights [1, B, H] (one token at positions[r]) scores its own request's
+    keys[r] ([1, N_r, row]) over its first widths[r] keys, or over its row of candidates
+    ([1, B, MS], MS = max(widths)). Returns [1, B, MS] fp32: row r's first widths[r]
+    scores are those packed_index_scores gives the request alone, the rest unset."""
+    _, b_n, heads, dim = q.shape
+    if not (dim <= 128 and heads >= 8 and dim % 32 == 0) or len(keys) != b_n or b_n > 16:
+        raise ValueError("Row-batched index scores need the MMA geometry and one key buffer per row")
+    if any(k.ndim != 3 or k.dtype != mx.uint8 or k.shape[-1] != dim // 2 + dim // 32 for k in keys):
+        raise ValueError("Expected packed FP4 index keys")
+    ms = max(widths)
+    head_split = heads >= 32
+    cols = 16 if head_split else 32
+    return _kernel(f"index_mma_rows{b_n}")(
+        inputs=[
+            q,
+            # An empty cache's stand-in stays in device memory (tiny inputs bind as constant).
+            *(k if k.size else mx.zeros((dim,), mx.uint8) for k in keys),
+            weights.astype(mx.float32),
+            mx.zeros((1,), mx.int32) if candidates is None else candidates.astype(mx.int32),
+            mx.array([heads, 0, ms, 0, ratio, 0], mx.int32),
+            mx.array([[k.shape[1], w, p] for k, w, p in zip(keys, widths, positions)], mx.int32),
+        ],
+        template=[
+            ("D", dim),
+            ("CANDIDATES", candidates is not None),
+            ("HEAD_SPLIT", head_split),
+            ("HEADS", heads),
+            ("RATIO", ratio),
+            ("R", q.dtype),
+        ],
+        grid=((ms + cols - 1) // cols * 128, b_n, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(1, b_n, ms)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def index_select_rows(scores, widths, counts, candidates=None):
+    """index_select of each row r of scores [1, B, MS] over its first widths[r] scores
+    (and candidates), with counts[r] slots: one kernel, row r's ids [1, 1, counts[r]] as
+    index_select gives them for that row alone (widths and counts positive)."""
+    b_n, ms = scores.shape[1], scores.shape[2]
+    ks = max(counts)
+    ids = _index_select_kernel(rows=True)(
+        inputs=[
+            scores.astype(mx.float32),
+            mx.zeros((8,), mx.int32) if candidates is None else candidates.astype(mx.int32),
+            mx.array([ms, ks, 0, 0, 0, 0, 0, 0], mx.uint32),
+            mx.array([[w, k] for w, k in zip(widths, counts)], mx.uint32),
+        ],
+        template=[("CAND", candidates is not None)],
+        grid=(1024 * b_n, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, b_n, ks)],
+        output_dtypes=[mx.int32],
+    )[0]
+    return [ids[:, r : r + 1, :k] for r, k in enumerate(counts)]
 
 
 _TOPK = r"""
@@ -985,9 +1066,11 @@ _INDEX_SELECT = r"""
     constexpr uint TPG = 1024, BINS = 4096;
     const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup, row = threadgroup_position_in_grid.x;
-    const uint n = meta[0], K = meta[1], k = min(K, n);
-    const auto s = scores + size_t(row) * n;
-    device int* out = ids + size_t(row) * K;
+    // Row width n and count K; SN / KS: the row strides of scores (and cand) / ids.
+    ROW_SELECT
+    const uint k = min(K, n);
+    const auto s = scores + size_t(row) * SN;
+    device int* out = ids + size_t(row) * KS;
     threadgroup atomic_uint hist[BINS];
     threadgroup uint part[32];
     threadgroup uint found_bin, found_above;
@@ -1050,18 +1133,25 @@ _INDEX_SELECT = r"""
         const uint key = v41_score_key(s[i]);
         const bool take = key > prefix || (key == prefix && r < ties);
         r += key == prefix;
-        if (take) out[o++] = CAND ? cand[size_t(row) * n + i] : int(i);
+        if (take) out[o++] = CAND ? cand[size_t(row) * SN + i] : int(i);
     }
 """
 
 
 @cache
-def _index_select_kernel():
+def _index_select_kernel(rows=False):
+    """rows: each row has its own width and count (rows[2r], rows[2r + 1]); the row strides
+    are meta[0] (scores, candidates) and meta[1] (ids)."""
+    select = (
+        "const uint n = rows[row * 2], K = rows[row * 2 + 1], SN = meta[0], KS = meta[1];"
+        if rows
+        else "const uint n = meta[0], K = meta[1], SN = n, KS = K;"
+    )
     return mx.fast.metal_kernel(
-        name="deepseek_v41_index_select",
-        input_names=["scores", "cand", "meta"],
+        name="deepseek_v41_index_select" + ("_rows" if rows else ""),
+        input_names=["scores", "cand", "meta"] + (["rows"] if rows else []),
         output_names=["ids"],
-        source=_INDEX_SELECT,
+        source=_INDEX_SELECT.replace("ROW_SELECT", select),
         header=_RADIX_HEADER,
     )
 

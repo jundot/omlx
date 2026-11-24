@@ -255,7 +255,7 @@ from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
 from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
-from .utils import gpu_power
+from .utils import gpu_power, macos_say
 from .utils.network import is_loopback_bind
 
 logging.basicConfig(level=logging.INFO)
@@ -3958,6 +3958,11 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
     ):
         models.append(
             ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx", model_type="markitdown")
+        )
+
+    if macos_say.enabled(_server_state.global_settings):
+        models.append(
+            ModelInfo(id=macos_say.MODEL_ID, owned_by="omlx", model_type="audio_tts")
         )
 
     # Favorites first; stable sort keeps alphabetical order within groups.
@@ -10146,7 +10151,7 @@ model and sampling defaults are managed via the admin page.
     # setup form crashing with a 500 (#2282). Passing api_key keeps the
     # two entry points enforcing the same auth. Scheduler/cache wiring
     # stays CLI-only on purpose; this entry point remains minimal.
-    from .settings import init_settings
+    from .settings import GRACEFUL_SHUTDOWN_TIMEOUT_S, init_settings
 
     settings = init_settings()
     if args.host is not None:
@@ -10180,7 +10185,12 @@ model and sampling defaults are managed via the admin page.
     # Start server
     import uvicorn
 
-    uvicorn.run(app, host=settings.server.host, port=args.port)
+    uvicorn.run(
+        app,
+        host=settings.server.host,
+        port=args.port,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT_S,
+    )
 
 
 if __name__ == "__main__":

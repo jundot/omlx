@@ -126,7 +126,8 @@ def test_plan_counts_only_what_a_stage_loads():
 
 
 @pytest.mark.skipif(not kernels.available(), reason="CUDA kernels")
-def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry():
+@pytest.mark.parametrize("bits", (2, 3, 4, 5))
+def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry(bits):
     # Qwen3.8 Flash-Next shapes with random bf16 weights: a kernel that fails
     # its check would only log a warning and leave the slow path in place.
     text = {
@@ -185,7 +186,7 @@ def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry():
     connection.enable_kernels()
     linear = GatedDeltaNet(weights.at("gdn"), text)
     linear.enable_kernels()
-    # Eight experts of the checkpoint's widths, 4-bit in groups of 64.
+    # Eight experts of the checkpoint's widths in groups of 64.
     bank = {"router": (8, 2560), "shared_expert_gate": (1, 2560)}
     bank.update({f"shared_expert.{n}_proj": (640, 2560) for n in ("gate", "up")})
     bank["shared_expert.down_proj"] = (2560, 640)
@@ -196,13 +197,13 @@ def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry():
     for name, shape in bank.items():
         dense = (0.02 * mx.random.normal(shape)).astype(mx.bfloat16)
         if name.startswith("switch_mlp"):
-            packed = mx.quantize(dense, group_size=64, bits=4)
+            packed = mx.quantize(dense, group_size=64, bits=bits)
             for part, value in zip(("weight", "scales", "biases"), packed):
                 arrays[f"{name}.{part}"] = value
         else:
             arrays[f"{name}.weight"] = dense
     arrays["gate.weight"] = arrays.pop("router.weight")
-    config = {"quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}
+    config = {"quantization": {"group_size": 64, "bits": bits, "mode": "affine"}}
     moe = MoE(Weights(arrays, config, ""), text)
     moe.enable_kernels()
     assert attention.fused_prep and attention.selection is not None

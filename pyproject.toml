@@ -110,9 +110,9 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit 138d761 (v0.7.11). oMLX model implementations remain registered
+    # mlx-vlm from commit 36494b4 (v0.8.1). oMLX model implementations remain registered
     # by their pre-load patches.
-    "mlx-vlm @ git+https://github.com/Neywa-Labs/mlx-vlm@138d7617d39653b39a5cbc379b1b5907a4481d67",
+    "mlx-vlm @ git+https://github.com/Neywa-Labs/mlx-vlm@36494b42c7676081aa3c14878b3175b90c2fedf4",
     # mlx-vlm requires mlx-audio>=0.6.2 in the shared runtime.
     "mlx-audio @ git+https://github.com/Neywa-Labs/mlx-audio@1157775c1999654b1ebde41ed03d88108e23f88b",
     "Pillow>=9.0.0",

@@ -118,6 +118,7 @@ class ModelLayout:
     # Whether mlx-lm can split this architecture into pipeline stages. False
     # means the model runs on one node or not at all, however well it fits.
     supports_pipeline: bool = False
+    unsupported_reason: str = ""
     # Layers a later stage may start at, for architectures whose layers read
     # state that an earlier layer keeps in its own cache. Empty means any.
     pipeline_stage_starts: tuple[int, ...] = ()
@@ -765,7 +766,7 @@ def _mlx_lm_accepts_config(config: dict[str, Any]) -> bool:
         return True
     try:
         from_dict(config)
-    except (AssertionError, KeyError, TypeError, ValueError):
+    except (AssertionError, KeyError, TypeError):
         return False
     return True
 
@@ -1591,7 +1592,10 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "safetensors layer indices must be contiguous and start at zero"
         )
-    loadable = _mlx_lm_accepts_config(config)
+    try:
+        loadable, unsupported_reason = _mlx_lm_accepts_config(config), ""
+    except ValueError as exc:
+        loadable, unsupported_reason = False, str(exc)
     return ModelLayout(
         source=str(root.resolve()),
         fixed_weight_bytes=fixed_bytes,
@@ -1603,6 +1607,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         tensor_parallel_divisors=_tensor_parallel_divisors(config),
         supports_tensor_parallel=(loadable and _supports_tensor_parallel(config)),
         supports_pipeline=loadable and _supports_pipeline(config),
+        unsupported_reason=unsupported_reason,
         pipeline_stage_starts=_pipeline_stage_starts(config) if loadable else (),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(config),
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(config),

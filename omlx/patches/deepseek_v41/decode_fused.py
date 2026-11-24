@@ -18,7 +18,13 @@ import numpy as np
 from . import decode_layer as DL
 from . import decode_moe as DM
 from . import growth
-from .kernels import index_select, packed_index_scores, packed_index_topk
+from .kernels import (
+    index_select,
+    index_select_rows,
+    packed_index_scores,
+    packed_index_scores_rows,
+    packed_index_topk,
+)
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 
 
@@ -235,10 +241,97 @@ def compress_index(att, x, qr, cache, shared, start, c):
     return shared["kv"], shared["idx"]
 
 
+def compress_index_nb(att, x, qr, caches, shareds, starts, c):
+    """compress_index for B decode requests (x [B, dim], qr [B, q_lora]; row r at starts[r]):
+    each request's compressor, key bookkeeping and query projections, then one scoring and
+    one selection kernel for the batch. Returns per request (its compressed rows, its
+    selected indices), compress_index's for that request."""
+    from .language import rope
+
+    layer = att._layer
+    ratio = c.compress_ratios[layer]
+    b_n = len(starts)
+    kv_source, index_source = layer in c.kv_source_layers, layer in c.index_source_layers
+    if not (kv_source or index_source):
+        return [(s["kv"], s["idx"]) for s in shareds]
+    latents = [None] * b_n
+    if kv_source:
+        xs = mx.split(x, b_n)
+        for r in range(b_n):
+            cache = caches[r]
+            latents[r] = att.compressor(xs[r].reshape(1, 1, -1), cache, starts[r])
+            if cache[2] is None:
+                cache[2] = pack_activation(mx.zeros((1, 0, c.head_dim), x.dtype), bits=4, group_size=16, e4m3_scale=True)
+            shareds[r]["kv"] = cache[2][:, : starts[r] // ratio]
+    if index_source:
+        idx = att.indexer
+        for r in range(b_n):
+            idx.update_keys(latents[r], caches[r], shareds[r], starts[r], starts[r] + 1, ratio, x.dtype)
+        q, w = _index_queries(idx, x[None], qr[None], list(starts))
+        for r, ids in enumerate(_index_select_nb(idx, q, w, shareds, starts, ratio, c)):
+            shareds[r]["idx"] = ids
+    for r in range(b_n):
+        if latents[r] is not None:
+            first = starts[r] // ratio
+            compressed = rope(latents[r], range(first * ratio, (starts[r] + 1) // ratio * ratio, ratio), c, True)
+            compressed = pack_activation(compressed, bits=4, group_size=16, e4m3_scale=True)
+            shareds[r]["kv"] = caches[r][2] = growth.append(caches[r], 2, shareds[r]["kv"], compressed, first)
+    return [(s["kv"], s["idx"]) for s in shareds]
+
+
+# A request's single query scans its visible keys in one tile up to this many (packed_index_topk).
+_INDEX_TILE_KEYS = 524288
+
+
+def _index_select_nb(idx, q, w, shareds, starts, ratio, c):
+    """Indexer.select for B decode requests (q [1, B, H, D], w [1, B, H]): one row-batched
+    scoring and selection kernel, each row over its own request's keys or candidates, or
+    per request where those kernels do not apply (the candidate-source layer, which also
+    picks candidate blocks; a geometry without the MMA scorer; an empty or multi-tile scan)."""
+    layer, b_n = idx._layer, len(starts)
+    keys = [s["index_k"] for s in shareds]
+    candidates = None
+    if layer == c.candidate_source_layer or not (q.shape[-1] <= 128 and q.shape[2] >= 8):
+        widths = None
+    elif 0 <= c.candidate_source_layer < layer:
+        blocks = [s["candidates"] for s in shareds]
+        widths = [b.shape[-1] * c.candidate_block_size for b in blocks]
+        counts = [min(c.index_topk, n) for n in widths]
+        most = max(b.shape[-1] for b in blocks)
+        blocks = mx.concatenate([b if b.shape[-1] == most else mx.pad(b, [(0, 0), (0, 0), (0, most - b.shape[-1])], constant_values=-1)
+                                 for b in blocks], 1)
+        candidates = idx.candidate_rows(blocks)
+    else:
+        widths = [min(k.shape[1], (s + 1) // ratio) for k, s in zip(keys, starts)]
+        counts = [min(c.index_topk, k.shape[1]) for k in keys]
+        if max(widths) > _INDEX_TILE_KEYS:
+            widths = None
+    if widths is None or not min(widths) or not min(counts):
+        return [idx.select(q[:, r : r + 1], w[:, r : r + 1], shareds[r], starts[r], ratio) for r in range(b_n)]
+    scores = packed_index_scores_rows(q, keys, w, starts, ratio, widths, candidates)
+    return index_select_rows(scores, widths, counts, candidates)
+
+
 def _rows(p, v):
     """p applied to each row of v ([1, R, K]) on its own, as when each token decodes alone
-    (a multi-row MLX GEMV rounds its fp32 sums differently)."""
+    (a multi-row MLX GEMV rounds its fp32 sums differently, and from 12 rows a wide quantized
+    projection runs as qmm, which rounds the dequantized weights to the activation dtype)."""
     return mx.concatenate([p(v[:, j : j + 1]) for j in range(v.shape[1])], 1)
+
+
+def _index_queries(idx, x, qr, positions):
+    """The indexer's query and head weights of the rows x [1, R, dim], qr [1, R, q_lora] at
+    positions, each row as when it decodes alone."""
+    from .language import rope
+
+    c = idx._config
+    q = _rows(idx.wq_b, qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
+    q = quantize_activation(rope(q, positions, c, True), bits=4)
+    weights = (
+        _rows(idx.weights_proj, x)
+        * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
+    ).astype(x.dtype).astype(mx.float32)
+    return q, weights
 
 
 def block_index_ok(c, start):
@@ -303,12 +396,7 @@ def _index_block(idx, x, qr, latent, cache, shared, start, ratio):
             previous = growth.append(cache, 3, previous, key, start // ratio)
         shared["block_index_k"] = cache[3] = previous
     key = shared["block_index_k"]
-    q = _rows(idx.wq_b, qr).reshape(1, r_n, c.index_n_heads, c.index_head_dim)
-    q = quantize_activation(rope(q, range(start, end), c, True), bits=4)
-    weights = (
-        _rows(idx.weights_proj, x)
-        * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
-    ).astype(x.dtype).astype(mx.float32)
+    q, weights = _index_queries(idx, x, qr, range(start, end))
     if not 0 <= c.candidate_source_layer < layer:
         ids, blocks = packed_index_topk(
             q, key, weights, start, ratio, c.index_topk,
@@ -320,9 +408,7 @@ def _index_block(idx, x, qr, latent, cache, shared, start, ratio):
             # only add -inf candidates and keep the order of the others.
             shared["block_candidates"] = blocks
         return ids
-    blocks = shared["block_candidates"]
-    candidates = blocks[..., None] * c.candidate_block_size + mx.arange(c.candidate_block_size)
-    candidates = mx.where(blocks[..., None] >= 0, candidates, -1).reshape(1, r_n, -1)
+    candidates = idx.candidate_rows(shared["block_candidates"])
     scores = packed_index_scores(q, key, weights, start, ratio, candidates)
     return index_select(scores, c.index_topk, candidates)
 
@@ -534,7 +620,7 @@ def _arange_i32(n):
 
 def batched_attention(att, q, packed, x, qr, caches, shareds, starts, cos, sin, c):
     """Attention for B requests whose windows are full (start >= window_size): one window
-    shift for the batch, per-request compressor / indexer, then the split attention with a
+    shift for the batch, compress_index_nb, then the split attention with a
     request grid axis. Each request's keys, their order and the arithmetic are those of
     attention_core (window rows old[1:] + new are exactly the rows it attends to). Returns
     act_quant(o) [B, H*D], or None when a request's window is not full yet."""
@@ -547,11 +633,7 @@ def batched_attention(att, q, packed, x, qr, caches, shareds, starts, cos, sin, 
     win = mx.concatenate([old[:, 1:], packed[:, None, :]], 1)
     for r in range(b_n):
         caches[r][1] = win[r : r + 1]
-    parts = None
-    if c.compress_ratios[att._layer]:
-        xs, qrs = mx.split(x, b_n), mx.split(qr, b_n)
-        parts = [compress_index(att, xs[r].reshape(-1), qrs[r].reshape(-1), caches[r], shareds[r], starts[r], c)
-                 for r in range(b_n)]
+    parts = compress_index_nb(att, x, qr, caches, shareds, starts, c) if c.compress_ratios[att._layer] else None
     return window_attention_bq(att, q, win, parts, shareds[0], cos, sin, c)
 
 
