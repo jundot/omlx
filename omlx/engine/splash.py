@@ -1760,6 +1760,8 @@ class SplashEngine(BaseEngine):
         )
 
     # -- plain completions -----------------------------------------------------------
+    # Splash added /v1/completions in 1.2.0, below MIN_SPLASH_VERSION, so every
+    # supported release has it and no version check is needed.
 
     async def stream_generate(
         self,
