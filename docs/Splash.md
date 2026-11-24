@@ -53,7 +53,7 @@ Unloading the model stops the Splash process. Splash runs in its own process gro
 
 | oMLX | Splash |
 | --- | --- |
-| Model's max context window, when set | `--max-context` (at most 256K); Splash refuses to start when its memory budget cannot hold it |
+| Model's max context window, when set | `--max-context`, at most 256K (1,010,000 for the Qwen models from Splash 1.4.0 on; past 256K Splash turns on YaRN, which changes answers at every length). When the memory budget cannot hold it, Splash fits the context to the budget |
 | Integrations → Memory limit (empty: enough for the model's context window) | `--max-memory`, never more than the oMLX memory limit leaves free |
 | Integrations → KV cache precision | `--kv-format` |
 | Integrations → Activation precision (Splash 1.6.1+) | `--activations`; `auto` is left implicit, `bf16` pins attention to bf16 on M5 and later |
