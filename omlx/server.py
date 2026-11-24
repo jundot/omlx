@@ -10151,7 +10151,7 @@ model and sampling defaults are managed via the admin page.
     # setup form crashing with a 500 (#2282). Passing api_key keeps the
     # two entry points enforcing the same auth. Scheduler/cache wiring
     # stays CLI-only on purpose; this entry point remains minimal.
-    from .settings import init_settings
+    from .settings import GRACEFUL_SHUTDOWN_TIMEOUT_S, init_settings
 
     settings = init_settings()
     if args.host is not None:
@@ -10185,7 +10185,12 @@ model and sampling defaults are managed via the admin page.
     # Start server
     import uvicorn
 
-    uvicorn.run(app, host=settings.server.host, port=args.port)
+    uvicorn.run(
+        app,
+        host=settings.server.host,
+        port=args.port,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT_S,
+    )
 
 
 if __name__ == "__main__":

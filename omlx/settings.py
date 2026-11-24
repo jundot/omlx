@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 # Settings file version for future migrations
 SETTINGS_VERSION = "1.0"
 
+# Seconds in-flight requests get to finish on SIGINT/SIGTERM. The Mac app kills
+# the server after 10 s, and the engine teardown needs the rest.
+GRACEFUL_SHUTDOWN_TIMEOUT_S = 5
+
 # Default base path
 DEFAULT_BASE_PATH = Path.home() / ".omlx"
 
