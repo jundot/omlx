@@ -180,6 +180,8 @@ def load_dflash_drafter(
     model, kind = load_drafter(path, kind="dflash")
     if kind != "dflash":
         raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
+    if getattr(model, "d2t", None) is not None:
+        raise ValueError(f"{path} drafts in a reduced vocabulary, which is not supported")
     cast = match_target_dtype(model, target_model)
     if cast:
         logger.info("DFlash drafter cast to fp16 to match the target: %d arrays", cast)

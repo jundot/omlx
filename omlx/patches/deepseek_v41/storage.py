@@ -49,9 +49,9 @@ _PAGE_IO_POOL = ThreadPoolExecutor(
 ROW_BATCH_ROWS = 256
 ROW_BATCH_MAX_GAP = 65536
 ROW_READ_RETRY_SECONDS = 60.0
-# Lookups up to this many rows (a decode token, a short verify block) advise
+# Lookups up to this many rows (16 decode or verify tokens of 24 rows) advise
 # their pages, then copy from the mapping: missing pages read all at once.
-ADVISE_MAX_ROWS = 64
+ADVISE_MAX_ROWS = 384
 
 # mincore observes the file cache without faulting the mapping into memory.
 _MINCORE = ctypes.CDLL(None).mincore

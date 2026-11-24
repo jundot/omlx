@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from functools import partial
 
 logger = logging.getLogger(__name__)
 
@@ -194,20 +195,40 @@ def apply_mlx_vlm_mtp_runtime_patch(model_type: str | None = None) -> bool:
 
 
 def apply_external_mtp_runtime_patch() -> None:
-    """Commit external MTP cache state on the verifier stream."""
-    from functools import wraps
+    """Roll external MTP rounds back by trimming the buffered sliding caches.
 
-    import mlx.core as mx
-    from mlx_vlm.speculative import mtp
+    mlx-vlm's transaction for rotating caches keeps the arrays from before the
+    verify, so every verify copies the sliding windows. A buffered cache has
+    the slack to drop the rejected rows instead.
+    """
+    from mlx_vlm.models.cache import BufferedRotatingKVCache
 
-    original = mtp._MTPVerifyResult.commit
-    if getattr(original, "_omlx_generation_stream", False):
+    cls = BufferedRotatingKVCache
+    if hasattr(cls, "start_speculation"):
         return
 
-    @wraps(original)
-    def commit(*args, **kwargs):
-        with mx.stream(mtp.generation_stream):
-            return original(*args, **kwargs)
+    def start(self, length):
+        self.is_speculating = True
+        return self.offset
 
-    commit._omlx_generation_stream = True
-    mtp._MTPVerifyResult.commit = commit
+    def validate(self, lengths, start_offset):
+        if len(set(lengths)) > 1:
+            raise RuntimeError("This rotating cache requires uniform acceptance.")
+
+    def commit(self, lengths, start_offset):
+        self.trim(self.offset - start_offset - lengths[0])
+        self.is_speculating = False
+
+    def abort(self, start_offset):
+        self.trim(self.offset - start_offset)
+        self.is_speculating = False
+
+    def start_speculation(self):
+        # ``keep`` rows use the ring layout, which cannot be trimmed.
+        return None if self.keep else partial(start, self)
+
+    cls.is_speculating = False
+    cls.start_speculation = property(start_speculation)
+    cls.validate_speculation = validate
+    cls.commit_speculation = commit
+    cls.abort_speculation = abort

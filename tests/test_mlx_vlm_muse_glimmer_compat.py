@@ -11,6 +11,7 @@ contract (dict tool arguments, to=self reasoning, reasoning_strength).
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -147,6 +148,22 @@ def test_image_processor_patch_layout_and_grid(applied):
     # Temporal copies are adjacent within each flattened patch.
     first = output["pixel_values"][0].reshape(2, 3, 14, 14)
     np.testing.assert_array_equal(first[0], first[1])
+
+
+def test_position_grid_swaps_axes_for_non_square_images(applied):
+    import mlx.core as mx
+    from mlx_vlm.models.muse_glimmer.vision import PatchEmbedder
+
+    config = SimpleNamespace(
+        patch_temporal=1, patch_size=1, hidden_size=1, pos_emb_height=4, pos_emb_width=4
+    )
+    embedder = PatchEmbedder(config)
+    table = 10.0 * mx.arange(4)[:, None] + mx.arange(4)[None]
+    embedder.position_embedding_table.weight = table.reshape(16, 1)
+    # grid_sample with meshgrid(pos_h, pos_w, indexing="xy") on a 2x4 grid.
+    expected = [0.5, 2.5, 10.5, 12.5, 20.5, 22.5, 30.5, 32.5]
+    actual = embedder._position_embeddings([(1, 2, 4)]).reshape(-1)
+    assert mx.allclose(actual, mx.array(expected)).item()
 
 
 def test_nope_layers_skip_rope(applied):
