@@ -2254,6 +2254,59 @@ class TestEnginePoolAsync:
         assert second is base_engine
         profile_engine.stop.assert_awaited_once()
 
+    def test_k2_ane_prefill_keeps_specprefill_in_the_signature(
+        self, pool_with_mock_engines
+    ):
+        """The reload is what rejects this combination."""
+        pool = pool_with_mock_engines
+        pool.get_entry("model-a").config_model_type = "k2_horizon"
+
+        def signature(**specprefill):
+            settings = ModelSettings(qwen35_ane_prefill_enabled=True, **specprefill)
+            return pool._engine_runtime_signature("model-a", settings)
+
+        assert signature() != signature(
+            specprefill_enabled=True, specprefill_draft_model="/draft"
+        )
+
+    @pytest.mark.asyncio
+    async def test_specprefill_draft_attaches_without_reload(
+        self, pool_with_mock_engines
+    ):
+        """An alias adds its draft to a busy engine, which then serves both."""
+        pool = pool_with_mock_engines
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings()
+        alias, other_draft = (
+            ModelSettings(specprefill_enabled=True, specprefill_draft_model=draft)
+            for draft in ("/draft", "/other")
+        )
+        engine = MagicMock(specprefill_draft_path=None)
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+
+        def attach(engine, draft_path):
+            assert pool.get_entry("model-a").in_use == 2
+            engine.specprefill_draft_path = draft_path
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch(
+                "omlx.engine_pool.attach_specprefill_draft", side_effect=attach
+            ) as attach_mock,
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            for settings in (alias, None, alias):
+                served = await pool.get_engine("model-a", runtime_settings=settings)
+                assert served is engine
+            with pytest.raises(ModelBusyError):
+                await pool.get_engine("model-a", runtime_settings=other_draft)
+
+        attach_mock.assert_called_once_with(engine, "/draft")
+        engine.start.assert_awaited_once()
+        engine.stop.assert_not_awaited()
+        assert pool.get_entry("model-a").in_use == 1
+
     @pytest.mark.asyncio
     async def test_embedding_engine_receives_scheduler_config(self, tmp_path):
         """Embedding chunk sizing should come from the shared scheduler config."""
@@ -3359,7 +3412,7 @@ class TestEnginePoolPrefillEviction:
             phys[0] -= pool[0]
             pool[0] = 0
 
-        def release_slots(request_id):
+        def release_slots(request_id, need_bytes):
             threads.append(threading.current_thread())
             phys[0] = 33 * gb
             return 16 * gb
@@ -3413,11 +3466,73 @@ class TestEnginePoolPrefillEviction:
 
         assert admitted is True
         scheduler._reclaim_prefill_headroom.assert_called_once()
-        scheduler.release_moe_offload_slots.assert_called_once_with("req-1")
+        # The shortfall after the reclaim: 46GB footprint + 10GB - 40GB.
+        scheduler.release_moe_offload_slots.assert_called_once_with("req-1", 16 * gb)
         assert threads and threads[0] is not threading.current_thread()
         release_hot_cache.assert_not_awaited()
         pool_obj._unload_engine.assert_not_awaited()
         pool_obj._release_ane_prefill_for_headroom.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("steps_left", [3, 1])
+    async def test_offload_slot_release_repeats_until_the_prefill_step_fits(
+        self, steps_left
+    ):
+        """The slot rung repeats on the shortfall left, then the hot cache is next."""
+        gb = 1024**3
+        phys = [52 * gb]
+        needs = []
+
+        def release_slots(request_id, need_bytes):
+            needs.append(need_bytes)
+            if len(needs) > steps_left:
+                return 0  # at the floor
+            phys[0] -= 4 * gb
+            return 4 * gb
+
+        scheduler = self._reclaim_scheduler(lambda: None)
+        scheduler.release_moe_offload_slots = MagicMock(side_effect=release_slots)
+        scheduler.requests = {"req-1": object()}
+        scheduler._hot_cache_limit_factor = MagicMock(return_value=1.0)
+        scheduler._prefill_speed_priority = False
+        release_hot_cache = AsyncMock(return_value=8 * gb)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=52 * gb,
+            target_cap_bytes=50 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=8192,
+            reason="prefill_preflight",
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            pool_obj = _make_pool(ceiling=0)
+            pool_obj._entries = {
+                "target": self._entry(
+                    "target", 40 * gb, scheduler=scheduler, executor=executor
+                ),
+            }
+            pool_obj._current_model_memory = 40 * gb
+            pool_obj._process_memory_enforcer = SimpleNamespace(
+                release_hot_cache_for_prefill=release_hot_cache
+            )
+            pool_obj._release_ane_prefill_for_headroom = AsyncMock(return_value=0)
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch("omlx.engine_pool.mx.get_cache_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint", side_effect=lambda: phys[0]
+                ),
+            ):
+                admitted = await pool_obj._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        if steps_left == 3:  # 12GB short: three 4GB steps, then it fits
+            assert needs == [12 * gb, 8 * gb, 4 * gb]
+            release_hot_cache.assert_not_awaited()
+        else:  # one step, then the floor: the hot cache covers the rest
+            assert needs == [12 * gb, 8 * gb]
+            release_hot_cache.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_recurring_headroom_pressure_escalates_to_bank_release(self):
@@ -3931,14 +4046,17 @@ class TestHasActiveRequests:
 
         engine = DummyEngine()
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
         with engine._active_lock:
             engine._active_count += 1
         assert engine.has_active_requests() is True
+        assert engine.active_request_count() == 1
 
         with engine._active_lock:
             engine._active_count -= 1
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
     def test_batched_engine_has_active_requests(self):
         """Test BatchedEngine.has_active_requests() via _output_collectors."""
@@ -3947,6 +4065,7 @@ class TestHasActiveRequests:
         engine = BatchedEngine.__new__(BatchedEngine)
         engine._engine = None
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
         # Simulate engine with active collectors
         mock_engine_core = MagicMock()
@@ -3955,10 +4074,15 @@ class TestHasActiveRequests:
         mock_engine_core.engine = mock_inner
         engine._engine = mock_engine_core
         assert engine.has_active_requests() is True
+        assert engine.active_request_count() == 1
+
+        mock_inner._output_collectors = {"req1": MagicMock(), "req2": MagicMock()}
+        assert engine.active_request_count() == 2
 
         # Empty collectors
         mock_inner._output_collectors = {}
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
     def test_vlm_engine_has_active_requests(self):
         """Test VLMBatchedEngine.has_active_requests() via _output_collectors."""
@@ -3967,6 +4091,7 @@ class TestHasActiveRequests:
         engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
         engine._engine = None
         assert engine.has_active_requests() is False
+        assert engine.active_request_count() == 0
 
         mock_engine_core = MagicMock()
         mock_inner = MagicMock()
@@ -3974,6 +4099,7 @@ class TestHasActiveRequests:
         mock_engine_core.engine = mock_inner
         engine._engine = mock_engine_core
         assert engine.has_active_requests() is True
+        assert engine.active_request_count() == 1
 
 
 class TestResolveModelId:

@@ -58,7 +58,9 @@ from mlx_vlm.speculative.utils import (  # noqa: E402, SLF001
     _mtp_rounds_batch,
 )
 
+from ..patches.mlx_lm_mtp.batch_generator import _head_input  # noqa: E402
 from ..patches.mlx_vlm_mtp import apply_external_mtp_runtime_patch  # noqa: E402
+from ..patches.qwen35_verify_qmm import set_verify_qmm_armed  # noqa: E402
 from ..utils.metal_sync import _sync_and_clear_cache  # noqa: E402
 from ..utils.model_loading import materialize_lazy_state  # noqa: E402
 
@@ -92,9 +94,12 @@ class _VLMAdapterMTPProxy:
     exposes ``language_model`` while ``draft_model.reset(model)`` runs.
     """
 
-    def __init__(self, adapter: nn.Module, language_model: Any) -> None:
+    def __init__(
+        self, adapter: nn.Module, language_model: Any, *, qwen_verify: bool = False
+    ) -> None:
         self._adapter = adapter
         self._language_model = language_model
+        self._qwen_verify = qwen_verify
         self._expose_language_model = False
         self._allow_language_model_fast_paths = not bool(
             getattr(adapter, "_uses_mrope", False)
@@ -116,7 +121,16 @@ class _VLMAdapterMTPProxy:
             return getattr(self._language_model, name)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return self._adapter(*args, **kwargs)
+        if not self._qwen_verify:
+            return self._adapter(*args, **kwargs)
+        # The same verify kernels Lightning MTP and DFlash run.
+        set_verify_qmm_armed(True)
+        try:
+            out = self._adapter(*args, **kwargs)
+        finally:
+            set_verify_qmm_armed(False)
+        out.hidden_states[-1] = _head_input(self._adapter, out.hidden_states[-1])
+        return out
 
     # Binders resolve these seams on the class (mock attributes must not pose as
     # capabilities), so __getattr__ delegation is not enough: define and forward.
@@ -294,15 +308,19 @@ def run_vlm_mtp_decode(
     target_for_rounds = target_language_model
     apply_external_mtp_runtime_patch()
     drafter_model = drafter.model
+    qwen_drafter = _read_model_type(drafter.model) == "qwen3_5_mtp"
     adapter_lm = getattr(target_language_model, "_language_model", None)
     if adapter_lm is not None:
-        target_for_rounds = _VLMAdapterMTPProxy(target_language_model, adapter_lm)
+        target_for_rounds = _VLMAdapterMTPProxy(
+            target_language_model, adapter_lm, qwen_verify=qwen_drafter
+        )
         drafter_model = _MTPResetBindingProxy(drafter.model, target_for_rounds)
+        if qwen_drafter:
+            # The target returns pre-norm hidden; the Qwen drafter reads it post-norm.
+            hidden = _head_input(target_language_model, hidden)
 
     is_batch = isinstance(first_bonus, mx.array) and first_bonus.size > 1
-    clear_before_replay = (
-        not is_batch and _read_model_type(drafter.model) == "qwen3_5_mtp"
-    )
+    clear_before_replay = qwen_drafter and not is_batch
     if clear_before_replay:
         if not isinstance(drafter_model, _MTPResetBindingProxy):
             drafter_model = _MTPResetBindingProxy(drafter.model, None)

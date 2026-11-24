@@ -12,11 +12,10 @@ from mlx_lm.utils import load_model
 from mlx_vlm.models.base import InputEmbeddingsFeatures, install_auto_processor_patch
 from mlx_vlm.utils import get_model_path, load_processor
 
-from . import apply_inkling2_patch
+from . import INKLING2_MODEL_TYPES, apply_inkling2_patch
 from . import model as inkling2
 from .processing import Inkling2Processor
 
-_MODEL_TYPE = "inkling2"
 _UNSUPPORTED_INPUTS = ("pixel_values_videos", "input_values", "input_features")
 _REGISTERED = False
 
@@ -25,12 +24,13 @@ def _register_mlx_vlm() -> None:
     global _REGISTERED
     if _REGISTERED:
         return
-    install_auto_processor_patch(_MODEL_TYPE, Inkling2Processor)
     # Without a MODEL_CONFIG entry apply_chat_template drops the image parts.
     model_config = getattr(prompt_utils, "MODEL_CONFIG", None)
     message_format = getattr(prompt_utils, "MessageFormat", None)
-    if isinstance(model_config, dict) and message_format is not None:
-        model_config.setdefault(_MODEL_TYPE, message_format.LIST_WITH_IMAGE_FIRST)
+    for model_type in INKLING2_MODEL_TYPES:
+        install_auto_processor_patch(model_type, Inkling2Processor)
+        if isinstance(model_config, dict) and message_format is not None:
+            model_config.setdefault(model_type, message_format.LIST_WITH_IMAGE_FIRST)
     _REGISTERED = True
 
 

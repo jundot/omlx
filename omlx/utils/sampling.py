@@ -79,20 +79,31 @@ def apply_min_p(
 _TOP_K_CHUNK = 128
 
 
+def _chunked_top_k(values: mx.array, k: int, chunk: int) -> mx.array:
+    vocab = values.shape[-1]
+    lead = values.shape[:-1]
+    blocks = values.reshape(-1, vocab // chunk, chunk)
+    best = mx.argpartition(-blocks.max(axis=-1), kth=k - 1, axis=-1)[:, :k]
+    cand = mx.take_along_axis(blocks, best[:, :, None], axis=1)
+    pick = mx.argpartition(-cand.reshape(-1, k * chunk), kth=k - 1, axis=-1)[:, :k]
+    picked = mx.take_along_axis(best, pick // chunk, axis=-1)
+    return (picked * chunk + pick % chunk).reshape(*lead, k)
+
+
 def top_k_indices(values: mx.array, k: int) -> mx.array:
     """Indices of the ``k`` largest entries along the last axis, unordered."""
     vocab = values.shape[-1]
     if k > 64 or vocab % _TOP_K_CHUNK or vocab < 64 * _TOP_K_CHUNK:
         return mx.argpartition(-values, kth=k - 1, axis=-1)[..., :k]
-    lead = values.shape[:-1]
-    blocks = values.reshape(-1, vocab // _TOP_K_CHUNK, _TOP_K_CHUNK)
-    best = mx.argpartition(-blocks.max(axis=-1), kth=k - 1, axis=-1)[:, :k]
-    cand = mx.take_along_axis(blocks, best[:, :, None], axis=1)
-    pick = mx.argpartition(-cand.reshape(-1, k * _TOP_K_CHUNK), kth=k - 1, axis=-1)[
-        :, :k
-    ]
-    chunk = mx.take_along_axis(best, pick // _TOP_K_CHUNK, axis=-1)
-    return (chunk * _TOP_K_CHUNK + pick % _TOP_K_CHUNK).reshape(*lead, k)
+    return _chunked_top_k(values, k, _TOP_K_CHUNK)
+
+
+def top_k_indices_wide(values: mx.array, k: int) -> mx.array:
+    """``top_k_indices`` for ``k`` up to a few hundred, with 64-wide chunks."""
+    vocab = values.shape[-1]
+    if vocab % 64 or vocab // 64 <= k:
+        return mx.argpartition(-values, kth=k - 1, axis=-1)[..., :k]
+    return _chunked_top_k(values, k, 64)
 
 
 def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:

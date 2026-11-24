@@ -17,9 +17,6 @@ from ...wire import HostArray
 from . import checks, kernels, root
 from .model import Config, Layer
 
-# Buffers MLX may keep cached after a chunk. Without a bound the cache grows
-# past the memory the supervisor's plan leaves free on the GPU.
-_CACHE_BYTES = 1 << 30
 _CONV = re.compile(r"self_attn\.([qkv])_conv1d\.weight")
 _EXPERT = re.compile(r"mlp\.experts\.(\d+)\.(\w+)\.(\w+)")
 _FORGET_GATE = ("A_log", "dt_bias", "f_a_proj.", "f_b_proj.")
@@ -219,7 +216,6 @@ def _quantization(
 
 
 def load_stage(model_dir: str | Path, first: int, last: int) -> Stage:
-    mx.set_cache_limit(_CACHE_BYTES)
     raw = checkpoint.load_config(model_dir)
     config = Config.from_dict(raw.get("text_config") or raw)
     names = list(checkpoint.tensors(model_dir))

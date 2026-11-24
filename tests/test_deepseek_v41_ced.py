@@ -225,7 +225,7 @@ def test_ced_and_full_prefill_blocks_share_one_ssd_budget(tmp_path):
     # Full prefill must not hit the CED block, but still counts and evicts it.
     manager = open_manager(full, block_size * 3 // 2)
     assert not manager.has_block(b"\x01" * 32)
-    assert manager._incompatible_index.total_size == block_size
+    assert manager._directory_index.total_size == block_size
     save(manager, b"\x02" * 32)
     manager.close()
     assert not ced_file.exists()

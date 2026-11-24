@@ -33,7 +33,8 @@
   <b>English</b> ·
   <a href="README.zh.md">中文</a> ·
   <a href="README.ko.md">한국어</a> ·
-  <a href="README.ja.md">日本語</a>
+  <a href="README.ja.md">日本語</a> ·
+  <a href="README.it.md">Italiano</a>
 </p>
 
 ---
@@ -288,9 +289,27 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/rerank` | Document reranking |
 | `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
-| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
+| `POST /v1/audio/transcriptions` | Speech-to-text, including speaker labels when supported |
+| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`); embedding models take `prompt` only |
 
 The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
+
+#### Transcription with speaker labels
+
+Select an installed speech model that supports timed speaker attribution, such as VibeVoice-ASR or Nemotron 3.5 Transcribe. Send a multipart request with the model ID from `GET /v1/models`:
+
+```sh
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer $OMLX_API_KEY" \
+  -F "file=@meeting.wav" \
+  -F "model=$MODEL_ID" \
+  -F "response_format=diarized_json" \
+  -F "chunking_strategy=auto"
+```
+
+The response includes text, the audio duration, and one segment per speaker turn with `speaker`, `start`, `end`, and `text`. Speaker labels are local to the recording.
+
+Streaming is not supported, and `chunking_strategy` must be `auto` or omitted; the whole file goes to the model. Models without timed speaker labels, including Nemotron checkpoints without the CTC alignment files, return HTTP 400.
 
 ### Tool Calling & Structured Output
 
@@ -486,3 +505,4 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
 - [m5gpu](https://github.com/beamivalice/m5gpu) - The GPU power limit writes the AGX GPU power target that m5gpu by beamivalice documented (`SetMaxGPUAbsolutePower` with `AbsoluteTarget`, and `-1000` to remove it)
 - [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Ming-3.0-tts's pipelined decode loop follows Stéphane Busso's ming-tts-serve, and its fused DiT kernels are adapted from ming-tts-serve's MIT-licensed `ming_fused.zig`
+- [Wikipedia](https://www.wikipedia.org) - Parts of the built-in oQ and oQe calibration text are truncated excerpts of Wikipedia articles, licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)

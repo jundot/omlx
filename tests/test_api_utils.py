@@ -3539,6 +3539,26 @@ class TestExtractMultimodalContent:
             "image_url": {"url": "data:image/png;base64,abc"},
         }
 
+    def test_converts_hf_image_part_with_data_uri(self):
+        """{"type": "image", "image": "<data URI>"} keeps the image (#5471)."""
+        message = Message(
+            role="user",
+            content=[
+                {"type": "text", "text": "What color is this image?"},
+                {"type": "image", "image": "data:image/png;base64,abc"},
+            ],
+        )
+
+        result = extract_multimodal_content([message])
+
+        assert result[0]["content"] == [
+            {"type": "text", "text": "What color is this image?"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+            },
+        ]
+
     def test_image_url_missing_url_dropped(self):
         """image_url item with no extractable URL should be dropped."""
         parts = _extract_multimodal_content_list(

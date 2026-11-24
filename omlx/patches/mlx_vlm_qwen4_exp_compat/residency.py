@@ -40,15 +40,23 @@ def _safetensors_header(path: Path) -> dict:
         if len(raw_size) != 8:
             return {}
         header_size = struct.unpack("<Q", raw_size)[0]
+        # A malformed file can declare a header far larger than itself.
+        if header_size > path.stat().st_size - 8:
+            return {}
         return json.loads(file.read(header_size))
 
 
 def _ple_tensor_bytes(ple_path: Path) -> tuple[int, bool]:
     index_path = ple_path / "model.safetensors.index.json"
-    if not index_path.is_file():
-        return 0, False
+    single = ple_path / "model.safetensors"
     try:
-        weight_map = json.loads(index_path.read_text()).get("weight_map") or {}
+        if index_path.is_file():
+            weight_map = json.loads(index_path.read_text()).get("weight_map") or {}
+        elif single.is_file():
+            # A checkpoint saved as one model.safetensors has no index.
+            weight_map = dict.fromkeys(_safetensors_header(single), single.name)
+        else:
+            return 0, False
     except (OSError, ValueError):
         return 0, False
 

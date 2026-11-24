@@ -14,6 +14,7 @@ from omlx.model_settings import (
     ModelSettingsManager,
     a8_prefill_on,
     ced_prefill_on,
+    resolve_lora_conflicts,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
 )
@@ -955,6 +956,37 @@ def test_prefill_conflict_resolution_leaves_clean_dicts_alone():
         assert resolved is data
 
 
+def test_lora_adapter_conflicts_raise_and_profile_merges_drop_them(tmp_path):
+    """Paths that skip the wrapped projections cannot run with an adapter; a
+    profile merged over such a base keeps the adapter and drops the others."""
+    with pytest.raises(ValueError, match="DFlash"):
+        ModelSettings(lora_adapter="/a", dflash_enabled=True)
+    resolved, names = resolve_lora_conflicts(
+        {
+            "lora_adapter": "/a",
+            "dflash_enabled": True,
+            "prefill_helper_node_id": "m5",
+            "max_tokens": 4,
+        }
+    )
+    assert names == ["dflash_enabled", "prefill_helper_node_id"]
+    settings = ModelSettings.from_dict(resolved)
+    assert (settings.dflash_enabled, settings.prefill_helper_node_id) == (False, None)
+    assert (settings.lora_adapter, settings.max_tokens) == ("/a", 4)
+
+    # A hand-edited file keeps the model's other settings.
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps(
+            {
+                "version": SETTINGS_VERSION,
+                "models": {"m": {"lora_adapter": "/a", "dflash_enabled": True}},
+            }
+        )
+    )
+    loaded = ModelSettingsManager(tmp_path).get_settings("m")
+    assert (loaded.lora_adapter, loaded.dflash_enabled) == ("/a", False)
+
+
 def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
     """The load path has to survive a settings file written by an older build
     or hand-edited: the model keeps its settings, minus the losing toggle."""
@@ -1009,6 +1041,39 @@ def test_old_a8_setting_names_still_load(tmp_path):
     # A record holding both names keeps the current one.
     both = {"qwen35_oq_a8_enabled": True, "a8_prefill_enabled": False}
     assert rename_legacy_fields(both) == {"a8_prefill_enabled": False}
+
+
+@pytest.mark.parametrize(("version", "expected"), [(2, None), (SETTINGS_VERSION, 3)])
+def test_ui_default_mtp_depth_loads_as_the_model_default(tmp_path, version, expected):
+    """UIs before settings v3 saved depth 3 for "Default"; it loads unset so the
+    model's own ceiling applies, while a 3 saved since then is a real choice."""
+    depth = {"mtp_enabled": True, "mtp_adaptive_max_depth": 3}
+    models = {"m": depth, "deep": {**depth, "mtp_adaptive_max_depth": 5}}
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps({"version": version, "models": models})
+    )
+    record = {
+        "name": "p",
+        "display_name": "P",
+        "created_at": "2026-06-01T00:00:00+00:00",
+        "updated_at": "2026-06-01T00:00:00+00:00",
+        "settings": dict(depth),
+    }
+    store_version = 1 if version < SETTINGS_VERSION else 2
+    (tmp_path / "model_profiles.json").write_text(
+        json.dumps({"version": store_version, "profiles": {"m": {"p": record}}})
+    )
+    (tmp_path / "global_templates.json").write_text(
+        json.dumps({"version": store_version, "templates": {"t": record}})
+    )
+
+    manager = ModelSettingsManager(tmp_path)
+    assert manager.get_settings("m").mtp_adaptive_max_depth == expected
+    assert manager.get_settings("deep").mtp_adaptive_max_depth == 5
+    profile = manager.get_profile("m", "p")["settings"]
+    assert profile.get("mtp_adaptive_max_depth") == expected
+    template = manager.get_template("t")["settings"]
+    assert template.get("mtp_adaptive_max_depth") == expected
 
 
 def test_oq_a8_exposes_no_kernel_choice():

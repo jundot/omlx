@@ -313,8 +313,12 @@ class StageServer:
                 item[1].set()
                 continue
             try:
-                wire.send(session.sock, *item)
-            except OSError:
+                if item[0] == "release":
+                    # Replies view MLX buffers until sent; the job's are all out now.
+                    tensors.release_cache()
+                else:
+                    wire.send(session.sock, *item)
+            except (OSError, RuntimeError):
                 with session.changed:
                     session.closed = True
                     session.changed.notify_all()
@@ -391,6 +395,7 @@ class StageServer:
                 with suppress(StageError):
                     self.upstream.cancel(job.job_id)
                 self.upstream.forget(job.job_id)
+            session.outbox.put(("release", None))
 
     def _run_chunks(self, session: _Session, job: _Job) -> None:
         stage, upstream = self.stage, self.upstream
@@ -555,6 +560,7 @@ def main(argv: list[str] | None = None) -> int:
         help="bytes a stage may hold before it drops layers or hands a prompt back",
     )
     parser.add_argument("--weights-on-gpu", action="store_true")
+    parser.add_argument("--packed-weights", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
@@ -571,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
     tensors.check_backend()
     tensors.limit_memory(args.memory_limit)
     tensors.weights_on_gpu = args.weights_on_gpu
+    tensors.packed_weights = args.packed_weights
     stage = families.stage_module(args.model_type).load_stage(
         args.model, args.first, args.last
     )

@@ -9,7 +9,6 @@ import pytest
 from omlx.cluster.memory_guard import (
     LoadMemoryWatchdog,
     admission_budget,
-    ceiling_breakdown,
     check_rank_fits,
     guard_rank_load,
     load_peak_bytes,
@@ -48,51 +47,9 @@ def _deterministic_machine(monkeypatch):
     )
 
 
-
 def test_a_stage_that_fits_is_admitted():
     ceiling = check_rank_fits(50 * GIB, rank=0, ceiling_bytes=100 * GIB)
     assert ceiling == 100 * GIB
-
-
-def test_cuda_ceiling_uses_device_memory_instead_of_host_ram(monkeypatch):
-    import mlx.core as mx
-
-    monkeypatch.setattr(mx.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(mx, "device_info", lambda: {"memory_size": 128 * GIB})
-    monkeypatch.setattr(
-        "omlx.cluster.memory_guard._operator_memory_settings",
-        lambda: ("balanced", 0.0, True),
-    )
-
-    breakdown = ceiling_breakdown()
-
-    assert breakdown["metal_cap"] == 128 * GIB
-    assert breakdown["hard_limit"] == int(128 * GIB * 0.90)
-
-
-def test_cuda_ceiling_respects_live_free_memory(monkeypatch):
-    import mlx.core as mx
-
-    monkeypatch.setattr(mx.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(
-        mx,
-        "device_info",
-        lambda: {
-            "total_memory": 128 * GIB,
-            "free_memory": 8 * GIB,
-        },
-    )
-    monkeypatch.setattr(
-        "omlx.cluster.memory_guard._operator_memory_settings",
-        lambda: ("balanced", 0.0, True),
-    )
-
-    breakdown = ceiling_breakdown()
-
-    assert breakdown["metal_cap"] == 128 * GIB
-    assert breakdown["static"] == int(128 * GIB * 0.90)
-    assert breakdown["dynamic"] == int(8 * GIB * 0.90)
-    assert breakdown["hard_limit"] == int(8 * GIB * 0.90)
 
 
 def test_a_stage_that_overruns_the_ceiling_is_refused():

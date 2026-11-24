@@ -270,3 +270,36 @@ final class MenubarLogTests: XCTestCase {
         XCTAssertTrue(try contents().hasSuffix("log opened before any probe ran\n"))
     }
 }
+
+/// 14-inch MacBook Pro at 1512x982: the notch spans x 663...848. Item x
+/// values come from a real menubar.log on that screen.
+final class MenubarNotchTests: XCTestCase {
+    private let builtIn = CGRect(x: 0, y: 0, width: 1512, height: 982)
+
+    private func covers(x: CGFloat, screen: CGRect? = nil, notch: Bool = true) -> Bool {
+        let screen = screen ?? builtIn
+        return MenubarNotch.covers(
+            itemFrame: CGRect(x: screen.minX + x, y: 949, width: 38, height: 33),
+            screenFrame: screen,
+            leftAreaWidth: notch ? 663 : nil,
+            rightAreaWidth: notch ? 664 : nil
+        )
+    }
+
+    func testLoggedHiddenItemsSitBehindTheNotch() {
+        XCTAssertTrue(covers(x: 773))
+        XCTAssertTrue(covers(x: 822))
+        XCTAssertFalse(covers(x: 886))
+        XCTAssertFalse(covers(x: 971))
+    }
+
+    func testNotchFollowsTheScreenOrigin() {
+        let rightOfExternal = CGRect(x: 1920, y: -98, width: 1512, height: 982)
+        XCTAssertTrue(covers(x: 800, screen: rightOfExternal))
+        XCTAssertFalse(covers(x: 900, screen: rightOfExternal))
+    }
+
+    func testScreenWithoutANotchNeverCovers() {
+        XCTAssertFalse(covers(x: 800, notch: false))
+    }
+}

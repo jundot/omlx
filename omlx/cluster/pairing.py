@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Code-based cluster pairing and enrollment bridge (cluster v2, Module B).
+"""Code-based cluster pairing and enrollment bridge (Module B).
 
 Replaces the 3-step copy-paste relay (shared secret + key-exchange tokens in
 both directions) with an exo-style flow:
@@ -19,10 +19,9 @@ both directions) with an exo-style flow:
 5. The joiner polls ``/api/cluster/pair/status/{node_id}`` and unwraps the
    cluster key locally with the code only it possesses.
 
-``DELETE /api/cluster/devices/{node_id}`` unpairs: the device-store entry and
-the stored cluster key are removed, any legacy ``enrolled-nodes.json`` entry
-is dropped, and the SSH trust installed at approve time is revoked
-best-effort.
+``DELETE /admin/api/cluster/forget`` unpairs: the device-store entry and
+the stored cluster key are removed, and the SSH trust installed at approve
+time is revoked best-effort.
 
 Module A (identity + discovery) is built concurrently on another branch.
 Every interaction with it is feature-detected: a real ``DeviceRegistry`` /
@@ -62,7 +61,7 @@ from .registry import SSH_USER_PATTERN
 
 logger = logging.getLogger(__name__)
 
-# --- Pairing policy (from ops/notes/omlx_cluster_v2_spec.md, Module B) ------
+# --- Pairing policy (Module B) -----------------------------------------------
 
 CODE_DIGITS = 6
 CODE_TTL_SECONDS = 10 * 60
@@ -226,7 +225,7 @@ def coordinator_identity_tag(
     ).hexdigest()
 
 
-# --- Small persisted stores (same conventions as registry.py/enrollment.py) -
+# --- Small persisted stores (same conventions as registry.py) ---------------
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -371,8 +370,8 @@ class JsonDeviceStore:
     class is unused (``DeviceRegistryBridge`` adapts it instead).
 
     Pending (``awaiting_approval``) requests are deliberately NOT written
-    here: like enrollment.py join keys, they are memory-only so a restart
-    invalidates half-finished pairings.
+    here: they are memory-only so a restart invalidates half-finished
+    pairings.
     """
 
     def __init__(self, base_path: Path) -> None:
@@ -594,7 +593,7 @@ def load_node_identity(base_path: Path) -> dict[str, Any]:
     }
 
 
-# --- Pending requests (memory-only, like enrollment.py join keys) ------------
+# --- Pending requests (memory-only) -------------------------------------------
 
 
 @dataclass
@@ -846,9 +845,6 @@ class PairingManager:
       :class:`DeviceRegistryBridge`), an object already speaking the
       device-store protocol, or ``None`` for the schema-compatible
       :class:`JsonDeviceStore` fallback.
-    * ``enrollment_store`` — the legacy ``ClusterEnrollmentStore``; consulted
-      on ``unpair`` so CUDA-enrolled entries with the same node_id are
-      dropped too.  Optional.
     * ``identity`` — dict with ``node_id``/``friendly_name``; default bridges
       to Module A's identity module (or the compatible local file).
     * ``enrollment_driver`` / ``revocation_driver`` — SSH TOFU trust
@@ -862,7 +858,6 @@ class PairingManager:
     def __init__(
         self,
         registry: Any = None,
-        enrollment_store: Any = None,
         *,
         base_path: Path | None = None,
         identity: dict[str, Any] | None = None,
@@ -888,7 +883,6 @@ class PairingManager:
             else load_node_identity(self.base_path)
         )
         self._devices = _coerce_device_store(registry, self.base_path)
-        self._enrollment_store = enrollment_store
         self._key_store = (
             key_store
             if key_store is not None
@@ -1657,8 +1651,6 @@ class PairingManager:
 
         Registry removal is the trust anchor and happens first (fail-closed);
         SSH material retraction is best-effort and reported, never raised.
-        Also drops any legacy ``enrolled-nodes.json`` entry with the same
-        node_id so both trusted-node inventories stay in step.
         """
 
         with self._lock:
@@ -1675,13 +1667,6 @@ class PairingManager:
             self._key_store.remove(node_id)
         if not (removed_device or key_record or was_pending):
             raise PairingStateError("unknown device")
-
-        removed_enrollment = False
-        if self._enrollment_store is not None:
-            remove_node = getattr(self._enrollment_store, "remove_node", None)
-            if callable(remove_node):
-                with suppress(Exception):
-                    removed_enrollment = bool(remove_node(node_id))
 
         revocation: dict[str, Any] = {"authorized_key_removed": False, "errors": []}
         material = {
@@ -1703,7 +1688,6 @@ class PairingManager:
             detail={
                 "removed_device": removed_device,
                 "removed_key": key_record is not None,
-                "removed_enrollment": removed_enrollment,
                 "was_pending": was_pending,
             },
         )
@@ -1712,7 +1696,6 @@ class PairingManager:
             "unpaired": True,
             "removed_device": removed_device,
             "removed_key": key_record is not None,
-            "removed_enrollment": removed_enrollment,
             "was_pending": was_pending,
             "revocation": revocation,
         }
@@ -1744,7 +1727,7 @@ class PairingManager:
         }
 
 
-# --- Configured singleton (mirrors enrollment.py's configure/get pattern) ----
+# --- Configured singleton ----------------------------------------------------
 
 _manager_lock = threading.Lock()
 _configured_manager: PairingManager | None = None
@@ -1754,7 +1737,6 @@ def configure_pairing_manager(
     base_path: Path,
     *,
     registry: Any = None,
-    enrollment_store: Any = None,
     join_watch_s: float | None = 2.0,
     **kwargs: Any,
 ) -> PairingManager:
@@ -1768,7 +1750,6 @@ def configure_pairing_manager(
     with _manager_lock:
         _configured_manager = PairingManager(
             registry,
-            enrollment_store,
             base_path=base_path,
             join_watch_s=join_watch_s,
             **kwargs,

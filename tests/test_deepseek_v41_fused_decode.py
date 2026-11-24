@@ -5,7 +5,8 @@ attention and shared-expert projections, MXFP4 routed experts, an MXFP8-exact bf
 checkpoint's parameter dtypes) runs every decode layer with the fused path on and off from the
 same input. The fused kernels only change accumulation orders the DeepSeek reference leaves
 free, so each layer's output must agree to rounding noise. build(fmt="affine") gives the
-projections the affine layouts of oQ2-oQ3 exports instead.
+projections the affine layouts of oQ2-oQ3 exports instead, and build(fmt="oqh") the same with
+oQh routed experts.
 """
 
 import zlib
@@ -18,12 +19,18 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
+from omlx.custom_kernels.oqh import fast as oqh_fast
+from omlx.oqh import format as oqh_format
+from omlx.oqh import quantize as oqh_quantize
+from omlx.oqh.modules import OqhSwitchLinear
 from omlx.patches.deepseek_v41 import decode_fused
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.patches.deepseek_v41.language import Block, LanguageModel
 from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan, OffloadedExpert
 from omlx.patches.deepseek_v41.quantization import QuantizedProjection, pack_activation
 from tests.test_deepseek_v41 import run_two_ranks
+
+_NEEDS_OQH = pytest.mark.skipif(not oqh_fast.has_native(), reason="oQh kernels not built")
 
 pytestmark = pytest.mark.skipif(
     mx.default_device() != mx.gpu, reason="fused decode kernels are Metal-only"
@@ -68,6 +75,17 @@ _FP32 = ("hc_", "attn_sink", "gate.bias", "compressor.")
 _AFFINE_BITS = {"wq_a": 8, "wkv": 4, "wq_b": 4, "wo_b": 6, "w1": 2, "w3": 2, "w2": 3, "shared_experts": 8}
 
 
+def _oqh_experts(weight, bits, key, row_parallel):
+    n_exp, rows, cols = weight.shape
+    block = oqh_format.block_for(cols, row_parallel)
+    signs = mx.array(oqh_format.make_signs(key, cols)).astype(mx.float32)
+    gram = mx.broadcast_to(mx.eye(cols), (n_exp, cols, cols))
+    m = OqhSwitchLinear(cols, rows, n_exp, bits, block)
+    m.weight, m.rscale, _, _ = oqh_quantize.quantize(weight.astype(mx.float32), gram, bits, signs, block)
+    m.oqh_signs = signs.reshape(-1, block).astype(mx.bfloat16)
+    return m
+
+
 def build(seed=4121, fmt="mxfp", **overrides):
     model = LanguageModel(replace(config(), **overrides))
     weights = []
@@ -83,7 +101,9 @@ def build(seed=4121, fmt="mxfp", **overrides):
     model.load_weights(weights, strict=True)
 
     def quantized(weight, bits, mode):
-        if fmt == "affine":
+        if fmt == "oqh" and role in ("w1", "w3", "w2"):
+            return _oqh_experts(weight, _AFFINE_BITS[role], role.replace("w3", "w1"), role == "w2")
+        if fmt in ("affine", "oqh"):
             bits = _AFFINE_BITS[role]
             packed, scales, biases = mx.quantize(weight.astype(mx.bfloat16), group_size=64, bits=bits)
             return QuantizedProjection(packed, scales, bits, "affine", biases=biases, group_size=64)
@@ -138,6 +158,8 @@ def shared_build():
         ("affine", True, 256),
         ("mxfp", False, 384),
         ("affine", True, 384),
+        pytest.param("oqh", False, 256, marks=_NEEDS_OQH),
+        pytest.param("oqh", True, 256, marks=_NEEDS_OQH),
     ],
 )
 def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles, inter):
@@ -451,6 +473,31 @@ def test_small_batches_keep_rows_kernels(monkeypatch, shared_build):
     assert names == ["gemv_fp8_nb"]
 
 
+@pytest.mark.parametrize("bits", [2, 4])
+def test_affine_codes_read_in_place_are_exact(bits):
+    """affine_codes_lane leaves 2- and 4-bit codes masked in place (code j * 2^(bits j)); times
+    aff_unit(j) = 2^-(bits j) each is its code exactly, at every lane position, so the rows
+    kernels' products q * (x * unit) equal code * x bit for bit."""
+    from omlx.patches.deepseek_v41 import decode_moe
+
+    n = 16 if bits == 2 else 8
+    source = f"""
+        const uint i = thread_position_in_grid.x;
+        float q[{n}];
+        affine_codes_lane<{bits}>(reinterpret_cast<const device uchar*>(words + i), q);
+        for (int j = 0; j < {n}; ++j) out[i * {n} + j] = q[j] * aff_unit<{bits}>(j);
+    """
+    kernel = mx.fast.metal_kernel(name=f"v41_test_affine_in_place_{bits}", input_names=["words"],
+                                  output_names=["out"], source=source, header=decode_moe._HEADER)
+    rng = np.random.default_rng(bits)
+    codes = rng.integers(0, 1 << bits, (64, n))
+    codes[0], codes[1] = 0, (1 << bits) - 1   # all-zero and all-max words
+    words = np.array([sum(int(c) << (bits * j) for j, c in enumerate(row)) for row in codes], np.uint32)
+    out = kernel(inputs=[mx.array(words)], grid=(64, 1, 1), threadgroup=(64, 1, 1),
+                 output_shapes=[(64 * n,)], output_dtypes=[mx.float32])[0]
+    np.testing.assert_array_equal(np.asarray(out).reshape(64, n), codes.astype(np.float32))
+
+
 def test_paired_weight_decoders_are_exact():
     """fp8_decode4 / fp4_decode8 give every E4M3 / E2M1 code its value times 2^-8 / 2^-14
     (E4M3FN NaN codes 0x7F / 0xFF read as 480, like the e4m3() helper; weights never hold them)."""
@@ -483,7 +530,7 @@ def test_paired_weight_decoders_are_exact():
     assert np.array_equal(np.signbit(np.asarray(out4)), np.arange(16) >= 8)
 
 
-@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
+@pytest.mark.parametrize("fmt", ["mxfp", "affine", pytest.param("oqh", marks=_NEEDS_OQH)])
 @pytest.mark.parametrize("nb", [3, 8, 16])
 def test_batched_moe_matches_single_token_moe(monkeypatch, shared_build, nb, fmt):
     """Without matrix tiles, each token of the batched MoE gets the single-token kernels'

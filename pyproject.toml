@@ -114,7 +114,7 @@ dependencies = [
     # by their pre-load patches.
     "mlx-vlm @ git+https://github.com/Neywa-Labs/mlx-vlm@138d7617d39653b39a5cbc379b1b5907a4481d67",
     # mlx-vlm requires mlx-audio>=0.6.2 in the shared runtime.
-    "mlx-audio @ git+https://github.com/Neywa-Labs/mlx-audio@8c244a1faff44cfa69e3151c195f52a4c1c90be5",
+    "mlx-audio @ git+https://github.com/Neywa-Labs/mlx-audio@1157775c1999654b1ebde41ed03d88108e23f88b",
     "Pillow>=9.0.0",
     "markitdown[pdf,docx,pptx]==0.1.9",
 ]
@@ -133,7 +133,7 @@ mcp = [
     "mcp>=2.0.0,<3",
 ]
 cluster = [
-    # mDNS advertise/browse for cluster v2 peer discovery (_omlx._tcp.local.).
+    # mDNS advertise/browse for cluster peer discovery (_omlx._tcp.local.).
     # Pure-Python; works in launchd agents. Absence disables mDNS only — the
     # IPv6 multicast fallback, manual peer add, and Tailscale paths keep
     # working (see omlx/cluster/discovery.py).
@@ -143,8 +143,8 @@ modelscope = [
     "modelscope>=1.28.0",
 ]
 audio = [
-    # mlx-audio from commit (8c244a1, v0.6.3) with tts/stt/sts extras
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Neywa-Labs/mlx-audio@8c244a1faff44cfa69e3151c195f52a4c1c90be5",
+    # mlx-audio from commit (1157775, v0.6.5) with tts/stt/sts extras
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Neywa-Labs/mlx-audio@1157775c1999654b1ebde41ed03d88108e23f88b",
     # Keep dependencies for existing audio models removed from upstream extras.
     "espeakng-loader>=0.2.4",
     "librosa==0.11.0",
@@ -202,8 +202,10 @@ bundle = [
 # PEP 735 development dependencies — installed by uv sync or pip install --group dev.
 [dependency-groups]
 dev = [
-    "pytest>=7.0.0",
+    # pytest 9.2 ignores xdist 3.8's loadgroup node id suffix (see ci.yml).
+    "pytest>=7.0.0,<9.2",
     "pytest-asyncio>=0.21.0",
+    "pytest-xdist>=3.8",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
@@ -234,13 +236,18 @@ where = [".", "apps/omlx-web"]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
-"omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
+"omlx" = [
+    "oq_calibration_data.json",
+    "oqe_calibration_data.json",
+    "oqe_refine_calibration_data.json",
+]
 "omlx.admin" = ["bench_corpora/*"]
 "omlx_web" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.patches.deepseek_v41" = ["LICENSE"]
 "omlx.custom_kernels.attention" = ["*.metallib", "*.so"]
 "omlx.custom_kernels.lowbit" = ["*.metallib", "*.so"]
+"omlx.custom_kernels.oqh" = ["*.metallib", "*.so"]
 "omlx.custom_kernels.quant_matmul" = ["*.metallib", "*.so"]
 "omlx.custom_kernels.sparse_index" = ["*.metallib", "*.so"]
 
@@ -269,8 +276,3 @@ python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-asyncio_mode = "auto"

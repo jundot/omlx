@@ -17,14 +17,18 @@ from typing import Any
 from ..adapter.output_parser import repair_tool_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..lora_adapters import apply_adapter
 from ..model_settings import (
     a8_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
+    specprefill_draft,
     validate_ane_prefill,
 )
+from ..oqh.format import is_oqh_checkpoint
 from ..patches.mlx_lm_mtp import drafter_target
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..specprefill.draft import attach_specprefill_draft
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.tokenizer import get_tokenizer_config, is_mimo_tool_template
 from .base import (
@@ -104,6 +108,8 @@ class BatchedEngine(BaseEngine):
         self._engine = None
         self._loaded = False
         self._dflash_drafter: Any | None = None
+        self.specprefill_draft_path: str | None = None
+        self.specprefill_failed_draft: str | None = None
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
         self._grammar_compiler_lock = threading.Lock()
@@ -380,12 +386,14 @@ class BatchedEngine(BaseEngine):
         # resident slot tensors (#1304).
         moe_offload_wrapped = 0
         offload_stats = offload_release = offload_restore = None
+        offload_releasable = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
                 moe_offload_caches,
                 moe_offload_stats,
+                releasable_moe_offload_bytes,
                 release_moe_offload_slots,
                 restore_moe_offload_slots,
             )
@@ -425,6 +433,9 @@ class BatchedEngine(BaseEngine):
                 offload_stats = functools.partial(moe_offload_stats, caches=caches)
                 offload_release = functools.partial(release_moe_offload_slots, caches)
                 offload_restore = functools.partial(restore_moe_offload_slots, caches)
+                offload_releasable = functools.partial(
+                    releasable_moe_offload_bytes, caches
+                )
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
@@ -437,6 +448,14 @@ class BatchedEngine(BaseEngine):
             self._model,
             self._model_settings,
         )
+        # After the fp16 recast so the adapter takes the activation dtype, and
+        # before the fusions and packers that replace the projections.
+        lora_path = getattr(self._model_settings, "lora_adapter", None)
+        if lora_path:
+            wrapped = await loop.run_in_executor(
+                get_mlx_executor(), apply_adapter, self._model, lora_path
+            )
+            logger.info("LoRA adapter %s: %d projections", lora_path, wrapped)
 
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
@@ -543,7 +562,11 @@ class BatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if a8_prefill_on(self._model_settings):
+        # A8 and ANE prefill read affine weights; oQh linears have none.
+        oqh = is_oqh_checkpoint(self._model_name)
+        if oqh and a8_prefill_on(self._model_settings):
+            logger.warning("A8 prefill does not read oQh weights; it stays off")
+        elif a8_prefill_on(self._model_settings):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -561,6 +584,9 @@ class BatchedEngine(BaseEngine):
 
         ane_backend = ane_prefill_backend(self.model_type)
         ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+        if ane_enabled and oqh:
+            logger.warning("ANE prefill does not read oQh weights; it stays off")
+            ane_enabled = False
         if ane_enabled:
             validate_ane_prefill(self._model_settings.to_dict(), self.model_type)
             ane_fraction = ane_prefill_fraction(
@@ -762,6 +788,7 @@ class BatchedEngine(BaseEngine):
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
+        scheduler.moe_offload_releasable = offload_releasable
         if ane_prefill_sequence_length:
             from ..patches.qwen35_ane_prefill import (
                 configure_qwen35_ane_prefill_scheduler,
@@ -785,70 +812,11 @@ class BatchedEngine(BaseEngine):
                 scheduler._set_model_info_for_monitor()
         scheduler.refresh_ssd_layer_signature()
 
-        # SpecPrefill: load draft model and pass to scheduler
-        if self._model_settings is not None:
-            specprefill_draft = getattr(
-                self._model_settings, "specprefill_draft_model", None
+        draft_path = specprefill_draft(self._model_settings)
+        if draft_path:
+            await loop.run_in_executor(
+                get_mlx_executor(), attach_specprefill_draft, self, draft_path
             )
-            specprefill_enabled = getattr(
-                self._model_settings, "specprefill_enabled", False
-            )
-            if specprefill_enabled and specprefill_draft:
-                try:
-
-                    def _load_draft():
-                        from ..patches.mlx_lm_mtp import set_mtp_active
-
-                        was_mtp = False
-                        try:
-                            from ..patches.mlx_lm_mtp import is_mtp_active
-
-                            was_mtp = is_mtp_active()
-                        except Exception:
-                            pass
-                        set_mtp_active(False)
-                        try:
-                            draft_tokenizer_config = get_tokenizer_config(
-                                specprefill_draft,
-                                trust_remote_code=self._trust_remote_code,
-                            )
-                            draft_model, _ = lm_load_compat(
-                                specprefill_draft,
-                                tokenizer_config=draft_tokenizer_config,
-                                trust_remote_code=self._trust_remote_code,
-                            )
-                            # Materialize frozen buffers (RoPE freqs, etc.)
-                            # on the loader thread. mlx_lm.load only does
-                            # mx.eval(model.parameters()) and leaves siblings
-                            # lazy bound to this thread's stream. Without
-                            # this, the first score_tokens() call from
-                            # Scheduler.step on the per-engine executor
-                            # thread raises "no Stream(gpu, X) in current
-                            # thread". Same root cause and fix as e93c408
-                            # for the VLM MTP drafter.
-                            materialize_lazy_state(draft_model)
-                            return draft_model
-                        finally:
-                            set_mtp_active(was_mtp)
-
-                    draft_model = await loop.run_in_executor(
-                        get_mlx_executor(), _load_draft
-                    )
-                    self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model,
-                        draft_model_name=specprefill_draft,
-                        keep_pct=getattr(
-                            self._model_settings, "specprefill_keep_pct", None
-                        ),
-                        threshold=getattr(
-                            self._model_settings, "specprefill_threshold", None
-                        ),
-                    )
-                    logger.info(
-                        f"SpecPrefill: draft model loaded ({specprefill_draft})"
-                    )
-                except Exception as e:
-                    logger.error(f"SpecPrefill: draft model load failed: {e}")
 
         self._loaded = True
         logger.info(f"BatchedEngine loaded: {self._model_name}")
@@ -925,6 +893,8 @@ class BatchedEngine(BaseEngine):
                 "_tokenizer",
                 "_grammar_compiler",
                 "_dflash_drafter",
+                "specprefill_draft_path",
+                "specprefill_failed_draft",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
         )
@@ -1123,14 +1093,12 @@ class BatchedEngine(BaseEngine):
         from the full prompt token count (system-only messages usually can't be
         templated on their own). Shared by ``chat`` and ``stream_chat`` so the
         non-streaming path protects the system prompt identically. No-op unless
-        the model has SpecPrefill enabled and the request has a system prompt.
+        SpecPrefill applies to the request and the request has a system prompt.
         """
-        specprefill_model_enabled = (
-            getattr(self._model_settings, "specprefill_enabled", False)
-            if self._model_settings
-            else False
-        )
-        if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
+        enabled = kwargs.get("specprefill")
+        if enabled is None:
+            enabled = getattr(self._model_settings, "specprefill_enabled", False)
+        if not enabled:
             return
         non_system = [
             m for m in messages if m.get("role") not in ("system", "developer")
@@ -1645,15 +1613,18 @@ class BatchedEngine(BaseEngine):
         ):
             yield output
 
-    def has_active_requests(self) -> bool:
-        """Check if the engine has active in-flight requests."""
+    def active_request_count(self) -> int:
+        """Number of requests holding a live output collector."""
         engine_core = getattr(self, "_engine", None)
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
-        return False
+                return len(getattr(inner, "_output_collectors", {}))
+        return 0
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        return self.active_request_count() > 0
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

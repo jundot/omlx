@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from transformers.utils.chat_template_utils import render_jinja_template
+
 from . import gguf
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,7 @@ VLM_MODEL_TYPES = {
     "inkling_mm_model",  # config model_type of Inkling Small checkpoints
     # mlx-lm's Inkling 2 module served through the VLM engine adapter.
     "inkling2",
+    "inkling2_loop",
     "muse_glimmer",
     "muse_spark",
     "glm5_next",
@@ -85,8 +88,8 @@ VLM_MODEL_TYPES = {
     "qwen3_omni_moe",
 }
 
-# Text-only model families that are implemented in mlx-vlm rather than
-# mlx-lm. They still use the VLM engine because that path loads mlx-vlm
+# Model families that are implemented in mlx-vlm rather than mlx-lm, mostly
+# text-only ones. They use the VLM engine because that path loads mlx-vlm
 # models and adapts their language model to oMLX's scheduler.
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
@@ -96,6 +99,9 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     # mlx-lm ships its own deepseek_v41 without the oMLX cache and kernels.
     "deepseek_v41",
     "glm5_next",
+    # Hy4 and Hy4-flash: text-only conversions have no mlx-lm module either.
+    "hy_v4_vl",
+    "hy_v4_flash",
     "minimax_m3",
     # The VLM engine's loader also reads the earlier oMLX layout of text-only
     # Muse Spark conversions.
@@ -945,18 +951,13 @@ def detect_thinking_default(
 ) -> bool | None:
     """Detect a model's effective thinking default from local metadata.
 
-    Inspects the Jinja chat template for ``enable_thinking`` references and
-    determines the default behaviour, including narrow model-family serving
-    recommendations when the raw template deliberately defaults to opt-in:
+    Renders the chat template without ``enable_thinking`` and compares the
+    prompt with explicit True and False renders:
 
-    * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
-      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
-      servers pass ``enable_thinking=true`` by default).
-    * **False** — model suppresses thinking by default (e.g. Gemma 4: only
-      enables thinking when ``enable_thinking`` is truthy,
-      ``default(false)``).
-    * **None** — template does not reference ``enable_thinking`` (model has
-      no thinking toggle).
+    * **True** - model thinks by default (e.g. Qwen 3.x, GLM-4.6V; Laguna:
+      Poolside recommends servers pass ``enable_thinking=true`` by default).
+    * **False** - model suppresses thinking by default (e.g. Gemma 4).
+    * **None** - template has no thinking toggle, or the probe cannot decide.
     """
     if template_text is None:
         template_text = _read_chat_template_text(model_path)
@@ -975,23 +976,30 @@ def detect_thinking_default(
     if model_config.get("model_type") == "laguna":
         return True
 
-    # Heuristic: if the template only disables thinking when explicitly
-    # ``enable_thinking is false``, then thinking is ON by default.
-    # If the template requires ``enable_thinking`` to be truthy or uses
-    # ``default(false)``, then thinking is OFF by default.
-    if "enable_thinking is false" in template_text:
-        return True  # ON by default (Qwen pattern)
-    # An explicit ``enable_thinking | default(true)`` filter states the ON
-    # default directly. It must be anchored and checked before the broad
-    # ``default(false)`` scan: a template may default *other* flags to false
-    # (e.g. ``preserve_thinking | default(false)``, Laguna S-2.1) without
-    # changing its thinking default.
-    if re.search(r"enable_thinking\s*\|\s*default\(true\)", template_text):
+    try:
+        silent = _render_generation_prompt(template_text)
+        enabled = _render_generation_prompt(template_text, enable_thinking=True)
+        disabled = _render_generation_prompt(template_text, enable_thinking=False)
+    except Exception as e:
+        logger.debug("Thinking default probe failed for %s: %s", model_path, e)
+        return None
+    if enabled == disabled:
+        return None
+    if silent == enabled:
         return True
-    if "default(false)" in template_text or "enable_thinking)" in template_text:
-        return False  # OFF by default (Gemma pattern)
-
+    if silent == disabled:
+        return False
     return None
+
+
+def _render_generation_prompt(template_text: str, **kwargs) -> str:
+    rendered, _ = render_jinja_template(
+        conversations=[[{"role": "user", "content": "Hello"}]],
+        chat_template=template_text,
+        add_generation_prompt=True,
+        **kwargs,
+    )
+    return rendered[0]
 
 
 # Context-length keys, in priority order. Order mirrors HuggingFace
@@ -1260,6 +1268,17 @@ def _is_adapter_dir(path: Path) -> bool:
     return (path / "adapter_config.json").exists()
 
 
+def _register_adapter(adapters: dict[str, str], path: Path, adapter_id: str) -> None:
+    if adapter_id in adapters:
+        logger.warning(
+            f"Duplicate LoRA adapter id '{adapter_id}' at {path}, "
+            f"keeping {adapters[adapter_id]}"
+        )
+        return
+    adapters[adapter_id] = str(path)
+    logger.info(f"Found LoRA adapter: {adapter_id}")
+
+
 def _is_model_dir(path: Path) -> bool:
     """Check if a directory contains a valid model (has config.json)."""
     return (path / "config.json").exists() and not _is_adapter_dir(path)
@@ -1515,14 +1534,26 @@ def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
     if not snapshots_dir.is_dir():
         return None
 
+    ref_files = []
     for ref_name in ("main", "master"):
+        ref_file = path / "refs" / ref_name
+        if not ref_file.exists():
+            continue
+        ref_files.append(ref_file)
         try:
-            commit_hash = (path / "refs" / ref_name).read_text().strip()
-        except OSError:
+            commit_hash = ref_file.read_text().strip()
+        except (OSError, ValueError):
+            # ValueError covers UnicodeDecodeError: a stray byte in the ref file
             continue
         snapshot = snapshots_dir / commit_hash
         if snapshot.is_dir():
             return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+    if ref_files:
+        logger.warning(
+            "Could not resolve pinned revision from %s — falling back to newest snapshot",
+            ", ".join(str(f) for f in ref_files),
+        )
 
     snapshots = [
         p
@@ -1993,7 +2024,9 @@ def _owner_folder(path: Path, model_dirs: list[Path]) -> str | None:
 
 
 def discover_models(
-    model_dir: Path, gguf_root: Path | None = None
+    model_dir: Path,
+    gguf_root: Path | None = None,
+    adapters: dict[str, str] | None = None,
 ) -> dict[str, DiscoveredModel]:
     """
     Scan model directory with two-level discovery.
@@ -2023,10 +2056,14 @@ def discover_models(
     Args:
         model_dir: Path to directory containing model subdirectories
         gguf_root: Where GGUF model folders are generated; None skips GGUFs
+        adapters: Receives LoRA adapter folders as {adapter_id: path}. They are
+            never models: a model's settings apply one on top of its weights.
 
     Returns:
         Dictionary mapping model_id to DiscoveredModel
     """
+    if adapters is None:
+        adapters = {}
     access_error = model_directory_access_error(model_dir)
     if access_error is not None:
         if "not readable" in access_error:
@@ -2043,10 +2080,7 @@ def discover_models(
             continue
 
         if _is_adapter_dir(subdir):
-            logger.info(
-                f"Skipping LoRA adapter: {subdir.name} "
-                "(oMLX does not support LoRA/PEFT adapters)"
-            )
+            _register_adapter(adapters, subdir, subdir.name)
         elif _register_gguf_folder(models, subdir, gguf_root):
             pass
         elif _is_model_dir(subdir):
@@ -2056,7 +2090,11 @@ def discover_models(
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
-                if _register_gguf_folder(
+                if _is_adapter_dir(hf_resolved.snapshot_path):
+                    _register_adapter(
+                        adapters, hf_resolved.snapshot_path, hf_resolved.model_id
+                    )
+                elif _register_gguf_folder(
                     models,
                     hf_resolved.snapshot_path,
                     gguf_root,
@@ -2089,10 +2127,8 @@ def discover_models(
                 ):
                     continue
                 if _is_adapter_dir(child):
-                    logger.info(
-                        f"Skipping LoRA adapter: {child.name} "
-                        "(oMLX does not support LoRA/PEFT adapters)"
-                    )
+                    has_children = True
+                    _register_adapter(adapters, child, child.name)
                 elif _register_gguf_folder(models, child, gguf_root):
                     has_children = True
                 elif _skip_splash_package(child):
@@ -2119,7 +2155,9 @@ def discover_models(
 
 
 def discover_models_from_dirs(
-    model_dirs: list[Path], gguf_root: Path | None = None
+    model_dirs: list[Path],
+    gguf_root: Path | None = None,
+    adapters: dict[str, str] | None = None,
 ) -> dict[str, DiscoveredModel]:
     """
     Scan multiple model directories and merge results.
@@ -2129,6 +2167,7 @@ def discover_models_from_dirs(
 
     Args:
         model_dirs: List of paths to directories containing model subdirectories
+        adapters: Receives LoRA adapter folders, earlier directory first
 
     Returns:
         Dictionary mapping model_id to DiscoveredModel
@@ -2142,7 +2181,7 @@ def discover_models_from_dirs(
             continue
 
         try:
-            discovered = discover_models(model_dir, gguf_root)
+            discovered = discover_models(model_dir, gguf_root, adapters)
         except ValueError as e:
             logger.warning(f"Skipping directory {model_dir}: {e}")
             continue

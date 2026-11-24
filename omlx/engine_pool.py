@@ -67,6 +67,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_metal_out_of_memory,
 )
+from .lora_adapters import adapter_info
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     detect_model_type,
@@ -80,8 +81,10 @@ from .model_settings import (
     ced_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
+    specprefill_draft,
     validate_ane_prefill,
 )
+from .patches.inkling2 import INKLING2_MODEL_TYPES
 from .patches.inkling2.dspark import (
     bundled_inkling2_dspark_path,
     load_inkling2_dspark_drafter,
@@ -93,6 +96,7 @@ from .prefill_helper.lending import lending_note
 from .prefill_helper.manager import prepare as prepare_prefill_helper
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
+from .specprefill.draft import attach_specprefill_draft
 from .speculative.dflash import context_bytes_per_row, load_dflash_drafter
 from .utils.fatal import exit_if_gpu_submissions_ignored, is_command_buffer_error
 from .utils.generation_config import SAMPLING_SETTING_KEYS, load_sampling_defaults
@@ -456,6 +460,8 @@ class EnginePool:
         self._starting_external: dict[str, SplashEngine] = {}
         # Scanned model roots, kept for org-qualified display/upload names.
         self._model_dirs: list[Path] = []
+        # LoRA adapter folders found in the model roots, by adapter id.
+        self._lora_adapters: dict[str, str] = {}
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
@@ -644,6 +650,17 @@ class EnginePool:
                 if v41_offload
                 else v41_estimate.resident_bytes
             )
+        if (
+            entry.engine_type == "vlm"
+            and entry.config_model_type == "hy_v4_flash"
+            and getattr(runtime_settings, "hy4_engram_ssd_offload", False)
+        ):
+            from .patches.hy_v4.engram_ssd import plan_engram_ssd
+
+            # Discovery charges the same 5% allowance on the table payload as
+            # on other weights. Keep the allowance on the resident remainder.
+            removed = plan_engram_ssd(entry.model_path).table_bytes
+            base = min(base, max(0, entry.estimated_size - int(removed * 1.05)))
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -724,12 +741,15 @@ class EnginePool:
                 extra += self._dflash_drafter_estimated_bytes(str(dspark_path), None)
         elif (
             getattr(runtime_settings, "mtp_enabled", False)
-            and entry.config_model_type == "inkling2"
+            and entry.config_model_type in INKLING2_MODEL_TYPES
         ):
             draft = bundled_inkling2_dspark_path(entry.model_path)
             if draft is not None:
                 # BF16 draft weights plus the folded [vocab, rank] Markov head.
                 extra += draft.stat().st_size + 201024 * 256 * 2
+        lora_path = getattr(runtime_settings, "lora_adapter", None)
+        if lora_path and (info := adapter_info(lora_path)) is not None:
+            extra += info.resident_bytes
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -1336,6 +1356,11 @@ class EnginePool:
                 entry, settings
             )
             add("deepseek_v41_engram_ssd_offload", v41_offload)
+            if entry.config_model_type == "hy_v4_flash":
+                add(
+                    "hy4_engram_ssd_offload",
+                    bool(data.get("hy4_engram_ssd_offload", False)),
+                )
             add(
                 "deepseek_v41_ced_prefill_enabled",
                 ced_prefill_on(settings),
@@ -1379,6 +1404,9 @@ class EnginePool:
         model_type = entry.config_model_type if entry else None
         backend = ane_prefill_backend(model_type)
         add("qwen35_ane_prefill_enabled", ane_active)
+        # These reject SpecPrefill at load, so a draft cannot be added in place.
+        if deployment is not None or (ane_active and backend == "k2"):
+            add("specprefill", specprefill_draft(data))
         if ane_active:
             add("ane_prefill_backend", backend)
             add(
@@ -1450,15 +1478,6 @@ class EnginePool:
                 data.get("moe_expert_offload_resident_fraction", 0.25),
             )
 
-        specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
-            "specprefill_draft_model"
-        )
-        add("specprefill_enabled", specprefill_active)
-        if specprefill_active:
-            add("specprefill_draft_model", data.get("specprefill_draft_model"))
-            add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
-            add("specprefill_threshold", data.get("specprefill_threshold"))
-
         dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
         dflash_draft = data.get("dflash_draft_model")
         if dflash_enabled and not dflash_draft and entry is not None:
@@ -1492,7 +1511,44 @@ class EnginePool:
             add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
             add("vlm_mtp_draft_block_size", data.get("vlm_mtp_draft_block_size"))
 
+        add("lora_adapter", data.get("lora_adapter") or None)
+
         return tuple(signature)
+
+    def _wanted_specprefill_draft(
+        self, entry: EngineEntry, runtime_settings: object | None
+    ) -> str | None:
+        """Return the draft these settings need on the loaded engine."""
+        if not hasattr(
+            entry.engine, "specprefill_draft_path"
+        ) or self._entry_is_diffusion_model(entry):
+            return None
+        settings = runtime_settings
+        if settings is None and self._settings_manager is not None:
+            settings = self._settings_manager.get_settings(entry.model_id)
+        draft = specprefill_draft(settings)
+        return None if draft == entry.engine.specprefill_failed_draft else draft
+
+    async def _attach_specprefill_draft(self, entry: EngineEntry, draft: str) -> None:
+        engine = entry.engine
+        task = asyncio.get_running_loop().run_in_executor(
+            get_mlx_executor(), attach_specprefill_draft, engine, draft
+        )
+        # A cancelled request still waits, so that no other load overlaps this one.
+        cancelled = False
+        entry.in_use += 1
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+        finally:
+            entry.in_use -= 1
+        if cancelled:
+            raise asyncio.CancelledError
+        if entry.engine is not engine:
+            raise ModelBusyError(entry.model_id, "load a SpecPrefill draft")
 
     @property
     def model_count(self) -> int:
@@ -1572,7 +1628,9 @@ class EnginePool:
         self._model_dirs = dirs
 
         gguf_root = _gguf_model_root()
-        discovered = discover_models_from_dirs(dirs, gguf_root)
+        adapters: dict[str, str] = {}
+        discovered = discover_models_from_dirs(dirs, gguf_root, adapters)
+        self._lora_adapters = adapters
 
         pinned_set = set(pinned_models or [])
 
@@ -1640,6 +1698,10 @@ class EnginePool:
                 logger.warning(f"Pinned model not found: {model_id}")
 
         logger.info(f"Discovered {len(self._entries)} models")
+
+    def lora_adapters(self) -> dict[str, str]:
+        """LoRA adapter folders found in the model roots, by adapter id."""
+        return dict(self._lora_adapters)
 
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
         "llm": "batched",
@@ -2404,6 +2466,7 @@ class EnginePool:
                 max_context=requested_context,
                 max_memory_bytes=budget,
                 kv_format=integrations.splash_kv_format,
+                activations=integrations.splash_activations,
                 ane_prefill=integrations.splash_ane_prefill,
                 cache_disk_bytes=cache_disk_bytes,
                 cache_dir=cache_dir,
@@ -2715,6 +2778,9 @@ class EnginePool:
             runtime_settings is not None and entry.runtime_settings_signature is None
         ):
             return None
+        draft = self._wanted_specprefill_draft(entry, runtime_settings)
+        if draft and draft != entry.engine.specprefill_draft_path:
+            return None
         self._validate_llm_engine_ready(model_id, entry.engine)
         if entry.runtime_settings_signature is None:
             entry.runtime_settings_signature = expected
@@ -2814,13 +2880,19 @@ class EnginePool:
 
             # Already loaded - just update access time
             if entry.engine is not None:
+                draft = self._wanted_specprefill_draft(entry, runtime_settings)
+                attached = entry.engine.specprefill_draft_path if draft else None
                 if (
-                    expected_signature is not None
-                    and entry.runtime_settings_signature is not None
-                    and entry.runtime_settings_signature != expected_signature
-                ) or (
-                    runtime_settings is not None
-                    and entry.runtime_settings_signature is None
+                    (
+                        expected_signature is not None
+                        and entry.runtime_settings_signature is not None
+                        and entry.runtime_settings_signature != expected_signature
+                    )
+                    or (
+                        runtime_settings is not None
+                        and entry.runtime_settings_signature is None
+                    )
+                    or (attached and attached != draft)
                 ):
                     self._raise_if_reload_busy(
                         entry,
@@ -2848,6 +2920,8 @@ class EnginePool:
                     unloaded_for_admission = True
                 elif entry.engine is not None:
                     self._validate_llm_engine_ready(model_id, entry.engine)
+                    if draft and not attached:
+                        await self._attach_specprefill_draft(entry, draft)
                     if entry.runtime_settings_signature is None:
                         entry.runtime_settings_signature = expected_signature
                     entry.last_access = time.time()
@@ -3278,7 +3352,7 @@ class EnginePool:
         evicted_any = False
         evicted_count = 0
         reclaim_attempted = False
-        slots_release_attempted = False
+        slots_exhausted = False
         slots_freed = 0
         ane_release_attempted = False
         hot_cache_attempted = False
@@ -3353,15 +3427,17 @@ class EnginePool:
                     )
                     continue
 
-                if not slots_release_attempted:
+                if not slots_exhausted:
                     # The requesting model's MoE offload slots return at its next
                     # decode step, so they go before cached prefixes and models.
-                    slots_release_attempted = True
-                    slots_freed = await self._release_offload_slots_for_headroom(
-                        exclude_model_id, request_id
+                    # Sized passes repeat until the step fits or the floor.
+                    released = await self._release_offload_slots_for_headroom(
+                        exclude_model_id, request_id, current + predicted - target
                     )
-                    if slots_freed:
+                    if released:
+                        slots_freed += released
                         continue
+                    slots_exhausted = True
 
                 if not hot_cache_attempted:
                     # Cached prefix blocks give way before any model does.
@@ -3583,9 +3659,10 @@ class EnginePool:
         return freed
 
     async def _release_offload_slots_for_headroom(
-        self, model_id: str, request_id: str
+        self, model_id: str, request_id: str, shortfall: int
     ) -> int:
-        """Release the model's MoE offload slots on its MLX thread; return the bytes."""
+        """Release ``shortfall`` bytes of the model's MoE offload slots, rounded up
+        to the next release step, on its MLX thread; return the bytes."""
         entry = self._entries.get(model_id)
         engine = entry.engine if entry is not None else None
         core = (
@@ -3600,7 +3677,9 @@ class EnginePool:
             return 0
         loop = asyncio.get_running_loop()
         try:
-            released = await loop.run_in_executor(executor, release, request_id)
+            released = await loop.run_in_executor(
+                executor, release, request_id, shortfall
+            )
         except Exception as e:
             logger.warning(
                 "MoE offload slot release failed for prefill request %s: %s",
@@ -4167,10 +4246,22 @@ class EnginePool:
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
             )
+            hy4_engram_on_ssd = entry.config_model_type == "hy_v4_flash" and getattr(
+                model_settings, "hy4_engram_ssd_offload", False
+            )
+            if hy4_engram_on_ssd and effective_type != "vlm":
+                raise ValueError("Hy4 Engram SSD offload requires the VLM engine")
             if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
             deployment = self._distributed_deployment_for_entry(entry)
+            if getattr(model_settings, "lora_adapter", None) and (
+                deployment is not None or effective_type not in ("batched", "vlm")
+            ):
+                raise ValueError(
+                    "A LoRA adapter applies only to a language or vision-language "
+                    f"model served on this Mac; remove it from {model_id}'s settings"
+                )
             base_resident_size = self._entry_resident_size(entry)
             if (
                 deployment is None
@@ -4358,6 +4449,8 @@ class EnginePool:
                 if isinstance(engine, SplashEngine):
                     # start() already stopped Splash; its error carries the
                     # tail of the Splash log. There is no MLX fallback.
+                    raise
+                if hy4_engram_on_ssd:
                     raise
                 if force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
@@ -4556,7 +4649,7 @@ class EnginePool:
             if (
                 model_settings is not None
                 and getattr(model_settings, "mtp_enabled", False)
-                and entry.config_model_type == "inkling2"
+                and entry.config_model_type in INKLING2_MODEL_TYPES
                 and hasattr(engine, "prepare_dflash_target")
             ):
                 draft_path = bundled_inkling2_dspark_path(entry.model_path)

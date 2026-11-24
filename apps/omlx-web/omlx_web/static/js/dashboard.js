@@ -70,6 +70,7 @@
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
+        'lora_adapter',
     ]);
     const DIFFUSION_UNSUPPORTED_CT_KWARGS = new Set([
         'enable_thinking',
@@ -217,6 +218,7 @@
                     web_search_content_max_chars: 20000,
                     splash_path: null,
                     splash_kv_format: 'int8',
+                    splash_activations: 'bf16',
                     splash_max_memory_gb: null,
                     splash_ssd_cache_gb: null,
                     splash_ane_prefill: true,
@@ -332,6 +334,7 @@
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
+            loraAdapters: [],
             aneTuning: {
                 tuningId: null,
                 modelId: null,
@@ -636,6 +639,7 @@
             oqPreserveNgram: false,
             oqMtpAssistantPath: '',
             oqEnhanced: false,
+            oqHadamard: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
             oqeStrictImatrix: false,
@@ -696,7 +700,7 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            benchUploadSkipped: null,  // { reason, features } from the upload_skipped event
             benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
@@ -1914,6 +1918,35 @@
                 const profile = this.profiles.find(p => p.name === this.activeProfileName);
                 return this.matchingProfileTemplate(profile)?.name || null;
             },
+            async loadLoraAdapters(modelId) {
+                this.loraAdapters = [];
+                try {
+                    const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/lora-adapters`);
+                    if (r.ok) this.loraAdapters = (await r.json()).adapters || [];
+                    else if (r.status === 401) window.location.href = '/admin';
+                } catch (_) { /* network error */ }
+            },
+            loraAdapterOptions() {
+                const current = this.modelSettings.lora_adapter;
+                // A saved path outside the model folders still shows as selected.
+                if (current && !this.loraAdapters.some(a => a.path === current)) {
+                    return [{ id: current, path: current, problem: null }, ...this.loraAdapters];
+                }
+                return this.loraAdapters;
+            },
+            loraAdapterLabel(a) {
+                const parts = [a.id];
+                if (a.rank) parts.push('r' + a.rank);
+                if (a.size_formatted) parts.push(a.size_formatted);
+                return parts.join(' · ');
+            },
+            selectedLoraAdapter() {
+                const current = this.modelSettings.lora_adapter;
+                return current ? this.loraAdapters.find(a => a.path === current) || null : null;
+            },
+            loraAdapterProblem() {
+                return this.selectedLoraAdapter()?.problem || '';
+            },
             async loadProfilesForModel(modelId) {
                 const seq = this._applySeq;
                 this.profiles = [];
@@ -2255,6 +2288,8 @@
                         model?.deepseek_v41_engram_ssd_offload_supported === true,
                     deepseek_v41_engram_ssd_offload_forced:
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
+                    hy4_engram_ssd_offload: s.hy4_engram_ssd_offload === true,
+                    hy4_engram_ssd_offload_supported: model?.hy4_engram_ssd_offload_supported === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     enableGpuPowerLimit: !!(s.gpu_power_limit_w),
@@ -2312,8 +2347,8 @@
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     mtp_enabled: s.mtp_enabled || false,
-                    mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
-                        ? String(s.mtp_adaptive_max_depth) : '3',
+                    mtp_adaptive_max_depth: [3, 4, 5, 6, 7, 8].includes(s.mtp_adaptive_max_depth)
+                        ? String(s.mtp_adaptive_max_depth) : '',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -2322,6 +2357,7 @@
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
+                    lora_adapter: isDiffusion ? '' : (s.lora_adapter || ''),
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     external_engine: s.external_engine || '',
@@ -3085,6 +3121,7 @@
                     await Promise.all([
                         this.loadProfilesForModel(model.id),
                         this.loadTemplates(),
+                        this.loadLoraAdapters(model.id),
                     ]);
                     if (this.reasoningParsers.length === 0) {
                         try {
@@ -3413,6 +3450,7 @@
                 if (this.modelSettings.deepseek_v41_engram_ssd_offload_supported) {
                     return 'deepseek_v41_engram_ssd_offload';
                 }
+                if (this.modelSettings.hy4_engram_ssd_offload_supported) return 'hy4_engram_ssd_offload';
                 return null;
             },
 
@@ -3598,6 +3636,7 @@
                         ms.deepseek_v41_engram_ssd_offload_forced
                             ? !!ms.deepseek_v41_engram_ssd_offload_requested
                             : !!ms.deepseek_v41_engram_ssd_offload,
+                    hy4_engram_ssd_offload: !!ms.hy4_engram_ssd_offload,
                     thinking_budget_enabled: ms.enableThinkingBudget,
                     thinking_budget_tokens: ms.enableThinkingBudget
                         ? (ms.thinking_budget_tokens || null)
@@ -3683,8 +3722,9 @@
                         ? (ms.dflash_verify_mode || 'adaptive')
                         : null,
                     mtp_enabled: !!ms.mtp_enabled,
-                    mtp_adaptive_max_depth: ms.mtp_enabled
-                        ? parseInt(ms.mtp_adaptive_max_depth || '3')
+                    // Empty -> the model's own default ceiling.
+                    mtp_adaptive_max_depth: ms.mtp_enabled && ms.mtp_adaptive_max_depth
+                        ? parseInt(ms.mtp_adaptive_max_depth)
                         : null,
                     mtp_fixed_depth: null,
                     qwen35_ane_prefill_shared_fraction: Number(ms.qwen35_ane_prefill_shared_fraction),
@@ -3696,6 +3736,7 @@
                         && ms.vlm_mtp_draft_block_size
                         ? parseInt(ms.vlm_mtp_draft_block_size)
                         : null,
+                    lora_adapter: ms.lora_adapter || null,
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };
@@ -3760,6 +3801,7 @@
                         vlm_mtp_enabled: false,
                         vlm_mtp_draft_model: null,
                         vlm_mtp_draft_block_size: null,
+                        lora_adapter: null,
                     });
                 }
                 if (this.selectedModel?.embedding_audio_supported) {
@@ -4068,7 +4110,7 @@
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
-                        this.modelSettings.mtp_adaptive_max_depth = '3';
+                        this.modelSettings.mtp_adaptive_max_depth = '';
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
@@ -4773,6 +4815,7 @@
                             web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                             splash_path: this.globalSettings.integrations.splash_path,
                             splash_kv_format: this.globalSettings.integrations.splash_kv_format,
+                            splash_activations: this.globalSettings.integrations.splash_activations,
                             splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
                             splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
                             splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
@@ -6060,6 +6103,17 @@
                     novel_ja: 'bench.config.context.novel_ja',
                 };
                 return window.t(keys[profile] || keys.code_python);
+            },
+
+            benchUploadSkippedLabel(reason) {
+                const keys = {
+                    external_endpoint: 'bench.upload_skipped.reason_external',
+                    splash: 'bench.upload_skipped.reason_splash',
+                    ane_aligned_prompt: 'bench.upload_skipped.reason_ane_aligned_prompt',
+                    custom_generation_length: 'bench.upload_skipped.reason_custom_generation_length',
+                    lora_adapter: 'bench.upload_skipped.reason_lora_adapter',
+                };
+                return window.t(keys[reason] || 'bench.upload_skipped.reason_default');
             },
 
             // User clicked "View live" on the banner — clear the stale
@@ -8212,6 +8266,7 @@
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
+                        payload.hadamard = this.oqHadamardActive();
                         payload.imatrix_reuse_cache = this.oqeReuseImatrixCache;
                         payload.imatrix_cache_path = this.oqeImatrixCachePath.trim();
                         payload.imatrix_strict = this.oqeStrictImatrix;
@@ -8225,7 +8280,7 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', 'oQ' + this.oqLevel + (this.oqEnhanced ? 'e' : ''));
+                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', this.oqLevelLabel(this.oqLevel));
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
@@ -8374,7 +8429,18 @@
             },
 
             oqLevelLabel(level) {
-                return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
+                return `oQ${level}${this.oqHadamardActive() ? 'h' : (this.oqEnhanced ? 'e' : '')}`;
+            },
+
+            oqSelectedModelSupportsOqh() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!model?.oqh_supported) return false;
+                // DeepSeek V4.1 takes oQh below oQ4 only.
+                return model.oqh_max_level == null || this.oqLevel < model.oqh_max_level;
+            },
+
+            oqHadamardActive() {
+                return this.oqEnhanced && this.oqHadamard && this.oqSelectedModelSupportsOqh();
             },
 
             oqSelectedModelIsVLM() {
@@ -9210,7 +9276,7 @@
             // A downloaded checkpoint with Hub changes offers Update instead of the download buttons.
             hfShowsUpdate() {
                 const detail = this.hfModelDetail;
-                return !!(detail && !detail.is_adapter && !detail.unsupported_reason && detail.layout !== 'gguf'
+                return !!(detail && !detail.unsupported_reason && detail.layout !== 'gguf'
                     && detail.update_files?.length && this.isModelDownloaded(detail.repo_id));
             },
 

@@ -31,6 +31,7 @@ from ..cluster.identity import get_node_identity
 from ..cluster.pairing import get_pairing_manager
 from ..cluster.registry import default_devices_path
 from ..exceptions import is_metal_out_of_memory
+from ..oqh import format as oqh_format
 from . import agent
 from . import launcher as default_launcher
 from .adapter import StageAdapter
@@ -41,7 +42,8 @@ from .session import PrefillHelperSession
 
 logger = logging.getLogger(__name__)
 
-# Activations of one chunk and allocator headroom on the helper.
+# Activations of one chunk and allocator headroom on a helper that does not
+# say what it keeps.
 _RESERVE_BYTES = 8 << 30
 # The OS and other apps on a helper with unified memory; the GPU budget alone
 # let the helper swap (105 GiB of layers on a 128 GB Mac or DGX Spark).
@@ -101,6 +103,19 @@ def helper_budget(info: dict) -> list[int]:
     return [budget]
 
 
+def helper_reserve(info: dict) -> int:
+    """Bytes the helper keeps free on each GPU besides its layers; a helper
+    daemon reports the reserve it plans its stages with."""
+    reserve = info.get("reserve")
+    return _RESERVE_BYTES if reserve is None else int(reserve)
+
+
+def no_gpu(info: dict, name: str) -> str:
+    """Why a helper daemon that answers has no GPU left."""
+    error = info.get("gpu_error")
+    return f"{name} lost its GPU, restart its helper" + (f": {error}" if error else "")
+
+
 def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
     """How to fit *size* bytes of model files on the helper Mac.
 
@@ -122,7 +137,11 @@ def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
 
 
 def fit_layers(
-    shared: int, per_layer: list[int], budgets: list[int], limit: int
+    shared: int,
+    per_layer: list[int],
+    budgets: list[int],
+    limit: int,
+    reserve: int = _RESERVE_BYTES,
 ) -> int:
     """How many leading layers fit in a helper's memory, one GPU after another.
 
@@ -131,7 +150,7 @@ def fit_layers(
     """
     held, layers = 0, per_layer[:limit]
     for index, budget in enumerate(sorted(budgets, reverse=True)[:2]):
-        start, used = held, _RESERVE_BYTES + (shared if index == 0 else 0)
+        start, used = held, reserve + (shared if index == 0 else 0)
         while held < len(layers) and used + layers[held] <= budget:
             used, held = used + layers[held], held + 1
         if held == start:
@@ -150,14 +169,18 @@ def _with_time_left(status: dict[str, Any]) -> dict[str, Any]:
 def held_layers(
     adapter: StageAdapter,
     model_path: str,
-    budgets: list[int],
+    info: dict,
     name: str,
     fixed: int | None = None,
 ) -> int:
     """Layers the helper holds: as many as fit, or the fixed number."""
     shared, per_layer = adapter.memory_plan(model_path)
     limit = adapter.split_limit(len(per_layer))
-    held = fit_layers(shared, per_layer, budgets, limit)
+    budgets = helper_budget(info)
+    if not budgets:
+        # A helper daemon starts only with a GPU, so a lost one may come back.
+        raise UnreachableError(no_gpu(info, name))
+    held = fit_layers(shared, per_layer, budgets, limit, helper_reserve(info))
     if fixed is not None:
         if fixed > limit:
             raise _PermanentError(
@@ -223,9 +246,13 @@ def this_host() -> dict | None:
 
 
 def _reach(
-    launcher: Any, node_id: str, report: Callable[..., None], adapter: StageAdapter
+    launcher: Any,
+    node_id: str,
+    report: Callable[..., None],
+    adapter: StageAdapter,
+    model_path: str,
 ) -> tuple:
-    """The helper and its ``remote_info``, if it can serve this family."""
+    """The helper and its ``remote_info``, if it can serve this model."""
     try:
         target = launcher.resolve_target(node_id)
     except UnreachableError:
@@ -236,9 +263,13 @@ def _reach(
     forget_host(node_id)
     report("connecting", name=target.name, link=target.link)
     info = launcher.remote_info(target, host=this_host())
-    problem = launcher.incompatible(info, adapter, target.name)
+    oqh = oqh_format.checkpoint_version(model_path)
+    problem = launcher.incompatible(info, adapter, target.name, oqh)
     if problem is not None:
         raise _PermanentError(problem)
+    update = agent.outdated(info) if "contracts" in info else None
+    if update:
+        logger.warning("Prefill helper on %s is outdated. %s", target.name, update)
     return target, info
 
 
@@ -404,11 +435,13 @@ class FilePrep:
         try:
             if self._cancel.is_set():
                 raise _CancelledError
-            target, info = _reach(self.launcher, self.node_id, self._set, self.adapter)
+            target, info = _reach(
+                self.launcher, self.node_id, self._set, self.adapter, self.model_path
+            )
             held = held_layers(
                 self.adapter,
                 self.model_path,
-                helper_budget(info),
+                info,
                 target.name,
                 self.layers,
             )
@@ -709,11 +742,13 @@ class PrefillHelperManager:
         if adopted is not None:
             target, info, held, process = adopted
         else:
-            target, info = _reach(launcher, self.node_id, self._report, self.adapter)
+            target, info = _reach(
+                launcher, self.node_id, self._report, self.adapter, self.model_path
+            )
             held = held_layers(
                 self.adapter,
                 self.model_path,
-                helper_budget(info),
+                info,
                 target.name,
                 self.fixed_layers,
             )

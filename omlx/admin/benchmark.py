@@ -43,6 +43,10 @@ _benchmark_runs: dict[str, "BenchmarkRun"] = {}
 # Valid prompt lengths for single request tests
 VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
 
+# Default token generation length for any request. Runs at a different
+# length stay out of the community leaderboard (see run_benchmark).
+DEFAULT_GENERATION_LENGTH = 128
+
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]
 
@@ -114,7 +118,7 @@ class BenchmarkRequest(BaseModel):
 
     model_id: str
     prompt_lengths: list[int]
-    generation_length: int = 128
+    generation_length: int = DEFAULT_GENERATION_LENGTH
     batch_sizes: list[int] = []
     context_profile: BenchmarkContextProfile = BenchmarkContextProfile.CODE_PYTHON
     warmup_mode: BenchmarkWarmupMode = BenchmarkWarmupMode.QUICK
@@ -136,6 +140,15 @@ class BenchmarkRequest(BaseModel):
                     f"Invalid prompt length {pl}. Must be one of {VALID_PROMPT_LENGTHS}"
                 )
         return sorted(v)
+
+    @field_validator("generation_length")
+    @classmethod
+    def validate_generation_length(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(
+                f"Generation length ({v}) must be higher than 0"
+            )
+        return v
 
     @field_validator("batch_sizes")
     @classmethod
@@ -814,6 +827,86 @@ def _restore_speed_priority(engine_pool: Any, previous: bool | None) -> None:
         config.prefill_speed_priority = previous
 
 
+def _pin_prefill_first(engine_pool: Any) -> bool | None:
+    """Turn decode fairness off for the benchmark's duration.
+
+    With fairness on, a batch test's prefills yield to the rows that already
+    decode, so the rows start seconds apart and the batch row no longer
+    measures concurrent decode. Returns the previous value for restoration,
+    or None when the pool exposes no config.
+    """
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is None:
+        return None
+    previous = bool(getattr(config, "decode_fairness", True))
+    config.decode_fairness = False
+    return previous
+
+
+def _restore_prefill_first(engine_pool: Any, previous: bool | None) -> None:
+    """Undo _pin_prefill_first (no-op when the pin never landed)."""
+    if previous is None:
+        return
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is not None:
+        config.decode_fairness = previous
+
+
+async def _lift_concurrency_for_batch(engine_pool: Any, batch_size: int) -> int | None:
+    """Raise the concurrent-request cap to the batch size for the batch tests.
+
+    The scheduler admits only max_concurrent_requests rows at a time. A wider
+    batch queues and runs in waves, so the test would measure the cap and
+    not the batch size. The lift only raises the cap, stays in memory
+    (settings.json is not written) and uses the same live seam as the
+    settings page. Returns the previous cap for restoration, or None when
+    nothing changed.
+    """
+    config = getattr(engine_pool, "_scheduler_config", None)
+    current = getattr(config, "max_num_seqs", None)
+    apply = getattr(engine_pool, "apply_max_concurrent_requests", None)
+    if not isinstance(current, int) or isinstance(current, bool):
+        return None
+    if current >= batch_size or apply is None:
+        return None
+    await apply(batch_size)
+    logger.info(
+        f"Benchmark: max concurrent requests raised {current} -> {batch_size} "
+        "for the batch tests"
+    )
+    return current
+
+
+async def _restore_concurrency(
+    engine_pool: Any, previous: int | None, lifted: int | None
+) -> None:
+    """Undo _lift_concurrency_for_batch (no-op when the lift never landed).
+
+    A cap the user changed during the run is kept.
+    """
+    if previous is None:
+        return
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if getattr(config, "max_num_seqs", None) != lifted:
+        return
+    try:
+        await engine_pool.apply_max_concurrent_requests(previous)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Benchmark: max concurrent requests restore failed: {e}")
+
+
+def _tokens_after(timeline: list[tuple[float, int]], at: float) -> int:
+    """Tokens a request produced after `at`, from its (time, count) timeline."""
+    if not timeline:
+        return 0
+    before = 0
+    for ts, count in timeline:
+        if ts > at:
+            break
+        before = count
+    return timeline[-1][1] - before
+
+
 def _get_batch_benchmark_core(engine: Any) -> Any | None:
     """Return the scheduler core when this engine supports batch benchmarks."""
     engine_core = getattr(engine, "_engine", None)
@@ -1224,6 +1317,7 @@ async def _run_batch_test(
         tokens = 0
         prev_tokens = 0
         reported_prompt_tokens = 0
+        timeline: list[tuple[float, int]] = []
 
         request_id = await engine_core.add_request(
             prompt=prompt,
@@ -1232,9 +1326,11 @@ async def _run_batch_test(
         )
 
         async for output in engine_core.stream_outputs(request_id):
+            now = time.perf_counter()
             if first_token is None and output.completion_tokens > prev_tokens:
-                first_token = time.perf_counter()
+                first_token = now
             prev_tokens = output.completion_tokens
+            timeline.append((now, output.completion_tokens))
             if output.finished:
                 tokens = output.completion_tokens
                 reported_prompt_tokens = output.prompt_tokens
@@ -1254,6 +1350,7 @@ async def _run_batch_test(
             "first_token_abs": first_token,
             "end_abs": end,
             "completion_tokens": tokens,
+            "timeline": timeline,
         }
 
     # Submit all requests concurrently. Nothing else generates during the
@@ -1286,10 +1383,22 @@ async def _run_batch_test(
     prefill_wall_time = max_first_token - wall_start
     pp_tps = total_prompt_tokens / max(prefill_wall_time, 1e-9)
 
-    # tg TPS: total generated tokens / generation wall time
-    # Generation starts when the last request finishes prefill
+    # tg TPS: tokens generated inside the generation window / its wall time.
+    # Generation starts when the last request finishes prefill. Tokens that
+    # earlier requests produced before that point (while later requests were
+    # still queued or in prefill) are outside the window and do not count;
+    # counting them made a batch wider than the concurrency cap report about
+    # batch_size / cap times its real throughput.
     gen_wall_time = wall_end - max_first_token
-    tg_tps = total_gen_tokens / max(gen_wall_time, 1e-9)
+    window_tokens = sum(_tokens_after(r["timeline"], max_first_token) for r in results)
+    tg_tps = window_tokens / max(gen_wall_time, 1e-9)
+    overlapped = sum(1 for r in results if r["end_abs"] > max_first_token)
+    if max_tokens > 1 and overlapped < batch_size:
+        logger.warning(
+            f"Benchmark batch {batch_size}x: only {overlapped} requests were "
+            "still generating when the last one started; the batch did not "
+            "run fully in parallel"
+        )
 
     return {
         "pp_tps": round(pp_tps, 1),
@@ -1394,7 +1503,17 @@ async def _run_external_batch_test(
         # response, and the window alone cannot tell a genuine decode phase
         # from a single-chunk dump.
         if decode_observed and gen_window > 0:
-            tg_tps = round(total_gen_tokens / gen_window, 1)
+            # Count only the tokens decoded inside the window. Streams report
+            # no per-token times, so each stream's share is spread evenly over
+            # its own decode span; a stream that finished before the last one
+            # started (a server that queued it) adds nothing.
+            window_tokens = 0.0
+            for s in stats_list:
+                span = s.last_content_time - s.first_content_time
+                start = max(s.first_content_time, max_first_token)
+                inside = s.last_content_time - start
+                window_tokens += s.completion_tokens * min(max(inside / span, 0.0), 1.0)
+            tg_tps = round(window_tokens / gen_window, 1)
 
     return {
         "pp_tps": pp_tps,
@@ -1940,6 +2059,9 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     # Throughput measurements must not be skewed by the memory-guard
     # throttle shrinking chunks; pin speed priority for the run.
     previous_speed_priority = _pin_speed_priority(engine_pool)
+    previous_decode_fairness = _pin_prefill_first(engine_pool)
+    previous_concurrency: int | None = None
+    lifted_concurrency: int | None = None
 
     try:
         run.model_settings_snapshot = _with_benchmark_context(
@@ -1971,6 +2093,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                     f"Benchmark: failed to read experimental flags for "
                     f"{request.model_id}: {e}"
                 )
+        lora_adapter = getattr(model_settings, "lora_adapter", None)
 
         # Phase 1: Unload all loaded models
         loaded_ids = engine_pool.get_loaded_model_ids()
@@ -2303,6 +2426,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             )
             current_test += len(request.batch_sizes)
 
+        # Batch tests must really run batch_size requests at once: raise the
+        # concurrent-request cap for this phase (restored in finally).
+        if request.batch_sizes and batch_core is not None and chat is None:
+            lifted_concurrency = max(request.batch_sizes)
+            previous_concurrency = await _lift_concurrency_for_batch(
+                engine_pool, lifted_concurrency
+            )
+
         for batch_size in (
             request.batch_sizes if (batch_core is not None or chat is not None) else []
         ):
@@ -2391,6 +2522,36 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             )
             return
 
+        if request.generation_length != DEFAULT_GENERATION_LENGTH:
+            # Non-default generation lengths are used to test different
+            # scenarios; keep them out of the omlx.ai community leaderboard.
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "custom_generation_length"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "custom_generation_length",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
+        if lora_adapter:
+            # The leaderboard files results under the base checkpoint, which
+            # an adapter run does not measure.
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "lora_adapter"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "lora_adapter",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
         if chat is not None:
             # Splash runs measure a different engine; keep them out of the
             # oMLX community leaderboard.
@@ -2469,6 +2630,11 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Benchmark: sampler stop failed: {e}")
         _restore_speed_priority(engine_pool, previous_speed_priority)
+        _restore_prefill_first(engine_pool, previous_decode_fairness)
+        # Shielded: a second cancel while restoring must not leave the cap raised.
+        await asyncio.shield(
+            _restore_concurrency(engine_pool, previous_concurrency, lifted_concurrency)
+        )
 
 
 async def _run_external_benchmark(run: BenchmarkRun) -> None:

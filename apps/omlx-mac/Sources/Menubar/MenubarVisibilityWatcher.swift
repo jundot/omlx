@@ -36,6 +36,8 @@ final class MenubarVisibilityWatcher {
     /// timer in `_doFinishLaunching` — gives ControlCenter time to settle
     /// before we conclude the icon is hidden.
     func scheduleInitialCheck(after delay: TimeInterval = 3.0) {
+        // A probe in the XCTest host reads the item as hidden and opens the alert.
+        guard !MenubarController.isRunningUnitTests else { return }
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             self?.checkOnce()
@@ -80,6 +82,20 @@ final class MenubarVisibilityWatcher {
         return !(api && visible && occlusion)
     }
 
+    /// A full menu bar parks new items behind the notch, where StatusKit
+    /// repair can't help.
+    private func isUnderNotch() -> Bool {
+        guard let window = statusItem?.button?.window, let screen = window.screen else {
+            return false
+        }
+        return MenubarNotch.covers(
+            itemFrame: window.frame,
+            screenFrame: screen.frame,
+            leftAreaWidth: screen.auxiliaryTopLeftArea?.width,
+            rightAreaWidth: screen.auxiliaryTopRightArea?.width
+        )
+    }
+
     /// One line carrying every signal the probe decides on, plus the button
     /// window frame. #1497 turned on that frame: the item reported itself
     /// visible while ControlCenter had parked it at y=-17, and nothing in
@@ -101,7 +117,8 @@ final class MenubarVisibilityWatcher {
         } ?? "none"
         return """
         hidden=\(isHidden()) api=\(item.isVisible) window=\(window.isVisible) \
-        occlusion=\(window.occlusionState.contains(.visible)) frame=\(frameText) screen=\(screenText)
+        occlusion=\(window.occlusionState.contains(.visible)) frame=\(frameText) screen=\(screenText) \
+        notch=\(isUnderNotch())
         """
     }
 
@@ -117,6 +134,13 @@ final class MenubarVisibilityWatcher {
         }
 
         didAlertOnce = true
+
+        if isUnderNotch() {
+            MenubarLog.write("hidden alert shown: icon is behind the camera notch")
+            showNotchAlert()
+            return
+        }
+
         MenubarLog.write("hidden alert shown")
 
         let alert = NSAlert()
@@ -169,6 +193,36 @@ final class MenubarVisibilityWatcher {
         }
     }
 
+    /// No Auto-Fix here: the approval is fine, the menu bar is just full.
+    private func showNotchAlert() {
+        let alert = NSAlert()
+        alert.messageText = "oMLX Menubar Icon Hidden"
+        alert.informativeText = """
+        The oMLX menubar icon is behind the camera notch. oMLX is still running.
+
+        macOS hides menu bar icons that don't fit beside the notch and doesn't \
+        show them anywhere else. To make room, quit or turn off a few other \
+        menu bar icons, or use a menubar manager like Ice or Bartender. The \
+        icon also shows on an external display.
+        """
+        let offersSettings = MenubarIconRecovery.isTahoeOrNewer
+        if offersSettings {
+            alert.addButton(withTitle: "Open Menu Bar Settings…")
+        }
+        alert.addButton(withTitle: "View Log")
+        alert.addButton(withTitle: "Dismiss")
+        alert.window.level = .floating
+
+        switch (offersSettings, alert.runModal()) {
+        case (true, .alertFirstButtonReturn):
+            MenubarIconRecovery.openMenuBarSettings()
+        case (true, .alertSecondButtonReturn), (false, .alertFirstButtonReturn):
+            MenubarLog.open()
+        default:
+            break
+        }
+    }
+
     /// Bundle id of the first known menu bar manager that's running, if any.
     /// Named in the log so a suppressed alert isn't a silent branch.
     private func runningMenuBarManager() -> String? {
@@ -181,6 +235,23 @@ final class MenubarVisibilityWatcher {
         return bundleIDs.first { bundleID in
             !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
         }
+    }
+}
+
+enum MenubarNotch {
+    /// The notch is the gap between the unobscured top-left and top-right
+    /// areas, measured from the screen's own edges.
+    static func covers(
+        itemFrame: CGRect,
+        screenFrame: CGRect,
+        leftAreaWidth: CGFloat?,
+        rightAreaWidth: CGFloat?
+    ) -> Bool {
+        guard let leftAreaWidth, let rightAreaWidth else { return false }
+        let notchMinX = screenFrame.minX + leftAreaWidth
+        let notchMaxX = screenFrame.maxX - rightAreaWidth
+        guard notchMaxX > notchMinX else { return false }
+        return itemFrame.minX < notchMaxX && itemFrame.maxX > notchMinX
     }
 }
 

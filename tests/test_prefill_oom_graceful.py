@@ -29,6 +29,7 @@ from omlx.memory_monitor import (
     MemoryMonitor,
     make_prefill_memory_profile,
 )
+from omlx.patches.moe_expert_offload import release_moe_offload_slots
 from omlx.prefill_transient_tracker import PrefillTransientTracker
 from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import (
@@ -2501,3 +2502,133 @@ def test_concurrent_admission_race_is_documented_not_fixed(monkeypatch):
         32, q_len, kv_len, 256, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
     )
     assert 2 * bounded_charge < unfused
+
+
+# --------------------------------------------------------------------------
+# MoE offload slot release vs the per-request pause limit
+# --------------------------------------------------------------------------
+
+
+class _SlotCache:
+    """ExpertCache's release surface: capacity, floor and byte accounting."""
+
+    def __init__(self, full, floor, expert_bytes):
+        self.full_capacity = self.capacity = full
+        self.floor = floor
+        self.expert_bytes = expert_bytes
+
+    def release_slots(self, capacity=None):
+        capacity = self.floor if capacity is None else max(capacity, self.floor)
+        if capacity >= self.capacity:
+            return 0
+        freed = (self.capacity - capacity) * self.expert_bytes
+        self.capacity = capacity
+        return freed
+
+
+def _long_offloaded_prefill(sized, chunks=10, growth=3 * _GB):
+    """Drive the pre-chunk guard through a long prompt with 32GB of slots above
+    the floor, 0.5GB short at the start and ``growth`` more per chunk. Each
+    pause runs the sized release (``sized``) or the release to the floor."""
+    hard = 43 * _GB
+    ns = _throttle_ctx(current=0, hard=hard, samples_bpt=1024 * 1024, min_chunk=256)
+    caches = [_SlotCache(full=34, floor=2, expert_bytes=_GB)]
+    min_transient = ns._admission_transient_bound(256, 0)
+    ns._fake_current = ns._prefill_abort_cap() - min_transient + _GB // 2
+    request = SimpleNamespace(prefill_eviction_retries=0)
+    ns.requests = {"r": request}
+    ns.running = {}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns.moe_offload_releasable = lambda: sum(
+        (c.capacity - c.floor) * c.expert_bytes for c in caches
+    )
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    pauses = 0
+    for _ in range(chunks):
+        while True:
+            try:
+                with (
+                    patch.object(sched_mod.mx, "get_active_memory", return_value=0),
+                    patch.object(
+                        sched_mod, "get_phys_footprint", return_value=ns._fake_current
+                    ),
+                ):
+                    Scheduler._guard_prefill_chunk(
+                        ns,
+                        256,
+                        kv_len=0,
+                        progress=0,
+                        loop_label="test",
+                        request_id="r",
+                    )
+                break
+            except _PrefillEvictionNeeded as e:
+                pauses += 1
+                ev = e.request
+                short = (
+                    ns._fake_current
+                    + ev.predicted_transient_bytes
+                    - ev.target_cap_bytes
+                )
+                freed = release_moe_offload_slots(caches, short if sized else None)
+                ns._fake_current -= freed
+        ns._fake_current += growth
+    return pauses, request, caches[0]
+
+
+def test_sized_slot_release_completes_a_prompt_main_completes():
+    """The sized release takes four pauses to reach the floor. They must not
+    spend the two-pause limit, or a later shortfall fails the prefill."""
+    pauses, request, cache = _long_offloaded_prefill(sized=False)
+    assert (pauses, cache.capacity) == (1, cache.floor)
+
+    pauses, request, cache = _long_offloaded_prefill(sized=True)
+    assert (pauses, cache.capacity) == (4, cache.floor)
+    assert request.prefill_eviction_retries == 0
+
+
+def _pause_ctx(releasable, running=()):
+    ns = _throttle_ctx(current=50 * _GB, hard=58 * _GB, samples_bpt=2 * 1024**2)
+    ns._fake_current = 50 * _GB
+    request = SimpleNamespace(prefill_eviction_retries=0, prefill_offload_pauses=0)
+    ns.requests = {"r": request}
+    ns.running = {rid: object() for rid in running}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns.moe_offload_releasable = lambda: releasable[0]
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    return ns, request
+
+
+def test_offload_slot_pauses_do_not_count_until_the_floor():
+    """Slot pauses are free up to four; at the floor pauses count, then it throttles."""
+    releasable = [32 * _GB]
+    ns, request = _pause_ctx(releasable)
+    for n in range(1, Scheduler._MAX_OFFLOAD_SLOT_PAUSES + 1):
+        with pytest.raises(_PrefillEvictionNeeded):
+            _call(ns, 2048)
+        assert (request.prefill_offload_pauses, request.prefill_eviction_retries) == (
+            n,
+            0,
+        )
+    # At most one free pause per release step, even if slots remain.
+    with pytest.raises(_PrefillEvictionNeeded):
+        _call(ns, 2048)
+    assert request.prefill_eviction_retries == 1
+    releasable[0] = 0  # at the floor
+    with pytest.raises(_PrefillEvictionNeeded):
+        _call(ns, 2048)
+    assert (request.prefill_offload_pauses, request.prefill_eviction_retries) == (4, 2)
+    assert _call(ns, 2048) < 2048  # pauses spent: throttle
+
+
+@pytest.mark.parametrize("releasable, running", [(32 * _GB, ("other",)), (0, ())])
+def test_offload_slot_pause_counts_without_a_release(releasable, running):
+    """The release is skipped while another request runs or at the floor."""
+    ns, request = _pause_ctx([releasable], running=running)
+    with pytest.raises(_PrefillEvictionNeeded):
+        _call(ns, 2048)
+    assert (request.prefill_offload_pauses, request.prefill_eviction_retries) == (0, 1)

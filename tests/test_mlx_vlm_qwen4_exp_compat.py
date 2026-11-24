@@ -18,6 +18,9 @@ from mlx_lm.models.rope_utils import initialize_rope
 from omlx import memory_monitor
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 from omlx.patches import qwen35_yarn
+from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+    qwen4_exp_residency_estimate,
+)
 
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
 qwen4_language = importlib.import_module("mlx_vlm.models.qwen4_exp.language")
@@ -679,6 +682,47 @@ def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
         result[key], mx.ones((1,), dtype=mx.bfloat16)
     ).item()
 
+
+def test_qwen4_exp_sanitize_splits_quantized_fused_experts():
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    gate_up = mx.quantize(mx.random.normal((2, 128, 64)), group_size=64, bits=4)
+    down = mx.quantize(mx.random.normal((2, 64, 64)), group_size=64, bits=4)
+    prefix = "model.language_model.layers.0.mlp.experts"
+    weights = {}
+    for name, params in (("gate_up_proj", gate_up), ("down_proj", down)):
+        for suffix, value in zip(("weight", "scales", "biases"), params):
+            weights[f"{prefix}.{name}.{suffix}"] = value
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=1,
+                num_experts=2,
+                ple_layer_ids=(),
+            )
+        )
+    )
+
+    result = Model.sanitize(model, weights)
+
+    assert [key for key in result if ".experts." in key] == []
+    gate, up = mx.split(mx.dequantize(*gate_up, group_size=64, bits=4), 2, axis=-2)
+    expected = {
+        "gate_proj": gate,
+        "up_proj": up,
+        "down_proj": mx.dequantize(*down, group_size=64, bits=4),
+    }
+    for name, want in expected.items():
+        base = f"language_model.model.layers.0.mlp.switch_mlp.{name}"
+        got = mx.dequantize(
+            result[f"{base}.weight"],
+            result[f"{base}.scales"],
+            result[f"{base}.biases"],
+            group_size=64,
+            bits=4,
+        )
+        assert mx.array_equal(got, want).item(), name
 
 
 def test_qwen4_resident_ple_looks_up_shard_windows_on_device():
@@ -1554,7 +1598,8 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path, mtp_num_exp
         configure_mtp_runtime(tmp_path, enabled=False)
 
 
-def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
+@pytest.mark.parametrize("indexed", [True, False])
+def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path, indexed):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
 
@@ -1569,13 +1614,15 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
         .reshape(4, 4)
         .astype(mx.bfloat16),
     }
-    filename = "model-00001-of-00001.safetensors"
+    filename = "model-00001-of-00001.safetensors" if indexed else "model.safetensors"
     mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {key: filename for key in tensors}}),
-        encoding="utf-8",
-    )
+    if indexed:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: filename for key in tensors}}),
+            encoding="utf-8",
+        )
 
+    assert qwen4_exp_residency_estimate(tmp_path).supported
     embedding = DiskBackedShardedEmbedding(
         tmp_path, prefix, num_embeddings=8, dims=4, num_shards=2
     )

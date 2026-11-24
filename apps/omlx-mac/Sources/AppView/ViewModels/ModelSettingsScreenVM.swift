@@ -68,6 +68,7 @@ final class ModelSettingsScreenVM {
         case dflashVerifyMode, dflashDraftWindowSize, dflashBlockSize
         case mtpEnabled, mtpAdaptiveMaxDepth
         case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
+        case loraAdapter
     }
 
     static var modelTypeOptions: [(String, String)] {
@@ -188,9 +189,9 @@ final class ModelSettingsScreenVM {
 
     static var mtpDepthOptions: [(String, String)] {
         let adaptive = String(localized: "settings.acceleration.mtp.depth.adaptive",
-                              defaultValue: "3 tokens (Default)",
-                              comment: "Default Lightning MTP adaptive maximum draft depth")
-        return [("3", adaptive)] + (4...6).map { depth in
+                              defaultValue: "Model default",
+                              comment: "Lightning MTP depth option that keeps the model's own default maximum")
+        return [("", adaptive)] + (3...8).map { depth in
             ("\(depth)", String(localized: "settings.acceleration.mtp.depth.option",
                                 defaultValue: "\(depth) tokens",
                                 comment: "Lightning MTP depth option; placeholder is the maximum draft token count"))
@@ -401,13 +402,17 @@ final class ModelSettingsScreenVM {
     // Experimental: native MTP
     var mtpEnabled: Bool = false
     /// Empty = adaptive depth.
-    var mtpAdaptiveMaxDepth: String = "3"
+    var mtpAdaptiveMaxDepth: String = ""
 
     // Experimental: VLM MTP (assistant-drafter speculative decoding for VLMs).
     // Block size is held as a string for the editor; empty = mlx-vlm default.
     var vlmMtpEnabled: Bool = false
     var vlmMtpDraftModel: String = ""
     var vlmMtpDraftBlockSize: String = ""
+
+    // LoRA adapter folder (empty = none) and the adapters the server found.
+    var loraAdapter: String = ""
+    var loraAdapters: [LoRAAdapterDTO] = []
 
     // Profiles
     var profiles: [ProfileDTO] = []
@@ -618,7 +623,7 @@ final class ModelSettingsScreenVM {
             return true
         case .mtpEnabled, .mtpAdaptiveMaxDepth, .vlmMtpEnabled, .vlmMtpDraftModel:
             return true
-        case .vlmMtpDraftBlockSize:
+        case .vlmMtpDraftBlockSize, .loraAdapter:
             return true
         case .alias, .modelType, .contextLength, .maxTokens:
             return false
@@ -717,6 +722,8 @@ final class ModelSettingsScreenVM {
             let profiles = try await client.listModelProfiles(id: modelID).profiles
             let templates = try await client.listProfileTemplates().templates
             let defaults = try await client.getGlobalSettings().sampling
+            // Optional: a server without the endpoint lists no adapters.
+            let adapters = (try? await client.listLoRAAdapters(id: modelID))?.adapters ?? []
             guard sequence == loadSequence else { return }
             if preservingEdits && profileDirty { return }
             self.allModels = models
@@ -831,15 +838,17 @@ final class ModelSettingsScreenVM {
                 self.dflashDraftWindowSize = s?.dflashDraftWindowSize.map(String.init) ?? ""
                 self.dflashBlockSize = s?.dflashBlockSize.map(String.init) ?? ""
                 self.mtpEnabled = s?.mtpEnabled ?? false
-                self.mtpAdaptiveMaxDepth = s?.mtpAdaptiveMaxDepth.flatMap { (3...6).contains($0) ? String($0) : nil } ?? "3"
+                self.mtpAdaptiveMaxDepth = s?.mtpAdaptiveMaxDepth.flatMap { (3...8).contains($0) ? String($0) : nil } ?? ""
                 self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
                 self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
                 self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
+                self.loraAdapter = s?.loraAdapter ?? ""
                 self.activeProfileName = s?.activeProfileName
             }
             self.profiles = profiles
             self.templates = templates
             self.serverDefaultSampling = defaults
+            self.loraAdapters = adapters
             // Resolve display scope from the source_template of the active
             // model profile (if any) — so applying the "Balanced" preset
             // lights up the Preset chip, not the local model copy.
@@ -868,8 +877,8 @@ final class ModelSettingsScreenVM {
         }
         var patch = ModelSettingsPatch()
         switch field {
-        case .alias:                   patch.modelAlias = alias.isEmpty ? nil : alias
-        case .modelType:               patch.modelTypeOverride = modelTypeOverride.isEmpty ? nil : modelTypeOverride
+        case .alias:                   patch.modelAlias = .some(alias.isEmpty ? nil : alias)
+        case .modelType:               patch.modelTypeOverride = .some(modelTypeOverride.isEmpty ? nil : modelTypeOverride)
         case .contextLength:           patch.maxContextWindow = Int(contextLength)
         case .maxTokens:               patch.maxTokens = Int(maxTokens)
         case .temperature:
@@ -1089,11 +1098,12 @@ final class ModelSettingsScreenVM {
         case .dflashBlockSize:         patch.dflashBlockSize = Int(dflashBlockSize)
         case .mtpEnabled, .mtpAdaptiveMaxDepth:
             patch.mtpEnabled = mtpEnabled
-            patch.mtpAdaptiveMaxDepth = Int(mtpAdaptiveMaxDepth) ?? 3
+            patch.mtpAdaptiveMaxDepth = .some(Int(mtpAdaptiveMaxDepth))
             patch.mtpFixedDepth = .some(nil)
         case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
+        case .loraAdapter:             patch.loraAdapter = loraAdapter
         }
         if thinkingForced { patch.enableThinking = .some(nil) }
         let targetModelID = modelID
@@ -1325,6 +1335,43 @@ final class ModelSettingsScreenVM {
             out.append((m.id, m.id))
         }
         return out
+    }
+
+    /// Adapters that fit this model, plus the saved one even when it does not
+    /// or lives outside the model folders. The value is the adapter path.
+    func loraAdapterOptions() -> [(String, String)] {
+        var out: [(String, String)] = [
+            ("", String(localized: "settings.advanced.lora_adapter.none",
+                        defaultValue: "None",
+                        comment: "LoRA adapter picker option that applies no adapter")),
+        ]
+        if !loraAdapter.isEmpty, !loraAdapters.contains(where: { $0.path == loraAdapter }) {
+            out.append((loraAdapter, URL(fileURLWithPath: loraAdapter).lastPathComponent))
+        }
+        for adapter in loraAdapters where adapter.problem == nil || adapter.path == loraAdapter {
+            out.append((adapter.path, "\(adapter.id) · r\(adapter.rank)"))
+        }
+        return out
+    }
+
+    /// The selected adapter's training base and targets, its problem, or a hint.
+    var loraAdapterDetail: String {
+        if let adapter = loraAdapters.first(where: { $0.path == loraAdapter }) {
+            if let problem = adapter.problem { return problem }
+            let base = adapter.baseModel ?? "?"
+            let targets = adapter.targets.joined(separator: ", ")
+            return String(localized: "settings.advanced.lora_adapter.info",
+                          defaultValue: "Trained on \(base) · \(targets)",
+                          comment: "LoRA adapter details: training base model and adapted projections")
+        }
+        if loraAdapters.isEmpty && loraAdapter.isEmpty {
+            return String(localized: "settings.advanced.lora_adapter.empty",
+                          defaultValue: "No LoRA adapters found. Put an adapter folder (with adapter_config.json) in a model folder.",
+                          comment: "Shown when the model folders hold no LoRA adapter")
+        }
+        return String(localized: "settings.advanced.lora_adapter.sub",
+                      defaultValue: "Adapters that do not fit this model are not listed. Applies after the model reloads.",
+                      comment: "Sublabel for the LoRA adapter picker")
     }
 
     static func isVlmMtpDraftModelCandidate(_ model: ModelDTO, currentModelID: String) -> Bool {
@@ -1905,6 +1952,7 @@ final class ModelSettingsScreenVM {
                 putString(ProfileSettingsKey.vlmMtpDraftModel, vlmMtpDraftModel)
                 putInt(ProfileSettingsKey.vlmMtpDraftBlockSize, vlmMtpDraftBlockSize)
             }
+            putString(ProfileSettingsKey.loraAdapter, loraAdapter)
         }
 
         return out
@@ -2142,6 +2190,7 @@ final class ModelSettingsScreenVM {
             ProfileSettingsKey.repetitionPenalty, ProfileSettingsKey.presencePenalty,
             ProfileSettingsKey.reasoningParser, ProfileSettingsKey.guidedGrammar,
             ProfileSettingsKey.chatTemplateKwargs, ProfileSettingsKey.forcedCtKwargs,
+            ProfileSettingsKey.loraAdapter,
         ]
         for key in clearable where body[key] == nil {
             body[key] = AnyCodable(NSNull())
