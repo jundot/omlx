@@ -221,6 +221,7 @@ def test_dedup_placeholder_rotating_block_backfilled(tmp_path):
 
     assert _rotating_layer_shape(ssd, b0) == REAL_ROTATING_SHAPE
     assert _rotating_layer_shape(ssd, b1) == REAL_ROTATING_SHAPE
+    assert ssd.load_block_with_metadata(b1)[1]["parent_hash"] == b0
     # The rotating meta now carries the boundary offset, not the relic
     # end-of-sequence offset.
     assert _rotating_meta(ssd, b0)[2] == str(BLOCK_SIZE)

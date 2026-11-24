@@ -749,6 +749,17 @@ class TestHotCacheByteAccounting:
             mgr_a.close()
             mgr_b.close()
 
+    def test_shared_budget_evicts_chain_from_the_tail(self):
+        budget, owner = SharedHotCacheBudget(3), object()
+        for block, parent in ((b"a", None), (b"b", b"a"), (b"c", b"b")):
+            budget.put(owner, block, 1, parent)
+        for block in (b"a", b"b", b"c"):
+            budget.touch(owner, block)
+
+        assert budget.put(owner, b"d", 1, b"c") == [(owner, b"d")]
+        assert budget.put(owner, b"e", 1, b"d") == [(owner, b"e")]
+        assert budget.put(owner, b"x", 1) == [(owner, b"c")]
+
     def test_shared_budget_shrink_respects_lru_and_protected_hashes(self, tmp_path):
         """Pressure shrink should skip protected active-request chains."""
         _, entry_size = self._make_raw_entry(tmp_path, b"budget_shrink_probe")

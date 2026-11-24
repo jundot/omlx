@@ -1626,6 +1626,7 @@ class _HotCacheBudgetEntry:
     owner: Any
     block_hash: bytes
     size_bytes: int
+    parent_hash: bytes | None = None
 
 
 class SharedHotCacheBudget:
@@ -1656,9 +1657,19 @@ class SharedHotCacheBudget:
     def touch(self, owner: Any, block_hash: bytes) -> None:
         """Mark an entry as recently used in the global LRU order."""
         with self._lock:
-            key = self._key(owner, block_hash)
-            if key in self._entries:
-                self._entries.move_to_end(key)
+            self._promote_chain(self._key(owner, block_hash))
+
+    def _promote_chain(self, key: tuple[int, bytes]) -> None:
+        # A prefix match starts at the root and stops at the first miss, so
+        # keep ancestors newer than the blocks that build on them, and evict a
+        # chain with a missing ancestor first.
+        path = []
+        while key is not None and (entry := self._entries.get(key)) is not None:
+            path.append(key)
+            parent = entry.parent_hash
+            key = None if parent is None else (key[0], parent)
+        for block in path:
+            self._entries.move_to_end(block, last=key is None)
 
     def forget(self, owner: Any, block_hash: bytes) -> None:
         """Remove one entry from budget accounting if present."""
@@ -1758,7 +1769,11 @@ class SharedHotCacheBudget:
         return freed
 
     def put(
-        self, owner: Any, block_hash: bytes, size_bytes: int
+        self,
+        owner: Any,
+        block_hash: bytes,
+        size_bytes: int,
+        parent_hash: bytes | None = None,
     ) -> list[tuple[Any, bytes]]:
         """Account an entry and return globally-evicted owners/block hashes."""
         victims: list[tuple[Any, bytes]] = []
@@ -1773,8 +1788,10 @@ class SharedHotCacheBudget:
                 owner=owner,
                 block_hash=block_hash,
                 size_bytes=size_bytes,
+                parent_hash=parent_hash,
             )
             self._total_bytes += size_bytes
+            self._promote_chain(key)
 
             while self._total_bytes > self.max_bytes and self._entries:
                 victim_key, victim = self._entries.popitem(last=False)
@@ -2137,7 +2154,10 @@ class PagedSSDCacheManager(CacheManager):
                 self._hot_cache[block_hash] = entry
                 self._hot_cache_total_bytes += entry_size
 
-            victims = self._hot_cache_budget.put(self, block_hash, entry_size)
+            metadata = entry.get("block_metadata")
+            victims = self._hot_cache_budget.put(
+                self, block_hash, entry_size, getattr(metadata, "parent_hash", None)
+            )
             for owner, victim_hash in victims:
                 evicted = owner._hot_cache_remove(victim_hash, update_budget=False)
                 if evicted is not None:
@@ -4492,6 +4512,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": blk_meta.model_name,
                 "block_size": blk_meta.block_size,
                 "cache_signature": blk_meta.cache_signature,
+                "parent_hash": blk_meta.parent_hash,
                 "layer_cache_types": entry["layer_cache_types"],
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
@@ -4528,6 +4549,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": blk_meta.model_name,
                 "block_size": blk_meta.block_size,
                 "cache_signature": blk_meta.cache_signature,
+                "parent_hash": blk_meta.parent_hash,
                 "layer_cache_types": entry["layer_cache_types"],
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
@@ -4601,6 +4623,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": block_metadata.model_name,
                 "block_size": block_metadata.block_size,
                 "cache_signature": block_metadata.cache_signature,
+                "parent_hash": block_metadata.parent_hash,
                 "layer_cache_types": layer_cache_types,
                 "layer_meta_states": block_metadata.layer_meta_states,
             }
