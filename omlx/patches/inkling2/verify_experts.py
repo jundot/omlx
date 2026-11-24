@@ -43,6 +43,16 @@ constant constexpr int RESULTS_PER_SIMDGROUP = 4;
 constant constexpr int BN = 8;
 // 1 when the NVFP4 tensor scale is applied in the kernel (float16).
 constant constexpr int GLOBAL = __GLOBAL__;
+// 1 to decode the codes through a threadgroup byte table (M1/M2), 0 through
+// a constant nibble table (M3 and later).
+constant constexpr int TG_TABLE = __TG_TABLE__;
+// 1 when every pair has its own expert (a decode step): no expert order.
+constant constexpr int DIRECT = __DIRECT__;
+
+// The fp4 values, as fp4_value decodes them.
+constant float E2M1[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
 // fp4_e2m1 -> float, as fp4.h converts it (through half).
 inline float fp4_value(uint8_t bits) {
@@ -61,9 +71,10 @@ inline float fp8_value(uint8_t bits) {
 }
 
 // qdot / qdot_safe of fp_quantized.h at bits == 4 over the first n values.
-// ``lut[b]`` holds the two fp4 values of byte b (low nibble first), decoded
-// as fp4_value does; every fp4 value is exact in float, so reading them from
-// the table leaves each product, and the sum order, unchanged.
+// The codes are read through a table of their fp4 values, decoded as
+// fp4_value does: every fp4 value is exact in float, so each product and the
+// sum order are unchanged. With TG_TABLE, ``lut[b]`` holds the two values of
+// byte b (low nibble first).
 inline float qdot_n(
     const device uint8_t* w,
     const thread float* x_thread,
@@ -71,12 +82,24 @@ inline float qdot_n(
     int n,
     threadgroup const float2* lut) {
   float accum = 0;
-  for (int i = 0; i < (n / 4); i++) {
-    float2 lo = lut[w[2 * i]];
-    float2 hi = lut[w[2 * i + 1]];
-    accum +=
-        (x_thread[4 * i] * lo.x + x_thread[4 * i + 1] * lo.y +
-         x_thread[4 * i + 2] * hi.x + x_thread[4 * i + 3] * hi.y);
+  if (TG_TABLE) {
+    for (int i = 0; i < (n / 4); i++) {
+      float2 lo = lut[w[2 * i]];
+      float2 hi = lut[w[2 * i + 1]];
+      accum +=
+          (x_thread[4 * i] * lo.x + x_thread[4 * i + 1] * lo.y +
+           x_thread[4 * i + 2] * hi.x + x_thread[4 * i + 3] * hi.y);
+    }
+  } else {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (n / 4); i++) {
+      uint16_t v = ws[i];
+      accum +=
+          (x_thread[4 * i] * E2M1[v & 15] +
+           x_thread[4 * i + 1] * E2M1[(v >> 4) & 15] +
+           x_thread[4 * i + 2] * E2M1[(v >> 8) & 15] +
+           x_thread[4 * i + 3] * E2M1[(v >> 12) & 15]);
+    }
   }
   return scale * accum;
 }
@@ -92,13 +115,17 @@ _SOURCE = r"""
 
     // Byte -> two fp4 values, shared by the threadgroup's 64 threads. On M1
     // the per-value decode costs more than the weight reads.
-    threadgroup float2 lut[256];
-    for (uint b = simd_gid * SIMD_SIZE + simd_lid; b < 256; b += 2 * SIMD_SIZE) {
-      lut[b] = float2(fp4_value(uint8_t(b & 15)), fp4_value(uint8_t(b >> 4)));
+    threadgroup float2 lut[TG_TABLE ? 256 : 1];
+    if (TG_TABLE) {
+      for (uint b = simd_gid * SIMD_SIZE + simd_lid; b < 256;
+           b += 2 * SIMD_SIZE) {
+        lut[b] = float2(fp4_value(uint8_t(b & 15)), fp4_value(uint8_t(b >> 4)));
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const int pair = int(order[threadgroup_position_in_grid.y]);
+    const int pair = DIRECT ? int(threadgroup_position_in_grid.y)
+                            : int(order[threadgroup_position_in_grid.y]);
     // An expert stack can pass 2 GiB, so its offsets need 64 bits.
     const size_t expert = size_t(rhs[pair]);
 
@@ -169,12 +196,31 @@ _SOURCE = r"""
 
 
 @cache
-def _kernel(global_scale: bool):
+def _threadgroup_table() -> bool:
+    """M1 and M2 GPUs (applegpu_g13*, g14*) decode faster through a
+    threadgroup byte table; on M3 and later its 2 KB and barrier per
+    threadgroup cost more than a constant nibble table."""
+    arch = mx.device_info().get("architecture", "")
+    digits = "".join(c for c in arch.rsplit("_g", 1)[-1] if c.isdigit())
+    return bool(digits) and int(digits) <= 14
+
+
+@cache
+def _kernel(global_scale: bool, direct: bool):
+    tg = _threadgroup_table()
+    header = (
+        _HEADER.replace("__GLOBAL__", str(int(global_scale)))
+        .replace("__TG_TABLE__", str(int(tg)))
+        .replace("__DIRECT__", str(int(direct)))
+    )
     return mx.fast.metal_kernel(
-        name=f"omlx_inkling2_verify_experts_nvfp4_g{int(global_scale)}",
+        name=(
+            f"omlx_inkling2_verify_experts_nvfp4_g{int(global_scale)}"
+            f"_t{int(tg)}_d{int(direct)}"
+        ),
         input_names=["x", "w", "scales", "gscale", "rhs", "order"],
         output_names=["y"],
-        header=_HEADER.replace("__GLOBAL__", str(int(global_scale))),
+        header=header,
         source=_SOURCE,
     )
 
@@ -193,12 +239,15 @@ def supported(proj, dtype) -> bool:
     return dtype in (mx.bfloat16, mx.float16) and n % 8 == 0 and k % 512 != 0
 
 
-def gather(proj, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array):
+def gather(
+    proj, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array | None
+):
     """``gather_qmm`` over P (row, expert) pairs, pairs grouped by expert.
 
     ``rhs`` holds the expert of each pair; pair ``p`` reads row
     ``p // pairs_per_row`` of ``x`` (``[R, K]``). ``order`` is
-    ``pair_order(rhs)``. Returns ``[P, N]``.
+    ``pair_order(rhs)``, or None when no two pairs share an expert (one
+    decode row), which runs the pairs as they come. Returns ``[P, N]``.
     """
     k = int(x.shape[-1])
     n = int(proj.weight.shape[-2])
@@ -206,8 +255,9 @@ def gather(proj, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array
     in_kernel = proj.scales_in_kernel(x.dtype)
     # Unused without the in-kernel tensor scale.
     gscale = proj.global_scale if in_kernel else proj.scales
-    return _kernel(in_kernel)(
-        inputs=[x, proj.weight, proj.scales, gscale, rhs, order],
+    direct = order is None
+    return _kernel(in_kernel, direct)(
+        inputs=[x, proj.weight, proj.scales, gscale, rhs, rhs if direct else order],
         template=[
             ("T", x.dtype),
             ("K_SIZE", k),

@@ -163,3 +163,25 @@ def test_decode_step_takes_the_kernel_with_gather_qmm_bits(dtype, monkeypatch):
     mx.eval(z)
     assert len(calls) == 2
     assert mx.array_equal(z, ref[1].squeeze(-2))
+
+
+@pytest.mark.parametrize("table", ["threadgroup", "constant"])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
+@pytest.mark.parametrize("rows", [1, 3])
+def test_both_code_tables_keep_gather_qmm_bits(table, dtype, rows, monkeypatch):
+    # M1/M2 read the codes through a threadgroup byte table, later GPUs
+    # through a constant nibble table; both must give gather_qmm's bits.
+    monkeypatch.setattr(
+        verify_experts, "_threadgroup_table", lambda: table == "threadgroup"
+    )
+    verify_experts._kernel.cache_clear()
+    try:
+        mod = _experts(2304, 1152)
+        x, inds, weights = _block(rows, 2304, 13, dtype)
+        z, _ = _armed(mod, x, inds, weights)
+        set_verify_qmm_armed(False)
+        monkeypatch.setattr(verify_experts, "supported", lambda proj, dt: False)
+        ref, _ = mod.unreduced(x, inds, weights)
+        assert mx.array_equal(z, ref)
+    finally:
+        verify_experts._kernel.cache_clear()
