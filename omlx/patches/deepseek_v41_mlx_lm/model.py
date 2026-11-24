@@ -37,7 +37,9 @@ class ModelArgs(ModelConfig):
         # converted while one Mac loads it whole.
         if "omlx_deepseek_v41" not in params:
             raise ValueError(
-                "DeepSeek V4.1 cluster ranks load converted checkpoints only"
+                "DeepSeek V4.1 needs a checkpoint converted by oMLX. Quantize the "
+                "original to oQ4e with Preserve MTP weights and Keep original "
+                "Engram tables on to keep its weights unchanged"
             )
         return super().from_dict(params)
 

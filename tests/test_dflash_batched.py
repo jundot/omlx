@@ -233,6 +233,15 @@ def _tiny_dspark_drafter(seed=0):
     return dd.DFlashDrafter(model, block_size=BLOCK, source_path="tiny")
 
 
+def test_load_rejects_a_reduced_draft_vocabulary(monkeypatch):
+    from omlx.speculative import dflash
+
+    model = SimpleNamespace(d2t=mx.zeros((8,), dtype=mx.int32))
+    monkeypatch.setattr(dflash, "load_drafter", lambda *a, **k: (model, "dflash"))
+    with pytest.raises(ValueError, match="reduced vocabulary"):
+        dflash.load_dflash_drafter("draft", _tiny_target())
+
+
 DRAFTER_FAMILIES = pytest.mark.parametrize(
     "make_drafter",
     [_tiny_drafter, _tiny_laguna_drafter, _tiny_muse_drafter, _tiny_dspark_drafter],

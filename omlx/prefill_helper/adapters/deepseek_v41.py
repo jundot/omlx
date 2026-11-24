@@ -10,8 +10,10 @@ for the helper's Engram layers.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -84,6 +86,14 @@ def _stage_from(lm: Any, k: int):
 class DeepseekV41Adapter(StageAdapter):
     model_types = ("deepseek_v41",)
     contract = 1
+
+    def serves(self, engine_type: str | None, model_path: str | Path | None) -> bool:
+        # load_first reads a layer range from converted shards only.
+        try:
+            config = json.loads((Path(model_path) / "config.json").read_text())
+        except (OSError, TypeError, ValueError):
+            return True
+        return "omlx_deepseek_v41" in config
 
     def layer_count(self, lm: Any) -> int:
         return lm._config.n_layers

@@ -31,6 +31,7 @@ from .manager import (
     fit_layers,
     helper_budget,
     helper_reserve,
+    no_gpu,
     prepare,
     this_host,
     transport_for,
@@ -217,9 +218,15 @@ def _check(node_id: str) -> dict:
         version["expected"] = __version__
     rows.append(version)
     budgets = helper_budget(info)
-    memory = {"key": "memory", "status": "pass", "bytes": sum(budgets)}
+    memory = {
+        "key": "memory",
+        "status": "pass" if sum(budgets) > 0 else "fail",
+        "bytes": sum(budgets),
+    }
     if "budgets" in info:
         memory["gpus"] = len(budgets)
+        if not budgets:
+            memory["fix"] = no_gpu(info, target.name)
     rows.append(memory)
     rows.append({"key": "disk", "status": "pass", "bytes": info.get("disk_free")})
     if "on_battery" in info:

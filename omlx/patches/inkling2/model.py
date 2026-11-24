@@ -30,9 +30,11 @@ import numpy as np
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, KVCache
 
+from .. import row_exact_gemv
+from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
-from . import kernels
+from . import kernels, verify_experts
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -404,14 +406,35 @@ class Inkling2Experts(nn.Module):
         inv = None
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
-        y = self.w13(xe, idx, do_sort)
+        # A row-exact verify block runs its pairs in expert order, so rows
+        # that share an expert read its weights once (same bits per pair).
+        order = None
+        if (
+            not do_sort
+            and 1 < inds.shape[0] <= verify_experts.MAX_ROWS
+            and is_row_exact_armed()
+            and verify_experts.supported(self.w13, x.dtype)
+            and verify_experts.supported(self.w2, x.dtype)
+        ):
+            pairs = inds.reshape(-1)
+            order = pair_order(pairs)
+            y = verify_experts.gather(
+                self.w13, x, pairs, inds.shape[-1], order
+            ).reshape(*inds.shape, 1, -1)
+        else:
+            y = self.w13(xe, idx, do_sort)
         s13 = self.w13.post_scale(idx, xe.dtype)
         if s13 is not None:
             s13 = s13[..., None, None].astype(y.dtype)
         act = _softcapped_swiglu(
             y[..., 0::2], y[..., 1::2], self._gcap, self._ucap, s13
         )
-        z = self.w2(act, idx, do_sort)
+        if order is not None:
+            z = verify_experts.gather(
+                self.w2, act.reshape(pairs.shape[0], -1), pairs, 1, order
+            ).reshape(*inds.shape, 1, -1)
+        else:
+            z = self.w2(act, idx, do_sort)
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
         z = z.squeeze(-2)
@@ -506,8 +529,54 @@ def _part(x: mx.array, i: int) -> mx.array:
     return x[i : i + 1].squeeze(0)
 
 
+def _bf16_loop_weights(layer: nn.Module):
+    """Cached BF16 transposed controller weights outside the parameter tree.
+
+    Only built when ``loop_down`` and ``loop_gain_forget`` are exact BF16
+    values (all published checkpoints); synthetic FP32 weights stay on FP32.
+    """
+    down, gf = layer.loop_down, layer.loop_gain_forget
+    hidden, rank = down.shape[2], down.shape[3]
+    if not kernels.loop_bf16_supported(hidden, rank):
+        return None
+    cached = layer.__dict__.get("_omlx_loop_bf16")
+    if cached is not None and cached[0] is down and cached[1] is gf:
+        return cached[2]
+    packed = None
+    d_bf = down.astype(mx.bfloat16)
+    g_bf = gf.astype(mx.bfloat16)
+    lossless = bool(
+        mx.array_equal(d_bf.astype(mx.float32), down)
+        and mx.array_equal(g_bf.astype(mx.float32), gf)
+    )
+    if lossless:
+        g_bf4 = g_bf.reshape(4, rank, 2, hidden)
+        pre = (
+            mx.contiguous(d_bf[:3].transpose(0, 1, 3, 2)),
+            mx.contiguous(g_bf4[:3].transpose(0, 3, 2, 1)),
+        )
+        post = (
+            mx.contiguous(d_bf[3:].transpose(0, 1, 3, 2)),
+            mx.contiguous(g_bf4[3:].transpose(0, 3, 2, 1)),
+        )
+        mx.eval(*pre, *post)
+        packed = (pre, post)
+    object.__setattr__(layer, "_omlx_loop_bf16", (down, gf, packed))
+    return packed
+
+
 def _mix_messages_normed(
-    mixed, messages, m0, n, down, gain_forget, norm_w, norm_eps, dtype, want_f32=False
+    mixed,
+    messages,
+    m0,
+    n,
+    down,
+    gain_forget,
+    norm_w,
+    norm_eps,
+    dtype,
+    want_f32=False,
+    bf16_weights=None,
 ):
     """``_mix_messages`` and the following RMSNorm and cast, with the steps
     around its matmuls in kernels; None to fall back. Input i is query i of
@@ -515,9 +584,15 @@ def _mix_messages_normed(
     if norm_w is None or not kernels.loop_messages_supported(mixed, messages):
         return None
     hidden = mixed.shape[-1]
-    z = kernels.loop_message_inputs(mixed, messages, m0, n)
-    low = _row_matmul(z, down.reshape(2 * n, hidden, -1))
-    gates = _row_matmul(kernels.loop_message_low(low), gain_forget)
+    rows = mixed.shape[0] * mixed.shape[1]
+    if bf16_weights is not None and rows <= _COMPILED_MAX_TOKENS:
+        down_t, gf_t = bf16_weights
+        low = kernels.loop_message_down_bf16(mixed, messages, down_t, m0)
+        gates = kernels.loop_message_gates_bf16(low, gf_t)
+    else:
+        z = kernels.loop_message_inputs(mixed, messages, m0, n)
+        low = _row_matmul(z, down.reshape(2 * n, hidden, -1))
+        gates = _row_matmul(kernels.loop_message_low(low), gain_forget)
     return kernels.loop_message_outputs(
         gates, mixed, messages, m0, n, norm_w, norm_eps, dtype, want_f32
     )
@@ -537,13 +612,30 @@ def _row_matmul(x: mx.array, w: mx.array) -> mx.array:
     return x @ w
 
 
+def _dense(weight: mx.array, x: mx.array) -> mx.array:
+    """``x @ weight.T``. Row-exact verify rows take the one-row gemv of a
+    decode step each (``row_exact_gemv``, else one matmul per row)."""
+    if x.size // x.shape[-1] > 1 and is_row_exact_armed():
+        y = row_exact_gemv.linear(weight, x)
+        return y if y is not None else _row_matmul(x, weight.T)
+    return x @ weight.T
+
+
+def _linear(proj: nn.Module, x: mx.array) -> mx.array:
+    """``proj(x)`` for the bias-free projections; a plain Linear goes through
+    ``_dense`` (QuantizedLinear has its own row-exact patch)."""
+    if type(proj) is nn.Linear:
+        return _dense(proj.weight, x)
+    return proj(x)
+
+
 def _project_slice(
     proj: nn.Module, x: mx.array, start: int, end: int | None
 ) -> mx.array:
     """Output rows ``[start:end]`` of a bias-free Linear or QuantizedLinear."""
     if type(proj) is nn.QuantizedLinear:
         return _row_slice(proj, start, end)(x)
-    return x @ proj.weight[start:end].T
+    return _dense(proj.weight[start:end], x)
 
 
 def _row_slice(proj: nn.QuantizedLinear, start: int, end: int | None):
@@ -639,7 +731,9 @@ class Inkling2Attention(nn.Module):
         dkv = self.dkv
         if self.sliding:
             if xk is None:
-                q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+                q, k, v, r, gate, sink = mx.split(
+                    _linear(self.in_proj, xq), self._cuts, axis=-1
+                )
             elif type(self.in_proj) in (nn.Linear, nn.QuantizedLinear):
                 # Looped passes give q, k and v their own inputs; project only
                 # the row slices of ``in_proj`` that each input uses.
@@ -663,9 +757,9 @@ class Inkling2Attention(nn.Module):
                 v, self.v_conv, vs, self._sconv_scale, out_dtype=mx.float32
             )
         else:
-            q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
-            kp = self.k_proj(xk)
-            vp = self.v_proj(xv)
+            q, r, gate, sink = mx.split(_linear(self.q_proj, xq), self._cuts, axis=-1)
+            kp = _linear(self.k_proj, xk)
+            vp = _linear(self.v_proj, xv)
             k, ks = kernels.dynamic_conv(
                 kp[..., :dkv],
                 kp[..., dkv:],
@@ -755,7 +849,7 @@ class Inkling2Attention(nn.Module):
         out = (out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(
             gate.dtype
         )
-        return self.o_proj(out)
+        return _linear(self.o_proj, out)
 
 
 def _cumsum(xs):
@@ -769,6 +863,12 @@ def _cumsum(xs):
 # the layer through compiled stages; longer prefill chunks stay eager, since
 # every new chunk length would otherwise retrace all layers.
 _COMPILED_MAX_TOKENS = 16
+
+# Decode and verify forwards queue every this many layer visits. Each visit is
+# many small dependent ops, so building a forward's graph takes the host a few
+# ms; queuing early lets the GPU run one visit while the host builds the next.
+# The last visit is left to the caller's eval. Values are unchanged.
+_EVAL_EVERY = 1
 
 
 class Inkling2Layer(nn.Module):
@@ -840,6 +940,8 @@ class Inkling2Layer(nn.Module):
             if self.layer_idx > 0:
                 mixed = self.attn_input(blocks, h_n)
         if messages is not None:
+            cached_loop = self.__dict__.get("_omlx_loop_bf16")
+            loop_bf16 = cached_loop[2] if cached_loop is not None else None
             normed = _mix_messages_normed(
                 mixed[:, :, : 1 if self.sliding else 3],
                 messages,
@@ -850,6 +952,7 @@ class Inkling2Layer(nn.Module):
                 attn_w,
                 self._norm_eps,
                 dtype,
+                bf16_weights=loop_bf16[0] if loop_bf16 is not None else None,
             )
             if normed is not None:
                 xq, xk, xv = (_part(normed[0], i) for i in range(3))
@@ -911,6 +1014,8 @@ class Inkling2Layer(nn.Module):
                 y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
             normed = None
             if messages is not None:
+                cached_loop = self.__dict__.get("_omlx_loop_bf16")
+                loop_bf16 = cached_loop[2] if cached_loop is not None else None
                 normed = _mix_messages_normed(
                     fused[0] if fused is not None else y[:, :, None],
                     messages,
@@ -922,6 +1027,7 @@ class Inkling2Layer(nn.Module):
                     self.mlp_norm.eps,
                     h.dtype,
                     want_f32=True,
+                    bf16_weights=loop_bf16[1] if loop_bf16 is not None else None,
                 )
             if normed is not None:
                 x, x32 = _part(normed[0], 0), _part(normed[1], 0)
@@ -984,6 +1090,8 @@ class Inkling2Layer(nn.Module):
                 _fp32_norm_stack(self, norms[-1:], "mlp"),
             ),
         )
+        if bank is not None:
+            _bf16_loop_weights(self)
         compiled = length <= _COMPILED_MAX_TOKENS
         if compiled and length > 1 and is_row_exact_armed():
             pre, post = self._pre_exact, self._post_exact
@@ -1077,6 +1185,8 @@ class Inkling2TextModel(nn.Module):
         else:
             h = self.embed_norm(self.embed(inputs))
         visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
+        eval_every = _EVAL_EVERY if h.shape[1] <= _COMPILED_MAX_TOKENS else 0
+        last = len(visits) - 1
         blocks: list = []
         prelude = bank = tau = None
         for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
@@ -1104,6 +1214,8 @@ class Inkling2TextModel(nn.Module):
                 bank=bank if loop_pass else None,
                 tau=None if layer.sliding else tau,
             )
+            if eval_every and visit < last and (visit + 1) % eval_every == 0:
+                mx.async_eval(h)
         _keep_fp32_weight(self.norm)
         norm_w = _fp32_norm_stack(self, (self.norm,), "final")
         fused = None
@@ -1158,22 +1270,22 @@ class Model(nn.Module):
 
     @property
     def _omlx_mtp_row_exact_verify(self) -> bool:
-        """Verify rows reproduce the serial decode rows only when every
-        projection they take is a QuantizedLinear (``row_exact_qmv``); a dense
-        multi-row matmul has its own arithmetic."""
+        """Verify rows reproduce the serial decode rows when every projection
+        they take is a plain Linear (``row_exact_gemv``) or a QuantizedLinear
+        (``row_exact_qmv``); a wrapper such as LoRA has its own arithmetic."""
         linears = [self.lm_head]
         for layer in self.model.layers:
             attn = layer.attn
             names = ("in_proj",) if attn.sliding else ("q_proj", "k_proj", "v_proj")
             linears += [getattr(attn, name) for name in names] + [attn.o_proj]
-        return all(type(m) is nn.QuantizedLinear for m in linears)
+        return all(type(m) in (nn.Linear, nn.QuantizedLinear) for m in linears)
 
     def logits_from_hidden(self, h):
         # Decode and verify rows run the cast, softcap and vocab bias as one
         # kernel; longer prefill chunks stay eager, like the layers.
         compiled = h.shape[-2] <= _COMPILED_MAX_TOKENS
         tail = _logit_tail_compiled if compiled else _logit_tail
-        return tail(self.lm_head(h), self._softcap, self._vocab_bias)
+        return tail(_linear(self.lm_head, h), self._softcap, self._vocab_bias)
 
     def encode_image(self, pixel_values: mx.array, image_grid_thw) -> mx.array:
         """Image-token embeddings for the processor's pixel blocks."""

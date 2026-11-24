@@ -208,6 +208,7 @@
                     markitdown_max_file_size_mb: 25,
                     markitdown_max_files_per_request: 5,
                     markitdown_pdf_processing_engine: 'markitdown',
+                    macos_say_enabled: false,
                     web_search_provider: 'ddgs',
                     web_search_brave_api_key: '',
                     web_search_searxng_url: '',
@@ -222,6 +223,7 @@
                     splash_max_memory_gb: null,
                     splash_ssd_cache_gb: null,
                     splash_ane_prefill: true,
+                    splash_max_concurrent_requests: null,
                 },
                 external_engines: {
                     splash: { available: false, path: null, auto_detected: null, version: null, label: null, reason: '', install_hint: '', models: [] },
@@ -4805,6 +4807,7 @@
                             markitdown_max_file_size_mb: this.globalSettings.integrations.markitdown_max_file_size_mb,
                             markitdown_max_files_per_request: this.globalSettings.integrations.markitdown_max_files_per_request,
                             markitdown_pdf_processing_engine: this.globalSettings.integrations.markitdown_pdf_processing_engine,
+                            macos_say_enabled: this.globalSettings.integrations.macos_say_enabled,
                             web_search_provider: this.globalSettings.integrations.web_search_provider,
                             web_search_brave_api_key: this.globalSettings.integrations.web_search_brave_api_key,
                             web_search_searxng_url: this.globalSettings.integrations.web_search_searxng_url,
@@ -4819,6 +4822,7 @@
                             splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
                             splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
                             splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
+                            splash_max_concurrent_requests: this.globalSettings.integrations.splash_max_concurrent_requests,
                         }),
                     });
                     if (!response.ok) {

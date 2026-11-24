@@ -39,6 +39,7 @@ from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.splash import (
     EXTERNAL_ENGINES,
+    SPLASH_NATIVE_CONTEXT,
     SplashEngine,
     SplashOptions,
     SplashTarget,
@@ -628,8 +629,10 @@ class EnginePool:
             # Splash plans its own budget; none of the MLX reservations apply.
             target, _ = self.splash_target(entry.model_id, runtime_settings)
             if target is not None:
-                wanted = self._splash_wanted_bytes(entry, runtime_settings, target)
                 limit = self._splash_admission_target()
+                wanted = self._splash_wanted_bytes(
+                    entry, runtime_settings, target, limit
+                )
                 return min(wanted, limit) if limit > 0 else wanted
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
             entry, runtime_settings, log_decision=log_decision
@@ -2265,12 +2268,12 @@ class EnginePool:
         )
 
     def _splash_sizing_context(
-        self, entry: EngineEntry, model_settings: object | None
+        self, entry: EngineEntry, model_settings: object | None, target: SplashTarget
     ) -> int | None:
         # The context the server would accept (get_max_context_window).
         configured = getattr(model_settings, "max_context_window", None)
         if configured:
-            return int(configured)
+            return min(int(configured), target.max_context)
         native = entry.model_context_length
         policy = get_global_settings().sampling.max_context_window_policy
         if native and policy:
@@ -2278,19 +2281,29 @@ class EnginePool:
         return native
 
     def _splash_wanted_bytes(
-        self, entry: EngineEntry, model_settings: object | None, target: SplashTarget
+        self,
+        entry: EngineEntry,
+        model_settings: object | None,
+        target: SplashTarget,
+        room: int,
     ) -> int:
         """The configured Splash memory limit, or enough for the context window."""
         settings = get_global_settings().integrations
         wanted = int((settings.splash_max_memory_gb or 0) * 1024**3)
         if wanted > 0:
             return wanted
-        return splash_memory_estimate(
-            entry.model_path,
-            target.draft_path,
-            self._splash_sizing_context(entry, model_settings),
-            settings.splash_kv_format,
-        )
+
+        def estimate(context: int | None) -> int:
+            return splash_memory_estimate(
+                entry.model_path, target.draft_path, context, settings.splash_kv_format
+            )
+
+        context = self._splash_sizing_context(entry, model_settings, target)
+        wanted = estimate(context)
+        if context and context > SPLASH_NATIVE_CONTEXT and 0 < room < wanted:
+            # Splash keeps the native window then and must not reserve more.
+            wanted = estimate(SPLASH_NATIVE_CONTEXT)
+        return wanted
 
     def _splash_admission_target(self) -> int:
         """Total the pool fills models up to (as admission does); 0 for no limit.
@@ -2312,10 +2325,9 @@ class EnginePool:
         The pool then counts the budget Splash planned as the model's size, so
         admission and the memory guard see Splash's share.
         """
-        wanted = self._splash_wanted_bytes(entry, model_settings, target)
         limit = self._splash_admission_target()
         if limit <= 0:
-            return wanted
+            return self._splash_wanted_bytes(entry, model_settings, target, 0)
         room = limit - self._current_model_memory
         if room <= 0:
             raise ModelLoadingError(
@@ -2323,7 +2335,7 @@ class EnginePool:
                 f"Splash cannot serve '{entry.model_id}': the oMLX memory limit "
                 "leaves no memory for it",
             )
-        return min(room, wanted)
+        return min(room, self._splash_wanted_bytes(entry, model_settings, target, room))
 
     async def _check_splash_launcher(
         self, model_id: str, runtime_settings: object | None
@@ -2429,6 +2441,8 @@ class EnginePool:
         # Only an explicit limit goes to Splash; otherwise Splash fits the
         # context to its budget and the server adopts what it planned.
         requested_context = getattr(model_settings, "max_context_window", None)
+        if requested_context:
+            requested_context = min(requested_context, target.max_context)
         budget = self._splash_memory_budget(entry, model_settings, target)
         if requested_context and budget < splash_memory_estimate(
             entry.model_path,
@@ -2449,6 +2463,14 @@ class EnginePool:
                 entry.model_id,
             )
             requested_context = None
+        if requested_context and requested_context > SPLASH_NATIVE_CONTEXT:
+            logger.warning(
+                "Splash: the %d-token context of %s is past the native %d; "
+                "YaRN is on and changes answers at every length",
+                requested_context,
+                entry.model_id,
+                SPLASH_NATIVE_CONTEXT,
+            )
         return SplashEngine(
             model_name=entry.model_path,
             model_id=entry.model_id,
@@ -2463,6 +2485,7 @@ class EnginePool:
                 ane_prefill=integrations.splash_ane_prefill,
                 cache_disk_bytes=cache_disk_bytes,
                 cache_dir=cache_dir,
+                max_concurrent_requests=integrations.splash_max_concurrent_requests,
             ),
         )
 
