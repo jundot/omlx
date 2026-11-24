@@ -2190,7 +2190,12 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
                 if model_type in INKLING2_MODEL_TYPES:
-                    return inkling2_vlm.load(self._model_name)
+                    return inkling2_vlm.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
+                    )
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
                         self._model_name,
@@ -2305,6 +2310,11 @@ class VLMBatchedEngine(BaseEngine):
                 self._model_name,
                 fraction,
             )
+            if (
+                not moe_offload_wrapped
+                and getattr(self._vlm_model, "model_type", None) in INKLING2_MODEL_TYPES
+            ):
+                raise ValueError("Could not install Inkling 2 expert offload.")
             if moe_offload_wrapped:
                 # The caches' slot maps and resident slots live on plain
                 # attributes outside the module tree, so the lazy-state

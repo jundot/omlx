@@ -54,6 +54,7 @@ from mlx_lm.models.switch_layers import (
 from ..custom_kernels.moe_staging import EXPERTS, MAX_BYTES, Staging
 from ..custom_kernels.moe_staging import NATIVE_AVAILABLE as STAGING_AVAILABLE
 from ..scheduler import _sync_and_clear_cache
+from .inkling2 import INKLING2_MODEL_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -364,13 +365,19 @@ class ExpertCache:
     moe_offload_cache = True  # walked by materialize_offload_state / stats
 
     def __init__(
-        self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView, floor: int = 1
+        self,
+        experts: nn.Module,
+        capacity: int,
+        disk: _GLUStoreView,
+        floor: int = 1,
+        *,
+        projections: tuple[str, ...] = _PROJS,
     ):
-        self.n_experts = glu.gate_proj["weight"].shape[0]
+        self.n_experts = getattr(experts, projections[0])["weight"].shape[0]
         self.full_capacity = min(capacity, self.n_experts)
         # The capacity release_slots() shrinks to: the routing top-k floor.
         self.floor = min(max(floor, 1), self.full_capacity)
-        self.projs = _PROJS
+        self.projs = projections
         self.disk = disk
         self._staging = None
         self._slot_specs = {
@@ -379,16 +386,16 @@ class ExpertCache:
                 for f in ("weight", "scales", "biases")
             ]
             for name in self.projs
-            for lin in (getattr(glu, name),)
+            for lin in (getattr(experts, name),)
         }
         # Per-projection quantization metadata: mixed-bit checkpoints (e.g.
         # oQ profiles with 8-bit down_proj over 4-bit gate/up) are valid and
         # must not inherit gate_proj's parameters.
         self.qparams = {
             name: (
-                getattr(glu, name).group_size,
-                getattr(glu, name).bits,
-                getattr(glu, name).mode,
+                getattr(experts, name).group_size,
+                getattr(experts, name).bits,
+                getattr(experts, name).mode,
             )
             for name in self.projs
         }
@@ -713,24 +720,8 @@ def _expert_route_chunks(
     return packed if padded_rows(packed) < padded_rows(whole) else whole
 
 
-class OffloadSwitchGLU(nn.Module):
-    """SwitchGLU whose experts live in an :class:`ExpertCache`."""
-
-    def __init__(
-        self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView, floor: int = 1
-    ):
-        super().__init__()
-        self.cache = ExpertCache(glu, capacity, disk, floor)
-        self.activation = glu.activation
-        # Fetch/compute overlap in decode: the GPU stays busy while slow
-        # reads of missing experts are pending.
-        self._overlap = True
-
-    def _glu(self, x: mx.array, slots: mx.array) -> mx.array:
-        c = self.cache
-        up = c.qmm("up_proj", x, slots)
-        gate = c.qmm("gate_proj", x, slots)
-        return c.qmm("down_proj", self.activation(up, gate), slots)
+class _OffloadExpertRoutes(nn.Module):
+    """Run routed GLU outputs using a slot cache and family-specific GLU math."""
 
     def _glu_routes(self, flat_x: mx.array, flat: list, pos: list, k: int) -> mx.array:
         """The experts' output for the flat route positions ``pos`` only.
@@ -795,10 +786,11 @@ class OffloadSwitchGLU(nn.Module):
             mx.async_eval(out)
         return out
 
-    def _forward(self, x: mx.array, indices: mx.array) -> mx.array:
+    def _forward(self, x: mx.array, indices: mx.array, do_sort: bool) -> mx.array:
         c = self.cache
         if (
             self._overlap
+            and not do_sort
             and not c.warm
             and indices.size < _SORT_MIN_ROUTES
             and _io_pool() is not None
@@ -807,16 +799,10 @@ class OffloadSwitchGLU(nn.Module):
         c.ensure(indices)
         slots = mx.take(c.map, indices)
         x = mx.expand_dims(x, (-2, -3))
-        # Mirror the stock SwitchGLU's sort rule exactly (threshold and all):
-        # decode calls are far below it, and forcing the sort there measured
-        # slower than it saved.
-        do_sort = indices.size >= _SORT_MIN_ROUTES
         inv = None
         if do_sort:
             x, slots, inv = _gather_sort(x, slots)
-        up = c.qmm("up_proj", x, slots, do_sort)
-        gate = c.qmm("gate_proj", x, slots, do_sort)
-        out = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
+        out = self._glu(x, slots, do_sort)
         if do_sort:
             out = _scatter_unsort(out, inv, indices.shape)
         return out.squeeze(-2)
@@ -882,9 +868,7 @@ class OffloadSwitchGLU(nn.Module):
                 inv = None
                 if do_sort:
                     xe, slots, inv = _gather_sort(xe, slots)
-                up = c.qmm("up_proj", xe, slots, do_sort)
-                gate = c.qmm("gate_proj", xe, slots, do_sort)
-                o = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
+                o = self._glu(xe, slots, do_sort)
                 if do_sort:
                     o = _scatter_unsort(o, inv, (padded_routes, 1))
                 o = o.squeeze(-2)[:n_routes, 0, :]
@@ -901,7 +885,7 @@ class OffloadSwitchGLU(nn.Module):
         inverse = mx.array(np.argsort(order, kind="stable"), dtype=mx.int32)
         return mx.take(out, inverse, axis=0).reshape(-1, k, d_model)
 
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+    def _run_routes(self, x: mx.array, indices: mx.array, do_sort: bool) -> mx.array:
         # A single _forward must have every expert it routes to resident AT
         # ONCE: a long prefill can route to more distinct experts than the
         # cache holds, in which case earlier installs would be evicted before
@@ -915,15 +899,37 @@ class OffloadSwitchGLU(nn.Module):
         if k > c.capacity:
             raise ValueError("Expert cache capacity is smaller than routing top-k")
         if n_tok * k <= c.capacity or n_tok == 1:
-            return self._forward(x, indices)
+            return self._forward(x, indices, do_sort)
         ids = flat_i.reshape(-1).tolist()
         if len(set(ids)) <= c.capacity:
-            return self._forward(x, indices)
+            return self._forward(x, indices, do_sort)
         flat_x = x.reshape(-1, x.shape[-1])
-        # Mirror the stock SwitchGLU's sort rule for the call as a whole, so
-        # every chunk runs the kernel the resident model would have used.
-        out = self._forward_expert_major(flat_x, ids, k, indices.size >= 64)
+        out = self._forward_expert_major(flat_x, ids, k, do_sort)
         return out.reshape(indices.shape + (x.shape[-1],))
+
+
+class OffloadSwitchGLU(_OffloadExpertRoutes):
+    """SwitchGLU whose experts live in an :class:`ExpertCache`."""
+
+    def __init__(
+        self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView, floor: int = 1
+    ):
+        super().__init__()
+        self.cache = ExpertCache(glu, capacity, disk, floor)
+        self.activation = glu.activation
+        # Keep the GPU busy while slow decode reads are pending.
+        self._overlap = True
+
+    def _glu(
+        self, x: mx.array, slots: mx.array, sorted_indices: bool = False
+    ) -> mx.array:
+        c = self.cache
+        up = c.qmm("up_proj", x, slots, sorted_indices)
+        gate = c.qmm("gate_proj", x, slots, sorted_indices)
+        return c.qmm("down_proj", self.activation(up, gate), slots, sorted_indices)
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        return self._run_routes(x, indices, indices.size >= _SORT_MIN_ROUTES)
 
 
 def _resolve_model_dir(model_path: str | Path) -> Path | None:
@@ -1124,6 +1130,10 @@ def apply_moe_expert_offload(
         else None
     )
     store = CheckpointExpertStore(model_dir)
+    if kind in INKLING2_MODEL_TYPES:
+        from .inkling2.moe_offload import apply_inkling2_expert_offload
+
+        return apply_inkling2_expert_offload(model, model_dir, store, resident_fraction)
     if not store:
         logger.warning("moe expert offload: no safetensors under %s", model_dir)
         return 0
@@ -1250,6 +1260,11 @@ def estimate_offload_admission_bytes(
         config_path = Path(model_dir) / "config.json"
         if config_path.exists():
             kind = json.loads(config_path.read_text()).get("model_type", "")
+            if kind in INKLING2_MODEL_TYPES:
+                from .inkling2.moe_offload import estimate_inkling2_expert_savings
+
+                savings = estimate_inkling2_expert_savings(model_dir, resident_fraction)
+                return max(0, full_size - savings)
             if kind == "deepseek_v41":
                 # V4.1 admission is owned by its own adapter's estimator.
                 return full_size

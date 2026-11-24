@@ -991,6 +991,10 @@ class Inkling2Layer(nn.Module):
             pre, post = self._pre_compiled, self._post_compiled
         else:
             pre, post = self._pre, self._post
+        # Expert offload reads router indices on the host to fill slots.
+        # Keep that part of the forward outside an MLX compiled graph.
+        if getattr(self.mlp.experts, "cache", None) is not None:
+            post = self._post
         messages = self.loop_message(*bank) if bank is not None else None
         q, k, v, rel, gate, sink, ks, vs, h_n = pre(
             h, blocks, states[0], states[1], tau, messages

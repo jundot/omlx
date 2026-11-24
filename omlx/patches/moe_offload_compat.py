@@ -8,8 +8,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from ..oqh.format import is_oqh_config
+from .inkling2 import INKLING2_MODEL_TYPES
 
-_SUPPORTED_TYPES = frozenset(
+_SUPPORTED_TYPES = INKLING2_MODEL_TYPES | frozenset(
     {
         "deepseek_v41",
         "deepseek_v4",
@@ -50,6 +51,14 @@ def moe_offload_compatibility(model_path):
 def _inspect(path, signature):
     raw = json.loads((Path(path) / "config.json").read_text())
     kind = raw["model_type"]
+    if kind in INKLING2_MODEL_TYPES:
+        from .inkling2.moe_offload import estimate_inkling2_expert_savings
+
+        try:
+            estimate_inkling2_expert_savings(Path(path), 0.125)
+        except ValueError as exc:
+            return False, str(exc)
+        return True, ""
     if kind == "deepseek_v41":
         from .deepseek_v41.moe_offload import estimate_expert_savings
 
