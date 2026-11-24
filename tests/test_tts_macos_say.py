@@ -71,7 +71,7 @@ def say(monkeypatch):
 
 
 def _speak(s, **body):
-    body = {"model": "macos-say", "input": "Dobrý den", **body}
+    body = {"model": "macos-say", "input": "Dobrý [[den]]", **body}
     return s.client.post("/v1/audio/speech", json=body)
 
 
@@ -90,15 +90,16 @@ def test_off_by_default(say):
 
 
 @pytest.mark.parametrize(
-    "body,argv_tail", [({"voice": "ash"}, []), ({"language": "cs_CZ"}, ["cs_CZ"])]
+    "body,argv_tail", [({"voice": "ash"}, []), ({"language": "-ebeep"}, ["-ebeep"])]
 )
 def test_voice_pick_reads_text_from_stdin(say, body, argv_tail):
     r = _speak(say, **body)
     assert r.status_code == 200, r.text
     assert r.content[:4] == b"RIFF"
     (pick_argv, pick_in), (say_argv, say_in) = say.calls
-    assert pick_argv[:2] == ["osascript", "-e"] and pick_argv[3:] == argv_tail
-    assert pick_in == say_in == "Dobrý den"
+    assert pick_argv[:2] == ["osascript", "-e"]
+    assert pick_argv[3:] == ["--", *argv_tail]
+    assert (pick_in, say_in) == ("Dobrý [[den]]", "Dobrý [ [den]]")
     assert not any("Dobrý" in a for a in pick_argv + say_argv)
     assert say_argv[:3] == ["say", "-v", _PICKED] and "-f" in say_argv
 

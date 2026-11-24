@@ -9,15 +9,12 @@ reached through ``osascript`` because PyObjC is not a dependency).
 
 from __future__ import annotations
 
-import logging
 import re
 import subprocess
 import tempfile
 from pathlib import Path
 
 from ..exceptions import InvalidRequestError
-
-logger = logging.getLogger(__name__)
 
 MODEL_ID = "macos-say"
 MAX_INPUT_CHARS = 4096  # OpenAI's limit for /v1/audio/speech
@@ -94,7 +91,8 @@ def voice_is_installed(voice: str) -> bool:
 
 def pick_voice(text: str, language: str | None) -> str:
     """Voice identifier for ``text``; ``""`` when detection is not sure."""
-    argv = ["osascript", "-e", _PICK_SCRIPT]
+    # Without "--", osascript reads a language that starts with "-e" as script code.
+    argv = ["osascript", "-e", _PICK_SCRIPT, "--"]
     if language and language.strip():
         argv.append(language.strip())
     try:
@@ -125,6 +123,8 @@ def synthesize(
         )
     if not name:
         name = pick_voice(text, language)
+    # say runs "[[...]]" in the text as a command, such as a pause of any length.
+    text = re.sub(r"\[(?=\[)", "[ ", text)
     args = ["say"]
     if name:
         args += ["-v", name]
