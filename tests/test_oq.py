@@ -1521,7 +1521,12 @@ class TestEngramPrecisionOption:
     @pytest.mark.skipif(sys.platform != "darwin", reason="Requires MLX on macOS")
     @pytest.mark.parametrize(
         "family,choice",
-        [("qwen4_exp", "8"), ("hy_v4_flash", "16"), ("hy_v4_flash", "8")],
+        [
+            ("qwen4_exp", "8"),
+            ("hy_v4_flash", "16"),
+            ("hy_v4_flash", "8"),
+            ("hy_v4_flash", "auto"),
+        ],
     )
     def test_streaming_engram_storage_with_mock_quantizer(
         self, tmp_path, monkeypatch, family, choice
@@ -1583,9 +1588,9 @@ class TestEngramPrecisionOption:
         def fake_quantize(values, group, bits, mode, **kwargs):
             calls.append((values.dtype, group, bits, mode))
             return (
-                mx.zeros((2, 24), dtype=mx.uint32),
-                mx.zeros((2, 3), dtype=mx.bfloat16),
-                mx.zeros((2, 3), dtype=mx.bfloat16),
+                mx.zeros((2, 96 * bits // 32), dtype=mx.uint32),
+                mx.zeros((2, 3), dtype=values.dtype),
+                mx.zeros((2, 3), dtype=values.dtype),
             )
 
         monkeypatch.setattr(oq, "_quantize_chunked", fake_quantize)
@@ -1599,17 +1604,17 @@ class TestEngramPrecisionOption:
             engram_precision=choice,
             sensitivity_map_override={0: 1.0},
         )
-        index = json.loads((output / "model.safetensors.index.json").read_text())[
-            "weight_map"
-        ]
+        hy4_bits = {"8": 8, "auto": 4}.get(choice) if family == "hy_v4_flash" else None
+        if hy4_bits is not None:
+            assert calls == [(mx.bfloat16, 32, hy4_bits, "affine")]
+            assert estimate["output_size_bytes"] == (216 if hy4_bits == 8 else 120)
         if family == "hy_v4_flash":
-            table = plan_engram_ssd(output).tables[1]
-            assert table.bits == (8 if choice == "8" else None)
-        if family == "hy_v4_flash" and choice == "8":
-            assert calls == [(mx.bfloat16, 32, 8, "affine")]
-            assert estimate["output_size_bytes"] == 216
-        else:
+            assert plan_engram_ssd(output).tables[1].bits == hy4_bits
+        if hy4_bits is None:
             assert not calls
+            index = json.loads((output / "model.safetensors.index.json").read_text())[
+                "weight_map"
+            ]
             assert set(index) == {renamed.get(name, name) for name in tensors}
             for name, (dtype, shape, payload) in tensors.items():
                 out_key = renamed.get(name, name)

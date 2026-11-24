@@ -8495,9 +8495,7 @@ def quantize_oq_streaming(
                     # the input dtype, which drives inference speed on Apple
                     # Silicon (M1/M2 prefer float16, M3/M4 handle both).
                     storage_dtype = target_dtype
-                    if engram_mode == "affine8" and _is_hy_v4_engram_table(
-                        tensor_name, config
-                    ):
+                    if _is_hy_v4_engram_table(tensor_name, config):
                         # Hy4's SSD loader requires BF16 scales and biases.
                         storage_dtype = mx.bfloat16
                     if (
@@ -8706,7 +8704,17 @@ def quantize_oq_streaming(
     has_decision_head = any(
         (source / name).is_file() for name in DECISION_SIDECAR_WEIGHTS
     )
-    if total_shards > 1 or engram_copies or engram_mode == "affine8" or has_decision_head:
+    # Hy4 SSD offload locates the table through the index even in a single shard.
+    has_hy4_engram = _is_hy_v4_config(config) and any(
+        _is_hy_v4_engram_table(name, config) for name in weight_map
+    )
+    if (
+        total_shards > 1
+        or engram_copies
+        or engram_mode == "affine8"
+        or has_decision_head
+        or has_hy4_engram
+    ):
         total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
         index = {
             "metadata": {"total_size": total_size},
