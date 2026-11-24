@@ -753,15 +753,6 @@ _uid_row_registry_lock = threading.Lock()
 # rest to DEBUG so the signal survives without flooding the logs.
 _UID_ROW_DRIFT_WARNING_INTERVAL_S = 60.0
 _uid_row_drift_last_warning = float("-inf")
-# A long request that starts before the Prefill Accelerator is attached
-# prefills on this Mac instead. Each one is worth a line, but a burst of them
-# (a chat client retrying, several tabs) must not flood the log: one WARNING
-# per window, the rest at DEBUG, the same contract as the drift correction.
-_PREFILL_HELPER_NOT_READY_WARNING_INTERVAL_S = 60.0
-_prefill_helper_not_ready_last_warning = float("-inf")
-# No helper is chosen in these states, so a long request prefilling on this Mac
-# is the configured behaviour and not a fallback worth a log line.
-_PREFILL_HELPER_QUIET_STATES = frozenset({"off", "stopped"})
 
 
 def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
@@ -825,25 +816,6 @@ def _log_drift_correction(uids, slot_count) -> None:
         "Realigned generation-batch row state from the uid registry "
         f"(uids={list(uids)}, had {slot_count} processor slots); "
         "stale or offset slots would have run the wrong sampler/processors."
-    )
-
-
-def _log_prefill_helper_not_ready(state: str, request_id: str) -> None:
-    """Log a request that prefills here because the helper is not attached.
-
-    One WARNING per window, the rest at DEBUG, so a burst of requests in the
-    same not-ready window still shows that each one stayed on this Mac.
-    """
-    global _prefill_helper_not_ready_last_warning
-    now = time.monotonic()
-    interval = _PREFILL_HELPER_NOT_READY_WARNING_INTERVAL_S
-    rate_limited = now - _prefill_helper_not_ready_last_warning < interval
-    if not rate_limited:
-        _prefill_helper_not_ready_last_warning = now
-    (logger.debug if rate_limited else logger.warning)(
-        f"Prefill Accelerator not ready (state: {state}) when request "
-        f"{request_id} started; this request prefills on this Mac alone, "
-        "which is slower for long prompts."
     )
 
 
@@ -2420,7 +2392,6 @@ class Scheduler:
         # Prefill Accelerator session for this model (see attach_prefill_helper).
         self._prefill_helper = None
         self._prefill_helper_retry: Callable[[], None] | None = None
-        self._prefill_helper_status: Callable[[], dict[str, Any]] | None = None
         # Packed prefill: "" once the model is known to be unsupported.
         self._packed_prefill_family: str | None = None
         self._packed_prefill_disabled: str | None = None
@@ -7041,28 +7012,6 @@ class Scheduler:
         """
         self._prefill_helper = session
 
-    def _prefill_helper_state(self) -> str | None:
-        """The Prefill Accelerator's state, or None when there is none to name.
-
-        The engine hands over the manager's status reader with the retry hook;
-        a scheduler built without one has no helper and nothing to report.
-        """
-        if self._prefill_helper_status is None:
-            return None
-        return self._prefill_helper_status().get("state") or None
-
-    def _warn_if_helper_not_ready(self, request_id: str) -> None:
-        """Say that a long request prefills here because the helper is not up.
-
-        Quiet when no helper is chosen ("off") or the user stopped it
-        ("stopped"): this Mac alone is what the settings ask for then. Quiet
-        too without a status reader, since there is no helper to name.
-        """
-        state = self._prefill_helper_state()
-        if state is None or state in _PREFILL_HELPER_QUIET_STATES:
-            return
-        _log_prefill_helper_not_ready(state, request_id)
-
     def _start_helper_prefill(
         self,
         request: "Request",
@@ -7077,25 +7026,19 @@ class Scheduler:
         it. A block drafter's layers come back from whichever Mac runs them.
         """
         session = self._prefill_helper
-        retry = self._prefill_helper_retry
-        # A long prompt with no session attached, on a model that has a helper.
-        waiting = (
-            session is None and retry is not None and len(tokens) - 1 >= MIN_TOKENS
-        )
-        if waiting:
+        if (
+            session is None
+            and self._prefill_helper_retry is not None
+            and len(tokens) - 1 >= MIN_TOKENS
+        ):
             # A helper back after a sleep can wait minutes in backoff.
-            retry()
+            self._prefill_helper_retry()
         drafter = _block_drafter_for(self.model)
         if (
             session is None
             or (drafter is not None and not session.adapter.captures_layers)
             or not session.accepts(len(tokens) - 1)
         ):
-            if waiting:
-                # A helper that is chosen but not attached yet leaves this
-                # long request on this Mac; say so instead of falling back
-                # silently.
-                self._warn_if_helper_not_ready(request.request_id)
             return False
         state = self._begin_prefill(request, tokens, cache)
         state.sampler = sampler
@@ -16585,7 +16528,6 @@ class Scheduler:
         self.tokenizer = None
         self._logprob_detokenizer = None
         self._prefill_helper_retry = None  # Its helper holds the language model.
-        self._prefill_helper_status = None  # A bound method of that helper too.
 
         # Release all cache-related references for GC
         if self._boundary_snapshot_store is not None:
