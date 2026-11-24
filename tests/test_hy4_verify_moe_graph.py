@@ -9,8 +9,11 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
-from omlx.patches.deepseek_v4.switch_layers import QuantizedSwitchLinear, SwitchGLU
-from omlx.patches.hy_v4 import language, layers, verify_dispatch
+from omlx.patches.deepseek_v4.switch_layers import (  # noqa: E402
+    QuantizedSwitchLinear,
+    SwitchGLU,
+)
+from omlx.patches.hy_v4 import language, layers, verify_dispatch  # noqa: E402
 
 
 def fixture(bits):
@@ -62,7 +65,8 @@ def test_short_verify_graph_is_bounded_by_decoder_lifetime(monkeypatch):
 def test_short_verify_tail_updates_children_and_unloads(monkeypatch):
     monkeypatch.setattr(language.MoE, "__call__", lambda self, x: x * self.gain)
     monkeypatch.setattr(
-        layers.HyperConnectionPre, "_mix",
+        layers.HyperConnectionPre,
+        "_mix",
         lambda self, x, weights: (x[:, :, 0], mx.ones(x.shape[:-1])),
     )
     with mx.stream(mx.cpu):

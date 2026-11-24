@@ -32,7 +32,9 @@ def test_sliding_values_match_stock_with_mask_and_sinks(monkeypatch, rows, full_
         row_end = mx.arange(keys - rows, keys)[:, None]
         mask = (columns >= (row_end - 511)) & (columns != 7) & (columns != 21)
         attention = SimpleNamespace(
-            kind="sliding", embed_q=lambda value: value, unembed_out=lambda value: value,
+            kind="sliding",
+            embed_q=lambda value: value,
+            unembed_out=lambda value: value,
             scale=256**-0.5,
         )
         inputs = attention, q, q_pe, latent, k_pe, None, mask[None, None], sinks
@@ -61,6 +63,7 @@ def test_sliding_append_and_undo_use_the_stock_layout(cursor, rows, accepted):
         pytest.skip("requires the validated MLX/Metal backend")
 
     from mlx_lm.models.cache import RotatingKVCache
+
     from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache
     from omlx.patches.hy_v4.verify_layers import _append, _sliding_layout
     from omlx.patches.mlx_lm_mtp import cache_rollback
@@ -99,6 +102,11 @@ def test_sliding_append_and_undo_use_the_stock_layout(cursor, rows, accepted):
     compare()
 
     assert window.trim(rows - accepted) == rows - accepted
-    baseline.keys, baseline.values, baseline.offset, baseline._idx = keys, values, 4096, cursor
+    baseline.keys, baseline.values, baseline.offset, baseline._idx = (
+        keys,
+        values,
+        4096,
+        cursor,
+    )
     baseline.update_and_fetch(new_keys[:, :, :accepted], new_values[:, :, :accepted])
     compare()

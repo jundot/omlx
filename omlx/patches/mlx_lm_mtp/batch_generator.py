@@ -4807,7 +4807,14 @@ def _run_verify_cycle_chain(
                 )
             elif prepare_block is not None:
                 prepared_block = _queue_dspark_block(
-                    dspark, prepare_block, gen_batch, state, hidden, host_arr, k, greedy=True
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    host_arr,
+                    k,
+                    greedy=True,
                 )
             host = host_arr.tolist()
         else:
@@ -4849,7 +4856,14 @@ def _run_verify_cycle_chain(
                 )
             elif prepare_block is not None:
                 prepared_block = _queue_dspark_block(
-                    dspark, prepare_block, gen_batch, state, hidden, result, k, greedy=False
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    result,
+                    k,
+                    greedy=False,
                 )
             verify_packet = result.tolist()
             if not verify_packet[-1]:

@@ -637,7 +637,14 @@ class Attention(nn.Module):
         return kv_cache, topk, gate, q_nope, q_pe, latent, k_pe, sinks
 
     def __call__(
-        self, x, mask, cache=None, prev_topk=None, positions=None, *, return_values=False
+        self,
+        x,
+        mask,
+        cache=None,
+        prev_topk=None,
+        positions=None,
+        *,
+        return_values=False,
     ):
         b, length = x.shape[:2]
         kv_cache, topk, gate, q_nope, q_pe, latent, k_pe, sinks = self._prepare_cache(

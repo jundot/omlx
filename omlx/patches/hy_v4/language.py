@@ -15,7 +15,8 @@ from mlx_vlm.models.base import LanguageModelOutput, create_attention_mask
 from ..deepseek_v4.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from ..deepseek_v41.mtp import AcceptanceDepthController
 from ..mlx_lm_mtp.cache_rollback import _is_decode_consistent_armed, _is_undo_armed
-from . import exact, kernels as hc_kernels, verify_dispatch
+from . import exact, verify_dispatch
+from . import kernels as hc_kernels
 from .config import TextConfig
 from .flash import Engram
 from .layers import (
@@ -61,12 +62,16 @@ class DecoderLayer(nn.Module):
         ):
             return False
         switch = mlp.switch_mlp
-        return type(switch) is SwitchGLU and "gate_up_proj" not in switch and all(
-            type(proj) is QuantizedSwitchLinear
-            and proj.mode == "affine"
-            and proj.bits == 4
-            and proj.group_size == 64
-            for proj in switch.projections()
+        return (
+            type(switch) is SwitchGLU
+            and "gate_up_proj" not in switch
+            and all(
+                type(proj) is QuantizedSwitchLinear
+                and proj.mode == "affine"
+                and proj.bits == 4
+                and proj.group_size == 64
+                for proj in switch.projections()
+            )
         )
 
     def _mlp_forward(self, x):
@@ -90,12 +95,16 @@ class DecoderLayer(nn.Module):
             modules += (attention.post_proj_norm,)
         owners = (attention, *modules)
         graph = self._verify_tail_graph
-        if graph is None or len(graph[0]) != len(owners) or any(
-            current is not saved for current, saved in zip(owners, graph[0])
+        if (
+            graph is None
+            or len(graph[0]) != len(owners)
+            or any(current is not saved for current, saved in zip(owners, graph[0]))
         ):
+
             def tail(values, gate, streams, post, transposed):
-                return layer_output(attention, pre, norm, mlp,
-                                    values, gate, streams, post, transposed)
+                return layer_output(
+                    attention, pre, norm, mlp, values, gate, streams, post, transposed
+                )
 
             graph = (owners, mx.compile(tail, inputs=[m.state for m in modules]))
             object.__setattr__(self, "_verify_tail_graph", graph)
@@ -177,10 +186,15 @@ class TextModel(nn.Module):
             mx.broadcast_to(h[:, :, None, :], (b, length, self.args.hc_mult, d))
         )
         if (
-            b == 1 and h.dtype == mx.bfloat16 and not self.training
-            and verify_dispatch.eligible(length) and hc_kernels.available()
-            and _is_undo_armed() and not _is_decode_consistent_armed()
-            and len(cache) == len(self.layers) and all(c is not None for c in cache)
+            b == 1
+            and h.dtype == mx.bfloat16
+            and not self.training
+            and verify_dispatch.eligible(length)
+            and hc_kernels.available()
+            and _is_undo_armed()
+            and not _is_decode_consistent_armed()
+            and len(cache) == len(self.layers)
+            and all(c is not None for c in cache)
         ):
             stack = self._verify_stack
             if stack is None or not stack.matches(self.layers):

@@ -95,8 +95,15 @@ class TestCacheRollback:
 class TestMtpBoundaryCommit:
     @staticmethod
     def _run_full_accept_cycle(
-        monkeypatch, *, emitted, drafts, clamp=None, context_copy=None,
-        prepare=None, draft_calls=None, commit_align=4,
+        monkeypatch,
+        *,
+        emitted,
+        drafts,
+        clamp=None,
+        context_copy=None,
+        prepare=None,
+        draft_calls=None,
+        commit_align=4,
     ):
         import mlx.core as mx
 
@@ -177,7 +184,9 @@ class TestMtpBoundaryCommit:
         return batch, state, cache
 
     @pytest.mark.parametrize("emitted,adopted", [(0, True), (3, False)])
-    def test_dspark_predraft_uses_the_final_accepted_row(self, monkeypatch, emitted, adopted):
+    def test_dspark_predraft_uses_the_final_accepted_row(
+        self, monkeypatch, emitted, adopted
+    ):
         queued = []
         draft_calls = []
         block = mx.array([99])
@@ -187,7 +196,11 @@ class TestMtpBoundaryCommit:
             return lambda: block
 
         self._run_full_accept_cycle(
-            monkeypatch, emitted=emitted, drafts=3, prepare=prepare, draft_calls=draft_calls
+            monkeypatch,
+            emitted=emitted,
+            drafts=3,
+            prepare=prepare,
+            draft_calls=draft_calls,
         )
         assert queued == [(3, 20, 3, 3)]
         if adopted:
@@ -206,15 +219,21 @@ class TestMtpBoundaryCommit:
 
         monkeypatch.setattr(bg, "_is_greedy", lambda _batch: False)
         monkeypatch.setattr(
-            bg, "_verify_stochastic",
+            bg,
+            "_verify_stochastic",
             lambda *args, **kwargs: mx.array([3, 1, 2, 3, 10, 11, 12, 20, 0]),
         )
         monkeypatch.setattr(
-            bg, "_stochastic_verify_tokens",
+            bg,
+            "_stochastic_verify_tokens",
             lambda *args, **kwargs: mx.array([3, 1, 2, 3, 10, 11, 12, 23]),
         )
         _, state, _ = self._run_full_accept_cycle(
-            monkeypatch, emitted=0, drafts=3, prepare=prepare, draft_calls=draft_calls,
+            monkeypatch,
+            emitted=0,
+            drafts=3,
+            prepare=prepare,
+            draft_calls=draft_calls,
             commit_align=8,
         )
         assert queued == [(3, 20)]
