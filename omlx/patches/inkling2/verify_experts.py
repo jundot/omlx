@@ -4,7 +4,7 @@
 A row-exact verify block keeps ``gather_qmm``'s unsorted per-pair gather, so
 every (row, expert) pair streams its expert's weights on its own. Consecutive
 tokens share experts (20 to 37% of the pairs of 2 to 4 rows of code), and
-those repeats cost as much as a new expert.
+those repeats cost almost as much as a new expert.
 
 This runs the same pairs in expert order, like ``moe_verify_gather`` does for
 affine experts: one threadgroup per pair and output tile, the grid covering
@@ -22,8 +22,6 @@ from __future__ import annotations
 from functools import cache
 
 import mlx.core as mx
-
-from ..moe_verify_gather import pair_order
 
 # Lightning MTP verifies up to 16 rows.
 MAX_ROWS = 16
@@ -154,15 +152,13 @@ def supported(proj, dtype) -> bool:
     """True when ``proj`` is an NVFP4 expert stack this kernel matches.
 
     BF16 activations only (FP16 takes the tensor scale inside ``gather_qmm``),
-    whole 8-column output tiles and whole scale groups, and a K that MLX sends
-    to ``fp_qmv`` and not to ``fp_qmv_fast`` (multiples of 512).
+    whole 8-column output tiles, and a K that MLX sends to ``fp_qmv`` and not
+    to ``fp_qmv_fast`` (multiples of 512).
     """
-    if mx.default_device() != mx.gpu:
-        return False
-    if proj.mode != "nvfp4" or proj.bits != 4 or proj.group_size != 16:
+    if mx.default_device() != mx.gpu or proj.mode != "nvfp4":
         return False
     n, k = proj.weight.shape[-2], proj.weight.shape[-1] * 8
-    return dtype == mx.bfloat16 and n % 8 == 0 and k % 16 == 0 and k % 512 != 0
+    return dtype == mx.bfloat16 and n % 8 == 0 and k % 512 != 0
 
 
 def gather(proj, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array):
@@ -176,7 +172,7 @@ def gather(proj, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array
     n = int(proj.weight.shape[-2])
     pairs = int(rhs.shape[0])
     return _kernel()(
-        inputs=[mx.contiguous(x), proj.weight, proj.scales, rhs, order],
+        inputs=[x, proj.weight, proj.scales, rhs, order],
         template=[
             ("T", x.dtype),
             ("K_SIZE", k),
@@ -188,6 +184,3 @@ def gather(proj, x: mx.array, rhs: mx.array, pairs_per_row: int, order: mx.array
         output_shapes=[(pairs, n)],
         output_dtypes=[x.dtype],
     )[0]
-
-
-__all__ = ["MAX_ROWS", "gather", "pair_order", "supported"]

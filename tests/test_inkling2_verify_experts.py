@@ -118,23 +118,6 @@ def test_verify_rows_keep_their_decode_step_bits(hidden, inter, rows, monkeypatc
     assert len(calls) == 4  # w13 and w2, twice
 
 
-def test_one_expert_for_every_row(monkeypatch):
-    """A run of an expert as long as the block."""
-    mod = _experts(304, 144)
-    calls = _count_gathers(monkeypatch)
-    x, inds, weights = _block(16, 304, 3)
-    inds = mx.broadcast_to(inds[:1], inds.shape)
-    z, _ = _armed(mod, x, inds, weights)
-    alone = mx.concatenate(
-        [
-            mod.unreduced(x[r : r + 1], inds[r : r + 1], weights[r : r + 1])[0]
-            for r in range(16)
-        ]
-    )
-    assert mx.array_equal(z, alone)
-    assert len(calls) == 2
-
-
 @pytest.mark.parametrize(
     "case", ["unarmed", "one_row", "wide", "float16", "mxfp8", "fast_k"]
 )

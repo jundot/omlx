@@ -30,6 +30,7 @@ import numpy as np
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, KVCache
 
+from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
 from . import kernels, verify_experts
@@ -415,7 +416,7 @@ class Inkling2Experts(nn.Module):
             and verify_experts.supported(self.w2, x.dtype)
         ):
             pairs = inds.reshape(-1)
-            order = verify_experts.pair_order(pairs)
+            order = pair_order(pairs)
             y = verify_experts.gather(
                 self.w13, x, pairs, inds.shape[-1], order
             ).reshape(*inds.shape, 1, -1)
