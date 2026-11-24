@@ -30,9 +30,10 @@ import numpy as np
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, KVCache
 
+from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
-from . import kernels
+from . import kernels, verify_experts
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -404,14 +405,35 @@ class Inkling2Experts(nn.Module):
         inv = None
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
-        y = self.w13(xe, idx, do_sort)
+        # A row-exact verify block runs its pairs in expert order, so rows
+        # that share an expert read its weights once (same bits per pair).
+        order = None
+        if (
+            not do_sort
+            and 1 < inds.shape[0] <= verify_experts.MAX_ROWS
+            and is_row_exact_armed()
+            and verify_experts.supported(self.w13, x.dtype)
+            and verify_experts.supported(self.w2, x.dtype)
+        ):
+            pairs = inds.reshape(-1)
+            order = pair_order(pairs)
+            y = verify_experts.gather(
+                self.w13, x, pairs, inds.shape[-1], order
+            ).reshape(*inds.shape, 1, -1)
+        else:
+            y = self.w13(xe, idx, do_sort)
         s13 = self.w13.post_scale(idx, xe.dtype)
         if s13 is not None:
             s13 = s13[..., None, None].astype(y.dtype)
         act = _softcapped_swiglu(
             y[..., 0::2], y[..., 1::2], self._gcap, self._ucap, s13
         )
-        z = self.w2(act, idx, do_sort)
+        if order is not None:
+            z = verify_experts.gather(
+                self.w2, act.reshape(pairs.shape[0], -1), pairs, 1, order
+            ).reshape(*inds.shape, 1, -1)
+        else:
+            z = self.w2(act, idx, do_sort)
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
         z = z.squeeze(-2)
