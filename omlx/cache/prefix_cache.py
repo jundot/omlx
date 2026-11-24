@@ -2267,6 +2267,7 @@ class BlockAwarePrefixCache(CacheManager):
                 layer_cache_types=types or None,
                 layer_meta_states=meta.get("layer_meta_states"),
                 hot_cache_write_back=hot_cache_write_back,
+                parent_hash=meta.get("parent_hash"),
             )
             if saved:
                 logger.debug(
@@ -2453,6 +2454,7 @@ class BlockAwarePrefixCache(CacheManager):
                 layer_cache_types=types or None,
                 layer_meta_states=new_meta,
                 hot_cache_write_back=hot_cache_write_back,
+                parent_hash=meta.get("parent_hash"),
             )
             if not saved:
                 return False

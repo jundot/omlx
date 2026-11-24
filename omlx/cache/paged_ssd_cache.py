@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -1626,6 +1626,8 @@ class _HotCacheBudgetEntry:
     owner: Any
     block_hash: bytes
     size_bytes: int
+    parent_hash: bytes | None = None
+    rooted: bool = True
 
 
 class SharedHotCacheBudget:
@@ -1636,6 +1638,8 @@ class SharedHotCacheBudget:
         self._entries: OrderedDict[tuple[int, bytes], _HotCacheBudgetEntry] = (
             OrderedDict()
         )
+        # Entries per parent.
+        self._children: Counter[tuple[int, bytes | None]] = Counter()
         self._total_bytes = 0
         self._lock = threading.RLock()
 
@@ -1656,17 +1660,44 @@ class SharedHotCacheBudget:
     def touch(self, owner: Any, block_hash: bytes) -> None:
         """Mark an entry as recently used in the global LRU order."""
         with self._lock:
-            key = self._key(owner, block_hash)
-            if key in self._entries:
-                self._entries.move_to_end(key)
+            self._touch(self._key(owner, block_hash))
+
+    def _touch(self, key: tuple[int, bytes]) -> None:
+        entry = self._entries.get(key)
+        if entry is not None:
+            parent = self._entries.get((key[0], entry.parent_hash))
+            entry.rooted = entry.parent_hash is None or (
+                parent is not None and parent.rooted
+            )
+            # Evict a block with a missing ancestor first.
+            self._entries.move_to_end(key, last=entry.rooted)
+
+    def _pop(self, key: tuple[int, bytes]) -> _HotCacheBudgetEntry | None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+            parent = (key[0], entry.parent_hash)
+            self._children[parent] -= 1
+            if not self._children[parent]:
+                del self._children[parent]
+        return entry
+
+    def _oldest(self, protected_hashes: set[bytes]) -> tuple[int, bytes] | None:
+        # A prefix match starts at the root and stops at the first miss, so
+        # evict each chain from its tail.
+        fallback = None
+        for key in self._entries:
+            if key[1] in protected_hashes:
+                continue
+            if key not in self._children:
+                return key
+            fallback = fallback or key
+        return fallback
 
     def forget(self, owner: Any, block_hash: bytes) -> None:
         """Remove one entry from budget accounting if present."""
         with self._lock:
-            key = self._key(owner, block_hash)
-            entry = self._entries.pop(key, None)
-            if entry is not None:
-                self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+            self._pop(self._key(owner, block_hash))
 
     def forget_owner(self, owner: Any) -> None:
         """Remove all entries owned by a cache manager."""
@@ -1674,8 +1705,7 @@ class SharedHotCacheBudget:
         with self._lock:
             keys = [key for key in self._entries if key[0] == owner_id]
             for key in keys:
-                entry = self._entries.pop(key)
-                self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+                self._pop(key)
 
     def clear_all_owners(self) -> int:
         """Clear the hot cache of every manager the budget still references.
@@ -1735,18 +1765,11 @@ class SharedHotCacheBudget:
 
         with self._lock:
             while self._total_bytes > target_bytes and self._entries:
-                victim_key = None
-                victim = None
-                for key, candidate in self._entries.items():
-                    if candidate.block_hash not in protected_hashes:
-                        victim_key = key
-                        victim = candidate
-                        break
-                if victim_key is None or victim is None:
+                victim_key = self._oldest(protected_hashes)
+                if victim_key is None:
                     break
 
-                self._entries.pop(victim_key)
-                self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
+                victim = self._pop(victim_key)
                 victims.append((victim.owner, victim.block_hash, victim.size_bytes))
 
         freed = 0
@@ -1758,30 +1781,34 @@ class SharedHotCacheBudget:
         return freed
 
     def put(
-        self, owner: Any, block_hash: bytes, size_bytes: int
+        self,
+        owner: Any,
+        block_hash: bytes,
+        size_bytes: int,
+        parent_hash: bytes | None = None,
     ) -> list[tuple[Any, bytes]]:
         """Account an entry and return globally-evicted owners/block hashes."""
         victims: list[tuple[Any, bytes]] = []
         size_bytes = max(0, int(size_bytes))
         with self._lock:
             key = self._key(owner, block_hash)
-            old = self._entries.pop(key, None)
-            if old is not None:
-                self._total_bytes = max(0, self._total_bytes - old.size_bytes)
-
+            self._pop(key)
             self._entries[key] = _HotCacheBudgetEntry(
                 owner=owner,
                 block_hash=block_hash,
                 size_bytes=size_bytes,
+                parent_hash=parent_hash,
             )
+            self._children[key[0], parent_hash] += 1
             self._total_bytes += size_bytes
 
-            while self._total_bytes > self.max_bytes and self._entries:
-                victim_key, victim = self._entries.popitem(last=False)
-                if victim_key == key and not self._entries:
-                    self._entries[victim_key] = victim
+            self._touch(key)
+
+            while self._total_bytes > self.max_bytes:
+                victim_key = self._oldest(set())
+                if victim_key == key and len(self._entries) == 1:
                     break
-                self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
+                victim = self._pop(victim_key)
                 victims.append((victim.owner, victim.block_hash))
 
         return victims
@@ -2137,7 +2164,10 @@ class PagedSSDCacheManager(CacheManager):
                 self._hot_cache[block_hash] = entry
                 self._hot_cache_total_bytes += entry_size
 
-            victims = self._hot_cache_budget.put(self, block_hash, entry_size)
+            metadata = entry.get("block_metadata")
+            victims = self._hot_cache_budget.put(
+                self, block_hash, entry_size, getattr(metadata, "parent_hash", None)
+            )
             for owner, victim_hash in victims:
                 evicted = owner._hot_cache_remove(victim_hash, update_budget=False)
                 if evicted is not None:
@@ -4492,6 +4522,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": blk_meta.model_name,
                 "block_size": blk_meta.block_size,
                 "cache_signature": blk_meta.cache_signature,
+                "parent_hash": blk_meta.parent_hash,
                 "layer_cache_types": entry["layer_cache_types"],
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
@@ -4528,6 +4559,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": blk_meta.model_name,
                 "block_size": blk_meta.block_size,
                 "cache_signature": blk_meta.cache_signature,
+                "parent_hash": blk_meta.parent_hash,
                 "layer_cache_types": entry["layer_cache_types"],
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
@@ -4601,6 +4633,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": block_metadata.model_name,
                 "block_size": block_metadata.block_size,
                 "cache_signature": block_metadata.cache_signature,
+                "parent_hash": block_metadata.parent_hash,
                 "layer_cache_types": layer_cache_types,
                 "layer_meta_states": block_metadata.layer_meta_states,
             }
