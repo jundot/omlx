@@ -600,11 +600,8 @@ class Attention(nn.Module):
             return cache, None
         return cache[0], (cache[1] if len(cache.caches) > 1 else None)
 
-    def __call__(
-        self, x, mask, cache=None, prev_topk=None, positions=None, *, return_values=False
-    ):
+    def _project_inputs(self, x):
         b, length, _ = x.shape
-        kv_cache, index_cache = self._caches(cache)
         gate = mx.sigmoid(exact.linear(self.linear_gate, x)).reshape(
             b, length, self.num_heads, self.v_head_dim
         )
@@ -617,6 +614,11 @@ class Attention(nn.Module):
         )
         latent = self.kv_a_layernorm(latent)[:, None]
         k_pe = k_pe.reshape(b, 1, length, self.rope_dim)
+        return gate, qr, q_nope, q_pe, latent, k_pe
+
+    def _prepare_cache(self, x, projected, mask, cache, prev_topk, positions):
+        kv_cache, index_cache = self._caches(cache)
+        gate, qr, q_nope, q_pe, latent, k_pe = projected
         offset = rope_offset(kv_cache)
         q_pe = rotate(self.rope, q_pe, offset, positions)
         k_pe = rotate(self.rope, k_pe, offset, positions)
@@ -632,6 +634,15 @@ class Attention(nn.Module):
             # DFly reuses this layer's selection for the last committed row.
             self._captured_topk = topk
         sinks = self.learnable_sink_param.astype(x.dtype)
+        return kv_cache, topk, gate, q_nope, q_pe, latent, k_pe, sinks
+
+    def __call__(
+        self, x, mask, cache=None, prev_topk=None, positions=None, *, return_values=False
+    ):
+        b, length = x.shape[:2]
+        kv_cache, topk, gate, q_nope, q_pe, latent, k_pe, sinks = self._prepare_cache(
+            x, self._project_inputs(x), mask, cache, prev_topk, positions
+        )
         if exact.block(x):
             out = self._exact_rows(
                 q_nope, q_pe, latent, k_pe, topk, mask, kv_cache, sinks

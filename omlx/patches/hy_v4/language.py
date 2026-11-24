@@ -14,6 +14,7 @@ from mlx_vlm.models.base import LanguageModelOutput, create_attention_mask
 
 from ..deepseek_v4.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from ..deepseek_v41.mtp import AcceptanceDepthController
+from ..mlx_lm_mtp.cache_rollback import _is_decode_consistent_armed, _is_undo_armed
 from . import exact, kernels as hc_kernels, verify_dispatch
 from .config import TextConfig
 from .flash import Engram
@@ -26,6 +27,7 @@ from .layers import (
     hc_expand,
 )
 from .rope import Positions
+from .verify_layers import LayerStack, layer_output
 
 
 class DecoderLayer(nn.Module):
@@ -92,9 +94,8 @@ class DecoderLayer(nn.Module):
             current is not saved for current, saved in zip(owners, graph[0])
         ):
             def tail(values, gate, streams, post, transposed):
-                updated = hc_expand(attention._project_output(values, gate), streams, post)
-                x, post = pre._mix(updated, transposed)
-                return hc_expand(mlp(norm(x)), updated, post)
+                return layer_output(attention, pre, norm, mlp,
+                                    values, gate, streams, post, transposed)
 
             graph = (owners, mx.compile(tail, inputs=[m.state for m in modules]))
             object.__setattr__(self, "_verify_tail_graph", graph)
@@ -140,6 +141,7 @@ class TextModel(nn.Module):
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.hc_head = HyperHead(args)
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self._verify_stack = None
         kinds = args.attention_kinds
         self._first = {k: kinds.index(k) for k in ("sparse", "sliding") if k in kinds}
 
@@ -174,6 +176,19 @@ class TextModel(nn.Module):
         streams = mx.contiguous(
             mx.broadcast_to(h[:, :, None, :], (b, length, self.args.hc_mult, d))
         )
+        if (
+            b == 1 and h.dtype == mx.bfloat16 and not self.training
+            and verify_dispatch.eligible(length) and hc_kernels.available()
+            and _is_undo_armed() and not _is_decode_consistent_armed()
+            and len(cache) == len(self.layers) and all(c is not None for c in cache)
+        ):
+            stack = self._verify_stack
+            if stack is None or not stack.matches(self.layers):
+                stack = LayerStack(self.layers, h)
+                object.__setattr__(self, "_verify_stack", stack)
+            if any(stack.ready):
+                streams = stack(streams, cache, masks, engram_inputs, positions)
+                return self.norm(self.hc_head(streams))
         prev_topk = None
         kinds = self.args.attention_kinds
         for layer, c, kind in zip(self.layers, cache, kinds):

@@ -66,13 +66,16 @@ def _is_decode_consistent_armed() -> bool:
         return False
 
 
-def stage_functional_rotating_update(self, keys, values) -> None:
+def stage_functional_rotating_update(
+    self, keys, values, *, decode_consistent=True
+) -> None:
     """Stage undo for a rotating-cache update that only rebinds arrays.
 
     DeepSeek's decode-consistent verify builds its physical-ring snapshots
     from the pre-update cache and then rebinds the cache to the final one.
     The old array wrappers are never mutated, so retaining their references
     is sufficient and avoids the defensive full-cache copy used for setitem.
+    Non-decode-consistent callers replay the accepted rows as one concat.
     """
     if not _is_undo_armed():
         self._mtp_undo = None
@@ -84,7 +87,7 @@ def stage_functional_rotating_update(self, keys, values) -> None:
         if hasattr(self, field)
     )
     snap = {field: getattr(self, field) for field in fields}
-    self._mtp_undo = (snap, keys, values, True)
+    self._mtp_undo = (snap, keys, values, decode_consistent)
 
 
 def _wrap_rotating(cls, fields) -> None:
