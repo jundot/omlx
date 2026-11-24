@@ -224,6 +224,8 @@ def test_grandparent_tip_stripped_prev_tip_kept(tmp_path):
     tip3 = _block_hash(cache, t3, -1)
     # tip1 is two generations back: rotating payload stripped.
     assert _rotating_layer_shape(ssd, tip1) == PLACEHOLDER_SHAPE
+    _, meta = ssd.load_block_with_metadata(tip1)
+    assert meta["parent_hash"] == _block_hash(cache, t1, -2)
     assert _rotating_layer_shape(ssd, tip2) == REAL_ROTATING_SHAPE
     assert _rotating_layer_shape(ssd, tip3) == REAL_ROTATING_SHAPE
 

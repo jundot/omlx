@@ -4391,7 +4391,12 @@ class VLMBatchedEngine(BaseEngine):
             prompts = [prompt] if isinstance(prompt, str) else prompt
             # A text-only chat template renders images as prose, and the
             # processor then fails with a misleading image-count error.
-            image_token = getattr(self._processor, "image_token", None)
+            # Gemma 3 expands boi_token into image tokens in its processor.
+            image_token = getattr(
+                self._processor,
+                "boi_token" if model_type == "gemma3" else "image_token",
+                None,
+            )
             texts = [item for item in prompts if isinstance(item, str)]
             if (
                 num_images

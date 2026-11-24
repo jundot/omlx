@@ -152,10 +152,16 @@ PRUNED_EXPERTS_VERSION = (1, 4, 1)
 # release on M5+ `auto` quantizes attention queries to int8, so oMLX pins bf16
 # by default and only sends the flag where it is understood.
 ACTIVATIONS_VERSION = (1, 6, 1)
+# Older launchers reject --max-concurrent-requests.
+MAX_CONCURRENT_REQUESTS_VERSION = (1, 7, 1)
 _PRUNED_EXPERTS_MULTIPLE = 8
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
-SPLASH_MAX_CONTEXT = 262144
+# Every family's native window. From 1.4.0 on Splash serves more with YaRN,
+# which changes answers at every length.
+SPLASH_NATIVE_CONTEXT = 262144
+SPLASH_YARN_CONTEXT = 1010000
+YARN_VERSION = (1, 4, 0)
 SPLASH_INSTALL_HINT = (
     "Splash is not installed: brew install incoai/tap/splash (M3 or later), "
     "or splash-m1 for M1/M2 Macs (https://github.com/paperniuk/splash/releases)"
@@ -240,6 +246,8 @@ _FAMILY_VERSIONS = {
 _GGUF_ONLY_FAMILIES = frozenset({"Qwen3.8-Flash-Next", "Flint"})
 # Families without a vision tower; Splash serves their models text only.
 _TEXT_ONLY_FAMILIES = frozenset({"Flint"})
+# Families without YaRN; a longer --max-context stops their startup.
+_NATIVE_CONTEXT_FAMILIES = frozenset({"Flint"})
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 _SHARD_INDEX = "model.safetensors.index.json"
 # Splash serves vision only with one of these from the target repository.
@@ -301,6 +309,10 @@ class SplashBinary:
     @property
     def accepts_activations(self) -> bool:
         return self.version_tuple >= ACTIVATIONS_VERSION
+
+    @property
+    def accepts_max_concurrent_requests(self) -> bool:
+        return self.version_tuple >= MAX_CONCURRENT_REQUESTS_VERSION
 
 
 def _version_tuple(version: str) -> tuple[int, int, int] | None:
@@ -601,6 +613,16 @@ class SplashTarget:
     family: str
     draft_path: Path
 
+    @property
+    def max_context(self) -> int:
+        """The largest ``--max-context`` Splash starts with."""
+        if (
+            self.family in _NATIVE_CONTEXT_FAMILIES
+            or self.binary.version_tuple < YARN_VERSION
+        ):
+            return SPLASH_NATIVE_CONTEXT
+        return SPLASH_YARN_CONTEXT
+
 
 def _check_model(
     path: Path, configured_binary: str | None
@@ -770,7 +792,7 @@ def splash_memory_estimate(
     """
     path = Path(model_path)
     text = _text_config(_read_config(path) or {}) or {}
-    context = min(max_context or SPLASH_MAX_CONTEXT, SPLASH_MAX_CONTEXT)
+    context = max_context or SPLASH_NATIVE_CONTEXT
     kv = _kv_bytes_per_token(text, kv_format) * context
     draft = int(_safetensors_bytes(draft_path) * _DRAFT_LOAD_RATIO)
     return _weight_bytes(path) + draft + _RUNTIME_RESERVE_BYTES + kv
@@ -1212,6 +1234,7 @@ class SplashOptions:
     ane_prefill: bool = True
     cache_disk_bytes: int = 0
     cache_dir: Path | None = None
+    max_concurrent_requests: int | None = None
 
 
 # -- engine -------------------------------------------------------------------------
@@ -1370,14 +1393,19 @@ class SplashEngine(BaseEngine):
         # Without a limit Splash fits its context to the memory budget; a
         # limit the budget cannot hold makes it refuse to start.
         if options.max_context:
-            command += [
-                "--max-context",
-                str(min(options.max_context, SPLASH_MAX_CONTEXT)),
-            ]
+            command += ["--max-context", str(options.max_context)]
         if options.max_memory_bytes > 0:
             command += ["--max-memory", str(options.max_memory_bytes)]
         if not options.ane_prefill:
             command.append("--disable-ane")
+        if (
+            options.max_concurrent_requests
+            and self._target.binary.accepts_max_concurrent_requests
+        ):
+            command += [
+                "--max-concurrent-requests",
+                str(options.max_concurrent_requests),
+            ]
         if options.cache_disk_bytes > 0 and options.cache_dir is not None:
             command += [
                 "--max-cache-disk",
