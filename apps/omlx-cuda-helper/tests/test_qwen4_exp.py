@@ -126,7 +126,8 @@ def test_plan_counts_only_what_a_stage_loads():
 
 
 @pytest.mark.skipif(not kernels.available(), reason="CUDA kernels")
-def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry():
+@pytest.mark.parametrize("bits", (2, 3, 4, 5))
+def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry(bits):
     # Qwen3.8 Flash-Next shapes with random bf16 weights: a kernel that fails
     # its check would only log a warning and leave the slow path in place.
     text = {
@@ -185,7 +186,7 @@ def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry():
     connection.enable_kernels()
     linear = GatedDeltaNet(weights.at("gdn"), text)
     linear.enable_kernels()
-    # Eight experts of the checkpoint's widths, 4-bit in groups of 64.
+    # Eight experts of the checkpoint's widths in groups of 64.
     bank = {"router": (8, 2560), "shared_expert_gate": (1, 2560)}
     bank.update({f"shared_expert.{n}_proj": (640, 2560) for n in ("gate", "up")})
     bank["shared_expert.down_proj"] = (2560, 640)
@@ -196,13 +197,13 @@ def test_kernels_pass_their_self_checks_on_the_checkpoint_geometry():
     for name, shape in bank.items():
         dense = (0.02 * mx.random.normal(shape)).astype(mx.bfloat16)
         if name.startswith("switch_mlp"):
-            packed = mx.quantize(dense, group_size=64, bits=4)
+            packed = mx.quantize(dense, group_size=64, bits=bits)
             for part, value in zip(("weight", "scales", "biases"), packed):
                 arrays[f"{name}.{part}"] = value
         else:
             arrays[f"{name}.weight"] = dense
     arrays["gate.weight"] = arrays.pop("router.weight")
-    config = {"quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}
+    config = {"quantization": {"group_size": 64, "bits": bits, "mode": "affine"}}
     moe = MoE(Weights(arrays, config, ""), text)
     moe.enable_kernels()
     assert attention.fused_prep and attention.selection is not None
@@ -254,63 +255,3 @@ def test_the_oqh_expert_kernel_matches_the_rebuilt_experts(bits, group, limit):
     for got, ref in ((act, want), (y, want_y)):
         got, ref = got.astype(mx.float32), ref.astype(mx.float32)
         assert (mx.linalg.norm(got - ref) / mx.linalg.norm(ref)).item() < 1e-3
-
-
-def test_expert_gemm_fits_accepts_5bit_affine_banks():
-    """oQ5e (5-bit, group-64 affine) expert banks must reach the fused
-    kernel instead of silently degrading to gather_qmm (#5551)."""
-    experts, n, width = 4, 256, 512
-    dense = mx.random.normal((experts, n, width)).astype(mx.bfloat16)
-    w, s, b = mx.quantize(dense, group_size=64, bits=5)
-    bank = (w, s, b, {"bits": 5, "group_size": 64, "mode": "affine"})
-    assert kernels.expert_gemm_fits(bank, width)
-    # Other affine bit-widths the table does not list still fall back.
-    bank3 = (w, s, b, {"bits": 3, "group_size": 64, "mode": "affine"})
-    assert not kernels.expert_gemm_fits(bank3, width)
-
-
-@pytest.mark.skipif(not kernels.available(), reason="CUDA kernels")
-def test_the_5bit_affine_expert_kernel_matches_dequantized_experts():
-    """The fused 5-bit affine path must equal dequantize + gather, matching
-    the tolerance the oQh parity test uses."""
-    experts, k, inner, tokens, top = 8, 512, 128, 256, 4
-    key = mx.random.key(5)
-
-    def bank(n, width):
-        dense = mx.random.normal((experts, n, width), key=key)
-        w, s, b = mx.quantize(dense.astype(mx.bfloat16), group_size=64, bits=5)
-        packed = (w, s, b, {"bits": 5, "group_size": 64, "mode": "affine"})
-        return packed, mx.dequantize(w, s, b, group_size=64, bits=5)
-
-    (gate_up, gu_dense), (down, d_dense) = bank(2 * inner, k), bank(k, inner)
-    assert kernels.expert_gemm_fits(gate_up, k)
-    assert kernels.expert_gemm_fits(down, inner)
-    x = mx.random.normal((tokens, k), key=key).astype(mx.bfloat16)
-    ids = mx.sort(
-        mx.random.randint(0, experts, (tokens * top,), key=key)
-    ).astype(mx.uint32)
-    src = mx.random.randint(0, tokens, (tokens * top,), key=key).astype(mx.uint32)
-    offsets = kernels.expert_offsets(ids, experts)
-
-    act = kernels.expert_gemm(x, gate_up, offsets, src, 2)
-    ref = mx.einsum(
-        "rk,rnk->rn",
-        x[src].astype(mx.float32),
-        gu_dense[ids].astype(mx.float32),
-    )
-    gate, up = ref[:, :inner], ref[:, inner:]
-    want = (gate / (1 + mx.exp(-gate))) * up
-    got = act.astype(mx.float32)
-    assert (mx.linalg.norm(got - want) / mx.linalg.norm(want)).item() < 1e-3
-
-    hidden = act.astype(mx.bfloat16)
-    y = kernels.expert_gemm(hidden, down, offsets)
-    ref_y = mx.einsum(
-        "rk,rnk->rn",
-        hidden.astype(mx.float32),
-        d_dense[ids].astype(mx.float32),
-    )
-    got_y = y.astype(mx.float32)
-    assert (
-        mx.linalg.norm(got_y - ref_y) / mx.linalg.norm(ref_y)
-    ).item() < 1e-3
