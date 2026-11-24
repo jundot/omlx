@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -579,6 +580,10 @@ class PagedCacheManager(CacheManager):
         # Tail blocks by chain parent (None for a root). A tail is shorter
         # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
+        # Full-size blocks stored with sliding-window state (OMLX_SWA_TAIL_ONLY),
+        # and whether this model stores window state at all.
+        self._swa_full_hashes: set = set()
+        self._swa_active = False
         # Tails shared across conversations, capped apart from ordinary tails.
         self._shared_tails: set[BlockHash] = set()
 
@@ -1017,6 +1022,7 @@ class PagedCacheManager(CacheManager):
             num_cached_tokens = 0
 
             num_full_blocks = len(token_ids) // self.block_size
+            level_parents: list = [None]  # parent hash before block i
 
             for i in range(num_full_blocks):
                 start = i * self.block_size
@@ -1061,6 +1067,7 @@ class PagedCacheManager(CacheManager):
 
                 cached_blocks.append(cached_block)
                 parent_hash = block_hash
+                level_parents.append(block_hash)
                 num_cached_tokens += self.block_size
                 self.stats.hits += 1
 
@@ -1079,6 +1086,36 @@ class PagedCacheManager(CacheManager):
                     cached_blocks.append(tail_block)
                     num_cached_tokens += tail_block.token_count
                     self.stats.hits += 1
+                    return cached_blocks, num_cached_tokens
+
+            if (
+                self._swa_active
+                and cached_blocks
+                and cached_blocks[-1].block_hash not in self._swa_full_hashes
+            ):
+                # Window state is stored only at turn ends (tails) and each
+                # store's last full block. Restore from the longest such point
+                # instead of a block whose window part is a placeholder.
+                for level in range(len(cached_blocks) - 1, -1, -1):
+                    tail = self._match_tail_block(
+                        token_ids,
+                        level_parents[level],
+                        level * self.block_size,
+                        extra_keys=extra_keys,
+                        extra_key_token_start=extra_key_token_start,
+                        extra_key_ranges=extra_key_ranges,
+                    )
+                    if tail is not None:
+                        return (
+                            cached_blocks[:level] + [tail],
+                            level * self.block_size + tail.token_count,
+                        )
+                    if (
+                        level > 0
+                        and cached_blocks[level - 1].block_hash in self._swa_full_hashes
+                    ):
+                        return cached_blocks[:level], level * self.block_size
+                return [], 0
 
             return cached_blocks, num_cached_tokens
 
