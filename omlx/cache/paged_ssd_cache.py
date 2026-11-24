@@ -368,6 +368,12 @@ _NUMERICS_REVISIONS = {
     "mlx_vlm.models.deepseekocr.vision": "mlx-vlm-138d761",
     "mlx_vlm.models.minicpmv4_6.vision": "mlx-vlm-138d761",
     "mlx_vlm.quantization.nvfp4": "mlx-vlm-138d761",
+    # mlx-vlm 36494b4 resizes Phi-4-MM position embeddings with ATen's filter
+    # and runs Mage-VL's norms and GELU in FP32.
+    "mlx_vlm.models.phi4mm.vision": "mlx-vlm-36494b4",
+    "mlx_vlm.models.mage_vl.vision": "mlx-vlm-36494b4",
+    # oMLX's Muse Glimmer swaps the position grid axes of non-square images.
+    "mlx_vlm.models.muse_glimmer.vision": "glimmer-position-xy-1",
     # Hy4 Flash blocks stored after a restore before #5534 hold wrong ranges.
     "omlx.patches.hy_v4.flash": "hy4-flash-ranges-1",
 }

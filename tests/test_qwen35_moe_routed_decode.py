@@ -477,3 +477,20 @@ def test_apply_is_idempotent(_patched_block):
     call = cls.__call__
     assert routed.apply_qwen35_moe_routed_decode_patch()
     assert cls.__call__ is call
+
+
+def test_reload_after_mtp_keeps_the_verify_window(monkeypatch, _patched_block):
+    """A model without MTP loads first, then one with MTP applies the router again."""
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    from omlx.patches import qwen35_moe_router, qwen35_verify_qmm
+
+    monkeypatch.setattr(
+        Qwen3_5BatchInvariantForward, "_feed_forward", lambda self, block, x: block(x)
+    )
+    qwen35_moe_router._ensure_vlm_verify_patch()
+    routed._ensure_verify_window_patch(_patched_block)
+    qwen35_verify_qmm._patch_verify_swiglu()
+    patched = Qwen3_5BatchInvariantForward._feed_forward
+    qwen35_moe_router._ensure_vlm_verify_patch()
+    assert Qwen3_5BatchInvariantForward._feed_forward is patched
