@@ -1284,6 +1284,11 @@ def test_nax_banded_attention_self_check_passes(dtype):
     [
         (1, 6, 2, 64, 64, 16, None),  # no cached keys, aligned tiles
         (1, 6, 2, 33, 300, 32, None),  # ragged query and key tails
+        (1, 6, 2, 2, 300, 32, None),  # shortest block the router sends
+        (1, 6, 2, 5, 12301, 48, None),  # short block, three key-range passes
+        (1, 6, 2, 31, 31, 16, None),  # short block, no cached keys
+        (1, 6, 2, 2, 2, 16, None),  # two queries, two keys
+        (2, 4, 1, 7, 60, 32, [0, 53]),  # short left-padded batch
         (1, 4, 4, 100, 100, 256, None),  # band longer than the keys
         (1, 6, 2, 200, 12301, 48, None),  # three key-range passes
         (2, 4, 1, 70, 190, 32, None),
@@ -1417,7 +1422,8 @@ def test_nax_banded_attention_declines_unsupported_inputs():
 
 def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
     """Full-attention prefill blocks build no mask on NAX hosts, lone or in a
-    left-padded batch; sliding layers, FP32 and short blocks keep their routes."""
+    left-padded batch, from two queries; sliding layers and FP32 keep their
+    routes, and one query stays on the decode path."""
     from omlx.patches.inkling2 import kernels
 
     nax_attention = _nax_banded_or_skip()
@@ -1427,7 +1433,9 @@ def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
     lp = mx.array([0, 13], dtype=mx.int32)
     expected = kernels._masked_attention(*args, scale, 0, None)
     expected_pair = kernels._masked_attention(*pair, scale, 0, lp)
-    mx.eval(expected, expected_pair)
+    short = _decode_attention_case(1, 6, 2, 2, 300, 32, mx.bfloat16, 128)
+    expected_short = kernels._masked_attention(*short, scale, 0, None)
+    mx.eval(expected, expected_pair, expected_short)
 
     calls = []
     banded = nax_attention.nax_banded_sink_attention
@@ -1445,19 +1453,24 @@ def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
     monkeypatch.setattr(kernels, "_masked_attention", no_masked)
     got = kernels.banded_sink_attention(*args, scale=scale)
     got_pair = kernels.banded_sink_attention(*pair, scale=scale, left_padding=lp)
-    assert calls == [args[0].shape, pair[0].shape]
-    for out, ref in ((got, expected), (got_pair, expected_pair)):
+    got_short = kernels.banded_sink_attention(*short, scale=scale)
+    assert calls == [args[0].shape, pair[0].shape, short[0].shape]
+    for out, ref in (
+        (got, expected),
+        (got_pair, expected_pair),
+        (got_short, expected_short),
+    ):
         diff = mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max()
         assert diff.item() < 1e-2
 
     monkeypatch.setattr(kernels, "_masked_attention", masked)
-    # Sliding layer, FP32 and a short block: not this kernel.
+    # Sliding layer, FP32 and a single query: not this kernel.
     mx.eval(kernels.banded_sink_attention(*args, scale=scale, window=32))
     wide = _decode_attention_case(1, 6, 2, 70, 300, 32, mx.float32, 128)
     mx.eval(kernels.banded_sink_attention(*wide, scale=scale))
-    short = _decode_attention_case(1, 6, 2, 8, 300, 32, mx.bfloat16, 128)
-    mx.eval(kernels.banded_sink_attention(*short, scale=scale))
-    assert len(calls) == 2
+    one = _decode_attention_case(1, 6, 2, 1, 300, 32, mx.bfloat16, 128)
+    mx.eval(kernels.banded_sink_attention(*one, scale=scale))
+    assert len(calls) == 3
 
 
 def test_inkling2_full_attention_prefill_falls_back_when_check_fails(monkeypatch):

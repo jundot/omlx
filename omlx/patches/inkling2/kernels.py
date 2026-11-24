@@ -1029,8 +1029,12 @@ _FLASH_SOURCE = """
 """
 _flash_kernel = None
 # Shorter query blocks take the decode kernel when batched or left-padded,
-# else SDPA.
+# else the NAX banded kernel (full attention, from two queries) or SDPA.
 _FLASH_MIN_QUERIES = 32
+# The NAX banded kernel takes full-attention blocks from two queries: a short
+# block's mask still spans every cached key, so the masked path pays for the
+# whole context to run a prompt tail or a few-token suffix.
+_NAX_BANDED_MIN_QUERIES = 2
 
 
 # FlashDecoding for batched or left-padded decode-sized query blocks (decode
@@ -1395,10 +1399,12 @@ def _use_nax_banded(q, length: int, window: int) -> bool:
 
     It reads the bias band, the sinks and the left padding in place, where
     the masked path builds a [heads, queries, keys] mask per query block.
+    Single queries, row-exact verify and batched decode-sized blocks are
+    routed before this check and keep their kernels.
     """
     return (
         not window
-        and length >= _FLASH_MIN_QUERIES
+        and length >= _NAX_BANDED_MIN_QUERIES
         and q.dtype in (mx.bfloat16, mx.float16)
         and q.shape[-1] == 128
         and mx.default_device() == mx.gpu
