@@ -85,6 +85,30 @@ _SINGLE_ROW_MARKER = "_omlx_drafter_single_row"
 # attention q/k/v tuple through ``vk_group_sg8`` (8 rows, K=4096, affine 4-bit
 # group 64), which differs from the per-row matvec at bf16 tail-ULP level and
 # flipped a 1-ULP greedy tie; row-exact arming is bit-identical to decode.
+#
+# Narrower armings were measured and rejected. Cause, localized by declining
+# route classes in the live engine (fixed prompts, 256 greedy tokens, identity
+# against the drafter-off run):
+#
+#   arming / declines                        tok/s   identical prompts
+#   row-exact (shipped)                       25.3    5/5
+#   sg8 single-projection declined            34.4    0/5
+#   + grouped sg8 declined                    33.5    1/5
+#   + lm_head qmm route declined              33.4    1/5
+#   + per-linear verify route declined        29.2    0/5
+#   lm_head alone on one-row arithmetic       33.3    0/5
+#   + sg8 single declined                     33.7    0/5
+#   + sg8 single and group declined           32.9    0/5
+#   drafter off (reference)                   29.2    -
+#
+# It is not one op: every multi-row verify projection (sg8 group and single,
+# msg/mma/skinny, the per-linear route, and stock multi-row qmm itself) rounds
+# differently from serial one-row arithmetic by a few bf16 tail ULP, and on
+# Bolt's 1-ULP top-2 ties that flips the greedy token. An isolated 9-row
+# verify forward and a 528-token prefill under each arming state are
+# bit-identical, so only the live end-to-end gate exposes it. Identity
+# therefore requires one-row arithmetic for the whole verify batch, which is
+# what this marker enables; the fast variants are not shippable.
 _ROW_EXACT_MARKER = "_omlx_mtp_row_exact_verify"
 
 
