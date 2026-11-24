@@ -15734,6 +15734,12 @@
             "state" : "translated",
             "value" : "Richieste simultanee"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "并发请求数"
+          }
         }
       }
     },
@@ -15757,6 +15763,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Quante richieste ogni modello Splash gestisce contemporaneamente. Auto usa il valore predefinito di Splash, 4. Vale da Splash 1.7.1."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每个 Splash 模型同时处理的请求数。自动使用 Splash 的默认值 4。适用于 Splash 1.7.1 及更高版本。"
           }
         }
       }
