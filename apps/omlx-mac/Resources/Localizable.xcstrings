@@ -15407,6 +15407,54 @@
         }
       }
     },
+    "integrations.splash.max_concurrent" : {
+      "comment" : "Row label for the Splash concurrent request limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gleichzeitige Anfragen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Concurrent Requests"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Richieste simultanee"
+          }
+        }
+      }
+    },
+    "integrations.splash.max_concurrent.sub" : {
+      "comment" : "Sublabel for the Splash concurrent request limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wie viele Anfragen jedes Splash-Modell gleichzeitig bedient. Auto nutzt Splashs Standard von 4. Gilt ab Splash 1.7.1."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How many requests each Splash model serves at once. Auto uses Splash's default of 4. Applies to Splash 1.7.1 and later."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quante richieste ogni modello Splash gestisce contemporaneamente. Auto usa il valore predefinito di Splash, 4. Vale da Splash 1.7.1."
+          }
+        }
+      }
+    },
     "integrations.splash.max_memory" : {
       "comment" : "Row label for the Splash memory limit",
       "extractionState" : "manual",

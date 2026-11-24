@@ -540,6 +540,8 @@
   "settings.integrations.splash.ssd_cache_warning": "Applies to each Splash model, and a model's cache stays after it unloads, so the total can grow to this size times the number of Splash models you use. Set a size when you use more than one.",
   "settings.integrations.splash.auto": "Auto",
   "settings.integrations.splash.invalid_size": "Enter a size in GB, or leave the field empty for automatic.",
+  "settings.integrations.splash.max_concurrent": "Solicitudes simultáneas",
+  "settings.integrations.splash.max_concurrent_hint": "Cuántas solicitudes atiende a la vez cada modelo de Splash. Auto usa el valor predeterminado de Splash, 4; las demás solicitudes esperan en la cola de Splash. Requiere Splash 1.7.1 o posterior y se aplica la próxima vez que se cargue el modelo.",
   "settings.integrations.splash.ane_prefill": "Neural Engine prefill",
   "settings.integrations.splash.ane_prefill_hint": "Let Splash run part of long prompts on the Neural Engine when that is faster.",
   "settings.integrations.splash.running": "Running",

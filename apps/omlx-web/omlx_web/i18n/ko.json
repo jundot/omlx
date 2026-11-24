@@ -540,6 +540,8 @@
   "settings.integrations.splash.ssd_cache_warning": "Splash 모델마다 따로 적용되고 모델을 내려도 캐시가 남으므로, 전체 사용량은 이 크기에 사용한 Splash 모델 수를 곱한 만큼까지 커질 수 있습니다. Splash 모델을 둘 이상 쓴다면 크기를 지정하세요.",
   "settings.integrations.splash.auto": "자동",
   "settings.integrations.splash.invalid_size": "GB 단위 크기를 입력하거나, 자동으로 두려면 비워 두세요.",
+  "settings.integrations.splash.max_concurrent": "동시 요청 수",
+  "settings.integrations.splash.max_concurrent_hint": "각 Splash 모델이 동시에 처리하는 요청 수. 자동은 Splash 기본값 4를 사용하며, 초과 요청은 Splash 대기열에서 기다립니다. Splash 1.7.1 이상이 필요하며 다음에 모델을 불러올 때 적용됩니다.",
   "settings.integrations.splash.ane_prefill": "Neural Engine 프리필",
   "settings.integrations.splash.ane_prefill_hint": "더 빠를 때 긴 프롬프트 일부를 Neural Engine에서 처리합니다.",
   "settings.integrations.splash.running": "실행 중",

@@ -1455,6 +1455,18 @@
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
                                     <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.max_concurrent') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.max_concurrent_hint') }}</p>
+                                    </div>
+                                    <select :value="globalSettings.integrations.splash_max_concurrent_requests ?? ''"
+                                            @change="globalSettings.integrations.splash_max_concurrent_requests = optionalNumber($event.target.value); saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="">{{ t('settings.integrations.splash.auto') }}</option>
+                                        {% for n in range(1, 9) %}<option value="{{ n }}">{{ n }}</option>{% endfor %}
+                                    </select>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.ane_prefill') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.ane_prefill_hint') }}</p>
                                     </div>

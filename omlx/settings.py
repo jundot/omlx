@@ -590,6 +590,8 @@ VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"
 SPLASH_KV_FORMATS = frozenset({"int8", "bf16"})
 # Activation precisions `splash serve --activations` accepts (Splash 1.6.1+).
 SPLASH_ACTIVATIONS = frozenset({"auto", "bf16"})
+# `splash serve --max-concurrent-requests` accepts 1-8.
+SPLASH_MAX_CONCURRENT_REQUESTS = 8
 
 
 @dataclass
@@ -1020,6 +1022,7 @@ class IntegrationSettings:
     splash_max_memory_gb: float | None = None  # None = what the ceiling leaves
     splash_ssd_cache_gb: float | None = None  # None = oMLX's SSD cache size
     splash_ane_prefill: bool = True
+    splash_max_concurrent_requests: int | None = None  # None = Splash's default
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -1052,6 +1055,7 @@ class IntegrationSettings:
             "splash_max_memory_gb": self.splash_max_memory_gb,
             "splash_ssd_cache_gb": self.splash_ssd_cache_gb,
             "splash_ane_prefill": self.splash_ane_prefill,
+            "splash_max_concurrent_requests": self.splash_max_concurrent_requests,
         }
 
     @classmethod
@@ -1094,6 +1098,7 @@ class IntegrationSettings:
             splash_max_memory_gb=data.get("splash_max_memory_gb"),
             splash_ssd_cache_gb=data.get("splash_ssd_cache_gb"),
             splash_ane_prefill=data.get("splash_ane_prefill", True),
+            splash_max_concurrent_requests=data.get("splash_max_concurrent_requests"),
         )
 
 
@@ -1957,6 +1962,14 @@ class GlobalSettings:
         ssd = self.integrations.splash_ssd_cache_gb
         if ssd is not None and ssd < 0:
             errors.append("splash_ssd_cache_gb must be >= 0")
+        concurrent = self.integrations.splash_max_concurrent_requests
+        if concurrent is not None and not (
+            1 <= concurrent <= SPLASH_MAX_CONCURRENT_REQUESTS
+        ):
+            errors.append(
+                "splash_max_concurrent_requests must be between 1 and "
+                f"{SPLASH_MAX_CONCURRENT_REQUESTS}"
+            )
 
         # HuggingFace validation
         if self.huggingface.endpoint:

@@ -1093,6 +1093,20 @@ class TestRequestTranslation:
     def test_default_activation_precision_keeps_bf16(self):
         assert SplashOptions().activations == "bf16"
 
+    @pytest.mark.parametrize(
+        ("version", "limit", "sent"),
+        [("1.7.1", 6, "6"), ("1.7.0", 6, None), ("1.7.1", None, None)],
+    )
+    def test_serve_command_max_concurrent_requests(
+        self, tmp_path, version, limit, sent
+    ):
+        engine = _engine(tmp_path, version=version, max_concurrent_requests=limit)
+
+        command = engine._serve_command(9000)
+
+        flag = "--max-concurrent-requests"
+        assert (command[command.index(flag) + 1] if flag in command else None) == sent
+
     def test_serve_command_leaves_unset_limits_to_splash(self, tmp_path):
         command = _engine(tmp_path)._serve_command(9000)
 
@@ -1911,6 +1925,7 @@ class TestAdminAPI:
             splash_ssd_cache_gb=0,
             splash_ane_prefill=False,
             splash_activations="auto",
+            splash_max_concurrent_requests=6,
         )
 
         assert "integrations" in result["runtime_applied"]
@@ -1921,11 +1936,13 @@ class TestAdminAPI:
         )
         assert (restored.splash_ssd_cache_gb, restored.splash_ane_prefill) == (0, False)
         assert restored.splash_activations == "auto"
+        assert restored.splash_max_concurrent_requests == 6
         for fields in (
             {"splash_kv_format": "fp8"},
             {"splash_activations": "fp8"},
             {"splash_max_memory_gb": 0},
             {"splash_ssd_cache_gb": -1},
+            {"splash_max_concurrent_requests": 9},
         ):
             with pytest.raises(HTTPException):
                 await _post_global(settings, **fields)

@@ -540,6 +540,8 @@
   "settings.integrations.splash.ssd_cache_warning": "Platí pro každý model Splash zvlášť a cache modelu zůstává i po jeho uvolnění, takže celkem může zabrat tuto velikost krát počet používaných modelů Splash. Pokud používáte více než jeden, nastavte velikost.",
   "settings.integrations.splash.auto": "Auto",
   "settings.integrations.splash.invalid_size": "Zadejte velikost v GB, nebo nechte pole prázdné pro automatickou volbu.",
+  "settings.integrations.splash.max_concurrent": "Souběžné požadavky",
+  "settings.integrations.splash.max_concurrent_hint": "Kolik požadavků obsluhuje každý model Splash současně. Auto použije výchozí hodnotu Splash 4; další požadavky čekají ve frontě Splash. Vyžaduje Splash 1.7.1 nebo novější a platí od dalšího načtení modelu.",
   "settings.integrations.splash.ane_prefill": "Prefill na Neural Engine",
   "settings.integrations.splash.ane_prefill_hint": "Nechat Splash spustit část dlouhých promptů na Neural Engine, když je to rychlejší.",
   "settings.integrations.splash.running": "Spuštěn",
