@@ -25,13 +25,7 @@ from .dspark import make_stages
 from .model import Model
 from .processing import Processor
 from .quantization import QuantizedProjection
-from .storage import (
-    DECODE_ROWS,
-    DiskEngramEmbedding,
-    EngramPrefetch,
-    TensorFile,
-    decode_array,
-)
+from .storage import DiskEngramEmbedding, EngramPrefetch, TensorFile, decode_array
 
 logger = logging.getLogger(__name__)
 
@@ -240,14 +234,6 @@ def load(
             # during loading, before BatchGenerator takes ownership.
             memory_scope.enter_context(wired_limit(model))
         engram_keys = set()
-        # One Engram lookup per decode or verify token reads
-        # n_heads x (max_ngram_size - 1) hashes. Advise a whole decode/verify
-        # batch -- the same row bound dedupe_tuple_ids uses to tell those
-        # batches from prefill -- so a verify block still takes the advised
-        # copy path instead of the I/O pool.
-        engram_advise_rows = (
-            config.engram_n_heads * (config.engram_max_ngram_size - 1) * DECODE_ROWS
-        )
         for module, spec in format_spec.get("engram_tables", {}).items():
             # Converted tables may live in their own file under another key.
             if not in_scope(f"{module}.weight"):
@@ -278,7 +264,6 @@ def load(
                     bias_key=spec.get("bias_key"),
                     bits=spec.get("bits"),
                     group_size=spec.get("group_size", 32),
-                    advise_max_rows=engram_advise_rows,
                 ),
             )
         if format_spec.get("engram_tables"):
