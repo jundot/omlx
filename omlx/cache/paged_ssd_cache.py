@@ -2013,6 +2013,13 @@ class PagedSSDCacheManager(CacheManager):
         # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
         # _enqueue_ssd_write (holds _pending_write_hashes_lock).
         self._pending_write_buffers: dict[bytes, dict] = {}
+        # Per-block write generations: bumped under _pending_write_hashes_lock
+        # each time a write for the block is enqueued. An in-flight write
+        # (background or inline) only publishes its file — or rolls back the
+        # shared final path / index entry — while its generation is still the
+        # newest, so a write superseded by a replace cannot clobber or delete
+        # the replacement's file (issue #5543).
+        self._block_write_generation: dict[bytes, int] = {}
 
         # Initialize directory structure and scan existing files
         # Skip in hot_cache_only mode: no SSD I/O, so no directories needed.
@@ -2202,6 +2209,8 @@ class PagedSSDCacheManager(CacheManager):
         with self._pending_write_hashes_lock:
             if block_hash in self._pending_write_buffers:
                 return True
+            generation = self._next_block_write_generation(block_hash)
+            entry["write_generation"] = generation
             self._pending_write_buffers[block_hash] = entry
             self._pending_write_hashes.add(block_hash)
 
@@ -2212,7 +2221,7 @@ class PagedSSDCacheManager(CacheManager):
 
         # 3. Queue third — enqueue for background writer.
         try:
-            item = (block_hash, tensors_raw, metadata, file_path)
+            item = (block_hash, tensors_raw, metadata, file_path, generation)
             # Non-blocking callers (hot-cache LRU spill) also wait so a
             # transient writer backlog doesn't silently drop blocks. Blocking
             # callers (shutdown flush) use the same bounded wait.
@@ -2235,8 +2244,9 @@ class PagedSSDCacheManager(CacheManager):
                 metadata,
                 file_path,
                 source="inline-fallback",
+                generation=generation,
             )
-            self._clear_pending_write(block_hash)
+            self._clear_pending_write(block_hash, generation=generation)
             return ok
 
     def _hot_cache_get(self, block_hash: bytes) -> dict | None:
@@ -2255,6 +2265,25 @@ class PagedSSDCacheManager(CacheManager):
         """Get entry from pending-write buffer. Returns None on miss."""
         with self._pending_write_hashes_lock:
             return self._pending_write_buffers.get(block_hash)
+
+    def _next_block_write_generation(self, block_hash: bytes) -> int:
+        """Reserve the next write generation for a block.
+
+        Caller must hold ``_pending_write_hashes_lock``.
+        """
+        generation = self._block_write_generation.get(block_hash, 0) + 1
+        self._block_write_generation[block_hash] = generation
+        return generation
+
+    def _is_current_write(self, block_hash: bytes, generation: int | None) -> bool:
+        """Whether ``generation`` is still the newest write for the block.
+
+        ``generation is None`` marks a call without replace tracking and
+        always wins. Caller must hold ``_pending_write_hashes_lock``.
+        """
+        if generation is None:
+            return True
+        return self._block_write_generation.get(block_hash) == generation
 
     def _hot_cache_remove(
         self, block_hash: bytes, *, update_budget: bool = True
@@ -3356,8 +3385,15 @@ class PagedSSDCacheManager(CacheManager):
         file_path: Path,
         *,
         source: str,
+        generation: int | None = None,
     ) -> bool:
-        """Write one serialized block to disk from raw tensor bytes."""
+        """Write one serialized block to disk from raw tensor bytes.
+
+        ``generation`` scopes the publish against replaces: if a newer write
+        for the same block was enqueued while this one was in flight, the
+        rename and any rollback touching the shared final path or index
+        entry are skipped, so the superseding write's file survives.
+        """
         with self._persistence_io():
             temp_path = None
             try:
@@ -3367,7 +3403,25 @@ class PagedSSDCacheManager(CacheManager):
                     str(temp_path), tensors_raw, metadata
                 )
 
-                os.rename(str(temp_path), str(file_path))
+                # Publish only if this write still owns the block. Holding
+                # the generation lock across check + rename serializes the
+                # publish against a concurrent enqueue, which bumps the
+                # generation under the same lock.
+                with self._pending_write_hashes_lock:
+                    if not self._is_current_write(block_hash, generation):
+                        # A newer write owns the final path; drop only our
+                        # own unique tmp file. Not an error: the
+                        # superseding write publishes (or cleans up) the
+                        # block itself.
+                        logger.debug(
+                            "Superseded %s write for %s; skipping publish",
+                            source,
+                            block_hash.hex()[:16],
+                        )
+                        with contextlib.suppress(Exception):
+                            temp_path.unlink()
+                        return True
+                    os.rename(str(temp_path), str(file_path))
                 _fsync_parent_dir(file_path)
 
                 # The block is now durable on disk; bump the persist counter
@@ -3425,11 +3479,21 @@ class PagedSSDCacheManager(CacheManager):
                 self._stats["errors"] += 1
                 with self._persistence_progress_lock:
                     self._persistence_failed = True
-                self._index.remove(block_hash)
-                for p in (temp_path, file_path):
+                # A superseded write may only remove its own unique tmp
+                # file; the shared final path and the index entry belong
+                # to the write that replaced it.
+                with self._pending_write_hashes_lock:
+                    is_current = self._is_current_write(block_hash, generation)
+                if is_current:
+                    self._index.remove(block_hash)
+                    for p in (temp_path, file_path):
+                        with contextlib.suppress(Exception):
+                            if p is not None and isinstance(p, Path) and p.exists():
+                                p.unlink()
+                else:
                     with contextlib.suppress(Exception):
-                        if p is not None and isinstance(p, Path) and p.exists():
-                            p.unlink()
+                        if isinstance(temp_path, Path) and temp_path.exists():
+                            temp_path.unlink()
                 return False
 
     @contextlib.contextmanager
@@ -3469,20 +3533,45 @@ class PagedSSDCacheManager(CacheManager):
             time.sleep(0.02)
 
     def _clear_pending_write(
-        self, block_hash: bytes, *, remove_hot_cache: bool = False
+        self,
+        block_hash: bytes,
+        *,
+        remove_hot_cache: bool = False,
+        generation: int | None = None,
     ) -> None:
-        """Clear pending-write bookkeeping after a queued or inline write."""
+        """Clear pending-write bookkeeping after a queued or inline write.
+
+        A superseded write (``generation`` older than the block's current
+        one) must leave the replacing write's bookkeeping — pending hash,
+        buffer entry, and hot-cache entry — untouched.
+        """
         with self._pending_write_hashes_lock:
+            if generation is not None and not self._is_current_write(
+                block_hash, generation
+            ):
+                return
             self._pending_write_hashes.discard(block_hash)
             self._pending_write_buffers.pop(block_hash, None)
+            if generation is not None:
+                self._block_write_generation.pop(block_hash, None)
         if remove_hot_cache:
             self._hot_cache_remove(block_hash)
 
-    def _mark_hot_cache_clean(self, block_hash: bytes) -> None:
-        """Mark a retained hot entry durable after its SSD write commits."""
+    def _mark_hot_cache_clean(
+        self, block_hash: bytes, generation: int | None = None
+    ) -> None:
+        """Mark a retained hot entry durable after its SSD write commits.
+
+        Only when the commit belongs to the entry's own write generation —
+        a superseded commit must not clean an entry a newer write still
+        owns.
+        """
         with self._hot_cache_lock:
             entry = self._hot_cache.get(block_hash)
-            if entry is not None:
+            if entry is not None and (
+                generation is None
+                or entry.get("write_generation") == generation
+            ):
                 entry["dirty"] = False
 
     def _writer_loop(self) -> None:
@@ -3511,21 +3600,34 @@ class PagedSSDCacheManager(CacheManager):
             if item is None:  # Sentinel for shutdown
                 break
 
-            block_hash, tensors_raw, metadata, file_path = item
+            # Legacy 4-tuple items carry no generation and are treated as
+            # trusted (never superseded).
+            if len(item) == 5:
+                block_hash, tensors_raw, metadata, file_path, generation = item
+            else:
+                block_hash, tensors_raw, metadata, file_path = item
+                generation = None
             try:
                 write_succeeded = self._write_block_file(
-                    block_hash, tensors_raw, metadata, file_path, source="background"
+                    block_hash,
+                    tensors_raw,
+                    metadata,
+                    file_path,
+                    source="background",
+                    generation=generation,
                 )
                 if write_succeeded:
-                    self._mark_hot_cache_clean(block_hash)
+                    self._mark_hot_cache_clean(block_hash, generation)
                 self._clear_pending_write(
-                    block_hash, remove_hot_cache=not self._hot_cache_enabled
+                    block_hash,
+                    remove_hot_cache=not self._hot_cache_enabled,
+                    generation=generation,
                 )
             finally:
                 # Avoid pinning the last raw tensor-byte batch while the
                 # writer thread blocks waiting for more work.
                 item = None
-                block_hash = tensors_raw = metadata = file_path = None
+                block_hash = tensors_raw = metadata = file_path = generation = None
 
     def save_block(
         self,
@@ -4008,7 +4110,9 @@ class PagedSSDCacheManager(CacheManager):
 
             # Track pending write
             with self._pending_write_hashes_lock:
+                generation = self._next_block_write_generation(block_hash)
                 self._pending_write_hashes.add(block_hash)
+            cache_entry["write_generation"] = generation
 
             # Enqueue full file write for background thread. Wait on Full so
             # transient bursts (faster than the writer can drain) don't
@@ -4016,7 +4120,7 @@ class PagedSSDCacheManager(CacheManager):
             try:
                 with self._persistence_io():
                     self._write_queue.put(
-                        (block_hash, tensors_raw, metadata, file_path),
+                        (block_hash, tensors_raw, metadata, file_path, generation),
                         timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
                     )
             except queue.Full:
@@ -4031,8 +4135,11 @@ class PagedSSDCacheManager(CacheManager):
                     metadata,
                     file_path,
                     source="inline-fallback",
+                    generation=generation,
                 )
-                self._clear_pending_write(block_hash, remove_hot_cache=True)
+                self._clear_pending_write(
+                    block_hash, remove_hot_cache=True, generation=generation
+                )
                 if not ok:
                     return False
                 self._stats["saves"] += 1
@@ -5662,6 +5769,7 @@ class PagedSSDCacheManager(CacheManager):
         with self._pending_write_hashes_lock:
             self._pending_write_buffers.clear()
             self._pending_write_hashes.clear()
+            self._block_write_generation.clear()
 
         logger.debug("PagedSSDCacheManager closed")
 

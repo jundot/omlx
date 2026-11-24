@@ -5062,3 +5062,101 @@ class TestManagersShareOneDirectory:
         c = self._open(tmp_path, "a", 1 << 30)
         assert c._tracked_ssd_size() == 0
         c.close()
+
+
+class TestInflightWriteSupersession:
+    """Regression tests for jundot/omlx#5543 (in-flight write races).
+
+    When the bounded write queue is saturated, ``save_block`` falls back to
+    an inline write. A stale background write for the same block that was
+    already dequeued is still in flight and must not clobber the
+    replacement: a successful stale write must not rename over the new
+    file, and a failed stale write must not unlink the new file or drop
+    its index entry.
+    """
+
+    BLOCK = b"same_block_hash_"
+    FILLER = b"queue_filler____"
+
+    @pytest.fixture
+    def mx(self):
+        import mlx.core as mx
+
+        return mx
+
+    @staticmethod
+    def _save(manager: PagedSSDCacheManager, mx, block_hash: bytes, fill: float, **kwargs):
+        kv = mx.full((1, 2, 16, 16), fill)
+        return manager.save_block(
+            block_hash=block_hash,
+            cache_data=[(kv, kv)],
+            token_count=16,
+            model_name="m",
+            layer_cache_types=["KVCache"],
+            **kwargs,
+        )
+
+    @classmethod
+    def _on_disk_value(cls, manager: PagedSSDCacheManager, mx) -> float | None:
+        path = manager._get_file_path(cls.BLOCK)
+        if not path.exists():
+            return None
+        arrays = mx.load(str(path))
+        return float(arrays[sorted(arrays)[0]].reshape(-1)[0])
+
+    @pytest.mark.parametrize("older_write_fails", [False, True])
+    def test_stale_inflight_write_cannot_clobber_replacement(
+        self, tmp_path: Path, monkeypatch, mx, older_write_fails: bool
+    ):
+        """The replacement must survive its stale in-flight predecessor.
+
+        older_write_fails=False: the stale write completes after the
+        inline replacement and must not rename over the new file.
+        older_write_fails=True: the stale write fails and must not unlink
+        the new file or remove its index entry.
+        """
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        # A one-slot write queue: the in-flight write fills it, so the
+        # replacement save falls back to an inline write.
+        monkeypatch.setattr(
+            ssd_mod, "_PENDING_WRITE_PUT_TIMEOUT_SECONDS", 0.05
+        )
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd",
+            max_size_bytes=100 * 1024**2,
+            expected_block_size_tokens=2048,
+            expected_kv_bytes_per_token=10**12,
+        )
+
+        release, started = threading.Event(), threading.Event()
+        write = manager._write_block_file
+
+        def held(*args, **kwargs):  # the background writer pauses mid-write
+            if kwargs.get("source") == "background":
+                started.set()
+                release.wait(30)
+            return write(*args, **kwargs)
+
+        monkeypatch.setattr(manager, "_write_block_file", held)
+        try:
+            self._save(manager, mx, self.BLOCK, 1.0)  # older in-flight write
+            assert started.wait(5), "background write never started"
+            self._save(manager, mx, self.FILLER, 0.0)  # fills the only slot
+            self._save(
+                manager, mx, self.BLOCK, 2.0, replace_existing=True
+            )  # written inline
+            if older_write_fails:
+                # The inline replacement has already committed; the injected
+                # error can only hit the stale in-flight write.
+                def boom(*args, **kwargs):
+                    raise OSError(errno.EIO, "injected")
+
+                monkeypatch.setattr(ssd_mod, "_write_safetensors_no_mx", boom)
+            release.set()
+            assert manager.wait_for_pending_writes(10)
+            assert self._on_disk_value(manager, mx) == 2.0
+            assert manager._index.contains(self.BLOCK)
+        finally:
+            release.set()
+            manager.close()
