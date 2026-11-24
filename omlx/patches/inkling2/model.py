@@ -844,6 +844,12 @@ def _cumsum(xs):
 # every new chunk length would otherwise retrace all layers.
 _COMPILED_MAX_TOKENS = 16
 
+# Decode and verify forwards queue every this many layer visits. Each visit is
+# many small dependent ops, so building a forward's graph takes the host a few
+# ms; queuing early lets the GPU run one visit while the host builds the next.
+# The last visit is left to the caller's eval. Values are unchanged.
+_EVAL_EVERY = 1
+
 
 class Inkling2Layer(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int, w13_spec: dict, w2_spec: dict):
@@ -1159,6 +1165,8 @@ class Inkling2TextModel(nn.Module):
         else:
             h = self.embed_norm(self.embed(inputs))
         visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
+        eval_every = _EVAL_EVERY if h.shape[1] <= _COMPILED_MAX_TOKENS else 0
+        last = len(visits) - 1
         blocks: list = []
         prelude = bank = tau = None
         for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
@@ -1186,6 +1194,8 @@ class Inkling2TextModel(nn.Module):
                 bank=bank if loop_pass else None,
                 tau=None if layer.sliding else tau,
             )
+            if eval_every and visit < last and (visit + 1) % eval_every == 0:
+                mx.async_eval(h)
         _keep_fp32_weight(self.norm)
         norm_w = _fp32_norm_stack(self, (self.norm,), "final")
         fused = None
