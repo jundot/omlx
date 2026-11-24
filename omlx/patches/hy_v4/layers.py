@@ -721,6 +721,30 @@ class Attention(nn.Module):
         q_latent = self.embed_q(q_nope)
         rows = mx.arange(total - length, total)
         mask = as_4d_mask(mask)
+        if (
+            self.kind == "sparse"
+            and verify_dispatch.eligible(length)
+            and topk is not None
+            and b == 1
+            and heads == 32
+            and topk.shape[-1] == 2048
+            and q_pe.shape[-1] == k_pe.shape[-1] == 64
+            and q_latent.shape[-1] == latent.shape[-1] == 512
+            and q_latent.dtype
+            == q_pe.dtype
+            == latent.dtype
+            == k_pe.dtype
+            == sinks.dtype
+            and latent.dtype in (mx.bfloat16, mx.float16)
+        ):
+            # The Metal implementation is only needed on the supported path.
+            from .verify_sparse import attend as attend_sparse_verify
+
+            return self.unembed_out(
+                attend_sparse_verify(
+                    q_latent, q_pe, latent, k_pe, topk, mask, sinks, self.scale
+                )
+            )
         if topk is None:
             keep = rows[:, None] >= mx.arange(total)
             if mask is not None:

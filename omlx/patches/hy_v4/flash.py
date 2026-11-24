@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import exact, indexing
+from . import exact, indexing, verify_dispatch
 from .config import TextConfig
 from .engram_ssd import open_embedding
 from .rope import TrailingRoPE, rope_at, rotate, rotate_pairs
@@ -16,6 +18,25 @@ _ROW_CHUNK = 256
 _FP8_MAX = 448.0
 # The Engram norms use PyTorch's default eps, the fp32 machine epsilon.
 _ENGRAM_EPS = float(np.finfo(np.float32).eps)
+
+
+@partial(mx.compile, shapeless=True)
+def _short_index_scores(dots, weights):
+    return (mx.maximum(dots, 0) * weights).sum(axis=1)
+
+
+@partial(mx.compile, shapeless=True)
+def _short_index_mask(logits, columns, own, valid):
+    keep = (columns < own[..., None]) & valid[:, None]
+    return mx.where(keep, logits, -mx.inf)
+
+
+@partial(mx.compile, shapeless=True)
+def _short_index_slots(chosen, values, left, own, total, expand, ratio):
+    picks = mx.where(values > -mx.inf, left[:, None, None] + chosen * ratio, total)
+    own_slots = left[:, None, None] + own[..., None] * ratio
+    slots = mx.concatenate((picks, own_slots), axis=-1).astype(mx.int32)
+    return (slots[..., None] + expand).flatten(-2)[:, None]
 
 
 class CompressedIndexer(nn.Module):
@@ -161,6 +182,24 @@ class CompressedIndexer(nn.Module):
         q = q.astype(mx.float32)
         w = w.swapaxes(-1, -2)[..., None]
         keys_t = groups[:, None].swapaxes(-1, -2)
+        if (
+            verify_dispatch.eligible(length)
+            and b == 1
+            and self.n_heads == 16
+            and self.ratio == 4
+            and cache is not None
+        ):
+            logits = _short_index_mask(
+                _short_index_scores(q @ keys_t, w),
+                mx.arange(count)[None, None],
+                own,
+                valid,
+            )
+            chosen = mx.argpartition(-logits, kth=keep - 1, axis=-1)[..., :keep]
+            values = mx.take_along_axis(logits, chosen, axis=-1)
+            return _short_index_slots(
+                chosen, values, left, own, mx.array(total), expand, mx.array(self.ratio)
+            )
         out = []
         for lo in range(0, length, _ROW_CHUNK):
             hi = min(length, lo + _ROW_CHUNK)
