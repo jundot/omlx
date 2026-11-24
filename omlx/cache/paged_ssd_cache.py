@@ -29,8 +29,9 @@ import struct
 import threading
 import time
 import uuid
-from collections import OrderedDict
-from dataclasses import dataclass
+import weakref
+from collections import Counter, OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -1255,18 +1256,27 @@ class PagedSSDCacheIndex:
     Thread-safe for concurrent access.
     """
 
-    def __init__(self, max_size_bytes: int):
+    def __init__(
+        self, max_size_bytes: int, directory: PagedSSDCacheIndex | None = None
+    ):
         """
         Initialize the SSD cache index.
 
         Args:
             max_size_bytes: Maximum total size of SSD cache files.
+            directory: Index of every block file in the cache directory. It
+                receives each change and drops removed blocks from all views.
         """
         self._index: dict[bytes, PagedSSDBlockMetadata] = {}
         self._lru: OrderedDict[bytes, float] = OrderedDict()
         self._total_size: int = 0
         self._max_size: int = max_size_bytes
-        self._lock = threading.RLock()
+        self._directory = directory
+        self._views: weakref.WeakSet[PagedSSDCacheIndex] = weakref.WeakSet()
+        self._lock = threading.RLock() if directory is None else directory._lock
+        if directory is not None:
+            with self._lock:
+                directory._views.add(self)
 
     def add(self, metadata: PagedSSDBlockMetadata) -> None:
         """
@@ -1285,6 +1295,9 @@ class PagedSSDCacheIndex:
             self._index[metadata.block_hash] = metadata
             self._lru[metadata.block_hash] = metadata.last_access
             self._total_size += metadata.file_size
+            if self._directory is not None:
+                # Each index adjusts its own total from its own entry's size.
+                self._directory.add(replace(metadata))
 
     def sort_lru_by_last_access(self) -> None:
         """Restore LRU ordering from each entry's last access timestamp."""
@@ -1330,6 +1343,10 @@ class PagedSSDCacheIndex:
             metadata = self._index.pop(block_hash)
             del self._lru[block_hash]
             self._total_size -= metadata.file_size
+            if self._directory is not None:
+                self._directory.remove(block_hash)
+            for view in self._views:
+                view.remove(block_hash)
             return metadata
 
     def touch(self, block_hash: bytes) -> None:
@@ -1344,6 +1361,8 @@ class PagedSSDCacheIndex:
                 self._index[block_hash].touch()
                 self._lru.move_to_end(block_hash)
                 self._lru[block_hash] = self._index[block_hash].last_access
+                if self._directory is not None:
+                    self._directory.touch(block_hash)
 
     def get_lru_entries(self, count: int) -> list[PagedSSDBlockMetadata]:
         """
@@ -1410,6 +1429,11 @@ class PagedSSDCacheIndex:
         with self._lock:
             return block_hash in self._index
 
+    def view_of(self, block_hash: bytes) -> PagedSSDCacheIndex:
+        """Return a view that holds the block, or this index."""
+        with self._lock:
+            return next((v for v in self._views if v.contains(block_hash)), self)
+
     @property
     def total_size(self) -> int:
         """Get total size of indexed files."""
@@ -1439,6 +1463,8 @@ class PagedSSDCacheIndex:
             if entry is not None:
                 self._total_size += actual_size - entry.file_size
                 entry.file_size = actual_size
+                if self._directory is not None:
+                    self._directory.update_file_size(block_hash, actual_size)
 
     def get_all_hashes(self) -> list[bytes]:
         """Get all indexed block hashes."""
@@ -1600,6 +1626,8 @@ class _HotCacheBudgetEntry:
     owner: Any
     block_hash: bytes
     size_bytes: int
+    parent_hash: bytes | None = None
+    rooted: bool = True
 
 
 class SharedHotCacheBudget:
@@ -1610,6 +1638,8 @@ class SharedHotCacheBudget:
         self._entries: OrderedDict[tuple[int, bytes], _HotCacheBudgetEntry] = (
             OrderedDict()
         )
+        # Entries per parent.
+        self._children: Counter[tuple[int, bytes | None]] = Counter()
         self._total_bytes = 0
         self._lock = threading.RLock()
 
@@ -1630,17 +1660,44 @@ class SharedHotCacheBudget:
     def touch(self, owner: Any, block_hash: bytes) -> None:
         """Mark an entry as recently used in the global LRU order."""
         with self._lock:
-            key = self._key(owner, block_hash)
-            if key in self._entries:
-                self._entries.move_to_end(key)
+            self._touch(self._key(owner, block_hash))
+
+    def _touch(self, key: tuple[int, bytes]) -> None:
+        entry = self._entries.get(key)
+        if entry is not None:
+            parent = self._entries.get((key[0], entry.parent_hash))
+            entry.rooted = entry.parent_hash is None or (
+                parent is not None and parent.rooted
+            )
+            # Evict a block with a missing ancestor first.
+            self._entries.move_to_end(key, last=entry.rooted)
+
+    def _pop(self, key: tuple[int, bytes]) -> _HotCacheBudgetEntry | None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+            parent = (key[0], entry.parent_hash)
+            self._children[parent] -= 1
+            if not self._children[parent]:
+                del self._children[parent]
+        return entry
+
+    def _oldest(self, protected_hashes: set[bytes]) -> tuple[int, bytes] | None:
+        # A prefix match starts at the root and stops at the first miss, so
+        # evict each chain from its tail.
+        fallback = None
+        for key in self._entries:
+            if key[1] in protected_hashes:
+                continue
+            if key not in self._children:
+                return key
+            fallback = fallback or key
+        return fallback
 
     def forget(self, owner: Any, block_hash: bytes) -> None:
         """Remove one entry from budget accounting if present."""
         with self._lock:
-            key = self._key(owner, block_hash)
-            entry = self._entries.pop(key, None)
-            if entry is not None:
-                self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+            self._pop(self._key(owner, block_hash))
 
     def forget_owner(self, owner: Any) -> None:
         """Remove all entries owned by a cache manager."""
@@ -1648,8 +1705,7 @@ class SharedHotCacheBudget:
         with self._lock:
             keys = [key for key in self._entries if key[0] == owner_id]
             for key in keys:
-                entry = self._entries.pop(key)
-                self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+                self._pop(key)
 
     def clear_all_owners(self) -> int:
         """Clear the hot cache of every manager the budget still references.
@@ -1709,18 +1765,11 @@ class SharedHotCacheBudget:
 
         with self._lock:
             while self._total_bytes > target_bytes and self._entries:
-                victim_key = None
-                victim = None
-                for key, candidate in self._entries.items():
-                    if candidate.block_hash not in protected_hashes:
-                        victim_key = key
-                        victim = candidate
-                        break
-                if victim_key is None or victim is None:
+                victim_key = self._oldest(protected_hashes)
+                if victim_key is None:
                     break
 
-                self._entries.pop(victim_key)
-                self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
+                victim = self._pop(victim_key)
                 victims.append((victim.owner, victim.block_hash, victim.size_bytes))
 
         freed = 0
@@ -1732,33 +1781,51 @@ class SharedHotCacheBudget:
         return freed
 
     def put(
-        self, owner: Any, block_hash: bytes, size_bytes: int
+        self,
+        owner: Any,
+        block_hash: bytes,
+        size_bytes: int,
+        parent_hash: bytes | None = None,
     ) -> list[tuple[Any, bytes]]:
         """Account an entry and return globally-evicted owners/block hashes."""
         victims: list[tuple[Any, bytes]] = []
         size_bytes = max(0, int(size_bytes))
         with self._lock:
             key = self._key(owner, block_hash)
-            old = self._entries.pop(key, None)
-            if old is not None:
-                self._total_bytes = max(0, self._total_bytes - old.size_bytes)
-
+            self._pop(key)
             self._entries[key] = _HotCacheBudgetEntry(
                 owner=owner,
                 block_hash=block_hash,
                 size_bytes=size_bytes,
+                parent_hash=parent_hash,
             )
+            self._children[key[0], parent_hash] += 1
             self._total_bytes += size_bytes
 
-            while self._total_bytes > self.max_bytes and self._entries:
-                victim_key, victim = self._entries.popitem(last=False)
-                if victim_key == key and not self._entries:
-                    self._entries[victim_key] = victim
+            self._touch(key)
+
+            while self._total_bytes > self.max_bytes:
+                victim_key = self._oldest(set())
+                if victim_key == key and len(self._entries) == 1:
                     break
-                self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
+                victim = self._pop(victim_key)
                 victims.append((victim.owner, victim.block_hash))
 
         return victims
+
+
+class _SSDDirectory:
+    """Files in one SSD cache directory, shared by every open manager on it."""
+
+    def __init__(self, max_size_bytes: int):
+        self.blocks = PagedSSDCacheIndex(max_size_bytes)
+        self.gdn_sidecars = GDNCheckpointIndex(max_size_bytes)
+
+
+_SSD_DIRECTORIES: weakref.WeakValueDictionary[Path, _SSDDirectory] = (
+    weakref.WeakValueDictionary()
+)
+_SSD_DIRECTORIES_LOCK = threading.Lock()
 
 
 class PagedSSDCacheManager(CacheManager):
@@ -1861,12 +1928,20 @@ class PagedSSDCacheManager(CacheManager):
         self._cache_dir = cache_dir
         self._auto_size = auto_size
         self._max_size = max_size_bytes
-        self._index = PagedSSDCacheIndex(max_size_bytes)
-        self._incompatible_index = PagedSSDCacheIndex(max_size_bytes)
+        # Released in close(), so a directory with no open manager is rescanned.
+        self._ssd_directory: _SSDDirectory | None = _SSDDirectory(max_size_bytes)
+        if cache_dir is not None and not hot_cache_only:
+            with _SSD_DIRECTORIES_LOCK:
+                self._ssd_directory = _SSD_DIRECTORIES.setdefault(
+                    Path(cache_dir), self._ssd_directory
+                )
+        self._directory_index = self._ssd_directory.blocks
+        # Blocks this manager can read; a view of ``_directory_index``.
+        self._index = PagedSSDCacheIndex(max_size_bytes, self._directory_index)
         # Durable GDN checkpoints are kept in a separate namespace and never
         # promoted into the raw-byte hot cache.  They still consume the same
-        # shared SSD budget as the two main block indexes.
-        self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
+        # shared SSD budget as the main block index.
+        self._gdn_sidecar_index = self._ssd_directory.gdn_sidecars
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
@@ -2017,7 +2092,8 @@ class PagedSSDCacheManager(CacheManager):
                 disk_info = (
                     f", disk_free={format_bytes(du.free)}, "
                     f"cache_used={format_bytes(self._tracked_ssd_size())}, "
-                    f"incompatible_files={self._incompatible_index.count}"
+                    f"incompatible_files="
+                    f"{self._directory_index.count - self._index.count}"
                 )
             except OSError:
                 pass
@@ -2088,7 +2164,10 @@ class PagedSSDCacheManager(CacheManager):
                 self._hot_cache[block_hash] = entry
                 self._hot_cache_total_bytes += entry_size
 
-            victims = self._hot_cache_budget.put(self, block_hash, entry_size)
+            metadata = entry.get("block_metadata")
+            victims = self._hot_cache_budget.put(
+                self, block_hash, entry_size, getattr(metadata, "parent_hash", None)
+            )
             for owner, victim_hash in victims:
                 evicted = owner._hot_cache_remove(victim_hash, update_budget=False)
                 if evicted is not None:
@@ -2159,7 +2238,6 @@ class PagedSSDCacheManager(CacheManager):
         # 2. Index second — makes the block discoverable in has_block/contains.
         if not self._index.contains(block_hash):
             self._enforce_size_limit_for_new_block(blk_meta.file_size)
-            self._incompatible_index.remove(block_hash)
             self._index.add(blk_meta)
 
         # 3. Queue third — enqueue for background writer.
@@ -2445,25 +2523,17 @@ class PagedSSDCacheManager(CacheManager):
                 os.close(root_fd)
 
     def _tracked_ssd_size(self) -> int:
-        """Return all tracked main-KV and GDN-sidecar bytes.
+        """Return all main-KV and GDN-sidecar bytes in the cache directory.
 
         Sidecars deliberately share the configured SSD budget with main KV
         files, so a long GDN history cannot grow without participating in the
         same size enforcement path.
         """
-        return (
-            self._index.total_size
-            + self._incompatible_index.total_size
-            + self._gdn_sidecar_index.total_size
-        )
+        return self._directory_index.total_size + self._gdn_sidecar_index.total_size
 
     def _tracked_ssd_count(self) -> int:
         """Return the count of tracked main-KV and GDN-sidecar files."""
-        return (
-            self._index.count
-            + self._incompatible_index.count
-            + self._gdn_sidecar_index.count
-        )
+        return self._directory_index.count + self._gdn_sidecar_index.count
 
     def _scan_existing_files(self) -> None:
         """Scan cache directory for existing files and build the compatible index.
@@ -2482,6 +2552,7 @@ class PagedSSDCacheManager(CacheManager):
         errors = 0
         orphaned_tmp_cleaned = 0
         unreadable_orphans = 0
+        added: list[PagedSSDBlockMetadata] = []
 
         for subdir in self.SUBDIR_CHARS:
             subdir_path = self._cache_dir / subdir
@@ -2510,12 +2581,19 @@ class PagedSSDCacheManager(CacheManager):
                         else:
                             unreadable_orphans += 1
                         continue
+                    known = self._directory_index.get(metadata.block_hash)
+                    if known is not None:
+                        # Another manager's reads are newer than the file mtime.
+                        metadata.last_access = known.last_access
                     if not self._is_compatible_block(metadata):
                         skipped_incompatible += 1
                         skipped_incompatible_bytes += metadata.file_size
-                        self._incompatible_index.add(metadata)
+                        if known is None:
+                            self._directory_index.add(metadata)
+                            added.append(metadata)
                         continue
                     self._index.add(metadata)
+                    added.append(metadata)
                     indexed += 1
                 except Exception as e:
                     logger.warning(f"Failed to read {file_path}: {e}")
@@ -2525,8 +2603,12 @@ class PagedSSDCacheManager(CacheManager):
             self._scan_existing_gdn_sidecars()
         )
 
-        self._index.sort_lru_by_last_access()
-        self._incompatible_index.sort_lru_by_last_access()
+        # Another manager can evict a file after this scan read its header.
+        for metadata in added:
+            if not metadata.file_path.exists():
+                self._directory_index.remove(metadata.block_hash)
+
+        self._directory_index.sort_lru_by_last_access()
         self._gdn_sidecar_index.sort_lru_by_last_access()
 
         log_msg = (
@@ -2617,7 +2699,8 @@ class PagedSSDCacheManager(CacheManager):
                         created_at=stat_result.st_ctime,
                         last_access=stat_result.st_mtime,
                     )
-                    self._gdn_sidecar_index.add(metadata)
+                    if not self._gdn_sidecar_index.contains(source_hash, digest):
+                        self._gdn_sidecar_index.add(metadata)
                     indexed += 1
                     total_bytes += stat_result.st_size
                 except (OSError, ValueError) as e:
@@ -3335,6 +3418,7 @@ class PagedSSDCacheManager(CacheManager):
                     )
                     with contextlib.suppress(Exception):
                         file_path.unlink()
+                    self._directory_index.remove(block_hash)
                 return True
             except Exception as e:
                 if isinstance(e, OSError) and e.errno in (
@@ -3945,7 +4029,6 @@ class PagedSSDCacheManager(CacheManager):
             self._enforce_size_limit_for_new_block(estimated_size)
 
             # SSD path: add to index for SSD file tracking
-            self._incompatible_index.remove(block_hash)
             self._index.add(block_metadata)
 
             # Hot cache disabled: use temporary buffer + immediate SSD write
@@ -4439,6 +4522,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": blk_meta.model_name,
                 "block_size": blk_meta.block_size,
                 "cache_signature": blk_meta.cache_signature,
+                "parent_hash": blk_meta.parent_hash,
                 "layer_cache_types": entry["layer_cache_types"],
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
@@ -4475,6 +4559,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": blk_meta.model_name,
                 "block_size": blk_meta.block_size,
                 "cache_signature": blk_meta.cache_signature,
+                "parent_hash": blk_meta.parent_hash,
                 "layer_cache_types": entry["layer_cache_types"],
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
@@ -4548,6 +4633,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": block_metadata.model_name,
                 "block_size": block_metadata.block_size,
                 "cache_signature": block_metadata.cache_signature,
+                "parent_hash": block_metadata.parent_hash,
                 "layer_cache_types": layer_cache_types,
                 "layer_meta_states": block_metadata.layer_meta_states,
             }
@@ -4959,7 +5045,7 @@ class PagedSSDCacheManager(CacheManager):
 
             metadata = self._index.remove(block_hash)
             if metadata is not None:
-                self._incompatible_index.add(metadata)
+                self._directory_index.add(metadata)
                 removed = True
 
             return removed
@@ -4983,10 +5069,7 @@ class PagedSSDCacheManager(CacheManager):
                 self._pending_write_buffers.pop(block_hash, None)
                 self._pending_write_hashes.discard(block_hash)
 
-            metadata = self._index.remove(block_hash)
-            incompatible_metadata = self._incompatible_index.remove(block_hash)
-            if metadata is None:
-                metadata = incompatible_metadata
+            metadata = self._directory_index.remove(block_hash)
             if metadata is None:
                 return False
 
@@ -5065,11 +5148,11 @@ class PagedSSDCacheManager(CacheManager):
     ) -> list[tuple[Any, Any]]:
         """Remove globally oldest tracked main or sidecar files.
 
-        Main compatible blocks, incompatible blocks, and GDN sidecars share a
-        single deterministic LRU walk.  Equal timestamps are resolved in the
-        fixed order compatible, incompatible, sidecar, then by the index's
-        stable key ordering.  This keeps the configured SSD limit safe while
-        avoiding a second, competing budget for GDN history.
+        Main blocks of every model and GDN sidecars share a single
+        deterministic LRU walk.  Equal timestamps are resolved in the fixed
+        order block, sidecar, then by the index's stable key ordering.  This
+        keeps the configured SSD limit safe while avoiding a second, competing
+        budget for GDN history.
         """
         evicted: list[tuple[Any, Any]] = []
 
@@ -5077,30 +5160,21 @@ class PagedSSDCacheManager(CacheManager):
             if max_count is not None and len(evicted) >= max_count:
                 break
 
-            compatible = self._index.get_lru_entries(1)
-            incompatible = self._incompatible_index.get_lru_entries(1)
+            blocks = self._directory_index.get_lru_entries(1)
             sidecars = self._gdn_sidecar_index.get_lru_entries(1)
-            candidates: list[tuple[float, int, Any, Any]] = []
-            if compatible:
-                candidates.append((compatible[0].last_access, 0, self._index, compatible[0]))
-            if incompatible:
-                candidates.append(
-                    (incompatible[0].last_access, 1, self._incompatible_index, incompatible[0])
-                )
-            if sidecars:
-                candidates.append(
-                    (sidecars[0].last_access, 2, self._gdn_sidecar_index, sidecars[0])
-                )
-            if not candidates:
+            if not blocks and not sidecars:
                 break
 
-            _, _, source_index, candidate = min(
-                candidates, key=lambda item: (item[0], item[1])
-            )
-            if source_index is self._gdn_sidecar_index:
-                metadata = source_index.remove_key(candidate.key)
+            if sidecars and (
+                not blocks or sidecars[0].last_access < blocks[0].last_access
+            ):
+                source_index = self._gdn_sidecar_index
+                metadata = source_index.remove_key(sidecars[0].key)
             else:
-                metadata = source_index.remove(candidate.block_hash)
+                # Only the owner's view can serve the block again if its
+                # unlink fails, so restore through that view.
+                source_index = self._directory_index.view_of(blocks[0].block_hash)
+                metadata = source_index.remove(blocks[0].block_hash)
             if metadata is not None:
                 evicted.append((source_index, metadata))
 
@@ -5228,7 +5302,7 @@ class PagedSSDCacheManager(CacheManager):
                 metadata.file_path.unlink(missing_ok=True)
             self._stats["evictions"] += 1
         except OSError as e:
-            restore_index = source_index or self._index
+            restore_index = source_index or self._directory_index
             # Restore the index entry so total_size matches disk reality.
             # The re-added entry lands at the LRU tail (most-recently
             # touched), which deprioritises immediate re-eviction.
@@ -5336,12 +5410,19 @@ class PagedSSDCacheManager(CacheManager):
         """
         with self._lock:
             count = 0
-            block_hashes = (
-                self._index.get_all_hashes() + self._incompatible_index.get_all_hashes()
-            )
-            for block_hash in dict.fromkeys(block_hashes):
+            for block_hash in self._directory_index.get_all_hashes():
                 if self.delete_block(block_hash):
                     count += 1
+
+            # Another manager's clear may already have deleted these files.
+            with self._hot_cache_lock:
+                clean = [
+                    block_hash
+                    for block_hash, entry in self._hot_cache.items()
+                    if not entry.get("dirty", True)
+                ]
+            for block_hash in clean:
+                self._hot_cache_remove(block_hash)
 
             for signature_digest, source_block_hash in list(
                 self._gdn_sidecar_index.get_all_keys()
@@ -5435,8 +5516,7 @@ class PagedSSDCacheManager(CacheManager):
             return {
                 metadata.file_path: metadata.file_size
                 for metadata in (
-                    *self._index.get_all_metadata(),
-                    *self._incompatible_index.get_all_metadata(),
+                    *self._directory_index.get_all_metadata(),
                     *self._gdn_sidecar_index.get_all_metadata(),
                 )
             }
@@ -5467,8 +5547,7 @@ class PagedSSDCacheManager(CacheManager):
             tracked_entries = [
                 metadata
                 for metadata in (
-                    *self._index.get_all_metadata(),
-                    *self._incompatible_index.get_all_metadata(),
+                    *self._directory_index.get_all_metadata(),
                     *self._gdn_sidecar_index.get_all_metadata(),
                 )
                 if _matches(metadata.model_name)
@@ -5612,6 +5691,7 @@ class PagedSSDCacheManager(CacheManager):
             self._hot_cache_total_bytes = 0
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
+        self._ssd_directory = None
         with self._pending_write_hashes_lock:
             self._pending_write_buffers.clear()
             self._pending_write_hashes.clear()

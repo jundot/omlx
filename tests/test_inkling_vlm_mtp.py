@@ -502,7 +502,7 @@ _TINY_VISION = dict(
 # that bf16 noise into chunking-dependent logits.
 _TINY_LOOP = dict(
     formats=("mxfp8",) * 18,
-    loop_config=dict(core_start=6, core_end=12, num_passes=3, gate_rank=8),
+    loop_config=dict(core_start=6, core_end=12, num_passes=3, gate_rank=64),
 )
 
 
@@ -549,6 +549,9 @@ def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None, **dims)
             weights.append((name, value))
         else:
             noise = mx.random.normal(value.shape) * 0.05
+            if name.endswith(("loop_down", "loop_gain_forget")):
+                # Checkpoints ship the controllers as BF16 values.
+                noise = noise.astype(mx.bfloat16)
             weights.append((name, noise.astype(value.dtype)))
     model.load_weights(weights)
     return model
@@ -608,6 +611,48 @@ def test_inkling2_loop_controller_ignores_prefill_chunking():
         full = _mix_messages(x, msg, down, gates)
         part = _mix_messages(x[:, :, :1000], msg[:, :, :1000], down, gates)
         assert mx.array_equal(part, full[:, :, :1000])
+
+
+def test_inkling2_bf16_loop_kernels_match_the_fp32_path():
+    import mlx.nn as nn
+
+    from omlx.patches.inkling2.model import _bf16_loop_weights, _mix_messages_normed
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernels")
+    hidden, rank = 2304, 64
+    mx.random.seed(5)
+    layer = nn.Module()
+    layer.loop_down = mx.random.normal((4, 2, hidden, rank)) * 0.05
+    layer.loop_gain_forget = mx.random.normal((4, rank, 2 * hidden)) * 0.05
+    # Weights that BF16 cannot hold exactly keep the FP32 path.
+    assert _bf16_loop_weights(layer) is None
+    for name in ("loop_down", "loop_gain_forget"):
+        value = getattr(layer, name).astype(mx.bfloat16).astype(mx.float32)
+        setattr(layer, name, value)
+    packed = _bf16_loop_weights(layer)
+    messages = mx.random.normal((2, 4, 4, hidden))
+    # Full and sliding attention inputs, then the MLP input.
+    for m0, n, qx, bf16 in (
+        (0, 3, 3, packed[0]),
+        (0, 3, 1, packed[0]),
+        (3, 1, 1, packed[1]),
+    ):
+        args = (
+            mx.random.normal((2, 4, qx, hidden)),
+            messages,
+            m0,
+            n,
+            layer.loop_down[m0 : m0 + n],
+            layer.loop_gain_forget[m0 : m0 + n],
+            mx.ones((qx, hidden)),
+            1e-6,
+            mx.bfloat16,
+        )
+        want = _mix_messages_normed(*args, want_f32=True)[1]
+        got = _mix_messages_normed(*args, want_f32=True, bf16_weights=bf16)[1]
+        # The paths sum in different orders, so low can round one BF16 ULP apart.
+        assert mx.allclose(got, want, rtol=1e-2, atol=1e-2)
 
 
 def test_inkling2_loop_model_type_uses_inkling2(tmp_path):
@@ -825,12 +870,13 @@ def test_inkling2_restored_state_decodes_and_joins_like_the_live_one():
             assert a.batch_size == 2
 
 
+@pytest.mark.parametrize("proj", ["quantized", "dense"])
 @pytest.mark.parametrize("width", [8, 16])
 @pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
-def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width):
-    """With its projections quantized, each verify row has the bits of the
-    serial decode step for its token, also when an unflagged forward of the
-    verify width traced the compiled layers first."""
+def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width, proj):
+    """With quantized projections, or BF16 dense ones as in the release, each
+    verify row has the bits of the serial decode step for its token, also when
+    an unflagged forward of the verify width traced the compiled layers first."""
     import mlx.nn as nn
 
     from omlx.patches.qwen35_verify_qmm import (
@@ -844,13 +890,15 @@ def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width):
     # Eight experts a token, so an 8-row block routes the 64 pairs that the
     # gather would otherwise sort.
     model = _inkling2_tiny(num_experts_per_tok=8, **dims)
-    assert not model._omlx_mtp_row_exact_verify
-    nn.quantize(
-        model,
-        group_size=64,
-        bits=8,
-        class_predicate=lambda _, m: isinstance(m, nn.Linear),
-    )
+    if proj == "quantized":
+        nn.quantize(
+            model,
+            group_size=64,
+            bits=8,
+            class_predicate=lambda _, m: isinstance(m, nn.Linear),
+        )
+    else:
+        model = _bf16(model)
     assert model._omlx_mtp_row_exact_verify
     ids = mx.random.randint(0, 300, (1, 40 + width))
     model(ids[:, :width], cache=model.make_cache())
@@ -858,6 +906,8 @@ def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width):
     def prefilled():
         cache = model.make_cache()
         model(ids[:, :40], cache=cache)
+        # As the server does after each prefill chunk.
+        mx.eval([c.state for c in cache])
         return cache
 
     cache = prefilled()
@@ -872,6 +922,9 @@ def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width):
         set_verify_qmm_armed(False)
     for row, expected in enumerate(serial):
         assert mx.array_equal(block[row], expected)
+    if dims:
+        # The looped rows ran the BF16 controller kernels.
+        assert model.model.layers[6].__dict__["_omlx_loop_bf16"][2] is not None
 
 
 def test_inkling2_fused_kernels_match_reference():
@@ -1022,6 +1075,69 @@ def test_inkling2_compiled_tails_keep_the_eager_bits():
     expected = swiglu(scaled[..., 0::2], scaled[..., 1::2], *caps)
     got = swiglu(y[..., 0::2], y[..., 1::2], *caps, s)
     assert mx.array_equal(got, expected)
+
+
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+def test_inkling2_fused_layer_kernels_keep_the_mlx_bits(dims, monkeypatch):
+    """The kernels that fold a layer's small ops together (projection
+    epilogue, attention-residual norms, loop controllers, expert sum) give the
+    MLX ops' bits on eager prefill chunks and compiled decode rows."""
+    if mx.default_device() != mx.gpu:
+        pytest.skip("fused kernels are GPU-only")
+    from omlx.patches.inkling2 import kernels
+
+    # The BF16 controller kernels keep row-exactness only, not these bits.
+    monkeypatch.setattr(kernels, "loop_bf16_supported", lambda *a: False)
+    # 128-wide heads: the projection epilogue covers that width only.
+    wide = dict(
+        head_dim=128,
+        swa_head_dim=128,
+        num_attention_heads=2,
+        swa_num_attention_heads=2,
+        num_key_value_heads=1,
+        swa_num_key_value_heads=1,
+    )
+    ids = mx.random.randint(0, 300, (1, 20))
+
+    def run(model):
+        from mlx.utils import tree_flatten
+
+        # BF16 activations, with the FP32 tensors the loader keeps.
+        keep = model.cast_predicate
+        cast = [
+            (k, v.astype(mx.bfloat16))
+            for k, v in tree_flatten(model.parameters())
+            if v.dtype == mx.float32 and keep(k)
+        ]
+        model.load_weights(cast, strict=False)
+        cache = model.make_cache()
+        outs = [model(ids[:, :17], cache=cache)]
+        outs += [model(ids[:, t : t + 1], cache=cache) for t in range(17, 20)]
+        mx.eval(outs)
+        return outs
+
+    names = ("qkv_post", "attn_res_fused", "moe_short_conv", "loop_message_outputs")
+    used = dict.fromkeys(names, 0)
+    for name in names:
+        original = getattr(kernels, name)
+
+        def spy(*args, _original=original, _name=name, **kwargs):
+            out = _original(*args, **kwargs)
+            used[_name] += out is not None
+            return out
+
+        monkeypatch.setattr(kernels, name, spy)
+    fused = run(_inkling2_tiny(**wide, **dims))
+    expected_used = set(names) - (set() if dims else {"loop_message_outputs"})
+    assert {n for n, count in used.items() if count} == expected_used
+
+    for name in ("qkv_post", "attn_res_fused", "moe_short_conv"):
+        monkeypatch.setattr(kernels, name, lambda *a, **k: None)
+    monkeypatch.setattr(kernels, "loop_messages_supported", lambda *a: False)
+    # A fresh model: compiled layer stages keep the graph of their first trace.
+    reference = run(_inkling2_tiny(**wide, **dims))
+    for got, want in zip(fused, reference):
+        assert mx.array_equal(got, want)
 
 
 def test_inkling2_model_is_freed_without_cyclic_gc():
@@ -1385,3 +1501,242 @@ def test_inkling2_varloop_single_pass_and_dspark_visit_guard(tmp_path):
             json.dumps({"model_type": "inkling2_loop", "text_config": override_text, "mtp_config": mtp})
         )
         assert bundled_inkling2_dspark_path(tmp_path) is None
+
+
+def _decode_attention_case(batch, heads, kv_heads, length, keys, extent, dtype, dim=64):
+    mx.random.seed(3)
+    q = (mx.random.normal((batch, heads, length, dim)) * 0.3).astype(dtype)
+    # K/V as a slice of a larger cache buffer, as the caches hand them over.
+    shape = (batch, kv_heads, keys + 40, dim)
+    k = (mx.random.normal(shape) * 0.3).astype(dtype)[:, :, 7 : 7 + keys]
+    v = mx.random.normal(shape).astype(dtype)[:, :, 7 : 7 + keys]
+    rel = mx.random.normal((batch, length, heads, extent)).astype(dtype)
+    sink = (mx.random.normal((batch, length, heads)) * 2).astype(dtype)
+    return q, k, v, rel, sink
+
+
+def _small_decode_chunks(monkeypatch, kernels):
+    """Several chunks at test sizes."""
+    monkeypatch.setattr(kernels, "_DECODE_CHUNK", 64)
+    monkeypatch.setattr(kernels, "_DECODE_SLIDING_CHUNK", 16)
+
+
+@pytest.mark.parametrize(
+    "heads, kv_heads, length, keys, window, left_padding",
+    [
+        (6, 2, 1, 1, 0, None),
+        (6, 2, 1, 300, 0, [0, 113]),
+        (6, 2, 1, 90, 32, [0, 70]),
+        (6, 2, 4, 300, 0, [41, 0]),
+        (6, 2, 5, 300, 32, None),
+        (12, 1, 2, 300, 0, None),
+    ],
+)
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_flash_decode_matches_masked_sdpa(
+    heads, kv_heads, length, keys, window, left_padding, dtype, monkeypatch
+):
+    """Batched decode and verify blocks; 300 keys are five chunks of 64, a
+    window of 32 is two chunks of 16, and 12 heads on one KV head fill two
+    simdgroups."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    _small_decode_chunks(monkeypatch, kernels)
+    args = _decode_attention_case(
+        2, heads, kv_heads, length, keys, 32, getattr(mx, dtype)
+    )
+    lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
+    scale = args[0].shape[-1] ** -0.5
+    expected = kernels._masked_attention(*args, scale, window, lp)
+    got = kernels.gqa_flash_decode_attention(
+        *args, scale=scale, window=window, left_padding=lp
+    )
+    routed = kernels.banded_sink_attention(
+        *args, scale=scale, window=window, left_padding=lp
+    )
+    assert mx.array_equal(routed, got)
+    assert got.shape == expected.shape and got.dtype == expected.dtype
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
+    assert diff.item() < 1e-2
+    # Keys strided in the head dimension take the scalar staging loop.
+    q, k, v, rel, sink = args
+    wide = mx.repeat(k, 2, axis=-1)[..., ::2], mx.repeat(v, 2, axis=-1)[..., ::2]
+    strided = kernels.gqa_flash_decode_attention(
+        q, *wide, rel, sink, scale=scale, window=window, left_padding=lp
+    )
+    assert mx.array_equal(strided, got)
+
+
+@pytest.mark.parametrize("window", [0, 32])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_flash_decode_rows_have_the_bits_of_one_row_calls(
+    window, dtype, monkeypatch
+):
+    """Each row of a left-padded batch of verify blocks is the decode step of
+    its token: one query over that row's own keys, alone."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    _small_decode_chunks(monkeypatch, kernels)
+    length, keys, pads = 8, 300, [0, 113]
+    q, k, v, rel, sink = _decode_attention_case(
+        2, 6, 2, length, keys, 32, getattr(mx, dtype)
+    )
+    scale = q.shape[-1] ** -0.5
+    block = kernels.banded_sink_attention(
+        q,
+        k,
+        v,
+        rel,
+        sink,
+        scale=scale,
+        window=window,
+        left_padding=mx.array(pads, dtype=mx.int32),
+    )
+    for row, pad in enumerate(pads):
+        for pos in range(length):
+            end = keys - length + 1 + pos
+            step = kernels.gqa_flash_decode_attention(
+                q[row : row + 1, :, pos : pos + 1],
+                k[row : row + 1, :, pad:end],
+                v[row : row + 1, :, pad:end],
+                rel[row : row + 1, pos : pos + 1],
+                sink[row : row + 1, pos : pos + 1],
+                scale=scale,
+                window=window,
+            )
+            assert mx.array_equal(block[row : row + 1, :, pos : pos + 1], step)
+
+
+
+@pytest.mark.parametrize("length", [1, 4])
+@pytest.mark.parametrize("window, pad", [(0, 0), (0, 7), (32, 0), (32, 280)])
+def test_inkling2_left_padded_row_takes_the_decode_kernel(
+    length, window, pad, monkeypatch
+):
+    """A row left alone in a batch cache keeps its left_padding. Its decode
+    steps and verify blocks take the decode kernel, not the masked path."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    _small_decode_chunks(monkeypatch, kernels)
+    args = _decode_attention_case(1, 6, 2, length, 300, 32, mx.bfloat16)
+    lp = mx.array([pad], dtype=mx.int32)
+    scale = args[0].shape[-1] ** -0.5
+    expected = kernels._masked_attention(*args, scale, window, lp)
+
+    def no_masked(*a, **kw):
+        raise AssertionError("a left-padded row took the masked path")
+
+    monkeypatch.setattr(kernels, "_masked_attention", no_masked)
+    got = kernels.banded_sink_attention(
+        *args, scale=scale, window=window, left_padding=lp
+    )
+    assert mx.array_equal(
+        got,
+        kernels.gqa_flash_decode_attention(
+            *args, scale=scale, window=window, left_padding=lp
+        ),
+    )
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
+    assert diff.item() < 1e-2
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_flash_decode_guards_wide_heads_and_unaligned_keys(dtype):
+    """A head too wide for the kernel's threadgroup memory falls back instead
+    of failing to load, and K/V views whose rows or base are off the 16-byte
+    grid of the vector load have the bits of their contiguous copies."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    dt = getattr(mx, dtype)
+    wide = _decode_attention_case(2, 2, 1, 1, 40, 32, dt, dim=512)
+    assert not kernels._use_flash_decode(wide[0], wide[1])
+    scale = 512**-0.5
+    assert mx.array_equal(
+        kernels.banded_sink_attention(*wide, scale=scale),
+        kernels._masked_attention(*wide, scale, 0, None),
+    )
+
+    q, _, _, rel, sink = _decode_attention_case(1, 6, 2, 1, 300, 32, dt)
+    scale = q.shape[-1] ** -0.5
+    # (buffer width, first row, first column): unaligned rows, unaligned base.
+    for width, row, col in ((71, 8, 0), (72, 7, 1)):
+        shape = (1, 2, 344, width)
+        view = (slice(None), slice(None), slice(row, row + 300), slice(col, col + 64))
+        k = (mx.random.normal(shape) * 0.3).astype(dt)[view]
+        v = mx.random.normal(shape).astype(dt)[view]
+        got = kernels.gqa_flash_decode_attention(
+            q, k, v, rel, sink, scale=scale, window=0
+        )
+        packed = kernels.gqa_flash_decode_attention(
+            q, mx.contiguous(k), mx.contiguous(v), rel, sink, scale=scale, window=0
+        )
+        assert mx.array_equal(got, packed)
+        expected = kernels._masked_attention(q, k, v, rel, sink, scale, 0, None)
+        diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+        assert diff.max().item() < 1e-2
+
+
+def test_inkling2_fits_threadgroup_caches_and_only_swallows_size_errors():
+    from omlx.patches.inkling2 import kernels
+
+    calls = []
+
+    def rejected():
+        calls.append(1)
+        raise ValueError(
+            "Thread group size (576) is greater than  the maximum allowed "
+            "threads per threadgroup (448)."
+        )
+
+    key = ("test-variant", 1)
+    kernels._launch_ok.pop(key, None)
+    try:
+        assert kernels._fits_threadgroup(key, rejected) is False
+        assert kernels._fits_threadgroup(key, rejected) is False
+        assert calls == [1], "a variant is probed once"
+    finally:
+        kernels._launch_ok.pop(key, None)
+
+    def other_error():
+        raise ValueError("shape mismatch")
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        kernels._fits_threadgroup(("test-variant", 2), other_error)
+    assert ("test-variant", 2) not in kernels._launch_ok
+
+
+def test_inkling2_attn_res_fused_falls_back_when_threadgroup_rejected(monkeypatch):
+    """M1-class GPUs cap some fused variants below their 576-thread groups
+    (hidden 2304); those calls must return None so the MLX ops run instead."""
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    hidden = 2304
+    blocks = [mx.random.normal((1, 2, hidden)) for _ in range(4)]
+    args = (
+        blocks,
+        mx.random.normal((1, 2, hidden)),
+        mx.random.normal((3, hidden)),
+        1.0,
+    )
+    kwargs = dict(
+        unit_eps=1e-6,
+        norm_weight=mx.ones((hidden,)),
+        norm_eps=1e-6,
+        out_dtype=mx.float16,
+        want_partial=True,
+    )
+    monkeypatch.setattr(kernels, "_fits_threadgroup", lambda key, launch: False)
+    assert kernels.attn_res_fused(*args, **kwargs) is None
+    monkeypatch.setattr(kernels, "_fits_threadgroup", lambda key, launch: True)
+    monkeypatch.setattr(kernels, "_launch_ok", {})
+    out = kernels.attn_res_fused(*args, **kwargs)
+    assert out is not None

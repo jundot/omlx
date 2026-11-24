@@ -2589,6 +2589,7 @@ class Scheduler:
         self._specprefill_draft_model: Any | None = None
         self._specprefill_default_keep_pct: float | None = None
         self._specprefill_default_threshold: int | None = None
+        self._specprefill_default_enabled = False
         self._draft_paged_ssd_cache_manager: Any | None = None
         self._draft_prefix_cache: Any | None = None
         # Track active specprefill request for RoPE cleanup
@@ -11692,6 +11693,7 @@ class Scheduler:
         draft_model_name: str | None = None,
         keep_pct: float | None = None,
         threshold: int | None = None,
+        default_enabled: bool = True,
     ) -> None:
         """Set the draft model for SpecPrefill scoring.
 
@@ -11705,6 +11707,7 @@ class Scheduler:
         self._specprefill_draft_model = draft_model
         self._specprefill_default_keep_pct = keep_pct
         self._specprefill_default_threshold = threshold
+        self._specprefill_default_enabled = default_enabled
         self._draft_prefix_cache = None
         if not draft_model_name:
             logger.info(

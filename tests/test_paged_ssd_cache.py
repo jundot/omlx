@@ -541,7 +541,7 @@ class TestPagedSSDCacheManager:
 
         assert manager.forget_block(block_hash) is True
         assert not manager._index.contains(block_hash)
-        assert manager._incompatible_index.contains(block_hash)
+        assert manager._directory_index.contains(block_hash)
         assert manager._tracked_ssd_size() == metadata.file_size
 
     def test_clear(self, tmp_path: Path):
@@ -1481,7 +1481,7 @@ class TestPagedSSDCacheManagerWithMLX:
         try:
             assert not manager.has_block(old_hash)
             assert old_path.exists()
-            assert manager._incompatible_index.total_size == old_size
+            assert manager._directory_index.total_size == old_size
 
             new_hash = b"\x81" + b"\x00" * 31
             cache_data = [(mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))]
@@ -1496,7 +1496,7 @@ class TestPagedSSDCacheManagerWithMLX:
 
             assert manager.has_block(new_hash)
             assert not old_path.exists()
-            assert manager._incompatible_index.total_size == 0
+            assert not manager._directory_index.contains(old_hash)
             assert manager._tracked_ssd_size() <= max_size
         finally:
             manager.close()
@@ -2614,7 +2614,7 @@ class TestEffectiveMaxSize:
 
         # Simulate: cache currently has 10GB, disk free is 90GB
         # So disk_available = 10GB + 90GB = 100GB
-        manager._index._total_size = 10 * 1024**3
+        manager._directory_index._total_size = 10 * 1024**3
 
         mock_usage = self._make_disk_usage(
             total=500 * 1024**3, used=410 * 1024**3, free=90 * 1024**3
@@ -2681,7 +2681,7 @@ class TestEffectiveMaxSize:
             )
             with patch("shutil.disk_usage", return_value=mock_usage) as mock_du:
                 assert manager.max_size == expected_gib * 1024**3
-                manager._index._total_size = 100 * 1024**3
+                manager._directory_index._total_size = 100 * 1024**3
                 assert manager.max_size == expected_gib * 1024**3
                 assert mock_du.call_count == 1
                 manager._disk_usage_cache_time -= 31
@@ -2691,7 +2691,7 @@ class TestEffectiveMaxSize:
                 assert manager.max_size == expected_gib * 1024**3
                 assert mock_du.call_count == 2
         finally:
-            manager._index._total_size = 0
+            manager._directory_index._total_size = 0
             manager.close()
 
     def test_utilization_never_exceeds_1(self, tmp_path: Path):
@@ -2703,7 +2703,7 @@ class TestEffectiveMaxSize:
 
         # Simulate: cache has 50GB, but disk only has 10GB free
         # So disk_available = 50GB + 10GB = 60GB, disk_limit = ~59.4GB
-        manager._index._total_size = 50 * 1024**3
+        manager._directory_index._total_size = 50 * 1024**3
 
         mock_usage = self._make_disk_usage(
             total=200 * 1024**3, used=190 * 1024**3, free=10 * 1024**3
@@ -2722,8 +2722,7 @@ class TestEffectiveMaxSize:
             cache_dir=tmp_path / "ssd_cache",
             max_size_bytes=100 * 1024**3,
         )
-        manager._index._total_size = 50 * 1024**3
-        manager._incompatible_index._total_size = 10 * 1024**3
+        manager._directory_index._total_size = 60 * 1024**3
 
         mock_usage = self._make_disk_usage(
             total=200 * 1024**3,
@@ -4955,3 +4954,111 @@ class TestTurboquantBitsSignature:
             assert payload["turboquant_kv_bits"] == 6.0
         finally:
             mgr.close()
+
+
+@pytest.mark.skipif(not _has_mlx(), reason="requires MLX")
+class TestManagersShareOneDirectory:
+    """Managers of different models share one SSD limit and LRU order (#5497)."""
+
+    @staticmethod
+    def _open(cache_dir: Path, model_name: str, max_size: int, **kwargs):
+        return PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name=model_name,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _save(manager: PagedSSDCacheManager, block_hash: bytes) -> Path:
+        import mlx.core as mx
+
+        assert manager.save_block(
+            block_hash,
+            [(mx.zeros((1, 4, 16, 32)), mx.zeros((1, 4, 16, 32)))],
+            16,
+            model_name=manager._expected_model_name,
+            layer_cache_types=["KVCache"],
+        )
+        assert manager.wait_for_pending_writes(5.0)
+        return manager._get_file_path(block_hash)
+
+    @pytest.mark.parametrize("evict_at", ["save", "startup"])
+    def test_eviction_takes_the_coldest_block_of_any_manager(
+        self, tmp_path: Path, evict_at: str
+    ):
+        warm, cold, new = (bytes([i]) * 32 for i in (0x11, 0x12, 0x21))
+        a = self._open(tmp_path, "a", 1 << 30)
+        warm_path = self._save(a, warm)
+        cold_path = self._save(a, cold)
+        # File times do not record reads, so only the live LRU protects it.
+        assert a.load_block(warm) is not None
+        size = warm_path.stat().st_size
+
+        if evict_at == "save":
+            a._max_size = size * 5 // 2
+            b = self._open(tmp_path, "b", size * 5 // 2)
+            self._save(b, new)
+        else:
+            b = self._open(tmp_path, "b", size * 3 // 2)
+        try:
+            assert warm_path.exists() and a.has_block(warm)
+            assert not cold_path.exists() and not a.has_block(cold)
+            on_disk = sum(p.stat().st_size for p in tmp_path.glob("?/*.safetensors"))
+            assert a._tracked_ssd_size() == b._tracked_ssd_size() == on_disk
+        finally:
+            a.close()
+            b.close()
+
+    def test_auto_limit_includes_blocks_of_other_managers(self, tmp_path: Path):
+        free = 1 << 30
+        a = self._open(tmp_path, "a", 1 << 30, auto_size=True)
+        b = self._open(tmp_path, "b", 1 << 30, auto_size=True)
+        try:
+            size = self._save(b, b"\x21" * 32).stat().st_size
+            a._disk_usage_cache = None
+            usage = shutil.disk_usage(tmp_path)._replace(free=free)
+            with patch("shutil.disk_usage", return_value=usage):
+                assert a._get_effective_max_size() == (size + free) // 2
+        finally:
+            a.close()
+            b.close()
+
+    def test_failed_unlink_keeps_the_owners_block(self, tmp_path: Path):
+        a = self._open(tmp_path, "a", 1 << 30)
+        b = self._open(tmp_path, "b", 1 << 30)
+        try:
+            self._save(a, b"\x11" * 32)
+            with patch.object(Path, "unlink", side_effect=PermissionError):
+                for source_index, metadata in b._evict_tracked_until_size(0):
+                    b._unlink_evicted(metadata, source_index)
+            assert a.has_block(b"\x11" * 32)
+        finally:
+            a.close()
+            b.close()
+
+    def test_clear_drops_memory_copies_in_every_manager(self, tmp_path: Path):
+        hot = {"hot_cache_max_bytes": 1 << 30, "hot_cache_write_through": True}
+        a = self._open(tmp_path, "a", 1 << 30, **hot)
+        b = self._open(tmp_path, "b", 1 << 30, **hot)
+        try:
+            self._save(b, b"\x21" * 32)
+            a.clear()
+            b.clear()
+            assert not b.has_block(b"\x21" * 32)
+        finally:
+            a.close()
+            b.close()
+
+    def test_directory_is_rescanned_after_the_last_manager_closes(self, tmp_path: Path):
+        a = self._open(tmp_path, "a", 1 << 30)
+        b = self._open(tmp_path, "b", 1 << 30)
+        path = self._save(a, b"\x11" * 32)
+        a.close()
+        assert b._tracked_ssd_size() == path.stat().st_size
+        b.close()
+
+        path.unlink()
+        c = self._open(tmp_path, "a", 1 << 30)
+        assert c._tracked_ssd_size() == 0
+        c.close()
