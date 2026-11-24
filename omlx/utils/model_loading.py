@@ -17,6 +17,7 @@ from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
+from ..patches.bailing_hybrid import normalize_bailing_hybrid_model_file
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +487,7 @@ def _patch_mlx_lm_load_config() -> None:
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
+        normalize_bailing_hybrid_model_file(cfg)
         normalize_mimo_mxfp4_quant(cfg)
         normalize_inkling2_modelopt_quant(cfg)
         normalize_raon1_mini_model_file(cfg)

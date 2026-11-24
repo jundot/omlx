@@ -996,3 +996,39 @@ def test_oq_preserves_ling_mtp_head(tmp_path, mtp_active):
     model, _ = load_model(output, strict=True)
     assert type(model.mtp[0].eh_proj) is nn.Linear
     assert isinstance(model.mtp[0].mlp.switch_mlp.gate_proj, QuantizedSwitchLinear)
+
+
+def test_normalize_drops_repo_local_bailing_hybrid_file():
+    from omlx.patches.bailing_hybrid import normalize_bailing_hybrid_model_file
+
+    cfg = _minimal_config(model_file="bailing_hybrid.py")
+    out = normalize_bailing_hybrid_model_file(cfg)
+    assert "model_file" not in out
+
+
+def test_normalize_leaves_other_model_files_alone():
+    from omlx.patches.bailing_hybrid import normalize_bailing_hybrid_model_file
+
+    other = _minimal_config(model_file="some_other_model.py")
+    assert normalize_bailing_hybrid_model_file(other)["model_file"] == "some_other_model.py"
+
+    foreign_type = _minimal_config(model_type="llama", model_file="bailing_hybrid.py")
+    assert (
+        normalize_bailing_hybrid_model_file(foreign_type)["model_file"]
+        == "bailing_hybrid.py"
+    )
+
+
+def test_patched_load_config_resolves_ling_without_remote_code(tmp_path):
+    """The checkpoint-local subclass must not shadow the vendored MTP module."""
+    from mlx_lm import utils as lu
+
+    from omlx.utils.model_loading import _patch_mlx_lm_load_config
+
+    _patch_mlx_lm_load_config()
+    (tmp_path / "config.json").write_text(
+        json.dumps(_minimal_config(model_file="bailing_hybrid.py"))
+    )
+    loaded = lu.load_config(tmp_path)
+    assert loaded.get("model_file") is None
+    assert loaded["model_type"] == "bailing_hybrid"

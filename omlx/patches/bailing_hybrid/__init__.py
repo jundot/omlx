@@ -18,6 +18,7 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 from .swiglu_clamp import ensure_swiglu_clamp
 
@@ -104,9 +105,34 @@ def is_applied() -> bool:
     return _APPLIED
 
 
+# The file name used by MLX conversions of Ling 3.x checkpoints.
+REMOTE_MODEL_FILE = "bailing_hybrid.py"
+
+
+def normalize_bailing_hybrid_model_file(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve Ling through the vendored module instead of the remote file.
+
+    Converted checkpoints ship ``config.json`` with ``model_file`` pointing at
+    a repository-local ``bailing_hybrid.py`` so that plain
+    ``mlx_lm.load(trust_remote_code=True)`` works. Under oMLX that file wins
+    over this package's vendored module, and because it subclasses stock
+    ``bailing_moe_v3`` it has no Lightning-MTP head: ``sanitize`` drops the
+    nextn layer, ``mtp_enabled`` stays inert and no error is raised. Dropping
+    the key makes mlx-lm resolve the reviewed vendored module by ``model_type``.
+    """
+    if (
+        config.get("model_type") == "bailing_hybrid"
+        and config.get("model_file") == REMOTE_MODEL_FILE
+    ):
+        config.pop("model_file")
+    return config
+
+
 __all__ = [
     "BRANCH_HEAD_SHA",
+    "REMOTE_MODEL_FILE",
     "SOURCE_URL",
     "apply_bailing_hybrid_patch",
     "is_applied",
+    "normalize_bailing_hybrid_model_file",
 ]
