@@ -23,9 +23,17 @@ Tests:
   in-memory markers cleared (as after a restart).
 - test_only_newest_full_blocks_keep_window — older full blocks are stripped
   beyond the cap; turn-end tails are not counted.
+- test_markers_follow_stored_payload — a block whose snapshot had no window
+  (a lean snapshot) is marked as such and does not count toward the cap.
+- test_backfill_keeps_interior_blocks_lean — a dedup'd interior block is not
+  given a window copy by the snapshot backfill.
+- test_unknown_block_is_not_remembered — a probe miss is not cached.
 - test_lean_snapshot_* — mid-prefill boundary snapshots far from the prompt
   end drop the window K/V (the store would strip it anyway); the last two
-  boundaries, the tail snapshot and recurrent states are kept.
+  boundaries, the tail snapshot and recurrent states are kept, on both the
+  in-memory and the SSD snapshot path.
+- test_lean_snapshots_store_and_restore — store fed lean snapshots keeps the
+  same layout and the lookup still restores at the turn end.
 """
 
 from __future__ import annotations
@@ -95,7 +103,9 @@ def _layers(seq_len, window=True):
     full-attention KVCache layer. ``window=False`` gives a conv-only
     ArraysCache, ``window="gdn"`` a recurrent one (3D conv + 4D state)."""
     sliding = [mx.ones((1, 3, 8)), mx.ones((1, 3, 8))]
-    if window == "gdn":
+    if window == "lean":
+        sliding = (mx.zeros((1,)), mx.zeros((1,)))
+    elif window == "gdn":
         sliding = [mx.ones((1, 3, 8)), mx.ones((1, 2, 8, 8))]
     elif window:
         sliding = [mx.ones((1, 2, WINDOW, 8)), mx.ones((1, 2, WINDOW, 8))] + sliding
@@ -115,10 +125,13 @@ def _layers(seq_len, window=True):
     ]
 
 
-def _store(cache, rid, num_tokens, window=True, tail_terminal=False):
+def _store(cache, rid, num_tokens, window=True, tail_terminal=False, lean_before=0):
+    """``lean_before``: snapshots below this boundary carry a window
+    placeholder, as the scheduler's lean snapshots do."""
     tokens = list(range(num_tokens))
     snapshots = {
-        b: _layers(b, window) for b in range(BLOCK_SIZE, num_tokens, BLOCK_SIZE)
+        b: _layers(b, window if b >= lean_before else "lean")
+        for b in range(BLOCK_SIZE, num_tokens, BLOCK_SIZE)
     }
     table = cache.store_cache(
         rid,
@@ -214,6 +227,53 @@ def test_only_newest_full_blocks_keep_window(tmp_path, tail_only):
     assert _sliding_has_window(ssd, _hash(cache, table, turns))  # turn-end tail
 
 
+def test_markers_follow_stored_payload(tmp_path, tail_only):
+    # The last full block's snapshot has no window (lean): it must not be
+    # marked as holding one, nor take a cap slot.
+    cache, ssd = _make_cache(tmp_path)
+    table = _store(
+        cache, "a", 3 * BLOCK_SIZE + 2, tail_terminal=True, lean_before=4 * BLOCK_SIZE
+    )
+    last_full = _hash(cache, table, 2)
+    assert not _sliding_has_window(ssd, last_full)
+    assert last_full in cache.paged_cache._swa_no_window
+    assert last_full not in cache._swa_full_fifo
+    assert _sliding_has_window(ssd, _hash(cache, table, 3))  # turn-end tail
+
+
+def test_backfill_keeps_interior_blocks_lean(tmp_path, tail_only):
+    cache, ssd = _make_cache(tmp_path)
+    _store(cache, "a", 4 * BLOCK_SIZE)
+    # Same prefix, longer: blocks 0-3 dedup and carry boundary snapshots.
+    table = _store(cache, "b", 6 * BLOCK_SIZE)
+    has_window = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(6)]
+    assert has_window == [False, False, False, True, False, True]
+
+
+def test_unknown_block_is_not_remembered(tmp_path, tail_only):
+    cache, _ = _make_cache(tmp_path)
+    missing = b"\x01" * 32
+    assert not cache.paged_cache._swa_has_window(missing)
+    assert missing not in cache.paged_cache._swa_no_window
+
+
+def test_lean_snapshots_store_and_restore(tmp_path, tail_only):
+    cache, ssd = _make_cache(tmp_path)
+    _store(cache, "turn-1", 2 * BLOCK_SIZE + 2, tail_terminal=True)
+    table = _store(
+        cache,
+        "turn-2",
+        5 * BLOCK_SIZE + 2,
+        tail_terminal=True,
+        lean_before=4 * BLOCK_SIZE,
+    )
+    has_window = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(6)]
+    assert has_window == [False, True, False, False, True, True]
+    prompt = list(range(5 * BLOCK_SIZE + 2)) + [999]
+    _, n = cache.paged_cache.get_computed_blocks(prompt)
+    assert n == 5 * BLOCK_SIZE + 2
+
+
 # --- Lean boundary snapshots (scheduler side) ---------------------------------
 
 from types import SimpleNamespace  # noqa: E402
@@ -227,15 +287,19 @@ def _snapshot(seq_len, window="window"):
 
 
 def _lean(token_count, prompt_len, source="prefill", window="window"):
-    stub = SimpleNamespace(
+    stub = _stub(prompt_len)
+    lean = Scheduler._swa_snapshot_is_lean(stub, "r", token_count, BLOCK_SIZE, source)
+    out = Scheduler._swa_lean_value(stub, _snapshot(token_count, window), lean)
+    return out[1][0]["state"]  # the sliding layer
+
+
+def _stub(prompt_len):
+    return SimpleNamespace(
         requests={"r": SimpleNamespace(prompt_token_ids=list(range(prompt_len)))},
         _PREFILL_SNAPSHOT_MARKER=Scheduler._PREFILL_SNAPSHOT_MARKER,
+        _swa_drop_window_states=Scheduler._swa_drop_window_states,
+        _extract_snapshot_cache_states=lambda c: (_layers(2 * BLOCK_SIZE), None),
     )
-    value = _snapshot(token_count, window)
-    out = Scheduler._swa_lean_snapshot(
-        stub, value, "r", token_count, BLOCK_SIZE, source
-    )
-    return out[1][0]["state"]  # the sliding layer
 
 
 def _is_placeholder(state):
@@ -263,3 +327,11 @@ def test_lean_snapshot_keeps_tail_and_recurrent_state(tail_only):
 def test_lean_snapshot_flag_off_keeps_window(monkeypatch):
     monkeypatch.delenv("OMLX_SWA_TAIL_ONLY", raising=False)
     assert not _is_placeholder(_lean(2 * BLOCK_SIZE, 10 * BLOCK_SIZE + 3))
+
+
+def test_lean_snapshot_ssd_path_drops_window(tail_only):
+    states, _ = Scheduler._extract_lean_snapshot_cache_states(
+        _stub(10 * BLOCK_SIZE), []
+    )
+    assert _is_placeholder(states[0]["state"])
+    assert tuple(states[1]["state"][0].shape)[2] == 2 * BLOCK_SIZE  # KV untouched

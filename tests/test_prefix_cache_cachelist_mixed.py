@@ -340,6 +340,9 @@ def test_prefill_snapshot_decoupled_from_live_cache():
         lambda: Scheduler._enable_mtp_boundary_alignment(stub)
     )
     stub._eval_snapshot_cache = lambda caches: None
+    stub.requests = {}
+    stub._swa_snapshot_is_lean = lambda *a: Scheduler._swa_snapshot_is_lean(stub, *a)
+    stub._swa_lean_value = lambda *a: Scheduler._swa_lean_value(stub, *a)
 
     Scheduler._on_prefill_boundary_snapshot(stub, "req-alias", [live], BLOCK_SIZE)
 

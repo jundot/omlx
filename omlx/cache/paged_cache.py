@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import threading
 import time
 from collections import OrderedDict
@@ -488,6 +487,10 @@ class BlockTable:
 # PagedCacheManager - Main manager (vLLM BlockPool style)
 # =============================================================================
 
+def _is_window_kv_shapes(k_shape, v_shape) -> bool:
+    return k_shape is not None and len(k_shape) == 4 and tuple(k_shape) == tuple(v_shape or ())
+
+
 def is_window_kv_state(state) -> bool:
     """True for a non-sliceable state that holds a sliding-window K/V pair.
 
@@ -500,11 +503,22 @@ def is_window_kv_state(state) -> bool:
         state = state[2]
     if not isinstance(state, (list, tuple)) or len(state) < 2:
         return False
-    k, v = state[0], state[1]
+    return _is_window_kv_shapes(
+        getattr(state[0], "shape", None), getattr(state[1], "shape", None)
+    )
+
+
+def is_window_layer(layer) -> bool:
+    """An extracted layer dict (``class_name``/``cache_type`` + ``state``)
+    of the ArraysCache family that holds sliding-window K/V."""
+    from .type_registry import CacheTypeRegistry
+
     return (
-        getattr(k, "ndim", 0) == 4
-        and getattr(v, "ndim", 0) == 4
-        and tuple(k.shape) == tuple(v.shape)
+        isinstance(layer, dict)
+        and CacheTypeRegistry.is_arrays_family(
+            str(layer.get("class_name") or layer.get("cache_type") or "")
+        )
+        and is_window_kv_state(layer.get("state"))
     )
 
 
@@ -1259,9 +1273,9 @@ class PagedCacheManager(CacheManager):
     def _swa_has_window(self, block_hash: Optional[BlockHash]) -> bool:
         """Whether a full block holds real sliding-window state.
 
-        Answered from what store_cache recorded, else read once from the
-        block's payload (a block stored before a restart) and remembered.
-        Called with ``self._lock`` held.
+        Answered from what store_cache recorded, else from the block's tensor
+        shapes (a block stored before a restart; no tensor data is read) and
+        remembered. Called with ``self._lock`` held.
         """
         if block_hash is None:
             return False
@@ -1269,24 +1283,20 @@ class PagedCacheManager(CacheManager):
             return True
         if block_hash in self._swa_no_window:
             return False
-        has_window = False
         ssd = self._paged_ssd_cache_manager
-        if ssd is not None:
-            from .type_registry import CacheTypeRegistry
+        peek = ssd.peek_block_shapes(block_hash) if ssd is not None else None
+        if peek is None:
+            return False  # not stored or unreadable right now: do not remember
+        from .type_registry import CacheTypeRegistry
 
-            try:
-                data, meta = ssd.load_block_with_metadata(
-                    block_hash, promote_to_hot_cache=False
-                )
-            except Exception:  # unreadable block: treat as no window
-                data, meta = None, None
-            types = (meta or {}).get("layer_cache_types") or []
-            has_window = any(
-                i < len(types)
-                and CacheTypeRegistry.is_arrays_family(types[i])
-                and is_window_kv_state(layer)
-                for i, layer in enumerate(data or ())
+        shapes, types = peek
+        has_window = any(
+            CacheTypeRegistry.is_arrays_family(t)
+            and _is_window_kv_shapes(
+                shapes.get(f"layer_{i}_state_0"), shapes.get(f"layer_{i}_state_1")
             )
+            for i, t in enumerate(types or ())
+        )
         known = self._swa_full_hashes if has_window else self._swa_no_window
         if len(known) > 200_000:
             known.clear()

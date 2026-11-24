@@ -7,8 +7,8 @@ with SSD persistence. oMLX only supports paged SSD-based caching.
 """
 
 import logging
-import os
 import math
+import os
 import threading
 import time
 from collections import OrderedDict, deque
@@ -38,6 +38,8 @@ from .paged_cache import (
     CacheBlock,
     PagedCacheManager,
     compute_block_hash,
+    is_window_kv_state,
+    is_window_layer,
     resolve_block_extra_keys,
 )
 from .paged_ssd_cache import (
@@ -52,7 +54,6 @@ from .paged_ssd_cache import (
 )
 from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
-from .paged_cache import is_window_kv_state
 from .type_registry import CacheTypeRegistry
 
 # Shared with class-level signature eligibility.
@@ -1392,12 +1393,17 @@ class BlockAwarePrefixCache(CacheManager):
                                 global_end,
                                 snapshot_cache_data,
                                 hot_cache_write_back=hot_cache_write_back,
+                                keep_window=swa_tail_repair,
                             )
                         )
                         if backfilled:
                             self._backfill_checked_hashes.add(existing_block.block_hash)
                             if swa_tail_repair:
-                                self.paged_cache._swa_full_hashes.add(
+                                # Payload may have changed: re-probe on lookup.
+                                self.paged_cache._swa_full_hashes.discard(
+                                    existing_block.block_hash
+                                )
+                                self.paged_cache._swa_no_window.discard(
                                     existing_block.block_hash
                                 )
                             if (
@@ -1557,15 +1563,6 @@ class BlockAwarePrefixCache(CacheManager):
                         swa_active and not is_last_block and i != swa_last_full_idx
                     ),
                 )
-                if swa_active and (is_last_block or i == swa_last_full_idx):
-                    if len(block_tokens) == self.block_size and not is_last_block:
-                        self._swa_track_full_block(block.block_hash, hot_cache_write_back)
-                    else:
-                        self.paged_cache._swa_no_window.discard(block.block_hash)
-                        self.paged_cache._swa_full_hashes.add(block.block_hash)
-                elif swa_active:
-                    # Stored with a window placeholder: no payload read needed later.
-                    self.paged_cache._swa_no_window.add(block.block_hash)
 
                 if block_kv_data and not self._block_token_count_matches_slices(
                     block_kv_data, block.token_count, layer_cache_types
@@ -1587,6 +1584,15 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.block_ids.pop()
                     block_table.num_tokens -= len(block_tokens)
                     break
+
+                if swa_active and block.block_hash:
+                    self._swa_mark_block(
+                        block.block_hash,
+                        block_kv_data,
+                        layer_cache_types,
+                        len(block_tokens) == self.block_size and not is_last_block,
+                        hot_cache_write_back,
+                    )
 
                 if block_kv_data and block.block_hash:
                     # Use per-block meta_states from boundary snapshot when
@@ -2246,18 +2252,31 @@ class BlockAwarePrefixCache(CacheManager):
     @classmethod
     def _swa_store_active(cls, cache_data) -> bool:
         """Tail-only window storage applies to models that store window state."""
-        if os.environ.get("OMLX_SWA_TAIL_ONLY") != "1":
-            return False
-        for layer in cache_data or ():
-            if (
-                isinstance(layer, dict)
-                and CacheTypeRegistry.is_arrays_family(
-                    str(layer.get("class_name") or layer.get("cache_type") or "")
-                )
-                and cls._is_window_state(layer.get("state"))
-            ):
-                return True
-        return False
+        return os.environ.get("OMLX_SWA_TAIL_ONLY") == "1" and any(
+            is_window_layer(layer) for layer in cache_data or ()
+        )
+
+    def _swa_mark_block(
+        self,
+        block_hash: bytes,
+        block_kv_data,
+        layer_cache_types,
+        is_full_non_tail: bool,
+        hot_cache_write_back: bool,
+    ) -> None:
+        """Record whether a just-stored block holds window state, from its payload."""
+        has_window = any(
+            CacheTypeRegistry.is_arrays_family(t) and self._is_window_state(layer)
+            for t, layer in zip(layer_cache_types or (), block_kv_data or ())
+        )
+        if not has_window:
+            self.paged_cache._swa_full_hashes.discard(block_hash)
+            self.paged_cache._swa_no_window.add(block_hash)
+        elif is_full_non_tail:
+            self._swa_track_full_block(block_hash, hot_cache_write_back)
+        else:
+            self.paged_cache._swa_no_window.discard(block_hash)
+            self.paged_cache._swa_full_hashes.add(block_hash)
 
     def _swa_track_full_block(
         self, block_hash: bytes, hot_cache_write_back: bool
@@ -2427,6 +2446,7 @@ class BlockAwarePrefixCache(CacheManager):
         boundary_tc: int,
         snapshot_cache_data: list[dict[str, Any]],
         hot_cache_write_back: bool = True,
+        keep_window: bool = False,
     ) -> bool:
         """Rewrite a dedup'd placeholder block with boundary-snapshot state.
 
@@ -2517,7 +2537,7 @@ class BlockAwarePrefixCache(CacheManager):
                         return True
                     new_data.append(("__cache_list__", subs))
                 elif (
-                    self.paged_cache._swa_active
+                    keep_window
                     and CacheTypeRegistry.is_arrays_family(type_name)
                     and self._is_window_state(snap_state)
                 ):
