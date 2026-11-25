@@ -156,6 +156,7 @@ _proc_listpids = None
 _task_info = None
 _mach_task_self: ctypes.c_uint | None = None
 _malloc_zone_pressure_relief = None
+_proc_reset_footprint_interval = None
 
 if sys.platform == "darwin":
     try:
@@ -181,6 +182,14 @@ if sys.platform == "darwin":
         _libproc = None
         _proc_pid_rusage = None
         _proc_listpids = None
+    if _libproc is not None:
+        # Private libproc export; without it the interval peak reads as 0.
+        _proc_reset_footprint_interval = getattr(
+            _libproc, "proc_reset_footprint_interval", None
+        )
+        if _proc_reset_footprint_interval is not None:
+            _proc_reset_footprint_interval.argtypes = [ctypes.c_int]
+            _proc_reset_footprint_interval.restype = ctypes.c_int
     try:
         _libc = ctypes.CDLL("/usr/lib/libc.dylib")
         _task_info = _libc.task_info
@@ -254,6 +263,32 @@ def get_lifetime_max_phys_footprint(pid: int | None = None) -> int:
     if rc != 0:
         return 0
     return info.ri_lifetime_max_phys_footprint
+
+
+def reset_interval_max_phys_footprint() -> None:
+    """Start a new interval for ``get_interval_max_phys_footprint``.
+
+    The kernel keeps one interval per process, so a reset by any caller
+    starts the window over for every reader.
+    """
+    if _proc_reset_footprint_interval is not None:
+        _proc_reset_footprint_interval(os.getpid())
+
+
+def get_interval_max_phys_footprint() -> int:
+    """Return this process's highest phys_footprint since the last reset, in bytes.
+
+    The kernel updates it on every footprint change, so it catches a peak that
+    rises and falls between two samples. Reading does not reset it. Returns 0
+    when the counter or its reset is unavailable.
+    """
+    if _proc_pid_rusage is None or _proc_reset_footprint_interval is None:
+        return 0
+    info = _RusageInfoV4()
+    rc = _proc_pid_rusage(os.getpid(), _RUSAGE_INFO_V4, ctypes.byref(info))
+    if rc != 0:
+        return 0
+    return info.ri_interval_max_phys_footprint
 
 
 def get_graphics_footprint() -> int:

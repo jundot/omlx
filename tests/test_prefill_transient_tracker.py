@@ -363,6 +363,22 @@ class TestFlatOverhead:
         assert t.flat_overhead_charge_for(True, 32) == 139 * self.MB
         assert t.flat_overhead_charge_for(False, 32) == 0
 
+    def test_chunk_narrower_than_any_measured_width_gets_scaled_overhead(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048, 1580 * self.MB, static_bytes=605 * self.MB, gathered_core=True
+        )
+        t.record_flat_reclaim(8192 * self.MB)
+        assert t.flat_overhead_charge_for(True, 2048) == 975 * self.MB
+        # 975 MB x (32 / 2048) ** (1/3): above the 139 MB a 32-token chunk
+        # measures, far below the whole 2048-token overhead.
+        assert t.flat_overhead_charge_for(True, 32) == int(975 * self.MB / 4)
+
+        t.observe_flat_overhead(
+            32, 148 * self.MB, static_bytes=9 * self.MB, gathered_core=True
+        )
+        assert t.flat_overhead_charge_for(True, 32) == 139 * self.MB
+
 
 class TestPoolReleaseAccounting:
     def test_repeated_releases_accumulate_without_exceeding_observed_overhead(self):

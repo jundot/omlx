@@ -132,7 +132,12 @@ from .utils.metal_sync import (
     set_chunk_memory_limit,
     unreleased_graphics_bytes,
 )
-from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
+from .utils.proc_memory import (
+    get_graphics_footprint,
+    get_interval_max_phys_footprint,
+    get_phys_footprint,
+    reset_interval_max_phys_footprint,
+)
 from .utils.sampling import make_no_repeat_ngram_processor, select_logprobs
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.sampling import make_shared_sampler as omlx_make_shared_sampler
@@ -1863,6 +1868,20 @@ _DECODE_ACTIVITY_TTL_S = 2.5
 _PACKED_PREFILL_MAX_ROWS = 4
 
 
+def _log_prefill_unthrottled(
+    request_id: str, chunk: int, current: int, target: int, kv_len: int
+) -> None:
+    logger.info(
+        "Prefill unthrottled for %s: chunk back to %d "
+        "(usage %.2fGB vs sizing target %.2fGB, kv_len=%d).",
+        request_id,
+        chunk,
+        current / 1024**3,
+        target / 1024**3,
+        kv_len,
+    )
+
+
 def _decode_share_for_floor(row_decode_tps: float | None) -> float:
     """Debt ratio that holds each running row at the rate floor.
 
@@ -2531,11 +2550,12 @@ class Scheduler:
         if config is not None and config.model_name:
             _model_label = config.model_name
         self._decode_activity_key: str = f"{_model_label}:{id(self):x}"
-        # Requests that already emitted the INFO throttle notice. The per-chunk
-        # shrink log is DEBUG, so a throttled prefill used to be silent at the
-        # default level even while it ran an order of magnitude slower; one
-        # line per request keeps that visible without a line per chunk.
-        self._throttle_notified_requests: set[str] = set()
+        # Last throttled chunk size logged per request. The per-chunk shrink
+        # log is DEBUG, so a throttled prefill used to be silent at the
+        # default level even while it ran an order of magnitude slower. An
+        # INFO line on each size change keeps the prefill speed traceable
+        # without a line per chunk while the size holds.
+        self._throttled_chunk_sizes: dict[str, int] = {}
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
         self._memory_admission_blocked_request_id: str | None = None
         self._memory_admission_blocked_since: float = 0.0
@@ -5110,6 +5130,13 @@ class Scheduler:
             # gathered sample.
             ewma = tracker.bytes_per_token_for(gathered_core)
             recent_reclaim = tracker.recent_reclaim_bytes
+            # The released pool held the last measured chunk's buffers. A
+            # narrower chunk can only take back its share: charging all of a
+            # 4096-token chunk's pool to a 32-token floor chunk rejected a
+            # 100K prompt at 8K tokens with 5.1GB of a 27.3GB cap unused.
+            pool_width = tracker.last_n_tokens_for(gathered_core)
+            if pool_width > n_tokens:
+                recent_reclaim = recent_reclaim * n_tokens // pool_width
             if ewma > 0:
                 per_token = max(per_token, ewma)
             last_n_tokens = tracker.last_n_tokens_for(gathered_core)
@@ -5355,7 +5382,7 @@ class Scheduler:
             min_chunk = n_tokens
         else:
             min_chunk = max(1, self._prefill_min_chunk_tokens, minimum_tokens)
-        current = self._current_usage_bytes()
+        current = self._current_usage_bytes(include_pool=False)
         if (
             current
             + self._admission_transient_bound(
@@ -5494,9 +5521,10 @@ class Scheduler:
     ) -> int:
         """Size against the candidate's prediction, including fixed costs.
 
-        Generic models also include size-independent reclaimed pool bytes.
-        Scaling a larger chunk's prediction proportionally discounts that
-        charge and can return a chunk whose predicted peak exceeds headroom.
+        Generic models also charge reclaimed pool bytes, scaled to the
+        candidate's width, and flat-overhead profiles a size-independent
+        overhead. Scaling a larger chunk's prediction proportionally would
+        misprice both, so each candidate is predicted on its own.
         The floor remains the caller's fallback when no candidate fits; the
         pre-chunk guard must reject that case before submitting work.
         """
@@ -5609,7 +5637,7 @@ class Scheduler:
         if soft_base <= 0 or hard_cap <= 0 or requested <= 0:
             return requested
 
-        current = self._current_usage_bytes()
+        current = self._current_usage_bytes(include_pool=False)
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
@@ -5642,6 +5670,10 @@ class Scheduler:
             # baseline (MoE prefill at tens of MB/token), the failure this
             # prevents.
             if current + per_token * requested <= target:
+                if not probe and self._throttled_chunk_sizes.pop(request_id, None):
+                    _log_prefill_unthrottled(
+                        request_id, requested, current, target, kv_len
+                    )
                 return requested
             maybe_raise_eviction = getattr(
                 self, "_raise_prefill_eviction_if_available", None
@@ -5706,12 +5738,27 @@ class Scheduler:
 
         n = self._snap_chunk_size(n, requested)
 
-        if (
-            n < requested
-            and not probe
-            and request_id not in self._throttle_notified_requests
-        ):
-            self._throttle_notified_requests.add(request_id)
+        previous = self._throttled_chunk_sizes.get(request_id)
+        if n < requested and not probe and previous is not None and n != previous:
+            self._throttled_chunk_sizes[request_id] = n
+            logger.info(
+                "Prefill chunk for %s: %d -> %d of %d requested "
+                "(usage %.2fGB vs sizing target %.2fGB, per_token=%.1fKB, "
+                "kv_len=%d).",
+                request_id,
+                previous,
+                n,
+                requested,
+                current / 1024**3,
+                target / 1024**3,
+                per_token / 1024,
+                kv_len,
+            )
+        elif n >= requested and not probe and previous is not None:
+            del self._throttled_chunk_sizes[request_id]
+            _log_prefill_unthrottled(request_id, requested, current, target, kv_len)
+        elif n < requested and not probe and previous is None:
+            self._throttled_chunk_sizes[request_id] = n
             binding_str, advice = describe_ceiling_binding(
                 static=self._memory_static_ceiling_bytes,
                 dynamic=self._memory_dynamic_ceiling_bytes,
@@ -5929,12 +5976,20 @@ class Scheduler:
         )
         return len(plans)
 
-    def _current_usage_bytes(self, *, refresh_mlx_active: bool = True) -> int:
+    def _current_usage_bytes(
+        self, *, refresh_mlx_active: bool = True, include_pool: bool = True
+    ) -> int:
         """Current memory usage for scheduler-side guard checks.
 
         Scheduler steps run on the MLX executor thread, so they can refresh
         mx.get_active_memory() safely. Event-loop callers such as early
         preflight use the cached executor sample and phys_footprint instead.
+
+        ``include_pool=False`` leaves out MLX's buffer pool. Prefill chunk
+        sizing uses it: a chunk runs under ``_chunk_backpressure``'s MLX
+        memory limit, and MLX trims the pool before it grows past that
+        limit, so pooled buffers are room the chunk can take rather than
+        usage on top of its transient.
         """
         active = self._last_mlx_active_memory_bytes
         cache = getattr(self, "_last_mlx_cache_memory_bytes", 0)
@@ -5953,6 +6008,7 @@ class Scheduler:
             int(get_phys_footprint())
             - unreleased_graphics_bytes(active + cache, fresh=refresh_mlx_active)
             - hot_cache_bytes
+            - (0 if include_pool else cache)
         )
         return max(active, phys, 0)
 
@@ -6070,7 +6126,7 @@ class Scheduler:
             drafter.release_request(request_id)
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
-        self._throttle_notified_requests.discard(request_id)
+        self._throttled_chunk_sizes.pop(request_id, None)
         self._clear_memory_admission_blocker(request_id)
         self._clear_store_cache_admission_blocker(request_id)
 
@@ -6295,6 +6351,14 @@ class Scheduler:
         The guard sizes a chunk from a prediction. If the chunk needs more,
         MLX waits for in-flight command buffers to retire before it encodes
         further ops, so the chunk runs slower instead of crossing the target.
+
+        The limit binds only MLX, and MLX fills its pool up to it, so the
+        footprint lands at the limit plus whatever grew outside MLX during the
+        chunk. That growth peaks mid-chunk and is gone by the chunk boundary
+        (oQ8e at step 2048: 0.73 GB at each boundary, 1.40 GB mid-chunk, which
+        crossed the enforcer's hard watermark 0.57 GB above the target). The
+        kernel's interval peak catches it, and later chunks keep the largest
+        growth seen out of the MLX limit.
         """
         target = (
             Scheduler._prefill_peak_target(self)
@@ -6304,13 +6368,34 @@ class Scheduler:
         if target <= 0:
             yield
             return
-        current = self._current_usage_bytes()
-        headroom = max(target - current, Scheduler._CHUNK_BACKPRESSURE_FLOOR_BYTES)
-        set_chunk_memory_limit(id(self), self._last_mlx_active_memory_bytes + headroom)
+        current = self._current_usage_bytes(include_pool=False)
+        outside_growth = getattr(self, "_chunk_outside_mlx_growth_bytes", 0)
+        headroom = max(
+            target - current - outside_growth,
+            Scheduler._CHUNK_BACKPRESSURE_FLOOR_BYTES,
+        )
+        mlx_limit = self._last_mlx_active_memory_bytes + headroom
+        outside_at_start = max(0, get_phys_footprint() - get_graphics_footprint())
+        reset_interval_max_phys_footprint()
+        set_chunk_memory_limit(id(self), mlx_limit)
         try:
             yield
         finally:
             set_chunk_memory_limit(id(self), None)
+            peak = get_interval_max_phys_footprint()
+            # MLX stays under its limit, so the rest of the peak grew outside
+            # MLX. A chunk that did not fill the limit understates the growth;
+            # keeping the largest seen covers the chunks that do.
+            growth = peak - mlx_limit - outside_at_start
+            if peak > 0 and growth > outside_growth:
+                self._chunk_outside_mlx_growth_bytes = growth
+                logger.info(
+                    "Prefill chunk grew %.2fGB outside MLX's limit "
+                    "(peak=%.2fGB, mlx_limit=%.2fGB); later chunks keep it free",
+                    growth / 1e9,
+                    peak / 1e9,
+                    mlx_limit / 1e9,
+                )
 
     @staticmethod
     def _chunk_memory_sample() -> tuple[int, int, int]:
@@ -14811,7 +14896,7 @@ class Scheduler:
             # _clear_request_admission_bookkeeping only runs on abort/failure
             # paths, so a request that was throttled and then completed
             # normally would keep its id here forever.
-            self._throttle_notified_requests.discard(rid)
+            self._throttled_chunk_sizes.pop(rid, None)
 
         for request_id in finished_ids:
             _mtp_priming.release_request(self.model, request_id)

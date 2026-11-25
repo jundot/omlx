@@ -125,6 +125,51 @@ class TestMetalReleaseLag:
         graphics[0] = 13.1 * self.GB
         assert metal_sync.unreleased_graphics_bytes(13 * self.GB) == 0
 
+    def test_cache_clear_leaves_the_next_gate_a_settled_reference(self, monkeypatch):
+        """Prefill gates run ~50 s apart, right after a clear (Mac, 2026-11-19).
+
+        Without the pre-clear sample the gate's own lagging residual was the
+        only one in the window and read as settled, hiding a 6.5 GiB release.
+        """
+        from omlx.utils import metal_sync
+
+        class FakeMx:
+            active, cache = 15 * self.GB, 6 * self.GB
+
+            def synchronize(self, stream=None):
+                pass
+
+            def get_active_memory(self):
+                return self.active
+
+            def get_cache_memory(self):
+                return self.cache
+
+            def clear_cache(self):
+                self.cache = 0
+
+        fake = FakeMx()
+        now = [100.0]
+        graphics = [21.3 * self.GB]
+        monkeypatch.setattr(metal_sync, "mx", fake)
+        monkeypatch.setattr(metal_sync.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            metal_sync, "get_graphics_footprint", lambda: int(graphics[0])
+        )
+        metal_sync._sync_and_clear_cache()
+        now[0] += 0.05
+        assert metal_sync.unreleased_graphics_bytes(fake.active) == pytest.approx(
+            6 * self.GB, abs=1
+        )
+        # The next chunk refills the pool before its gate clears it again.
+        now[0] += 50.0
+        fake.cache = 6 * self.GB
+        metal_sync._sync_and_clear_cache()
+        now[0] += 0.05
+        assert metal_sync.unreleased_graphics_bytes(fake.active) == pytest.approx(
+            6 * self.GB, abs=1
+        )
+
     def test_settled_level_follows_the_recent_window(self, monkeypatch):
         from omlx.utils import metal_sync
 

@@ -84,6 +84,9 @@ def _sync_and_clear_cache(stream=None):
                 raise
         try:
             mx.synchronize()  # default stream
+            # The guard measures right after this clear, while the ledger still
+            # charges the pool; this sample is its settled reference.
+            unreleased_graphics_bytes(mx.get_active_memory() + mx.get_cache_memory())
             mx.clear_cache()
         except RuntimeError as exc:
             exit_if_gpu_submissions_ignored(exc)
