@@ -2,8 +2,8 @@
 """Splash engine: serve a model through a Splash server process.
 
 Splash (https://github.com/incoai/splash) runs Qwen3.8-27B,
-Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next and
-Flint on its own Metal engine with DFlash2 speculative decoding.
+Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next,
+Flint and Inkling-2-Mini on its own Metal engine with DFlash2 speculative decoding.
 It is a separate program, so this engine does not load weights in-process.
 ``start()`` stages the oMLX model folder as an entry of a private Hugging Face
 cache, launches ``splash serve --offline`` for it on a loopback port and
@@ -157,11 +157,14 @@ MAX_CONCURRENT_REQUESTS_VERSION = (1, 7, 1)
 _PRUNED_EXPERTS_MULTIPLE = 8
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
-# Every family's native window. From 1.4.0 on Splash serves more with YaRN,
-# which changes answers at every length.
 SPLASH_NATIVE_CONTEXT = 262144
 SPLASH_YARN_CONTEXT = 1010000
 YARN_VERSION = (1, 4, 0)
+_INKLING2_FAMILY = "Inkling-2-Mini"
+_INKLING2_TEXT_TYPE = "inkling2_loop_text"
+_INKLING2_CONTEXT = 1010000
+_INKLING2_LAYER_VISITS = 48
+_INKLING2_FULL_ATTENTION_VISITS = 8
 SPLASH_INSTALL_HINT = (
     "Splash is not installed: brew install incoai/tap/splash (M3 or later), "
     "or splash-m1 for M1/M2 Macs (https://github.com/paperniuk/splash/releases)"
@@ -235,19 +238,30 @@ SPLASH_FAMILIES: dict[str, dict[str, Any]] = {
         "num_experts": 256,
         "num_experts_per_tok": 6,
     },
+    _INKLING2_FAMILY: {
+        "model_type": _INKLING2_TEXT_TYPE,
+        "hidden_size": 2304,
+        "num_hidden_layers": 24,
+        "vocab_size": 201024,
+        "n_routed_experts": 128,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "num_experts_per_tok": 8,
+    },
 }
 # The first Splash release that serves each family, where later than 1.3.0.
 _FAMILY_VERSIONS = {
     "Qwen3.8-Flash-Next": FLASH_NEXT_VERSION,
     "Qwen3.5-122B-A10B": (1, 4, 1),
     "Flint": (1, 4, 1),
+    _INKLING2_FAMILY: (1, 7, 2),
 }
 # Families Splash loads from GGUFs only, not from MLX checkpoints.
 _GGUF_ONLY_FAMILIES = frozenset({"Qwen3.8-Flash-Next", "Flint"})
-# Families without a vision tower; Splash serves their models text only.
-_TEXT_ONLY_FAMILIES = frozenset({"Flint"})
+_TEXT_ONLY_FAMILIES = frozenset({"Flint", _INKLING2_FAMILY})
 # Families without YaRN; a longer --max-context stops their startup.
-_NATIVE_CONTEXT_FAMILIES = frozenset({"Flint"})
+_NATIVE_CONTEXT_FAMILIES = frozenset({"Flint", _INKLING2_FAMILY})
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 _SHARD_INDEX = "model.safetensors.index.json"
 # Splash serves vision only with one of these from the target repository.
@@ -261,6 +275,7 @@ SPLASH_DRAFT_REPOS = {
     "Qwen3.8-Flash-Next": "incoai/Qwen3.8-Flash-Next-DFlash2",
     "Qwen3.5-122B-A10B": "incoai/Ornith-1.5-122B-DFlash2",
     "Flint": "incoai/Flint-DFlash2",
+    _INKLING2_FAMILY: "incoai/Inkling-2-Mini-DFlash2",
 }
 
 # Splash quantizes the BF16 DFlash2 draft to 4 bits when it loads it.
@@ -587,11 +602,14 @@ def _quantization_problem(config: dict, binary: SplashBinary) -> str:
 
 def _is_splash_draft(draft: dict, text: dict) -> bool:
     architectures = draft.get("architectures") or []
+    target_layers = text.get("num_hidden_layers")
+    if text.get("model_type") == _INKLING2_TEXT_TYPE:
+        target_layers = _INKLING2_LAYER_VISITS
     return (
         "DFlash2DraftModel" in architectures
         and draft.get("hidden_size") == text.get("hidden_size")
         and draft.get("vocab_size") == text.get("vocab_size")
-        and draft.get("num_target_layers") == text.get("num_hidden_layers")
+        and draft.get("num_target_layers") == target_layers
     )
 
 
@@ -614,13 +632,19 @@ class SplashTarget:
     draft_path: Path
 
     @property
+    def native_context(self) -> int:
+        if self.family == _INKLING2_FAMILY:
+            return _INKLING2_CONTEXT
+        return SPLASH_NATIVE_CONTEXT
+
+    @property
     def max_context(self) -> int:
         """The largest ``--max-context`` Splash starts with."""
         if (
             self.family in _NATIVE_CONTEXT_FAMILIES
             or self.binary.version_tuple < YARN_VERSION
         ):
-            return SPLASH_NATIVE_CONTEXT
+            return self.native_context
         return SPLASH_YARN_CONTEXT
 
 
@@ -769,7 +793,9 @@ def _weight_bytes(path: Path) -> int:
 def _kv_bytes_per_token(text: dict, kv_format: str) -> int:
     layer_types = text.get("layer_types") or []
     layers = sum(1 for kind in layer_types if kind == "full_attention")
-    if not layers:
+    if text.get("model_type") == _INKLING2_TEXT_TYPE:
+        layers = _INKLING2_FULL_ATTENTION_VISITS
+    elif not layers:
         layers = text["num_hidden_layers"] // text.get("full_attention_interval", 1)
     values = layers * 2 * text["num_key_value_heads"] * text["head_dim"]
     # int8 pages carry one 1-byte scale per 64 values.
