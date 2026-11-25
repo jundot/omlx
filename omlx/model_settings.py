@@ -56,7 +56,6 @@ _LORA_CONFLICTS = (
     ("dflash_enabled", "DFlash"),
     ("vlm_mtp_enabled", "VLM MTP"),
     ("qwen35_ane_prefill_enabled", "ANE prefill"),
-    ("moe_expert_offload_enabled", "MoE expert offload"),
     ("prefill_helper_node_id", "a Prefill Accelerator"),
     ("external_engine", "an external engine"),
 )
