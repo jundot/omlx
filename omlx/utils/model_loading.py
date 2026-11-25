@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,12 @@ from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
 
+try:
+    import mlx_vlm.utils as mlx_vlm_utils
+except ImportError:
+    # mlx-vlm: absent from a CUDA cluster worker's venv (#4739).
+    mlx_vlm_utils = None
+
 logger = logging.getLogger(__name__)
 
 _VLM_TEXT_PREFIX = "language_model."
@@ -32,6 +39,7 @@ _RUNTIME_TEXT_PREFIX = "language_model.model."
 _MATERIALIZE_EVAL_CHUNK = 8
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
+_vlm_trust_remote_code = ContextVar("omlx_vlm_trust_remote_code", default=False)
 
 _REMOTE_CODE_METADATA_PATTERNS = [
     "*.json",
@@ -59,6 +67,36 @@ def ensure_model_code_trusted(
             f"module ({model_file!r}) to build its architecture. This is disabled "
             "by default. Enable Trust Remote Code for this model if you trust it."
         )
+
+
+def _patch_mlx_vlm_model_file_trust() -> None:
+    get_model_and_args = mlx_vlm_utils.get_model_and_args
+    load_model = mlx_vlm_utils.load_model
+
+    def checked_get_model_and_args(config, model_path=None):
+        if model_path is not None:
+            ensure_model_code_trusted(
+                config,
+                model_path=model_path,
+                trust_remote_code=_vlm_trust_remote_code.get(),
+            )
+        return get_model_and_args(config, model_path=model_path)
+
+    def load_model_with_trust(model_path, *args, trust_remote_code=False, **kwargs):
+        token = _vlm_trust_remote_code.set(trust_remote_code)
+        try:
+            return load_model(
+                model_path, *args, trust_remote_code=trust_remote_code, **kwargs
+            )
+        finally:
+            _vlm_trust_remote_code.reset(token)
+
+    mlx_vlm_utils.get_model_and_args = checked_get_model_and_args
+    mlx_vlm_utils.load_model = load_model_with_trust
+
+
+if mlx_vlm_utils is not None:
+    _patch_mlx_vlm_model_file_trust()
 
 
 def preflight_text_remote_code(
