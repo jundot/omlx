@@ -432,18 +432,18 @@ class TestBinary:
 
 class TestCompatibility:
 
-    def test_inkling2_uses_its_loop_draft_on_splash_1_7_2(self, tmp_path, launchers):
+    def test_inkling2_uses_its_loop_draft_on_splash_1_7_3(self, tmp_path, launchers):
         model = _write_model(tmp_path / "Inkling-2-Mini", INKLING2_TEXT)
         wrong = _write_draft(tmp_path / "24-layers", INKLING2_TEXT)
         draft = _write_draft(tmp_path / "48-visits", INKLING2_TEXT, target_layers=48)
 
-        launchers("splash", version="1.7.1")
+        launchers("splash", version="1.7.2")
         assert resolve_splash_target(model, None, [str(draft)]) == (
             None,
-            "Inkling-2-Mini needs Splash 1.7.2 or later",
+            "Inkling-2-Mini needs Splash 1.7.3 or later",
         )
 
-        launchers("splash", version="1.7.2")
+        launchers("splash", version="1.7.3")
         assert splash_mod.splash_draft_to_download(model, None, [str(wrong)]) == (
             "incoai/Inkling-2-Mini-DFlash2"
         )
@@ -451,7 +451,7 @@ class TestCompatibility:
         assert reason == ""
         assert target.draft_path == draft
         assert target.max_context == target.native_context == 1010000
-        assert not splash_mod.splash_has_vision(
+        assert splash_mod.splash_has_vision(
             {"text_config": INKLING2_TEXT, "vision_config": {}}
         )
 
@@ -691,7 +691,7 @@ class TestGguf:
 
         models = discover_models(tmp_path / "models", tmp_path / "gguf")
         folder = Path(models[source.stem].model_path)
-        launchers("splash", version="1.7.2")
+        launchers("splash", version="1.7.3")
         target, reason = resolve_splash_target(folder, None, [str(draft)])
         assert reason == ""
         assert target.family == "Inkling-2-Mini"
@@ -1029,6 +1029,15 @@ class TestStaging:
         staged = stage_model(snapshot, "omlx/m", tmp_path / "hub")
 
         assert (staged / "config.json").resolve().parent == blobs.resolve()
+
+    def test_inkling2_vision_checkpoint_stages_without_a_processor_file(self, tmp_path):
+        model = _write_model(tmp_path / "m", INKLING2_TEXT)
+        config = json.loads((model / "config.json").read_text())
+        (model / "config.json").write_text(json.dumps({**config, "vision_config": {}}))
+
+        snapshot = stage_model(model, "omlx/m", tmp_path / "hub")
+
+        assert not (snapshot / "preprocessor_config.json").exists()
 
     def test_optiq_layout_stages_as_splash_reads_it(self, tmp_path):
         # Splash refuses index shards outside the snapshot root and a vision

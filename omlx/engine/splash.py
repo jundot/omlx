@@ -255,11 +255,11 @@ _FAMILY_VERSIONS = {
     "Qwen3.8-Flash-Next": FLASH_NEXT_VERSION,
     "Qwen3.5-122B-A10B": (1, 4, 1),
     "Flint": (1, 4, 1),
-    _INKLING2_FAMILY: (1, 7, 2),
+    _INKLING2_FAMILY: (1, 7, 3),
 }
 # Families Splash loads from GGUFs only, not from MLX checkpoints.
 _GGUF_ONLY_FAMILIES = frozenset({"Qwen3.8-Flash-Next", "Flint"})
-_TEXT_ONLY_FAMILIES = frozenset({"Flint", _INKLING2_FAMILY})
+_TEXT_ONLY_FAMILIES = frozenset({"Flint"})
 # Families without YaRN; a longer --max-context stops their startup.
 _NATIVE_CONTEXT_FAMILIES = frozenset({"Flint", _INKLING2_FAMILY})
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
@@ -873,8 +873,10 @@ def _snapshot_additions(model_path: Path) -> dict[str, Path | bytes]:
         index = {**index, "weight_map": weight_map}
         additions[_SHARD_INDEX] = json.dumps(index, indent=2).encode()
     config = _read_config(model_path) or {}
-    if splash_has_vision(config) and not any(
-        (model_path / name).is_file() for name in _PROCESSOR_FILES
+    if (
+        splash_has_vision(config)
+        and splash_family(config) != _INKLING2_FAMILY
+        and not any((model_path / name).is_file() for name in _PROCESSOR_FILES)
     ):
         vision = config["vision_config"]
         processor = {

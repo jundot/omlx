@@ -4,7 +4,7 @@
 
 ## Setup
 
-1. Install Splash 1.3.0 or later (1.4.0 or later for Flash-Next, 1.4.1 or later for Ornith-1.5-122B and Flint, 1.7.2 or later for Inkling-2-Mini):
+1. Install Splash 1.3.0 or later (1.4.0 or later for Flash-Next, 1.4.1 or later for Ornith-1.5-122B and Flint, 1.7.3 or later for Inkling-2-Mini):
 
    | Build | Launcher | Macs | Install |
    | --- | --- | --- | --- |
@@ -27,7 +27,7 @@ Quantized checkpoints of the families Splash supports:
 - Qwen3.8-Flash-Next GGUFs need Splash 1.4.0 or later, for example the Q2_0 variant of `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` or an Unsloth GGUF. Flash-Next MLX checkpoints do not run on Splash. Its DFlash2 draft is `incoai/Qwen3.8-Flash-Next-DFlash2`.
 - Qwen3.5-122B-A10B models, such as Ornith-1.5-122B, need Splash 1.4.1 or later, as MLX checkpoints (`ornith-ai/Ornith-1.5-122B-MLX-4bit`, with its vision tower) or GGUFs (`unsloth/Ornith-1.5-122B-GGUF`, with a vision projector for image input). Their DFlash2 draft is `incoai/Ornith-1.5-122B-DFlash2`.
 - Flint GGUFs need Splash 1.4.1 or later, for example a variant of `unsloth/flint-GGUF`. Flint has no vision tower, so it always serves text only, and Flint MLX checkpoints do not run on Splash. Its DFlash2 draft is `incoai/Flint-DFlash2`.
-- Inkling-2-Mini needs Splash 1.7.2 or later. It serves text from GGUFs such as `unsloth/Inkling-2-Mini-GGUF`, MLX conversions (`mlx-community/Inkling-2-Mini-4bit` needs Splash 1.7.3 or later), or the original mixed NVFP4/MXFP8 weights in `thinkingmachines/Inkling-2-Mini`. Its draft is `incoai/Inkling-2-Mini-DFlash2`.
+- Inkling-2-Mini needs Splash 1.7.3 or later, as GGUFs (`unsloth/Inkling-2-Mini-GGUF`, with a vision projector for image input), MLX conversions such as `mlx-community/Inkling-2-Mini-4bit`, or the original mixed NVFP4/MXFP8 weights in `thinkingmachines/Inkling-2-Mini`. Its draft is `incoai/Inkling-2-Mini-DFlash2`.
 - MoE GGUFs pruned to fewer routed experts than their family need Splash 1.4.1 or later, for example `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF`, which keeps 256 of Flash-Next's 512 experts. The expert count must be a multiple of 8; Splash checks the rest when it loads the file. Pruned MLX checkpoints do not run on Splash.
 
 Prebuilt Splash packages (`incoai/*-Splash`) are not supported; Splash 1.3.1 replaced them with the MLX checkpoints above. The model downloader refuses them and names the MLX model that holds the same weights.
@@ -87,5 +87,5 @@ The admin benchmark runs on Splash models through Splash's chat API, with thinki
 ## Limits
 
 - Text completions send the prompt as raw text, without the chat template. Nothing splits reasoning out of the reply, so the thinking budget does not apply to them.
-- Image input works for checkpoints with a vision tower (`vision_config` in `config.json`): oMLX passes image parts through to Splash, in chat completions, the Responses API and the Anthropic Messages API. Flint, Inkling-2-Mini and checkpoints without a vision tower start with `--language-only`. Splash does not read video or audio input.
+- Image input works for checkpoints with a vision tower (`vision_config` in `config.json`): oMLX passes image parts through to Splash, in chat completions, the Responses API and the Anthropic Messages API. Flint and checkpoints without a vision tower start with `--language-only`. Splash does not read video or audio input.
 - The other acceleration settings (MTP, DFlash, TurboQuant, ANE prefill, and so on) configure oMLX's MLX engines and do not apply while Splash serves the model.
