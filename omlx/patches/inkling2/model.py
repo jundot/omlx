@@ -398,6 +398,15 @@ class Inkling2Experts(nn.Module):
     def unreduced(self, x: mx.array, inds: mx.array, weights: mx.array):
         """The routed expert outputs [N, K, H] and their FP32 weights [N, K]
         (NVFP4 tensor scale included), before ``moe_sum``."""
+        z = self.routes(x, inds)
+        # z carries w2's activation dtype (gather_qmm keeps its input dtype).
+        s2 = self.w2.post_scale(inds, z.dtype)
+        if s2 is not None:
+            weights = weights * s2
+        return z, weights
+
+    def routes(self, x: mx.array, inds: mx.array) -> mx.array:
+        """Unweighted per-route outputs ``[..., k, H]`` (before the w2 post-scale)."""
         xe = mx.expand_dims(x, (-2, -3))
         armed = is_row_exact_armed()
         # The expert-order kernel repeats gather_qmm's one-pair arithmetic, so
@@ -440,11 +449,7 @@ class Inkling2Experts(nn.Module):
             z = self.w2(act, idx, do_sort)
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
-        z = z.squeeze(-2)
-        s2 = self.w2.post_scale(inds, act.dtype)
-        if s2 is not None:
-            weights = weights * s2
-        return z, weights
+        return z.squeeze(-2)
 
 
 def moe_sum(z: mx.array, weights: mx.array) -> mx.array:
@@ -606,9 +611,12 @@ def _row_matmul(x: mx.array, w: mx.array) -> mx.array:
     does: a multi-row matmul switches kernels with the row count."""
     rows = x.shape[-2]
     if rows > 1 and is_row_exact_armed():
-        return mx.concatenate(
-            [x[..., row : row + 1, :] @ w for row in range(rows)], axis=-2
-        )
+        # One single-row product per row in a batch: with a stride-0 weight
+        # batch MLX keeps the one-row kernel instead of folding the rows into
+        # a multi-row matmul.
+        batch = mx.broadcast_shapes(x.shape[:-2], w.shape[:-2])
+        wb = mx.broadcast_to(w[..., None, :, :], (*batch, rows, *w.shape[-2:]))
+        return (x[..., :, None, :] @ wb).squeeze(-2)
     return x @ w
 
 
@@ -982,6 +990,17 @@ class Inkling2Layer(nn.Module):
         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
+        residual, x, x32, s2 = self._post_attn(out, gate, h, mlp_blocks, s2, messages)
+        z, zw = self.mlp.unreduced(x, x32)
+        h, s3 = self._post_mlp(residual, z, zw, s3, h)
+        return h, s2, s3
+
+    def _post_attn(self, out, gate, h, mlp_blocks, s2, messages=None):
+        """``_post`` up to the MoE: the residual, the MoE input (and its FP32
+        copy, or None), the conv state.
+
+        Expert offload compiles this and :meth:`_post_mlp` around an eager MoE.
+        """
         a = self.attn.output(out, gate)
         # The conv kernels also do the FP32 residual adds: the attention
         # output joins h (off a block boundary), the MLP output the residual.
@@ -1040,7 +1059,11 @@ class Inkling2Layer(nn.Module):
                         self.loop_gain_forget[3:],
                     ).squeeze(0)
                 x, x32 = _norm(self.mlp_norm, y).astype(h.dtype), None
-        z, zw = self.mlp.unreduced(x, x32)
+        return residual, x, x32, s2
+
+    def _post_mlp(self, residual, z, zw, s3, h):
+        """``_post`` after the MoE: ``z``/``zw`` are ``mlp.unreduced``'s
+        outputs; ``h`` gives the output dtype."""
         conv = kernels.moe_short_conv(
             z, zw, self.mlp_conv, s3, self._conv_scale, residual, h.dtype
         )
@@ -1053,8 +1076,7 @@ class Inkling2Layer(nn.Module):
                 residual=residual,
                 dtype=h.dtype,
             )
-        h, s3 = conv
-        return h, s2, s3
+        return conv
 
     def __call__(self, h, blocks, cache=None, bank=None, tau=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
