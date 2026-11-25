@@ -1340,6 +1340,117 @@ def test_inkling2_flash_attention_matches_masked_sdpa(
     assert diff.item() < 1e-2
 
 
+def _nax_banded_or_skip():
+    from omlx.custom_kernels.nax import is_nax_available
+    from omlx.utils import nax_attention
+
+    if mx.default_device() != mx.gpu or not is_nax_available():
+        pytest.skip("NAX GPU")
+    return nax_attention
+
+
+@pytest.mark.parametrize(
+    "batch, heads, kv_heads, length, keys, extent, left_padding",
+    [
+        (1, 6, 2, 64, 64, 16, None),  # no cached keys, aligned tiles
+        (1, 6, 2, 33, 300, 32, None),  # ragged query and key tails
+        (1, 6, 2, 9, 12301, 48, None),  # shortest block, three key-range passes
+        (1, 4, 4, 100, 100, 256, None),  # band longer than the keys
+        (3, 6, 2, 40, 300, 48, [0, 31, 260]),  # left-padded batch
+    ],
+)
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_nax_banded_attention_matches_fp32(
+    batch, heads, kv_heads, length, keys, extent, left_padding, dtype
+):
+    nax_attention = _nax_banded_or_skip()
+    q, k, v, rel, sink = _decode_attention_case(
+        batch, heads, kv_heads, length, keys, extent, getattr(mx, dtype), dim=128
+    )
+    # Peaked, so a wrong band, sink or padding moves the result past the bound.
+    rel, sink = rel * 6, sink * 4
+    lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
+    scale = 128**-0.5
+    got = nax_attention.nax_banded_sink_attention(
+        q, k, v, rel, sink, scale=scale, left_padding=lp
+    )
+    ref = nax_attention._banded_reference(q, k, v, rel, sink, scale, lp)
+    assert mx.abs(got.astype(mx.float32) - ref).max().item() < 2e-2
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_nax_banded_attention_passes_repeat_one_dispatch(dtype):
+    # Key-range passes hand the fp32 row state on: same bits as one dispatch,
+    # also past the passes queued between evaluations.
+    nax_attention = _nax_banded_or_skip()
+    q, k, v, rel, sink = _decode_attention_case(
+        2, 6, 2, 77, 1000, 48, getattr(mx, dtype), 128
+    )
+    lp = mx.array([0, 100], dtype=mx.int32)
+    scale = 128**-0.5
+    one = nax_attention._run_banded(q, k, v, rel, sink, scale, 0, lp)
+    for pass_keys in (32, 96, 512):
+        many = nax_attention._run_banded(q, k, v, rel, sink, scale, pass_keys, lp)
+        assert mx.array_equal(one, many).item()
+
+
+def test_nax_banded_attention_rows_do_not_depend_on_the_block():
+    # A row's output depends on its own keys only, so prefill chunk
+    # boundaries do not change it.
+    nax_attention = _nax_banded_or_skip()
+    q, k, v, rel, sink = _decode_attention_case(1, 6, 2, 96, 700, 48, mx.bfloat16, 128)
+    scale = 128**-0.5
+    whole = nax_attention.nax_banded_sink_attention(q, k, v, rel, sink, scale=scale)
+    head = nax_attention.nax_banded_sink_attention(
+        q[:, :, :64],
+        k[:, :, :-32],
+        v[:, :, :-32],
+        rel[:, :64],
+        sink[:, :64],
+        scale=scale,
+    )
+    tail = nax_attention.nax_banded_sink_attention(
+        q[:, :, 64:], k, v, rel[:, 64:], sink[:, 64:], scale=scale
+    )
+    assert mx.array_equal(whole, mx.concatenate([head, tail], axis=2)).item()
+
+
+def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
+    """Full-attention blocks of more than 8 queries, lone or left-padded,
+    build no mask on NAX hosts; shorter blocks and sliding layers keep SDPA."""
+    from omlx.patches.inkling2 import kernels
+
+    nax_attention = _nax_banded_or_skip()
+    scale = 128**-0.5
+    calls = []
+    banded = nax_attention.nax_banded_sink_attention
+
+    def counting(*a, **kw):
+        out = banded(*a, **kw)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(nax_attention, "nax_banded_sink_attention", counting)
+    lp = mx.array([0, 13], dtype=mx.int32)
+    for batch, length, padding, window, taken in (
+        (1, 70, None, 0, True),
+        (2, 70, lp, 0, True),
+        (1, 9, None, 0, True),
+        (1, 8, None, 0, False),
+        (1, 70, None, 32, False),
+    ):
+        args = _decode_attention_case(batch, 6, 2, length, 300, 32, mx.bfloat16, 128)
+        calls.clear()
+        got = kernels.banded_sink_attention(
+            *args, scale=scale, window=window, left_padding=padding
+        )
+        assert any(calls) == taken
+        if taken:
+            ref = kernels._masked_attention(*args, scale, 0, padding)
+            diff = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max()
+            assert diff.item() < 1e-2
+
+
 def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
     # NAX hosts run full-attention prefill through the masked path; at 64K
     # keys the masks of all query blocks once took 12 GiB together.

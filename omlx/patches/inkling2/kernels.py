@@ -8,6 +8,7 @@ import logging
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
+from ...utils import nax_attention
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import verify_attention
 
@@ -1544,6 +1545,13 @@ def banded_sink_attention(
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )
+    if not window:
+        # NAX hosts: full attention without building the additive mask.
+        out = nax_attention.nax_banded_sink_attention(
+            q, k, v, rel, sink, scale=scale, left_padding=left_padding
+        )
+        if out is not None:
+            return out
     return _masked_attention(q, k, v, rel, sink, scale, window, left_padding)
 
 
