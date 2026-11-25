@@ -706,9 +706,14 @@
             benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
-            // bench is running" banner + disables Start so the user doesn't
-            // race a 409 on the server.
+            // bench is running" banner.
             benchOtherActive: null,
+            benchQueue: [],
+            // One follow loop at a time; a second would double-poll.
+            benchFollowing: false,
+            // Config of the run on screen; the form may already describe a queued one.
+            benchRun: null,
+            benchCompleted: [],
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -5473,6 +5478,50 @@
                     this.loadBenchDeviceInfo();
                 }
 
+                const body = JSON.stringify({
+                    model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
+                    context_profile: this.benchContextProfile,
+                    align_prompt_to_ane: this.benchAlignPromptToAne,
+                    prompt_lengths: promptLengths,
+                    generation_length: 128,
+                    batch_sizes: batchSizes,
+                    force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
+                    external: this.benchExternalEnabled ? this.externalRequestBody() : null,
+                });
+
+                if (this.benchRunning) {
+                    try {
+                        const response = await fetch('/admin/api/bench/start', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body,
+                        });
+                        if (response.status === 401) {
+                            window.location.href = '/admin';
+                            return;
+                        }
+                        const data = await response.json();
+                        if (!response.ok) throw new Error(data.detail || window.t('js.error.start_benchmark_failed'));
+                        if (data.status === 'queued') {
+                            this.benchQueue = data.queue || [];
+                        } else {
+                            // Nothing was running any more, so the server started this one.
+                            this.benchOtherActive = {
+                                bench_id: data.bench_id,
+                                model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
+                                context_profile: this.benchContextProfile,
+                                force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
+                                external: this.benchExternalEnabled,
+                            };
+                            this.acceptOtherBench(true);
+                        }
+                    } catch (err) {
+                        this.benchError = err.message;
+                    }
+                    return;
+                }
+
+                this._benchArchive();
                 // Reset state
                 this.benchRunning = true;
                 this.benchProgress = null;
@@ -5488,21 +5537,17 @@
                 this.benchRunExternal = this.benchExternalEnabled
                     ? { base_url: this.externalBaseUrl.trim(), model: this.externalModel.trim() }
                     : null;
+                this.benchRun = {
+                    model_id: this.benchModelId,
+                    force_lm_engine: this.benchForceLmEngine,
+                    context_profile: this.benchContextProfile,
+                };
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
-                            context_profile: this.benchContextProfile,
-                            align_prompt_to_ane: this.benchAlignPromptToAne,
-                            prompt_lengths: promptLengths,
-                            generation_length: 128,
-                            batch_sizes: batchSizes,
-                            force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
-                            external: this.benchExternalEnabled ? this.externalRequestBody() : null,
-                        }),
+                        body,
                     });
 
                     if (response.status === 401) {
@@ -5518,12 +5563,75 @@
                     }
 
                     const data = await response.json();
+                    if (data.status === 'queued') {
+                        // Another tab started a run first; attach to it.
+                        this.benchRunning = false;
+                        this.benchQueue = data.queue || [];
+                        await this.loadBenchState();
+                        // The previous run may still be uploading, so the
+                        // queued run has no SSE stream yet; follow it here.
+                        if (!this.benchRunning) this._benchFollowQueue();
+                        return;
+                    }
                     this.benchBenchId = data.bench_id;
                     this.connectBenchSSE(data.bench_id);
                 } catch (err) {
                     console.error('Failed to start benchmark:', err);
                     this.benchError = window.t('js.error.start_benchmark_error').replace('{message}', err.message);
                     this.benchRunning = false;
+                }
+            },
+
+            _benchArchive() {
+                if (!this.benchSingleResults.length && !this.benchBatchResults.length) return;
+                let text;
+                try {
+                    text = this.benchBuildText();
+                } catch (e) {
+                    console.error('Failed to archive benchmark results:', e);
+                    return;
+                }
+                const model = this.benchRunExternal?.model || this.benchRun?.model_id || this.benchModelId;
+                this.benchCompleted = [{ model_id: model, text }, ...this.benchCompleted].slice(0, 10);
+            },
+
+            async _benchFollowQueue() {
+                if (this.benchFollowing) return;
+                this.benchFollowing = true;
+                try {
+                    for (let i = 0; i < 240; i++) {
+                        await new Promise(r => setTimeout(r, 500));
+                        let data;
+                        try {
+                            const resp = await fetch('/admin/api/bench/active');
+                            if (!resp.ok) return;
+                            data = await resp.json();
+                        } catch (err) {
+                            return;
+                        }
+                        this.benchQueue = data.queue || [];
+                        if (data.running && data.bench_id && data.bench_id !== this.benchBenchId) {
+                            this.benchOtherActive = data;
+                            // Keep the form: the user may be editing the next request.
+                            this.acceptOtherBench(true);
+                            return;
+                        }
+                        if (!data.running && this.benchQueue.length === 0) return;
+                    }
+                } finally {
+                    this.benchFollowing = false;
+                }
+            },
+
+            async removeFromBenchQueue(queueId) {
+                try {
+                    const resp = await fetch(
+                        `/admin/api/bench/queue/${encodeURIComponent(queueId)}`,
+                        { method: 'DELETE' }
+                    );
+                    if (resp.ok) this.benchQueue = (await resp.json()).queue || [];
+                } catch (err) {
+                    this.benchError = err.message;
                 }
             },
 
@@ -5593,6 +5701,7 @@
                             this.benchProgress = null;
                             es.close();
                             this.benchEventSource = null;
+                            this._benchFollowQueue();
                         } else if (data.type === 'upload_skipped') {
                             this.benchUploadSkipped = {
                                 reason: data.reason || 'external_endpoint',
@@ -5604,6 +5713,7 @@
                             es.close();
                             this.benchEventSource = null;
                             this.loadModels();
+                            this._benchFollowQueue();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
                             this.benchRunning = false;
@@ -5611,6 +5721,7 @@
                             es.close();
                             this.benchEventSource = null;
                             this.loadModels();
+                            this._benchFollowQueue();
                         }
 
                     } catch (err) {
@@ -5633,6 +5744,7 @@
                 if (!this.benchBenchId) return;
                 try {
                     await fetch(`/admin/api/bench/${this.benchBenchId}/cancel`, { method: 'POST' });
+                    this.benchQueue = [];
                 } catch (err) {
                     console.error('Failed to cancel benchmark:', err);
                 }
@@ -5897,6 +6009,11 @@
             },
 
             benchBuildText() {
+                const run = this.benchRun || {
+                    model_id: this.benchModelId,
+                    force_lm_engine: this.benchForceLmEngine,
+                    context_profile: this.benchContextProfile,
+                };
                 const pad = (s, w) => s.toString().padStart(w);
                 const rpad = (s, w) => s.toString().padEnd(w);
                 let lines = [];
@@ -5916,15 +6033,15 @@
                 } else {
                     lines.push(
                         window.t('bench.results.text_export.benchmark_model')
-                            .replace('{model}', () => this.benchModelId)
+                            .replace('{model}', () => run.model_id)
                     );
-                    lines.push(this.benchForceLmEngine
+                    lines.push(run.force_lm_engine
                         ? window.t('bench.results.text_export.engine_force_lm')
                         : window.t('bench.results.text_export.engine_auto'));
                 }
                 lines.push(
                     window.t('bench.results.text_export.context')
-                        .replace('{context}', this.benchContextLabel(this.benchContextProfile))
+                        .replace('{context}', this.benchContextLabel(run.context_profile))
                 );
                 lines.push('='.repeat(80));
 
@@ -5996,10 +6113,9 @@
                 return lines.join('\n');
             },
 
-            benchCopyText() {
-                const text = this.benchBuildText();
+            benchCopyText(text = this.benchBuildText(), key = true) {
                 const onSuccess = () => {
-                    this.benchCopied = true;
+                    this.benchCopied = key;
                     setTimeout(() => { this.benchCopied = false; }, 2000);
                 };
                 if (navigator.clipboard && window.isSecureContext) {
@@ -6040,6 +6156,7 @@
                     const resp = await fetch('/admin/api/bench/active');
                     if (!resp.ok) return;
                     const data = await resp.json();
+                    this.benchQueue = data.queue || [];
 
                     if (!data.running || !data.bench_id) {
                         this.benchOtherActive = null;
@@ -6084,21 +6201,29 @@
             // Restore the config UI from an active run discovered via
             // /api/bench/active. External model ids aren't in the local
             // dropdown, so the external flag drives which controls light up.
-            _restoreBenchRunSource(data) {
-                this.benchContextProfile = data.context_profile || 'code_python';
-                if (data.external) {
-                    this.benchExternalEnabled = true;
-                    this.benchRunExternal = {
+            _restoreBenchRunSource(data, keepForm = false) {
+                const profile = data.context_profile || 'code_python';
+                this.benchRun = {
+                    model_id: data.model_id,
+                    force_lm_engine: !!data.force_lm_engine,
+                    context_profile: profile,
+                };
+                this.benchRunExternal = data.external
+                    ? {
                         // base_url is intentionally not exposed by the API;
                         // fall back to this browser's stored setting.
                         base_url: this.externalBaseUrl.trim(),
                         model: data.model_id,
-                    };
+                    }
+                    : null;
+                if (keepForm) return;
+                this.benchContextProfile = profile;
+                if (data.external) {
+                    this.benchExternalEnabled = true;
                 } else {
                     this.benchModelId = data.model_id;
                     this.benchForceLmEngine = !!data.force_lm_engine;
                     this.benchExternalEnabled = false;
-                    this.benchRunExternal = null;
                 }
             },
 
@@ -6128,12 +6253,13 @@
             // result display, attach to the active run. The replay-on-
             // subscribe stream re-delivers every event so the new bench
             // populates its table from the start.
-            acceptOtherBench() {
+            acceptOtherBench(keepForm = false) {
                 if (!this.benchOtherActive) return;
                 const other = this.benchOtherActive;
                 this.benchOtherActive = null;
+                this._benchArchive();
                 this.benchBenchId = other.bench_id;
-                this._restoreBenchRunSource(other);
+                this._restoreBenchRunSource(other, keepForm);
                 this.benchRunning = true;
                 this.benchSingleResults = [];
                 this.benchBatchResults = [];
@@ -6280,7 +6406,7 @@
             // Local runs unload the resident models, so they ask first. External
             // endpoints and additions to a running accuracy queue do not.
             requestBenchConfirm(kind) {
-                if (kind === 'throughput' && this.benchExternalEnabled) return this.startBenchmark();
+                if (kind === 'throughput' && (this.benchExternalEnabled || this.benchRunning)) return this.startBenchmark();
                 if (kind === 'accuracy' && (this.accExternalEnabled || this.accRunning)) return this.addToAccQueue();
                 this.benchConfirm = kind;
             },
