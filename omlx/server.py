@@ -251,6 +251,8 @@ from .model_settings import (
     specprefill_draft,
 )
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .patches.inkling2 import INKLING2_MODEL_TYPES
+from .patches.inkling2.grammar import compile_answer_grammar
 from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
 from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
@@ -5856,6 +5858,8 @@ def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | Non
     # channel headers that a bare grammar would mask.
     if reasoning_parser is None and engine.model_type == "gpt_oss":
         return "harmony"
+    if reasoning_parser is None and engine.model_type in INKLING2_MODEL_TYPES:
+        return "inkling2"
     return reasoning_parser
 
 
@@ -5874,6 +5878,10 @@ def _compile_with_structural_tag(
     import xgrammar as xgr
 
     ct_kwargs = chat_template_kwargs or {}
+    if reasoning_parser == "inkling2":
+        return compile_answer_grammar(
+            compiler, fmt, ct_kwargs, max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT
+        )
     if reasoning_parser == "minimax_m3":
         reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
     else:
