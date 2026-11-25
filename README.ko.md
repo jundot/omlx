@@ -140,7 +140,7 @@ brew services restart omlx  # 재시작
 brew services info omlx     # 상태 확인
 ```
 
-서비스는 기본 설정으로 `omlx serve`를 실행합니다 (`~/.omlx/models`, 포트 8000). `omlx start`, `omlx stop`, `omlx restart`는 공통 lifecycle 명령이며, Homebrew 설치에서는 `brew services`로 위임됩니다. 커스터마이즈하려면 환경 변수(`OMLX_MODEL_DIR`, `OMLX_PORT` 등)를 설정하거나, `omlx serve --model-dir /your/path`를 한 번 실행하여 `~/.omlx/settings.json`에 설정을 저장하세요.
+서비스는 기본 설정으로 `omlx serve`를 실행합니다 (`~/.omlx/models`, 포트 8000). `omlx start`, `omlx stop`, `omlx restart`는 공통 lifecycle 명령이며, Homebrew 설치에서는 `brew services`로 위임됩니다. 커스터마이즈하려면 `omlx serve --model-dir /your/path`를 한 번 실행하여 `~/.omlx/settings.json`에 설정을 저장하세요.
 
 로그는 두 곳에 기록됩니다:
 - **서비스 로그**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)

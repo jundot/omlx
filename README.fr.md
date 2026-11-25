@@ -120,7 +120,7 @@ brew services restart omlx  # Redémarrer
 brew services info omlx     # Vérifier le statut
 ```
 
-Le service lance `omlx serve` avec les paramètres par défaut (`~/.omlx/models`, port 8000). Pour personnaliser, définissez des variables d'environnement (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) ou lancez `omlx serve --model-dir /votre/chemin` une fois pour sauvegarder les paramètres dans `~/.omlx/settings.json`.
+Le service lance `omlx serve` avec les paramètres par défaut (`~/.omlx/models`, port 8000). Pour personnaliser, lancez `omlx serve --model-dir /votre/chemin` une fois pour sauvegarder les paramètres dans `~/.omlx/settings.json`.
 
 Les logs sont écrits à deux endroits :
 - **Log du service** : `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)

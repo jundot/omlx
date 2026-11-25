@@ -29,7 +29,7 @@ See [Development](../README.md#development) for the other `make` targets and app
 - If you haven't had a PR merged here before, open an issue or discussion before sending a PR with over 1,000 changed lines or a new subsystem, so I can check the approach before you put in the work. I move such PRs to draft until that discussion happens.
 - Keep each PR focused on one problem or coherent feature. Include the settings, API, and UI integration it needs, but separate unrelated changes. For stacked PRs, explain the dependency and merge order.
 - Fix the underlying problem and reuse existing code paths. Preserve supported behavior; explain any compatibility changes or performance tradeoffs.
-- Follow the existing style, Black formatting, and Ruff configuration. Keep unrelated formatting and development artifacts out of the diff. Preserve third-party license notices and use Apache-2.0 SPDX headers for new original code.
+- Format the lines you change with Black and follow the Ruff configuration. Keep unrelated formatting and development artifacts out of the diff. Preserve third-party license notices and use Apache-2.0 SPDX headers for new original code.
 
 ## Test Your Change
 

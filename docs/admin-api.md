@@ -1,6 +1,6 @@
 # Admin API
 
-The admin API under `/admin/api/` manages a running oMLX server: settings, models, downloads, quantization, benchmarks, and serving stats. The web UI and the macOS app use the same endpoints. It stays available when the server runs without the web UI (`omlx serve --headless` or `OMLX_HEADLESS=1`), so scripts and other clients can control the server the same way.
+The admin API under `/admin/api/` manages a running oMLX server: settings, models, downloads, quantization, benchmarks, and serving stats. The web UI and the macOS app use the same endpoints. It stays available when the server runs without the web UI (`omlx serve --headless`), so scripts and other clients can control the server the same way.
 
 ## Authentication
 

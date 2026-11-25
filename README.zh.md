@@ -119,7 +119,7 @@ brew services restart omlx  # 重启
 brew services info omlx     # 查看状态
 ```
 
-服务使用默认配置运行 `omlx serve`（`~/.omlx/models`，端口 8000）。要自定义，可以设置环境变量（`OMLX_MODEL_DIR`、`OMLX_PORT` 等），或运行一次 `omlx serve --model-dir /your/path` 将设置保存到 `~/.omlx/settings.json`。
+服务使用默认配置运行 `omlx serve`（`~/.omlx/models`，端口 8000）。要自定义，可以运行一次 `omlx serve --model-dir /your/path` 将设置保存到 `~/.omlx/settings.json`。
 
 日志写入两个位置：
 - **服务日志**: `$(brew --prefix)/var/log/omlx.log`（stdout/stderr）

@@ -119,7 +119,7 @@ brew services restart omlx  # 再起動
 brew services info omlx     # ステータス確認
 ```
 
-サービスはデフォルト設定で`omlx serve`を実行します（`~/.omlx/models`、ポート8000）。カスタマイズするには、環境変数（`OMLX_MODEL_DIR`、`OMLX_PORT`など）を設定するか、`omlx serve --model-dir /your/path`を一度実行して`~/.omlx/settings.json`に設定を保存してください。
+サービスはデフォルト設定で`omlx serve`を実行します（`~/.omlx/models`、ポート8000）。カスタマイズするには、`omlx serve --model-dir /your/path`を一度実行して`~/.omlx/settings.json`に設定を保存してください。
 
 ログは2か所に記録されます：
 - **サービスログ**: `$(brew --prefix)/var/log/omlx.log`（stdout/stderr）

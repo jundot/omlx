@@ -141,7 +141,7 @@ brew services restart omlx  # Riavvia
 brew services info omlx     # Controlla lo stato
 ```
 
-Il servizio esegue `omlx serve` con valori predefiniti che non richiedono alcuna configurazione (`~/.omlx/models`, porta 8000). `omlx start`, `omlx stop` e `omlx restart` sono i comandi portabili per il ciclo di vita del server; nelle installazioni Homebrew vengono delegati a `brew services`. Per personalizzare la configurazione, imposta le variabili d'ambiente (`OMLX_MODEL_DIR`, `OMLX_PORT` ecc.) oppure esegui una volta `omlx serve --model-dir /your/path` per salvare le impostazioni in `~/.omlx/settings.json`.
+Il servizio esegue `omlx serve` con valori predefiniti che non richiedono alcuna configurazione (`~/.omlx/models`, porta 8000). `omlx start`, `omlx stop` e `omlx restart` sono i comandi portabili per il ciclo di vita del server; nelle installazioni Homebrew vengono delegati a `brew services`. Per personalizzare la configurazione, esegui una volta `omlx serve --model-dir /your/path` per salvare le impostazioni in `~/.omlx/settings.json`.
 
 I log vengono scritti in due posizioni:
 - **Log del servizio**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
@@ -377,7 +377,7 @@ omlx serve --model-dir ~/models --api-key your-secret-key
 # Solo localhost: la verifica si può saltare dalle impostazioni globali del pannello di amministrazione
 
 # L'accesso dalla rete richiede l'autenticazione
-OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
+omlx serve --model-dir ~/models --host 0.0.0.0 --api-key your-secret-key
 
 # Solo API di inferenza e di amministrazione, senza l'interfaccia web (non viene salvato nelle impostazioni)
 omlx serve --model-dir ~/models --headless

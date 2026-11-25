@@ -25,9 +25,9 @@ These rules apply to the lines you add or change. Older code in this repository 
 - Do not ship a fix for a cause you have not confirmed. A change that might help does not belong in the diff.
 - Make the smallest change that fixes the cause. Reuse the code path that already exists.
 - Do not fix a bug by turning a feature off, skipping it for one model, or adding a switch that disables it.
-- Do not fix a bug by tuning a constant, such as a chunk size, a retry count, a timeout or a buffer size.
-- Do not add a setting, a fallback, a retry, a cooldown, or a guard for a state that cannot occur.
-- Do not add an `OMLX_*` environment variable that switches behavior. If the user needs a toggle, make it a model setting with an entry in the settings UI.
+- Do not fix a bug by tuning a constant, such as a chunk size, a retry count, a timeout or a buffer size, unless you have confirmed that the constant is the cause.
+- Do not add a setting, a fallback, a retry or a cooldown as extra defense around a fix. Do not add a guard for a state that cannot occur.
+- Do not add an `OMLX_*` environment variable that switches behavior. If the user needs a toggle, make it a setting with an entry in the settings UI.
 - Do not rewrite a hot path for a small gain.
 - Do not remove an existing recovery or fallback branch before you read the commit that added it.
 - Do not mix unrelated cleanup into the change.
@@ -47,7 +47,7 @@ These rules apply to the lines you add or change. Older code in this repository 
 - Put imports at the top of the file. An optional dependency goes there too, inside `try` and `except ImportError`.
 - Validate input where it enters, such as an API request, a config file or the CLI. Inside, do not check again. Write no `None` check, `hasattr` or `getattr` default for a value the caller always sets.
 - Do not catch an exception to hide it. Write no `except: pass`, and no `except Exception` around code that cannot raise.
-- Do not silence a lint or type error with `# noqa`, `# type: ignore`, `cast` or `Any`. Fix what it reports.
+- Do not use `# noqa`, `# type: ignore`, `cast` or `Any` to get a line you wrote past the linter or the type checker. Fix the line.
 - Return early instead of nesting.
 - Do not add a wrapper with one caller, a helper that only forwards a call, or a second copy of a helper that exists.
 - When you replace an internal function, move its callers and delete the old one. Leave no compatibility layer and no parallel old and new path.
@@ -63,7 +63,7 @@ These rules apply to the lines you add or change. Older code in this repository 
 - Assert what a caller can observe, with the exact value. Do not assert only that something is set or was called, and do not copy the implementation into the test.
 - Do not add tests for trivial behavior, or several cases that check the same thing.
 - Do not skip, loosen or delete an existing test to make your change pass. Do not add `sleep` or retries.
-- A fix that needs a change to the test harness or the import structure is too big. Look for a smaller one.
+- A bug fix that has to rework the test harness or restructure how modules import each other is too big. Look for a smaller one.
 
 ## Pull requests
 
@@ -88,7 +88,7 @@ The first section, `TL;DR`, belongs to the user.
 
 The maintainer closes a pull request without review when this section is missing, empty or written by an AI.
 
-You may write the other sections. Under Validation, list only what was run, with the Mac and the model. Leave out test counts, lint results and CI status. Put numbers in a table and add no diagram.
+You may write the other sections. Under Validation, list what was run, with the Mac and the model, and what remains untested. Leave out test counts, lint results and CI status. Put numbers in a table and add no diagram.
 
 ### Examples
 
