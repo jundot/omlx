@@ -9453,8 +9453,8 @@ class Scheduler:
         turn end and the store's last full block, and writes a placeholder
         elsewhere. Holding the window for the other boundaries until the store
         costs one window copy each (~170 MB on Inkling 2 Mini), so a long fresh
-        prompt holds GBs it throws away. Keep the tail snapshot and the last
-        two boundaries before the prompt end.
+        prompt holds GBs it throws away. Keep the tail snapshot and the
+        boundaries keep_window_checkpoint selects for the prompt.
         """
         if (
             not self.config.window_state_at_turn_ends
@@ -9466,7 +9466,11 @@ class Scheduler:
         prompt = getattr(request, "prompt_token_ids", None) if request else None
         if not prompt:
             return False
-        return token_count < ((len(prompt) - 1) // block_size - 1) * block_size
+        from .cache.paged_cache import keep_window_checkpoint
+
+        return not keep_window_checkpoint(
+            token_count // block_size - 1, (len(prompt) - 1) // block_size
+        )
 
     @staticmethod
     def _swa_drop_window_states(layers: Any) -> Any:

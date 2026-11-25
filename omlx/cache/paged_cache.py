@@ -512,6 +512,23 @@ def is_window_kv_state(state) -> bool:
     )
 
 
+def keep_window_checkpoint(block_index: int, num_full_blocks: int) -> bool:
+    """Whether full block ``block_index`` of a chain keeps its window state.
+
+    The last two full blocks always do. Further back, a block keeps it when
+    its end is a multiple of the largest power of two not above half its
+    distance ``d`` from the end. That is about 2*log2(n) checkpoints per
+    conversation, and an edit that stock storage resumes ``k`` blocks before
+    the end resumes at most ``5k/3`` blocks before it here. A longer chain
+    keeps a subset of what a shorter one keeps, so checkpoints are only ever
+    removed as a conversation grows.
+    """
+    d = num_full_blocks - 1 - block_index
+    if d < 2:
+        return True
+    return (block_index + 1) % (1 << ((d // 2).bit_length() - 1)) == 0
+
+
 def is_window_layer(layer) -> bool:
     """An extracted layer dict (``class_name``/``cache_type`` + ``state``)
     of the ArraysCache family that holds sliding-window K/V."""

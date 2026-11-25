@@ -4,42 +4,41 @@
 Inkling 2 keeps each sliding visit's window K/V in an ArraysCache. A boundary
 snapshot of that state is the whole window (~170 MB for Inkling 2 Mini), so
 storing one in every block fills a 5 GB hot cache near 48k tokens and the
-prefix chain is evicted. With the flag on, window state is stored only in a
-store's last block (the turn end) and its last full block; the newest few
-such full blocks keep it. The lookup restores from the longest point that
-still has window state.
+prefix chain is evicted. With the setting on, window state is stored only in
+a store's last block (the turn end) and in the full blocks
+keep_window_checkpoint selects: the last two, then sparser further back
+(about 2*log2(n) per conversation). The lookup restores from the longest
+point that still has window state.
 
 Tests:
-- test_window_state_kept_only_in_last_full_block — interior blocks get a
-  window placeholder, the turn end keeps the window, full-attention KV stays.
-- test_flag_off_keeps_stock_storage — without the flag every snapshot block
-  keeps its window state.
+- test_checkpoint_rule_bounds_edit_cost — the rule keeps an edit's
+  re-prefill within 5/3 of stock and only removes checkpoints as a chain grows.
+- test_single_store_keeps_rule_checkpoints — one long store: only the
+  selected blocks keep the window, full-attention KV stays in every block.
+- test_flag_off_keeps_stock_storage — without the setting every snapshot
+  block keeps its window state.
 - test_state_without_window_is_unaffected — conv-only and recurrent
-  (GDN-style: 3D conv + 4D state) ArraysCache layers are stored as before
-  even with the flag on.
+  (GDN-style: 3D conv + 4D state) ArraysCache layers are stored as before.
 - test_lookup_falls_back_to_block_with_window — a longer match ending on a
   stripped block restores from the newest block that has window state.
 - test_lookup_reads_payload_when_marker_is_unknown — same, with the
   in-memory markers cleared (as after a restart).
-- test_only_newest_full_blocks_keep_window — older full blocks are stripped
-  beyond the cap; turn-end tails are not counted.
-- test_full_size_turn_ends_are_capped — a turn end that fills its block is
-  counted toward the cap like any full block.
-- test_lookup_reads_ssd_file_shapes — the shape check on SSD files (no hot
-  cache) finds the turn end after the in-memory markers are cleared.
+- test_lookup_reads_ssd_file_shapes — same, from SSD files (no hot cache).
+- test_growing_chain_is_thinned_to_rule — a conversation growing turn by
+  turn ends with exactly the selected checkpoints, for turns ending inside a
+  block and on a block boundary; the turn-end tail keeps its window.
 - test_markers_follow_stored_payload — a block whose snapshot had no window
-  (a lean snapshot) is marked as such and does not count toward the cap.
-- test_backfill_keeps_interior_blocks_lean — a dedup'd interior block is not
-  given a window copy by the snapshot backfill.
+  (a lean snapshot) is marked as such.
+- test_backfill_keeps_interior_blocks_lean — a longer store over the same
+  prefix ends with the selected checkpoints only.
 - test_unknown_block_is_not_remembered — a probe miss is not cached.
-- test_lean_snapshot_* — mid-prefill boundary snapshots far from the prompt
-  end drop the window K/V (the store would strip it anyway); the last two
-  boundaries, the tail snapshot and recurrent states are kept, on both the
-  in-memory and the SSD snapshot path.
+- test_lean_snapshots_store_and_restore — a store fed lean snapshots still
+  restores at the turn end.
+- test_lean_snapshot_* — mid-prefill boundary snapshots the rule does not
+  select drop the window K/V (the store would strip it anyway); the tail
+  snapshot and recurrent states are kept, in memory and on the SSD path.
 - test_setting_reaches_scheduler_config — settings.json, the env var and the
   CLI flag all set it; old settings files default to off.
-- test_lean_snapshots_store_and_restore — store fed lean snapshots keeps the
-  same layout and the lookup still restores at the turn end.
 """
 
 from __future__ import annotations
@@ -48,7 +47,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from omlx.cache.paged_cache import PagedCacheManager
+from omlx.cache.paged_cache import PagedCacheManager, keep_window_checkpoint
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
 
@@ -80,9 +79,9 @@ class MockModel:
 def _make_cache(tmp_path, turn_ends=True, ssd_only=False):
     paged_cache = PagedCacheManager(
         block_size=BLOCK_SIZE,
-        max_blocks=200,
+        max_blocks=400,
         model_name="test-model",
-        initial_blocks=200,
+        initial_blocks=400,
     )
     ssd = PagedSSDCacheManager(
         cache_dir=tmp_path / "ssd_cache",
@@ -164,12 +163,29 @@ def _kv_len(ssd, block_hash):
     return int(data[1][0].shape[2])
 
 
-def test_window_state_kept_only_in_last_full_block(tmp_path):
+def _rule(n):
+    return [keep_window_checkpoint(i, n) for i in range(n)]
+
+
+def test_checkpoint_rule_bounds_edit_cost():
+    for n in range(1, 200):
+        kept = [i + 1 for i in range(n) if keep_window_checkpoint(i, n)]
+        assert kept[-1] == n
+        if n > 1:  # a longer chain keeps a subset of a shorter one's
+            shorter = {i + 1 for i in range(n - 1) if keep_window_checkpoint(i, n - 1)}
+            assert set(kept) - {n} <= shorter
+        for edit in range(n):  # first changed block; stock resumes at it
+            resume = max((b for b in kept if b <= edit), default=0)
+            assert 3 * (n - resume) <= 5 * (n - edit)
+
+
+def test_single_store_keeps_rule_checkpoints(tmp_path):
     cache, ssd = _make_cache(tmp_path)
-    table = _store(cache, "a", 4 * BLOCK_SIZE)
-    has_window = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(4)]
-    assert has_window == [False, False, False, True]
-    assert all(_kv_len(ssd, _hash(cache, table, i)) == BLOCK_SIZE for i in range(4))
+    table = _store(cache, "a", 20 * BLOCK_SIZE)
+    has_window = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(20)]
+    assert has_window == _rule(20)
+    assert not all(has_window)
+    assert all(_kv_len(ssd, _hash(cache, table, i)) == BLOCK_SIZE for i in range(20))
 
 
 def test_flag_off_keeps_stock_storage(tmp_path):
@@ -188,20 +204,26 @@ def test_state_without_window_is_unaffected(tmp_path, kind):
     assert not getattr(cache.paged_cache, "_swa_active", False)
 
 
+LONG = 20  # blocks in the second turn
+MATCH = 11  # blocks a diverging prompt matches
+RESUME = max(i + 1 for i in range(MATCH) if keep_window_checkpoint(i, LONG))
+
+
 def _two_turns(cache):
-    # Turn 1 ends at block 1 (window kept); turn 2 extends to block 3,
-    # so block 2 is stored with a window placeholder.
+    # Turn 2 extends turn 1 to LONG blocks; a prompt that diverges after
+    # MATCH blocks resumes at the newest selected checkpoint before it.
     _store(cache, "turn-1", 2 * BLOCK_SIZE)
-    return _store(cache, "turn-2", 4 * BLOCK_SIZE)
+    return _store(cache, "turn-2", LONG * BLOCK_SIZE)
 
 
 def test_lookup_falls_back_to_block_with_window(tmp_path):
     cache, _ = _make_cache(tmp_path)
     _two_turns(cache)
-    prompt = list(range(3 * BLOCK_SIZE + 1))
+    assert RESUME < MATCH
+    prompt = list(range(MATCH * BLOCK_SIZE)) + [-1]
     blocks, n = cache.paged_cache.get_computed_blocks(prompt)
-    assert n == 2 * BLOCK_SIZE
-    assert len(blocks) == 2
+    assert n == RESUME * BLOCK_SIZE
+    assert len(blocks) == RESUME
 
 
 def test_lookup_reads_payload_when_marker_is_unknown(tmp_path):
@@ -209,35 +231,23 @@ def test_lookup_reads_payload_when_marker_is_unknown(tmp_path):
     _two_turns(cache)
     cache.paged_cache._swa_full_hashes.clear()
     cache.paged_cache._swa_no_window.clear()
-    prompt = list(range(3 * BLOCK_SIZE + 1))
+    prompt = list(range(MATCH * BLOCK_SIZE)) + [-1]
     _, n = cache.paged_cache.get_computed_blocks(prompt)
-    assert n == 2 * BLOCK_SIZE
+    assert n == RESUME * BLOCK_SIZE
 
 
-def test_only_newest_full_blocks_keep_window(tmp_path):
+@pytest.mark.parametrize("extra", [2, 0], ids=["tail-turn-ends", "aligned-turn-ends"])
+def test_growing_chain_is_thinned_to_rule(tmp_path, extra):
     cache, ssd = _make_cache(tmp_path)
-    keep = BlockAwarePrefixCache._SWA_KEEP_FULL_BLOCKS
-    turns = keep + 3
-    # Each turn ends 2 tokens into a new block: the tail is the turn end,
-    # the block before it is the store's last full block.
+    turns = 24
     for t in range(1, turns + 1):
-        table = _store(cache, f"t{t}", t * BLOCK_SIZE + 2, tail_terminal=True)
+        table = _store(
+            cache, f"t{t}", t * BLOCK_SIZE + extra, tail_terminal=bool(extra)
+        )
     full = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(turns)]
-    assert full[-keep:] == [True] * keep
-    assert not any(full[: turns - keep])
-    assert _sliding_has_window(ssd, _hash(cache, table, turns))  # turn-end tail
-
-
-def test_full_size_turn_ends_are_capped(tmp_path):
-    cache, ssd = _make_cache(tmp_path)
-    keep = BlockAwarePrefixCache._SWA_KEEP_FULL_BLOCKS
-    turns = keep + 3
-    # Each turn ends on a block boundary: its last block is a full turn end.
-    for t in range(1, turns + 1):
-        table = _store(cache, f"t{t}", t * BLOCK_SIZE)
-    full = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(turns)]
-    assert full[-keep:] == [True] * keep
-    assert not any(full[: turns - keep])
+    assert full == _rule(turns)
+    if extra:
+        assert _sliding_has_window(ssd, _hash(cache, table, turns))  # turn-end tail
 
 
 def test_lookup_reads_ssd_file_shapes(tmp_path):
@@ -246,9 +256,9 @@ def test_lookup_reads_ssd_file_shapes(tmp_path):
     assert ssd.wait_for_pending_writes(timeout=30)
     cache.paged_cache._swa_full_hashes.clear()
     cache.paged_cache._swa_no_window.clear()
-    prompt = list(range(3 * BLOCK_SIZE + 1))
+    prompt = list(range(MATCH * BLOCK_SIZE)) + [-1]
     _, n = cache.paged_cache.get_computed_blocks(prompt)
-    assert n == 2 * BLOCK_SIZE
+    assert n == RESUME * BLOCK_SIZE
 
 
 def test_markers_follow_stored_payload(tmp_path):
@@ -261,17 +271,16 @@ def test_markers_follow_stored_payload(tmp_path):
     last_full = _hash(cache, table, 2)
     assert not _sliding_has_window(ssd, last_full)
     assert last_full in cache.paged_cache._swa_no_window
-    assert last_full not in cache._swa_full_fifo
     assert _sliding_has_window(ssd, _hash(cache, table, 3))  # turn-end tail
 
 
 def test_backfill_keeps_interior_blocks_lean(tmp_path):
     cache, ssd = _make_cache(tmp_path)
-    _store(cache, "a", 4 * BLOCK_SIZE)
-    # Same prefix, longer: blocks 0-3 dedup and carry boundary snapshots.
-    table = _store(cache, "b", 6 * BLOCK_SIZE)
-    has_window = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(6)]
-    assert has_window == [False, False, False, True, False, True]
+    _store(cache, "a", 20 * BLOCK_SIZE)
+    # Same prefix, longer: blocks 0-19 dedup and carry boundary snapshots.
+    table = _store(cache, "b", 24 * BLOCK_SIZE)
+    has_window = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(24)]
+    assert has_window == _rule(24)
 
 
 def test_unknown_block_is_not_remembered(tmp_path):
@@ -292,7 +301,10 @@ def test_lean_snapshots_store_and_restore(tmp_path):
         lean_before=4 * BLOCK_SIZE,
     )
     has_window = [_sliding_has_window(ssd, _hash(cache, table, i)) for i in range(6)]
-    assert has_window == [False, True, False, False, True, True]
+    # The rule for 5 full blocks, except block 2 whose snapshot was lean.
+    expected = _rule(5)
+    expected[2] = False
+    assert has_window == expected + [True]
     prompt = list(range(5 * BLOCK_SIZE + 2)) + [999]
     _, n = cache.paged_cache.get_computed_blocks(prompt)
     assert n == 5 * BLOCK_SIZE + 2
@@ -337,10 +349,11 @@ def test_lean_snapshot_drops_window_far_from_prompt_end():
     assert _is_placeholder(_lean(2 * BLOCK_SIZE, prompt))
 
 
-def test_lean_snapshot_keeps_last_two_boundaries():
+def test_lean_snapshot_keeps_rule_checkpoints():
     prompt = 10 * BLOCK_SIZE + 3
-    for boundary in (9 * BLOCK_SIZE, 10 * BLOCK_SIZE):
-        assert not _is_placeholder(_lean(boundary, prompt))
+    for b in range(1, 11):
+        kept = keep_window_checkpoint(b - 1, 10)
+        assert _is_placeholder(_lean(b * BLOCK_SIZE, prompt)) != kept
 
 
 def test_lean_snapshot_keeps_tail_and_recurrent_state():

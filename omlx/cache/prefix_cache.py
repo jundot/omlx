@@ -10,7 +10,7 @@ import logging
 import math
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -39,6 +39,7 @@ from .paged_cache import (
     compute_block_hash,
     is_window_kv_state,
     is_window_layer,
+    keep_window_checkpoint,
     resolve_block_extra_keys,
 )
 from .paged_ssd_cache import (
@@ -327,7 +328,6 @@ class BlockAwarePrefixCache(CacheManager):
         # Request to block table mapping
         self._request_tables: dict[str, BlockCacheEntry] = {}
 
-        self._swa_full_fifo: deque = deque()
         # Supersede-on-extend lineage: newest tip block hash -> previous tip
         # block hash. When a chain is extended again, the tip two generations
         # back is dropped: a tail is deleted, a rotating full block loses its
@@ -1100,13 +1100,9 @@ class BlockAwarePrefixCache(CacheManager):
         swa_active = self._swa_store_active(cache_data)
         if swa_active:
             self.paged_cache._swa_active = True
-        # Window state is kept in the last block (turn end) and the last full
-        # block of each store; other blocks get a placeholder for it.
-        swa_last_full_idx = (
-            num_new_blocks - 2
-            if store_terminal and trailing_partial_tokens > 0
-            else num_new_blocks - 1
-        )
+        # Window state is kept in the last block (turn end) and in the full
+        # blocks keep_window_checkpoint selects; others get a placeholder.
+        swa_full_blocks = (existing_tokens + len(new_tokens)) // self.block_size
         self._last_partial_tokens_skipped = (
             0 if store_terminal else trailing_partial_tokens
         )
@@ -1402,14 +1398,10 @@ class BlockAwarePrefixCache(CacheManager):
                         if backfilled:
                             self._backfill_checked_hashes.add(existing_block.block_hash)
                             if swa_tail_repair:
-                                # Payload may have changed: re-probe it, and a
-                                # full block with window joins the keep-N queue.
-                                h = existing_block.block_hash
-                                with self.paged_cache._lock:
-                                    self.paged_cache._swa_remember(h, None)
-                                    has_window = self.paged_cache._swa_has_window(h)
-                                if has_window:
-                                    self._swa_track_full_block(h, hot_cache_write_back)
+                                # Payload may have changed: re-probe on lookup.
+                                self.paged_cache._swa_remember(
+                                    existing_block.block_hash, None
+                                )
                             if (
                                 len(self._backfill_checked_hashes)
                                 > _BACKFILL_CHECKED_MAX_ENTRIES
@@ -1564,7 +1556,11 @@ class BlockAwarePrefixCache(CacheManager):
                     externalize_arrays=split_gdn_layout,
                     live_state_at_true_end=live_state_at_true_end,
                     swa_strip_window=(
-                        swa_active and not is_last_block and i != swa_last_full_idx
+                        swa_active
+                        and not is_last_block
+                        and not keep_window_checkpoint(
+                            global_start // self.block_size, swa_full_blocks
+                        )
                     ),
                 )
 
@@ -1590,12 +1586,15 @@ class BlockAwarePrefixCache(CacheManager):
                     break
 
                 if swa_active and block.block_hash:
-                    self._swa_mark_block(
+                    self.paged_cache._swa_remember(
                         block.block_hash,
-                        block_kv_data,
-                        layer_cache_types,
-                        len(block_tokens) == self.block_size,
-                        hot_cache_write_back,
+                        any(
+                            CacheTypeRegistry.is_arrays_family(t)
+                            and is_window_kv_state(layer)
+                            for t, layer in zip(
+                                layer_cache_types or (), block_kv_data or ()
+                            )
+                        ),
                     )
 
                 if block_kv_data and block.block_hash:
@@ -1799,6 +1798,9 @@ class BlockAwarePrefixCache(CacheManager):
                 self._store_tip_hashes.add(new_tip.block_hash)
                 if len(self._store_tip_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
                     self._store_tip_hashes.clear()
+
+        if swa_active:
+            self._swa_thin_checkpoints(block_table, hot_cache_write_back)
 
         # Exact terminal blocks are discoverable only through
         # fetch_exact_prefix(); never expose them to general prefix matching.
@@ -2248,52 +2250,39 @@ class BlockAwarePrefixCache(CacheManager):
         self._tail_hashes.discard(block_hash)
         return True
 
-    # window_state_at_turn_ends: newest full (non-tail) blocks that keep window
-    # state. shortcut: one queue per model, shared by all conversations; with
-    # more than 4 sessions taking turns, a session's last full block is
-    # stripped before its next turn (its tail still restores). Upgrade to a
-    # per-conversation cap (via _tip_lineage) if that shows up in practice.
-    _SWA_KEEP_FULL_BLOCKS = 4
-
     def _swa_store_active(self, cache_data) -> bool:
         """Turn-end window storage applies to models that store window state."""
         return self._window_state_at_turn_ends and any(
             is_window_layer(layer) for layer in cache_data or ()
         )
 
-    def _swa_mark_block(
-        self,
-        block_hash: bytes,
-        block_kv_data,
-        layer_cache_types,
-        is_full: bool,
-        hot_cache_write_back: bool,
-    ) -> None:
-        """Record whether a just-stored block holds window state, from its payload."""
-        has_window = any(
-            CacheTypeRegistry.is_arrays_family(t) and is_window_kv_state(layer)
-            for t, layer in zip(layer_cache_types or (), block_kv_data or ())
-        )
-        if has_window and is_full:
-            self._swa_track_full_block(block_hash, hot_cache_write_back)
-        else:
-            self.paged_cache._swa_remember(block_hash, has_window)
+    def _swa_thin_checkpoints(self, block_table, hot_cache_write_back: bool) -> None:
+        """Strip window state from this chain's full blocks that
+        keep_window_checkpoint no longer selects now that the chain grew.
 
-    def _swa_track_full_block(
-        self, block_hash: bytes, hot_cache_write_back: bool
-    ) -> None:
-        """Keep window state in the newest few full blocks; strip older ones."""
-        fifo = self._swa_full_fifo
-        if block_hash in fifo:
-            return
-        fifo.append(block_hash)
-        self.paged_cache._swa_remember(block_hash, True)
-        while len(fifo) > self._SWA_KEEP_FULL_BLOCKS:
-            old = fifo.popleft()
-            self.paged_cache._swa_remember(old, False)
-            self._strip_rotating_payload(
-                old, hot_cache_write_back, strip_window_arrays=True
-            )
+        shortcut: a block shared with a shorter conversation is thinned by the
+        longer one's spacing; the shorter one keeps its turn end. Track
+        checkpoints per chain if shared prefixes branch often.
+        """
+        paged = self.paged_cache
+        full = [
+            block
+            for block in map(paged.allocated_blocks.get, block_table.block_ids)
+            if block is not None
+            and block.block_hash is not None
+            and block.token_count == self.block_size
+        ]
+        for i, block in enumerate(full):
+            if keep_window_checkpoint(i, len(full)):
+                continue
+            with paged._lock:
+                has_window = paged._swa_has_window(block.block_hash)
+                if has_window:
+                    paged._swa_remember(block.block_hash, False)
+            if has_window:
+                self._strip_rotating_payload(
+                    block.block_hash, hot_cache_write_back, strip_window_arrays=True
+                )
 
     def _strip_rotating_payload(
         self,
