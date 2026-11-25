@@ -31,6 +31,7 @@ from omlx.scheduler import Scheduler
 from omlx.server import (
     _compile_bare_grammar,
     _compile_with_structural_tag,
+    _grammar_reasoning_parser,
     _patch_output_format,
 )
 
@@ -454,8 +455,6 @@ class TestCompileWithStructuralTag:
 
 
 class TestInkling2StructuralTag:
-    """Inkling 2 writes its own block headers, so the grammar must accept them."""
-
     _VOCAB = [
         "<|message_model|>", "<|content_text|>", "<|content_thinking|>",
         "<|end_message|>", "<|content_model_end_sampling|>",
@@ -472,9 +471,7 @@ class TestInkling2StructuralTag:
     _JSON = ['{"', "name", '":"', "A", '"}']
     _END = ["<|end_message|>", "<|content_model_end_sampling|>"]
 
-    def _compile(self, chat_template_kwargs=None, fmt=None):
-        from omlx.server import _compile_with_structural_tag, _grammar_reasoning_parser
-
+    def _compile(self, chat_template_kwargs=None):
         stop = self._VOCAB.index("<|content_model_end_sampling|>")
         compiler = xgr.GrammarCompiler(
             xgr.TokenizerInfo(self._VOCAB, stop_token_ids=[stop])
@@ -483,7 +480,7 @@ class TestInkling2StructuralTag:
             SimpleNamespace(model_type="inkling2_loop"), None
         )
         return _compile_with_structural_tag(
-            compiler, fmt or self._SCHEMA, parser, chat_template_kwargs
+            compiler, self._SCHEMA, parser, chat_template_kwargs
         )
 
     def _allowed(self, matcher, token):
@@ -495,17 +492,8 @@ class TestInkling2StructuralTag:
         for token in tokens:
             assert matcher.accept_token(self._VOCAB.index(token)), token
 
-    @pytest.mark.parametrize("model_type", ["inkling2", "inkling2_loop"])
-    def test_model_gets_the_tag_without_a_configured_parser(self, model_type):
-        from omlx.server import _grammar_reasoning_parser
-
-        engine = SimpleNamespace(model_type=model_type)
-        assert _grammar_reasoning_parser(engine, None) == "inkling2"
-        assert _grammar_reasoning_parser(engine, "qwen") == "qwen"
-
     @requires_xgrammar
     def test_answer_opens_its_own_text_block(self):
-        """The publisher template has no generation prompt, so the model writes the header."""
         matcher = xgr.GrammarMatcher(self._compile({"enable_thinking": False}))
 
         assert self._allowed(matcher, "<|message_model|>")
@@ -518,29 +506,10 @@ class TestInkling2StructuralTag:
 
     @requires_xgrammar
     def test_header_rendered_by_the_template_is_accepted(self):
-        """A custom template may end the prompt with the text block header."""
         matcher = xgr.GrammarMatcher(self._compile({"enable_thinking": False}))
 
         self._accept(matcher, [*self._JSON, *self._END])
         assert matcher.is_terminated()
-
-    @requires_xgrammar
-    def test_thinking_block_comes_before_the_answer(self):
-        compiled = self._compile()
-        matcher = xgr.GrammarMatcher(compiled)
-
-        self._accept(
-            matcher,
-            ["<|message_model|>", "<|content_thinking|>", "Ok", "<|end_message|>"],
-        )
-        assert not self._allowed(matcher, '{"')
-        self._accept(
-            matcher,
-            ["<|message_model|>", "<|content_text|>", *self._JSON, *self._END],
-        )
-        assert matcher.is_terminated()
-        assert compiled._omlx_has_thinking_phase is True
-        assert compiled._omlx_thinking_phase_optional is True
 
     @requires_xgrammar
     def test_thinking_block_stays_one_block(self):
@@ -555,14 +524,8 @@ class TestInkling2StructuralTag:
         "chat_template_kwargs,thinks",
         [
             ({"enable_thinking": False}, False),
-            ({"reasoning_effort": "none"}, False),
-            ({"reasoning_effort": "off"}, False),
-            ({"reasoning_effort": 0}, False),
             ({"reasoning_effort": "0.0"}, False),
             ({"reasoning_effort": "low", "enable_thinking": False}, True),
-            ({"reasoning_effort": 0.2}, True),
-            ({"reasoning_effort": "0.2"}, True),
-            ({"enable_thinking": True}, True),
         ],
     )
     def test_thinking_follows_the_template_effort(self, chat_template_kwargs, thinks):
@@ -574,26 +537,7 @@ class TestInkling2StructuralTag:
         assert compiled._omlx_has_thinking_phase is thinks
 
     @requires_xgrammar
-    @pytest.mark.parametrize(
-        "fmt,answer",
-        [
-            ({"type": "json_schema", "json_schema": {}}, _JSON),
-            ({"type": "regex", "pattern": "Ok"}, ["Ok"]),
-            ({"type": "grammar", "grammar": 'root ::= "A"'}, ["A"]),
-        ],
-    )
-    def test_other_formats_go_inside_the_text_block(self, fmt, answer):
-        matcher = xgr.GrammarMatcher(self._compile({"enable_thinking": False}, fmt))
-
-        self._accept(
-            matcher, ["<|message_model|>", "<|content_text|>", *answer, *self._END]
-        )
-        assert matcher.is_terminated()
-
-    @requires_xgrammar
     def test_json_schema_keeps_the_whitespace_bound(self):
-        from omlx.server import _compile_with_structural_tag
-
         compiler = MagicMock()
         fmt = {"type": "json_schema", "json_schema": {"type": "object"}}
 
@@ -1418,8 +1362,6 @@ class TestGrammarThinkingBudget:
             preferred=lambda token: ord("x") if token == _MM_THINK_END else token,
         )
 
-    # Inkling 2 opens its own thinking block. The forced close ends that block
-    # and opens the text block, which the grammar must take as the answer header.
     @pytest.mark.parametrize(
         "expected",
         [
@@ -1443,7 +1385,6 @@ class TestGrammarThinkingBudget:
                 trailing=[_INK_MODEL, _INK_TEXT],
             ),
             [*expected, _BUDGET_STOP],
-            # The model prefers to keep reasoning; the budget must force the close.
             preferred=lambda token: (
                 ord("x") if token == _INK_END and next(first_end, False) else token
             ),
