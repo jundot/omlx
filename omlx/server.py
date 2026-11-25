@@ -5496,7 +5496,7 @@ async def create_chat_completion(
                 if tool_calls and output.finish_reason != "length"
                 else output.finish_reason
             )
-            reasoning_token_count = _count_reasoning_tokens(
+            reasoning_token_count = _estimate_reasoning_tokens(
                 engine.tokenizer, cleaned_thinking, output.completion_tokens
             )
 
@@ -5606,27 +5606,13 @@ def _normalize_structured_outputs(
     return None
 
 
-def _count_reasoning_tokens(
-    tokenizer, reasoning_text: Optional[str], completion_tokens: Optional[int]
+def _estimate_reasoning_tokens(
+    tokenizer, reasoning_text: str, completion_tokens: int
 ) -> int:
-    """Count reasoning tokens for usage reporting.
-
-    The reasoning text is re-tokenized after generation, so it can include
-    text the model never generated: the scheduler prepends ``<think>\\n`` to a
-    prompt-opened block and the streaming parser keeps the newline. Strip the
-    surrounding whitespace, skip special tokens, and cap the count at the
-    completion tokens so usage never reports more reasoning than output.
-    """
-    text = (reasoning_text or "").strip()
-    if not text:
+    if not reasoning_text:
         return 0
-    try:
-        count = len(tokenizer.encode(text, add_special_tokens=False))
-    except TypeError:
-        count = len(tokenizer.encode(text))
-    if completion_tokens is not None:
-        count = min(count, completion_tokens)
-    return count
+    token_ids = tokenizer.encode(reasoning_text.strip(), add_special_tokens=False)
+    return min(len(token_ids), completion_tokens)
 
 
 def _choice_logprobs(entries) -> ChoiceLogprobs:
@@ -7339,7 +7325,7 @@ async def stream_chat_completion(
             total_time = end_time - start_time
             pt = last_output.prompt_tokens
             ct = last_output.completion_tokens
-            reasoning_token_count = _count_reasoning_tokens(
+            reasoning_token_count = _estimate_reasoning_tokens(
                 engine.tokenizer, accumulated_reasoning, ct
             )
             usage_chunk = ChatCompletionChunk(
@@ -9183,7 +9169,7 @@ async def create_response(
                         )
                     )
 
-            reasoning_token_count = _count_reasoning_tokens(
+            reasoning_token_count = _estimate_reasoning_tokens(
                 engine.tokenizer, reasoning_text, output.completion_tokens
             )
             usage = build_response_usage(
@@ -9990,7 +9976,7 @@ async def stream_responses_api(
             f"{last_output.completion_tokens} tokens in {total_duration:.2f}s "
             f"({tokens_per_sec:.1f} tok/s)"
         )
-        reasoning_token_count = _count_reasoning_tokens(
+        reasoning_token_count = _estimate_reasoning_tokens(
             engine.tokenizer, reasoning_text, last_output.completion_tokens
         )
         usage_data = {
