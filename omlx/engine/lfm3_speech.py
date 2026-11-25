@@ -13,8 +13,10 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
+import anyio
 import numpy as np
 from mlx_vlm.generate.audio import generate_audio
 from mlx_vlm.prompt_utils import apply_chat_template
@@ -127,13 +129,25 @@ class LFM3Speech:
         if engine_core is None:
             raise RuntimeError("Engine not started. Call start() first.")
         start = time.monotonic()
-        loop = asyncio.get_running_loop()
         # Keeps the pool from evicting the model while the speech loop runs.
         self._engine._speech_active += 1
         try:
-            result = await loop.run_in_executor(
-                engine_core._mlx_executor, lambda: self._run(*args, **kwargs)
-            )
+            work = engine_core._mlx_executor.submit(self._run, *args, **kwargs)
+            pending = asyncio.wrap_future(work)
+            try:
+                result = await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                if not work.cancel():
+                    # A running executor job cannot be cancelled. Keep the
+                    # model and uploaded audio alive until it finishes, even
+                    # inside Starlette's cancelled response scope.
+                    with anyio.CancelScope(shield=True), suppress(Exception):
+                        while not pending.done():
+                            with suppress(asyncio.CancelledError):
+                                await asyncio.shield(pending)
+                        if not pending.cancelled():
+                            pending.result()
+                raise
         finally:
             self._engine._speech_active -= 1
         logger.info(
