@@ -157,14 +157,14 @@ MAX_CONCURRENT_REQUESTS_VERSION = (1, 7, 1)
 _PRUNED_EXPERTS_MULTIPLE = 8
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
-# The Qwen families' native window. From 1.4.0 on Splash serves more with
-# YaRN, which changes answers at every length.
 SPLASH_NATIVE_CONTEXT = 262144
 SPLASH_YARN_CONTEXT = 1010000
 YARN_VERSION = (1, 4, 0)
 _INKLING2_FAMILY = "Inkling-2-Mini"
 _INKLING2_TEXT_TYPE = "inkling2_loop_text"
 _INKLING2_CONTEXT = 1010000
+_INKLING2_LAYER_VISITS = 48
+_INKLING2_FULL_ATTENTION_VISITS = 8
 SPLASH_INSTALL_HINT = (
     "Splash is not installed: brew install incoai/tap/splash (M3 or later), "
     "or splash-m1 for M1/M2 Macs (https://github.com/paperniuk/splash/releases)"
@@ -259,10 +259,9 @@ _FAMILY_VERSIONS = {
 }
 # Families Splash loads from GGUFs only, not from MLX checkpoints.
 _GGUF_ONLY_FAMILIES = frozenset({"Qwen3.8-Flash-Next", "Flint"})
-# Families Splash serves as text only, even if the checkpoint has a tower.
 _TEXT_ONLY_FAMILIES = frozenset({"Flint", _INKLING2_FAMILY})
 # Families without YaRN; a longer --max-context stops their startup.
-_NO_YARN_FAMILIES = frozenset({"Flint", _INKLING2_FAMILY})
+_NATIVE_CONTEXT_FAMILIES = frozenset({"Flint", _INKLING2_FAMILY})
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 _SHARD_INDEX = "model.safetensors.index.json"
 # Splash serves vision only with one of these from the target repository.
@@ -601,38 +600,11 @@ def _quantization_problem(config: dict, binary: SplashBinary) -> str:
     )
 
 
-def _inkling2_loop(text: dict) -> tuple[int, int, int] | None:
-    loop = text.get("loop_config")
-    if loop is None:
-        # The published Mini schedule also covers older generated GGUF configs.
-        return 6, 18, 3
-    if not isinstance(loop, dict):
-        return None
-    start, end, passes = (
-        loop.get(key) for key in ("core_start", "core_end", "num_passes")
-    )
-    layers = text.get("num_hidden_layers")
-    if (
-        type(layers) is int
-        and type(start) is int
-        and type(end) is int
-        and type(passes) is int
-        and 0 <= start < end <= layers
-        and passes >= 1
-    ):
-        return start, end, passes
-    return None
-
-
 def _is_splash_draft(draft: dict, text: dict) -> bool:
     architectures = draft.get("architectures") or []
     target_layers = text.get("num_hidden_layers")
     if text.get("model_type") == _INKLING2_TEXT_TYPE:
-        loop = _inkling2_loop(text)
-        if loop is None or target_layers is None:
-            return False
-        start, end, passes = loop
-        target_layers += (end - start) * (passes - 1)
+        target_layers = _INKLING2_LAYER_VISITS
     return (
         "DFlash2DraftModel" in architectures
         and draft.get("hidden_size") == text.get("hidden_size")
@@ -668,7 +640,10 @@ class SplashTarget:
     @property
     def max_context(self) -> int:
         """The largest ``--max-context`` Splash starts with."""
-        if self.family in _NO_YARN_FAMILIES or self.binary.version_tuple < YARN_VERSION:
+        if (
+            self.family in _NATIVE_CONTEXT_FAMILIES
+            or self.binary.version_tuple < YARN_VERSION
+        ):
             return self.native_context
         return SPLASH_YARN_CONTEXT
 
@@ -817,29 +792,11 @@ def _weight_bytes(path: Path) -> int:
 
 def _kv_bytes_per_token(text: dict, kv_format: str) -> int:
     layer_types = text.get("layer_types") or []
+    layers = sum(1 for kind in layer_types if kind == "full_attention")
     if text.get("model_type") == _INKLING2_TEXT_TYPE:
-        loop = _inkling2_loop(text)
-        full_layers = [5, 11, 17, 23]
-        if len(layer_types) == text["num_hidden_layers"]:
-            full_layers = [
-                index
-                for index, kind in enumerate(layer_types)
-                if kind == "full_attention"
-            ]
-        elif isinstance(local_layers := text.get("local_layer_ids"), list):
-            full_layers = [
-                index
-                for index in range(text["num_hidden_layers"])
-                if index not in local_layers
-            ]
-        layers = len(full_layers)
-        if loop is not None:
-            start, end, passes = loop
-            layers += sum(start <= index < end for index in full_layers) * (passes - 1)
-    else:
-        layers = sum(1 for kind in layer_types if kind == "full_attention")
-        if not layers:
-            layers = text["num_hidden_layers"] // text.get("full_attention_interval", 1)
+        layers = _INKLING2_FULL_ATTENTION_VISITS
+    elif not layers:
+        layers = text["num_hidden_layers"] // text.get("full_attention_interval", 1)
     values = layers * 2 * text["num_key_value_heads"] * text["head_dim"]
     # int8 pages carry one 1-byte scale per 64 values.
     return values * 2 if kv_format == "bf16" else values + values // 64

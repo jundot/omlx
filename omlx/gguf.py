@@ -81,7 +81,6 @@ _HF_MODEL_TYPES = {
 CONFIG_FILE = "config.json"
 _CHAT_TEMPLATE_FILE = "chat_template.jinja"
 _GENERATION_CONFIG_FILE = "generation_config.json"
-# Rebuild generated folders with Inkling 2's loop and attention metadata.
 _FOLDER_LAYOUT = 6
 
 # The qwen35 pre-tokenizer: Qwen2's letter class extended to combining
@@ -102,7 +101,6 @@ _FLINT_PATTERNS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
-# Inkling 2 uses the o200k split pattern and matches whole vocabulary pieces.
 _INKLING2_PATTERN = (
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
@@ -110,9 +108,6 @@ _INKLING2_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
-# The GGUF tokenizer profiles (tokenizer.ggml.pre) oMLX derives a tokenizer
-# for, as Splash does: the split patterns, whether to normalize with NFC,
-# and whether BPE uses a whole vocabulary token before trying merges.
 _TOKENIZER_PROFILES: dict[str, tuple[tuple[str, ...], bool, bool]] = {
     "qwen35": ((_QWEN35_PATTERN,), True, False),
     "flint": (_FLINT_PATTERNS, False, False),
@@ -125,16 +120,13 @@ _USER_DEFINED_TOKEN = 4
 _TOKENIZER_ARRAYS = frozenset(
     {"tokenizer.ggml.tokens", "tokenizer.ggml.token_type", "tokenizer.ggml.merges"}
 )
-# Per-layer arrays the derived config reads.
 _LAYER_ARRAYS = frozenset(
     {
         "flint.attention.sliding_window_pattern",
         "inkling2.attention.head_count",
         "inkling2.attention.head_count_kv",
-        "inkling2.attention.sliding_window_pattern",
         "inkling2_loop.attention.head_count",
         "inkling2_loop.attention.head_count_kv",
-        "inkling2_loop.attention.sliding_window_pattern",
     }
 )
 
@@ -455,44 +447,24 @@ def derive_config(
     if layers is not None:
         # MTP layers are not part of the model the engines run.
         layers -= field("nextn_predict_layers") or 0
-    header_layers = layers
     hf_type = _HF_MODEL_TYPES.get(arch)
     inkling = hf_type == "inkling2_loop"
-    loop = None
-    repeated = 0
-    if inkling and layers is not None:
-        original_layout = arch == "inkling2"
-        start = field("loop.core_start" if original_layout else "loop.start")
-        end = field("loop.core_end" if original_layout else "loop.end")
-        passes = field("num_loops" if original_layout else "loop.count")
+    if arch == "inkling2" and layers is not None:
+        start = field("loop.core_start")
+        end = field("loop.core_end")
+        passes = field("num_loops")
         if start is not None and end is not None and passes is not None:
-            # Unsloth's original layout counts applications across all loop passes.
-            if original_layout:
-                repeated = (passes - 1) * (end - start)
-            if passes >= 1 and 0 <= start < end <= layers - repeated:
-                layers -= repeated
-                loop = {"core_start": start, "core_end": end, "num_passes": passes}
-            else:
-                layers = None
+            layers -= (passes - 1) * (end - start)
 
     tokens = metadata.get("tokenizer.ggml.tokens")
     if isinstance(tokens, ArrayInfo):
         vocab_size = tokens.length
     else:
         vocab_size = len(tokens) if isinstance(tokens, list) else None
-    if inkling:
-        padded = field("vocab_size")
-        vocab_size = (
-            padded
-            if padded is not None and vocab_size is not None and padded >= vocab_size
-            else None
-        )
 
     def head_count(name: str) -> int | None:
         value = metadata.get(f"{arch}.attention.{name}")
-        if inkling and isinstance(value, list):
-            if not value or len(value) != header_layers:
-                return None
+        if isinstance(value, list) and value:
             first = _int(value[0])
             return first if all(_int(count) == first for count in value) else None
         return _int(value)
@@ -507,7 +479,7 @@ def derive_config(
         "full_attention_interval": field("full_attention_interval"),
         "num_experts": field("expert_count"),
         "num_experts_per_tok": field("expert_used_count"),
-        "vocab_size": vocab_size,
+        "vocab_size": field("vocab_size") if inkling else vocab_size,
     }
     if inkling:
         sizes["n_routed_experts"] = sizes.pop("num_experts")
@@ -520,21 +492,15 @@ def derive_config(
         window
         and isinstance(pattern, list)
         and layers is not None
-        and header_layers is not None
-        and len(pattern) >= header_layers
+        and len(pattern) >= layers
         and all(isinstance(slides, bool) for slides in pattern)
     ):
-        if loop is not None and repeated:
-            # Keep the first visit of each weight layer.
-            end = loop["core_end"]
-            pattern = pattern[:end] + pattern[end + repeated :]
+        # Only the full layers' KV grows with the context (Flint).
         text["sliding_window"] = window
         text["layer_types"] = [
             "sliding_attention" if slides else "full_attention"
             for slides in pattern[:layers]
         ]
-    if loop is not None:
-        text["loop_config"] = loop
     text["model_type"] = f"{hf_type}_text" if hf_type else arch
     config: dict[str, Any] = {"model_type": hf_type or arch, "text_config": text}
     if projector is not None:
