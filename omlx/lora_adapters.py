@@ -117,7 +117,13 @@ class LoRALinear(nn.Module):
         self.freeze()
 
     def __call__(self, x: mx.array) -> mx.array:
-        y = self.base(x)
+        return self.add_delta(x, self.base(x))
+
+    def add_delta(self, x: mx.array, y: mx.array) -> mx.array:
+        """This wrapper's output from ``y``, its base's output for ``x``.
+
+        Grouped launches that run several bases at once add each delta here.
+        """
         # One kernel for the up-projection and the add: decode is launch-bound.
         out = mx.addmm(y, x @ self.lora_a.T, self.lora_b)
         return out if out.dtype == y.dtype else out.astype(y.dtype)

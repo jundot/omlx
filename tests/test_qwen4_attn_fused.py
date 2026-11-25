@@ -19,7 +19,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from omlx.lora_adapters import LoRALinear
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_yarn import apply_qwen35_yarn_patch
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -466,3 +468,65 @@ def test_decode_prep_matches_mlx_path(monkeypatch, context, positions):
         monkeypatch.setattr(attn_fused, "_DISABLED", False)
         assert _bit_equal(got, want)
         assert all(_bit_equal(g, w) for g, w in zip(got_state, want_state))
+
+
+def _lora(base: nn.QuantizedLinear, rank: int = 8) -> LoRALinear:
+    """``base`` under a LoRA wrapper with a nonzero delta."""
+    in_dims = base.scales.shape[-1] * base.group_size
+    lora_a = (mx.random.normal((rank, in_dims)) * in_dims**-0.5).astype(mx.bfloat16)
+    lora_b = (mx.random.normal((rank, base.weight.shape[0])) * 0.1).astype(mx.bfloat16)
+    return LoRALinear(base, lora_a, lora_b)
+
+
+def test_lora_wrapped_projections_keep_the_grouped_launch(monkeypatch):
+    """With q/k/v/o_proj under ``LoRALinear``, a decode row still takes the
+    grouped launch, on the quantized bases, and each projection keeps the
+    bits of the wrapper's own call (its base plus its delta)."""
+    # The projection launch reads no SDPA plan, so it runs on any GPU class.
+    monkeypatch.setattr(attn_fused, "_gpu_class", lambda: "d")
+    attn = _attention(seed=3)
+    x = (mx.random.normal((1, 1, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+    positions = _positions(0, 1)
+    if not attn._fused_projections_ready(x, positions):
+        pytest.skip("the grouped projection launch does not run on this GPU")
+
+    names = ("q_proj", "k_proj", "v_proj", "o_proj")
+    attn.update_modules({name: _lora(getattr(attn, name)) for name in names})
+    mx.eval(attn.parameters())
+    bases = [getattr(attn, name).base for name in names[:3]]
+    bases.append(attn.indexer.index_qk_proj)
+
+    launches = []
+    tiled = row_exact_qmv.quantized_linears_tiled
+
+    def recording(linears, *args):
+        outputs = tiled(linears, *args)
+        launches.append(([id(linear) for linear in linears], outputs is not None))
+        return outputs
+
+    monkeypatch.setattr(row_exact_qmv, "quantized_linears_tiled", recording)
+    keys = []
+    prep = attn._prep_qk
+
+    def capturing(q_out, k_out, rope_positions):
+        keys.append(k_out)
+        return prep(q_out, k_out, rope_positions)
+
+    monkeypatch.setattr(attn, "_prep_qk", capturing)
+
+    assert attn._fused_projections_ready(x, positions)
+    q_out, index_out, v_out, *_ = attn._fused_prologue(x, 0, positions)
+    o_in = mx.random.normal((1, 1, attn.o_proj.lora_a.shape[1])) * 0.5
+    o_in = o_in.astype(mx.bfloat16)
+    o_out = attn._fused_output(o_in, 1)
+
+    assert launches == [
+        ([id(linear) for linear in bases], True),
+        ([id(attn.o_proj.base)], True),
+    ]
+    assert _bit_equal(q_out, attn.q_proj(x).reshape(1, -1))
+    assert _bit_equal(keys[0], attn.k_proj(x).reshape(1, -1))
+    assert _bit_equal(v_out, attn.v_proj(x))
+    assert _bit_equal(index_out, attn.indexer.index_qk_proj(x))
+    assert _bit_equal(o_out, attn.o_proj(o_in))
+    assert not _bit_equal(o_out, attn.o_proj.base(o_in))
