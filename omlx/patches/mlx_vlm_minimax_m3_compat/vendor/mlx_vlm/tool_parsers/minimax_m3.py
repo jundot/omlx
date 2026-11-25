@@ -9,7 +9,11 @@ tool_call_end = "]<]minimax[>[</tool_call>"
 _NS_TOKEN = "]<]minimax[>["
 _ELEMENT_START = f"{_NS_TOKEN}<"
 _ELEMENT_END_START = f"{_NS_TOKEN}</"
-_TAG_NAME_RE = re.compile(r"[A-Za-z_$][\w:.$-]*")
+# Element boundaries come from the namespace token and the literal closing tag,
+# so the name rule only has to keep out structural characters. Argument keys such
+# as AWS IAM "aws:ResourceTag/<key>" or MIME types ("application/json") contain
+# "/" and must round-trip instead of failing the whole call.
+_TAG_NAME_RE = re.compile(r"[^\s<>]+")
 _INVOKE_RE = re.compile(
     rf"{re.escape(_NS_TOKEN)}<invoke\b(?P<attrs>[^>]*)>"
     rf"(?P<body>.*?){re.escape(_NS_TOKEN)}</invoke>",
