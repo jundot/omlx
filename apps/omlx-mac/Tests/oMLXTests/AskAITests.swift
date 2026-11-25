@@ -519,6 +519,18 @@ final class AskAITests: XCTestCase {
         XCTAssertEqual(reads, 1)
     }
 
+    func testPromptPlaceholdersKeepReplacementValuesLiteral() {
+        var reads = 0
+        var context = PromptContext()
+        context.app = "Editor {model}"
+        context.model = "qwen"
+        context.readClipboard = { reads += 1; return "sample" }
+
+        let filled = PromptPlaceholders.fill("{app} / {model} / {clipboard} / {clipboard}", context: context)
+        XCTAssertEqual(filled, "Editor {model} / qwen / sample / sample")
+        XCTAssertEqual(reads, 1)
+    }
+
     @MainActor
     func testConversationFillsThePromptOnce() throws {
         var first = PromptContext()
