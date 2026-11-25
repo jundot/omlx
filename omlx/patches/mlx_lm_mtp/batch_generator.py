@@ -200,6 +200,8 @@ def apply() -> bool:
                     )
                 _drop_mtp_batch_state(self, "batch-ineligible")
 
+            sent_uid = self.__dict__.pop("_omlx_first_token_sent", None)
+            first_sent = tuple(self.uids) == (sent_uid,)
             if _is_mtp_eligible(self):
                 handed_off = False
                 if _singleton_mtp_handoff_ready(self):
@@ -207,10 +209,18 @@ def apply() -> bool:
                     # singleton back to the standard step at the drained-queue
                     # boundary so the late join merges this very call (#2515).
                     handed_off = _handoff_mtp_for_late_join(self, self._omlx_mtp_state)
+                if not handed_off and not first_sent:
+                    first = _emit_first_token(self)
+                    if first is not None:
+                        return first
                 if not handed_off:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
+                            if first_sent:
+                                state.queue.popleft()
+                                _bump_emit_stat(state, "init")
+                                first_sent = False
                             with _spec_command_buffers(model):
                                 return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
@@ -229,6 +239,11 @@ def apply() -> bool:
                         _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
+            if first_sent:
+                # The standard step would emit the sent token again.
+                emitted = len(self.tokens[0])
+                self._step()
+                del self.tokens[0][emitted:]
             _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
             tax_probe = getattr(self, "_omlx_mtp_tax_probe", None)
@@ -1544,6 +1559,28 @@ def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
     except Exception as exc:
         logger.warning("MTP batch reconcile failed: %s", exc)
         return False
+
+
+def _emit_first_token(gen_batch: Any) -> Optional[List[Any]]:
+    """Stream the token sampled from the prompt; the next call starts drafting."""
+    if (
+        getattr(gen_batch, "_omlx_mtp_state", None) is not None
+        or gen_batch._num_tokens[0] != 0
+        # Only MTP init publishes the prefix snapshot.
+        or gen_batch.max_tokens[0] <= 1
+        or _cluster_mtp(gen_batch.model) is not None
+    ):
+        return None
+    # A boundary snapshot needs this token in the cache.
+    align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+    if align > 0 and (len(gen_batch.tokens[0]) + 1) % align == 0:
+        return None
+    result = _emit_response(
+        gen_batch, int(gen_batch._next_tokens.item()), gen_batch._next_logprobs[0]
+    )
+    if result[0].finish_reason is None:
+        gen_batch._omlx_first_token_sent = gen_batch.uids[0]
+    return result
 
 
 def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:

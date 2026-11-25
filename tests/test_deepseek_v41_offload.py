@@ -868,7 +868,7 @@ def test_parallel_pages_preserve_order_short_reads_and_warm_hits(tmp_path, monke
         return original(fd, min(count, 4096), offset)
 
     monkeypatch.setattr(storage.os, "pread", short_read)
-    ids = np.tile(np.array([4095, 0, 255, 256, 1023, 256]), 32)
+    ids = np.tile(np.array([4095, 0, 255, 256, 1023, 256]), 80)
     try:
         actual, dtype = reader.read("w", ids)
         assert dtype == "U8" and calls
@@ -908,8 +908,8 @@ def test_decode_lookup_advises_every_page_before_copying(tmp_path, monkeypatch):
         path, "w", "s", bias_key="b", bits=4, group_size=32
     )
     try:
-        # One decode token's rows, spread over many pages.
-        ids = np.array([[1, 900, 3000]])
+        # A full decode or verify batch, spread over many pages.
+        ids = np.arange(0, 3840, 10).reshape(16, 24)
         data = embed._read_rows(ids)
         np.testing.assert_array_equal(data[0][0], weights[ids.reshape(-1)])
         # The I/O pool reads one tensor at a time; advice starts all of them.
@@ -1037,7 +1037,7 @@ def test_page_read_failure_drains_workers_before_close(tmp_path, monkeypatch):
 
 def test_slow_warm_gather_rearms_page_prefetch(tmp_path, monkeypatch):
     reader, _ = page_table(tmp_path)
-    ids = np.arange(256)
+    ids = np.arange(512)
     try:
         reader.read("w", ids)
         assert reader._seen_pages is not None

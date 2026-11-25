@@ -813,7 +813,7 @@ class MiniMaxM3OutputParserSession:
                     if isinstance(call, dict) and call.get("name")
                 ]
             except Exception as e:  # noqa: BLE001
-                logger.debug("MiniMax M3 tool-call parse failed: %s", e)
+                logger.warning("MiniMax M3 tool-call parse failed: %s", e)
 
         return OutputParserFinalizeResult(
             stream_text=stream_text,

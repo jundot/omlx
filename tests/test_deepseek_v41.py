@@ -1526,9 +1526,11 @@ def test_cluster_lightning_mtp_head_loads_on_rank_zero_only(tmp_path):
 
 
 def test_cluster_layout_of_converted_and_source_checkpoints(tmp_path, monkeypatch):
+    from omlx.cluster.autoconfigure import choose_parallelism
     from omlx.cluster.catalogue import assess_model_path
-    from omlx.cluster.planner import NodeBudget, complete_model_layout
+    from omlx.cluster.planner import NodeBudget, PlanningError, complete_model_layout
     from omlx.patches.deepseek_v41.convert import convert
+    from omlx.prefill_helper.adapters import adapter_for_model
 
     source, _ = write_checkpoint(tmp_path, **_ENGRAM)
     target = tmp_path / "converted"
@@ -1545,6 +1547,10 @@ def test_cluster_layout_of_converted_and_source_checkpoints(tmp_path, monkeypatc
 
     # Ranks load their part of converted shards only.
     assert not raw.supports_pipeline and not raw.supports_tensor_parallel
+    with pytest.raises(PlanningError, match="converted by oMLX"):
+        choose_parallelism(raw, nodes)
+    assert adapter_for_model("deepseek_v41", "vlm", source) is None
+    assert adapter_for_model("deepseek_v41", "vlm", target) is not None
     assert fit.supports_pipeline and fit.supports_tensor_parallel
     # The converter keeps the tables outside the index, in a file that holds
     # other tensors too. Stages hold the tables; tensor ranks read them from SSD.

@@ -1106,7 +1106,7 @@ def test_manager_retries_a_helper_that_lost_its_gpu(tmp_path, monkeypatch):
     manager.close()
 
 
-def test_manager_retries_an_offline_helper_on_use(tmp_path, monkeypatch):
+def test_manager_retries_an_offline_helper_on_use(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (600.0,))
     monkeypatch.setattr(manager_module, "_RETRY_ON_USE_S", 0.0)
     fake = _FakeLauncher(None)
@@ -1114,9 +1114,17 @@ def test_manager_retries_an_offline_helper_on_use(tmp_path, monkeypatch):
     manager = _manager(fake, [], tmp_path / "speeds.json")
     manager.configure("node-1", None)
     _wait_state(manager, "offline", reason="does not answer over SSH")
+    monkeypatch.setattr(manager_module, "_RETRY_ON_USE_S", 600.0)
+    for _ in range(2):
+        manager.retry_if_offline()
+    monkeypatch.setattr(manager_module, "_RETRY_ON_USE_S", 0.0)
+    noted = [r.getMessage() for r in caplog.records if "not ready" in r.getMessage()]
+    assert len(noted) == 1 and "does not answer over SSH" in noted[0]
     fake.unreachable = False
     manager.retry_if_offline()
     _wait_state(manager, "ready")
+    manager.retry_if_offline()
+    assert caplog.text.count("not ready") == 1
     manager.close()
     # A copy that waits for the user is not cancelled.
     old = {"name": "Old", "bytes": 20 << 30, "used": 0.0}
@@ -1127,6 +1135,7 @@ def test_manager_retries_an_offline_helper_on_use(tmp_path, monkeypatch):
     manager.configure("node-1", None)
     _wait_state(manager, "needs_files")
     manager.retry_if_offline()
+    assert caplog.text.count("not ready") == 2
     assert manager._commands.empty()
     assert manager.status()["state"] == "needs_files"
     manager.close()

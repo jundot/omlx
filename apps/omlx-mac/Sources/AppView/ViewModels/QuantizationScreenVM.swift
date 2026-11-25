@@ -9,6 +9,7 @@ final class QuantizationScreenVM {
     var oqLevel: Double = 4
     var textOnly: Bool = false
     var preserveMtp: Bool = false
+    var preserveNgram: Bool = false
     var dtype: String = "bfloat16"
     var enhanced: Bool = false
     var hadamard: Bool = false
@@ -94,6 +95,10 @@ final class QuantizationScreenVM {
 
     var selectedHasMTP: Bool {
         models.first(where: { $0.path == selectedModelPath })?.hasMtpHeads ?? false
+    }
+
+    var selectedHasEngram: Bool {
+        models.first(where: { $0.path == selectedModelPath })?.modelType == "deepseek_v41"
     }
 
     /// Estimate strip — memory pill. Mirrors `oqEstimatedMemory` in JS:
@@ -248,6 +253,7 @@ final class QuantizationScreenVM {
         let path = selectedModelPath
         let level = oqLevel
         let preserve = selectedHasMTP && preserveMtp
+        let preserveTables = selectedHasEngram && preserveNgram
         estimateDebounceTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(300))
             if Task.isCancelled { return }
@@ -255,7 +261,8 @@ final class QuantizationScreenVM {
                 let est = try await client.estimateOQ(
                     modelPath: path,
                     oqLevel: level,
-                    preserveMtp: preserve
+                    preserveMtp: preserve,
+                    preserveNgramTable: preserveTables
                 )
                 await MainActor.run {
                     guard let self else { return }
@@ -285,6 +292,7 @@ final class QuantizationScreenVM {
             textOnly: textOnly,
             dtype: dtype,
             preserveMtp: selectedHasMTP && preserveMtp,
+            preserveNgramTable: selectedHasEngram && preserveNgram,
             enhanced: enhanced,
             hadamard: hadamardActive,
             imatrixCachePath: imatrixCachePath.trimmingCharacters(in: .whitespacesAndNewlines),

@@ -667,10 +667,11 @@ class TestUnauthenticatedInference:
         response = client.post(
             path, json={}, headers={"Authorization": "Bearer management-key"}
         )
-        assert response.status_code == 422
+        expected = 400 if path.startswith("/v1/messages") else 422
+        assert response.status_code == expected
         settings.auth.allow_unauthenticated_inference = True
         # An empty payload reaches request validation only after auth succeeds.
-        assert client.post(path, json={}).status_code == 422
+        assert client.post(path, json={}).status_code == expected
 
     @pytest.mark.parametrize(
         "method,path",

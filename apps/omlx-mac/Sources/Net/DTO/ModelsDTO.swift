@@ -166,6 +166,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     var guidedGrammar: String? = nil
     var moeExpertOffloadEnabled: Bool? = nil
     var moeExpertOffloadResidentFraction: Double? = nil
+    var loopcdEnabled: Bool? = nil
+    var loopcdSkipThinking: Bool? = nil
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
     let turboquantKvScheme: String?

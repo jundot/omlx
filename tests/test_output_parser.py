@@ -881,6 +881,30 @@ class TestOutputParserFactory:
         assert final.tool_calls == [{"name": "lookup", "arguments": '{"query":"mlx"}'}]
         assert final.finish_reason == "tool_calls"
 
+    @pytest.mark.parametrize(
+        "key", ["ec2:ResourceTag/lab:managed", "/index.html", "Order Date"]
+    )
+    def test_minimax_m3_parser_keeps_any_argument_key(self, key):
+        ns = "]<]minimax[>["
+        tokenizer = CohereTokenizer(
+            {
+                1: f'{ns}<tool_call>{ns}<invoke name="save">{ns}<files>'
+                f"{ns}<{key}>x{ns}</{key}>{ns}</files>{ns}</invoke>{ns}</tool_call>"
+            }
+        )
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+        session = factory.create_session(tokenizer)
+        session.process_token(1)
+
+        final = session.finalize()
+
+        assert final.finish_reason == "tool_calls"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"files": {key: "x"}}
+
     def test_minimax_m3_parser_normalizes_thinking_and_strips_eos(self):
         tokenizer = CohereTokenizer(
             {

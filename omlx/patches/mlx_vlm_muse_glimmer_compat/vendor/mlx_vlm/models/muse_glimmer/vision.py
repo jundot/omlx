@@ -114,7 +114,9 @@ class PatchEmbedder(nn.Module):
         all_weights = [[] for _ in range(4)]
 
         for temporal, height, width in grid:
-            temporal, height, width = int(temporal), int(height), int(width)
+            # Matches the trained order: the reference samples the grid with
+            # `meshgrid(pos_h, pos_w, indexing="xy")`, so height and width swap roles.
+            temporal, height, width = int(temporal), int(width), int(height)
             h_grid = (np.arange(height, dtype=np.float32) + 0.5) * (side / height) - 0.5
             w_grid = (np.arange(width, dtype=np.float32) + 0.5) * (side / width) - 0.5
             h0, w0 = (

@@ -64,6 +64,7 @@ from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
+from ..patches.inkling2.loopcd import apply_loopcd
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
@@ -79,6 +80,7 @@ from ..utils.image import (
     extract_media_from_messages,
     image_hash_prefixes,
 )
+from ..utils.sampling import seed_request_stream
 from ..utils.video import (
     NATIVE_VIDEO_MODEL_TYPES,
     attach_native_video_processor,
@@ -840,63 +842,6 @@ def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
     return isinstance(metadata, dict) and metadata.get("format") == "mlx"
 
 
-def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
-    """Derive Gemma4's legacy full-attention head fields from ``per_layer_config``.
-
-    Newer Gemma4 checkpoints (Transformers >= 5.15) record the ``head_dim`` /
-    ``num_key_value_heads`` overrides of the full-attention layers under
-    ``text_config.per_layer_config`` instead of the legacy global
-    ``global_head_dim`` / ``num_global_key_value_heads`` fields. The pinned
-    mlx-vlm Gemma4 loader reads only the legacy fields, so it sizes the
-    full-attention K/V projections with the sliding-window head count and
-    ``load_weights`` fails with a shape mismatch (#3537).
-
-    Returns the legacy fields that are absent from ``text_config`` and can be
-    derived unambiguously (every overridden full-attention layer agrees), or
-    an empty dict.
-    """
-    text_config = config.get("text_config")
-    if not isinstance(text_config, dict):
-        return {}
-    model_type = str(text_config.get("model_type") or config.get("model_type") or "")
-    if not model_type.startswith("gemma4"):
-        return {}
-    per_layer = text_config.get("per_layer_config")
-    if not isinstance(per_layer, dict) or not per_layer:
-        return {}
-    layer_types = text_config.get("layer_types")
-    if not isinstance(layer_types, list):
-        layer_types = None
-
-    derived: dict[str, int] = {}
-    for legacy_key, layer_key in (
-        ("global_head_dim", "head_dim"),
-        ("num_global_key_value_heads", "num_key_value_heads"),
-    ):
-        if text_config.get(legacy_key) is not None:
-            continue
-        values: set[int] = set()
-        for layer_id, overrides in per_layer.items():
-            if not isinstance(overrides, dict) or overrides.get(layer_key) is None:
-                continue
-            if layer_types is not None:
-                try:
-                    layer_idx = int(layer_id)
-                except (TypeError, ValueError):
-                    continue
-                if not 0 <= layer_idx < len(layer_types):
-                    continue
-                if layer_types[layer_idx] != "full_attention":
-                    continue
-            try:
-                values.add(int(overrides[layer_key]))
-            except (TypeError, ValueError):
-                continue
-        if len(values) == 1:
-            derived[legacy_key] = values.pop()
-    return derived
-
-
 @contextlib.contextmanager
 def _preserve_gemma4_unified_image_processor_on_load(model_dir: Path):
     """Keep the gemma4_unified image processor built from processor_config.json.
@@ -915,55 +860,6 @@ def _preserve_gemma4_unified_image_processor_on_load(model_dir: Path):
         yield
     finally:
         _vu.load_image_processor = original
-
-
-@contextlib.contextmanager
-def _derive_gemma4_global_kv_on_load(model_dir: Path):
-    """Feed ``per_layer_config``-only Gemma4 head overrides to the mlx-vlm loader.
-
-    Wraps ``mlx_vlm.utils.load_config`` for one ``vlm_load(...)`` so the
-    config handed to the Gemma4 ``TextConfig`` carries ``global_head_dim`` /
-    ``num_global_key_value_heads`` derived from ``per_layer_config`` when the
-    checkpoint does not spell them out (#3537). Checkpoints that already
-    carry the legacy fields, and non-Gemma4 models, are untouched.
-    """
-    config_path = model_dir / "config.json"
-    try:
-        config = json.loads(config_path.read_text())
-    except Exception:
-        yield
-        return
-    derived = (
-        _gemma4_global_kv_from_per_layer_config(config)
-        if isinstance(config, dict)
-        else {}
-    )
-    if not derived:
-        yield
-        return
-
-    import mlx_vlm.utils as _vu
-
-    original_load_config = _vu.load_config
-
-    def _patched_load_config(model_path, **kwargs):
-        loaded = original_load_config(model_path, **kwargs)
-        text_config = loaded.get("text_config") if isinstance(loaded, dict) else None
-        if isinstance(text_config, dict):
-            for key, value in derived.items():
-                if text_config.get(key) is None:
-                    text_config[key] = value
-        return loaded
-
-    logger.info(
-        "derive_gemma4_global_kv_on_load: per_layer_config -> %s",
-        ", ".join(f"{k}={v}" for k, v in derived.items()),
-    )
-    _vu.load_config = _patched_load_config
-    try:
-        yield
-    finally:
-        _vu.load_config = original_load_config
 
 
 @contextlib.contextmanager
@@ -2114,7 +2010,6 @@ class VLMBatchedEngine(BaseEngine):
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _strip_vision_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
-                _derive_gemma4_global_kv_on_load(Path(self._model_name)),
                 _preserve_gemma4_unified_image_processor_on_load(
                     Path(self._model_name)
                 ),
@@ -2190,12 +2085,14 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
                 if model_type in INKLING2_MODEL_TYPES:
-                    return inkling2_vlm.load(
+                    loaded = inkling2_vlm.load(
                         self._model_name,
                         lazy=getattr(
                             self._model_settings, "moe_expert_offload_enabled", False
                         ),
                     )
+                    apply_loopcd(loaded[0], self._model_settings)
+                    return loaded
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
                         self._model_name,
@@ -2585,6 +2482,13 @@ class VLMBatchedEngine(BaseEngine):
         else:
             self._vision_cache = None
             self._vision_cache_enabled = False
+
+        if getattr(self._processor, "tool_parser_type", None) == "deepseek_v4":
+            from ..patches.deepseek_v4.tokenizer_patch import (
+                install_vlm_tokenizer_protocol,
+            )
+
+            install_vlm_tokenizer_protocol(self._processor.tokenizer)
 
         # Extract tokenizer from processor with deep-copy for thread safety.
         # The processor keeps the original tokenizer for executor-thread work
@@ -3549,6 +3453,8 @@ class VLMBatchedEngine(BaseEngine):
                     skip_audio_token=role != "user" or msg_num_audios == 0,
                     num_images=msg_num_images,
                     num_audios=msg_num_audios,
+                    # Phi-3-V numbers images across the whole conversation.
+                    image_offset=num_images - remaining_images - msg_num_images,
                 )
                 # Prompt-only message formats render a plain string instead of a
                 # role/content dict; there is no content list to collapse.
@@ -4401,7 +4307,12 @@ class VLMBatchedEngine(BaseEngine):
             prompts = [prompt] if isinstance(prompt, str) else prompt
             # A text-only chat template renders images as prose, and the
             # processor then fails with a misleading image-count error.
-            image_token = getattr(self._processor, "image_token", None)
+            # Gemma 3 expands boi_token into image tokens in its processor.
+            image_token = getattr(
+                self._processor,
+                "boi_token" if model_type == "gemma3" else "image_token",
+                None,
+            )
             texts = [item for item in prompts if isinstance(item, str)]
             if (
                 num_images
@@ -5999,8 +5910,7 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             limit_ctx = contextlib.nullcontext()
 
-        if seed is not None:
-            mx.random.seed(seed)
+        seed_request_stream(seed)
 
         tokenizer = self._tokenizer
         if hasattr(tokenizer, "stopping_criteria"):

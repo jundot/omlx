@@ -1067,7 +1067,7 @@ class TestRequestTranslation:
         assert value("--draft-model") == str((tmp_path / "draft").resolve())
         assert value("--idle-release") == "off"
         assert value("--kv-format") == "bf16"
-        assert value("--max-context") == str(splash_mod.SPLASH_MAX_CONTEXT)
+        assert value("--max-context") == "1000000"
         assert value("--max-memory") == str(24 * GIB)
         assert value("--max-cache-disk") == str(5 * GIB)
         assert value("--cache-dir") == str(tmp_path / "ssd")
@@ -1092,6 +1092,20 @@ class TestRequestTranslation:
 
     def test_default_activation_precision_keeps_bf16(self):
         assert SplashOptions().activations == "bf16"
+
+    @pytest.mark.parametrize(
+        ("version", "limit", "sent"),
+        [("1.7.1", 6, "6"), ("1.7.0", 6, None), ("1.7.1", None, None)],
+    )
+    def test_serve_command_max_concurrent_requests(
+        self, tmp_path, version, limit, sent
+    ):
+        engine = _engine(tmp_path, version=version, max_concurrent_requests=limit)
+
+        command = engine._serve_command(9000)
+
+        flag = "--max-concurrent-requests"
+        assert (command[command.index(flag) + 1] if flag in command else None) == sent
 
     def test_serve_command_leaves_unset_limits_to_splash(self, tmp_path):
         command = _engine(tmp_path)._serve_command(9000)
@@ -1777,6 +1791,36 @@ class TestEnginePool:
         assert engine._options.max_memory_bytes == 4 * GIB
         assert engine._options.max_context is None
 
+    def test_context_past_the_native_window_needs_room_and_yarn(
+        self, tmp_path, launchers, global_settings, caplog
+    ):
+        launchers("splash", version="1.4.0")
+        pool, entry = _pool(tmp_path)
+        pool._get_final_ceiling = lambda: 0
+        settings = ModelSettings(external_engine="splash", max_context_window=2 * 10**6)
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        draft = engine._target.draft_path
+
+        def estimate(context):
+            return splash_memory_estimate(entry.model_path, draft, context, "int8")
+
+        assert engine._options.max_context == 1010000
+        assert engine._options.max_memory_bytes == estimate(1010000)
+        assert "YaRN is on" in caplog.text
+
+        # No room for the longer window: the budget of the native one.
+        caplog.clear()
+        pool._get_final_ceiling = lambda: estimate(1010000) - 1
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        assert engine._options.max_context is None
+        assert engine._options.max_memory_bytes == estimate(262144)
+        assert "YaRN is on" not in caplog.text
+
+        launchers("splash", version="1.3.2")
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        assert engine._options.max_context == 262144
+        assert SplashTarget(_binary("1.7.1"), "Flint", draft).max_context == 262144
+
     async def test_load_counts_the_planned_budget_and_unload_skips_mlx_barrier(
         self, tmp_path, launchers, global_settings
     ):
@@ -1911,6 +1955,7 @@ class TestAdminAPI:
             splash_ssd_cache_gb=0,
             splash_ane_prefill=False,
             splash_activations="auto",
+            splash_max_concurrent_requests=6,
         )
 
         assert "integrations" in result["runtime_applied"]
@@ -1921,11 +1966,13 @@ class TestAdminAPI:
         )
         assert (restored.splash_ssd_cache_gb, restored.splash_ane_prefill) == (0, False)
         assert restored.splash_activations == "auto"
+        assert restored.splash_max_concurrent_requests == 6
         for fields in (
             {"splash_kv_format": "fp8"},
             {"splash_activations": "fp8"},
             {"splash_max_memory_gb": 0},
             {"splash_ssd_cache_gb": -1},
+            {"splash_max_concurrent_requests": 9},
         ):
             with pytest.raises(HTTPException):
                 await _post_global(settings, **fields)
@@ -2211,9 +2258,8 @@ class TestMemoryEstimate:
         assert int8 - fixed == 33_280 * 262144
         bf16 = splash_memory_estimate(model, draft, 65536, "bf16")
         assert bf16 - fixed == 65_536 * 65536
-        # Splash caps context at 256K, and no limit means the whole window.
+        # No limit means the whole native window.
         assert splash_memory_estimate(model, draft, None, "int8") == int8
-        assert splash_memory_estimate(model, draft, 10**6, "int8") == int8
 
     def test_counts_a_vision_tower_in_a_subdirectory(self, tmp_path):
         model = _write_model(tmp_path / "m")
