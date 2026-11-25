@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time as _time
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional, Union
 
@@ -8704,15 +8705,13 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         texts = "\n".join(t for t in ds["text"] if t.strip())
     elif dataset == "c4":
         ds = load_dataset("allenai/c4", "en", split="validation", streaming=True)
-        texts = "\n".join(
-            item["text"] for i, item in enumerate(ds) if i < num_samples * 2
-        )
+        texts = "\n".join(item["text"] for item in islice(ds, max(0, num_samples * 2)))
     elif dataset == "code":
         ds = load_dataset(
             "bigcode/starcoderdata", "python", split="train", streaming=True
         )
         texts = "\n".join(
-            item["content"] for i, item in enumerate(ds) if i < num_samples * 2
+            item["content"] for item in islice(ds, max(0, num_samples * 2))
         )
     elif dataset == "multilingual":
         langs = ["en", "ko", "zh", "ja", "de", "fr", "es"]
@@ -8721,9 +8720,7 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         for lang in langs:
             try:
                 ds = load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
-                lang_texts = [
-                    item["text"] for i, item in enumerate(ds) if i < per_lang * 2
-                ]
+                lang_texts = [item["text"] for item in islice(ds, per_lang * 2)]
                 all_texts.extend(lang_texts)
             except Exception:
                 logger.warning(f"Failed to load CulturaX/{lang}, skipping")
@@ -8735,7 +8732,7 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
             ds = load_dataset(
                 "bigcode/starcoderdata", "python", split="train", streaming=True
             )
-            code_texts = [item["content"] for i, item in enumerate(ds) if i < half * 2]
+            code_texts = [item["content"] for item in islice(ds, half * 2)]
         except Exception:
             logger.warning("Failed to load code dataset")
 
@@ -8743,9 +8740,7 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         for lang in ["en", "ko", "zh", "ja"]:
             try:
                 ds = load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
-                ml_texts.extend(
-                    item["text"] for i, item in enumerate(ds) if i < half // 2
-                )
+                ml_texts.extend(item["text"] for item in islice(ds, half // 2))
             except Exception:
                 pass
         texts = "\n".join(code_texts + ml_texts)
