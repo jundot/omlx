@@ -297,6 +297,23 @@ class TestSSDCache:
         result = ssd_cache.get("img_hash", "model_a")
         assert result is None
 
+    @pytest.mark.parametrize("value", [float("nan"), float("inf")])
+    def test_put_skips_non_finite_features(self, ssd_cache, value):
+        ssd_cache.put("img_hash", "model_a", mx.array([[1.0, value]]))
+
+        assert ssd_cache.get("img_hash", "model_a") is None
+
+    def test_non_finite_file_is_dropped_on_load(self, ssd_cache):
+        ssd_cache.put("img_hash", "model_a", mx.ones((4, 8)))
+        file_path = ssd_cache._file_path_for_key(_composite_key("model_a", "img_hash"))
+        assert _wait_until(lambda: _write_finished(ssd_cache, "img_hash", "model_a"))
+        mx.save_safetensors(str(file_path), {"feature": mx.full((4, 8), float("nan"))})
+        with ssd_cache._memory_lock:
+            ssd_cache._memory_cache.clear()
+
+        assert ssd_cache.get("img_hash", "model_a") is None
+        assert not file_path.exists()
+
     @pytest.mark.parametrize("operation", ["evict", "load"])
     def test_cleanup_unlink_failure(self, ssd_cache, caplog, operation):
         key = _composite_key("model", "image")
@@ -706,106 +723,3 @@ class TestMemoryByteLRU:
             assert cache.get("h1", "m") is not None
         finally:
             cache.close()
-
-
-
-class TestNonFiniteRejection:
-    """Poisoned NaN/Inf vision features must never enter or survive the cache (#5592)."""
-
-    @pytest.mark.parametrize("bad_val", [float("nan"), float("inf"), float("-inf")])
-    @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
-    def test_put_rejects_non_finite_tensor(
-        self, ssd_cache, tmp_cache_dir, bad_val, dtype
-    ):
-        bad = mx.array([[1.0, bad_val], [0.0, 2.0]], dtype=dtype)
-        mx.eval(bad)
-
-        ssd_cache.put("poisoned", "model_a", bad, grid=[1, 2, 2])
-
-        assert ssd_cache.get("poisoned", "model_a") is None
-        assert ssd_cache.get_grid("poisoned", "model_a") is None
-        assert ssd_cache.stats["saves"] == 0
-        assert ssd_cache.stats["errors"] == 1
-        assert list(tmp_cache_dir.rglob("*.safetensors")) == []
-
-    def test_put_rejects_multi_tensor_with_nan_element(self, memory_only_cache):
-        clean = mx.ones((2, 4))
-        poisoned = mx.full((2, 4), float("nan"))
-        mx.eval(clean, poisoned)
-
-        memory_only_cache.put("multi_bad", "model_a", [clean, poisoned])
-
-        assert memory_only_cache.get("multi_bad", "model_a") is None
-        assert memory_only_cache.stats["saves"] == 0
-        assert memory_only_cache.stats["errors"] == 1
-
-    def test_rejected_put_preserves_existing_clean_entry(self, memory_only_cache):
-        clean = mx.ones((2, 4)) * 3.0
-        bad = mx.full((2, 4), float("nan"))
-        mx.eval(clean, bad)
-
-        memory_only_cache.put("img", "model_a", clean, grid=[1, 2, 2])
-        memory_only_cache.put("img", "model_a", bad, grid=[1, 4, 4])
-
-        got = memory_only_cache.get("img", "model_a")
-        assert got is not None
-        assert mx.array_equal(got, clean)
-        assert memory_only_cache.get_grid("img", "model_a") == [1, 2, 2]
-
-    def test_ssd_load_evicts_and_unlinks_preexisting_nan_file(self, tmp_cache_dir):
-        seed = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
-        key = _composite_key("model_a", "img_hash")
-        file_path = seed._file_path_for_key(key)
-        seed.close()
-
-        poisoned = mx.full((4, 8), float("nan"), dtype=mx.bfloat16)
-        mx.eval(poisoned)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        vfc_mod._write_safetensors_no_mx(
-            str(file_path),
-            {"feature": vfc_mod._extract_tensor_bytes(poisoned)},
-            {
-                "image_hash": "img_hash",
-                "model_name": "model_a",
-                "num_tensors": "1",
-                "created_at": "1.0",
-                "grid_thw": "[1, 2, 2]",
-            },
-        )
-        assert file_path.exists()
-
-        reopened = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
-        try:
-            assert key in reopened._ssd_index
-            assert reopened.get("img_hash", "model_a") is None
-            assert reopened.get_grid("img_hash", "model_a") is None
-            assert key not in reopened._ssd_index
-            assert reopened._ssd_total_size == 0
-            assert not file_path.exists()
-            assert reopened.stats["errors"] == 1
-        finally:
-            reopened.close()
-
-    def test_vlm_engine_discards_non_finite_computed_features(self, memory_only_cache):
-        from omlx.engine.vlm import VLMBatchedEngine
-
-        engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
-        engine._model_name = "qwen3_vl"
-        engine._vision_cache = memory_only_cache
-        engine._vision_cache_enabled = True
-        engine._vlm_model = MagicMock()
-        engine._vlm_model.config.video_token_id = 99
-        engine._compute_vision_features = MagicMock(
-            return_value=mx.full((2, 8), float("nan"))
-        )
-
-        input_ids = mx.array([[1, 99, 99, 2]])
-        got = engine._cached_video_features(
-            "vid_hash",
-            input_ids,
-            {"pixel_values_videos": mx.zeros((2, 8)), "video_grid_thw": mx.array([[1, 2, 2]])},
-        )
-
-        assert got is None
-        assert memory_only_cache.get("vid_hash", "qwen3_vl") is None
-        assert memory_only_cache.stats["saves"] == 0

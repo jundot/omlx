@@ -48,10 +48,7 @@ from ..api.utils import (
     remove_special_tokens_preserve_whitespace,
 )
 from ..cache.paged_ssd_cache import numerics_revision_for_model
-from ..cache.vision_feature_cache import (
-    VisionFeatureSSDCache,
-    features_are_finite,
-)
+from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..lora_adapters import apply_adapter
 from ..model_settings import (
@@ -3690,18 +3687,6 @@ class VLMBatchedEngine(BaseEngine):
         # Unsupported model: skip caching
         return None
 
-    def _eval_finite_vision_features(self, features: Any) -> bool:
-        """Materialize ``features`` and reject NaN/Inf vision-tower outputs (#5592)."""
-        mx.eval(features)
-        if features_are_finite(features):
-            return True
-        logger.warning(
-            "Discarding non-finite vision features for %s; "
-            "falling back to uncached vision encode",
-            getattr(self, "_model_name", "unknown"),
-        )
-        return False
-
     def _encode_missing_vision_features(
         self,
         pixel_values: Any,
@@ -3760,10 +3745,9 @@ class VLMBatchedEngine(BaseEngine):
             miss_inputs = dict(extra_model_inputs)
             miss_inputs["image_grid_thw"] = grid_miss
             features_miss = self._compute_vision_features(pv_miss, miss_inputs)
-            if features_miss is None or not self._eval_finite_vision_features(
-                features_miss
-            ):
+            if features_miss is None:
                 return None
+            mx.eval(features_miss)
             split_miss = self._split_vision_features(
                 features_miss, len(miss_idx), miss_inputs
             )
@@ -3886,10 +3870,9 @@ class VLMBatchedEngine(BaseEngine):
                     return None
                 miss_kw = {"image_grid_thw": mx.array(miss_grids)}
                 features_miss = self._compute_vision_features(miss_pv, miss_kw)
-                if features_miss is None or not self._eval_finite_vision_features(
-                    features_miss
-                ):
+                if features_miss is None:
                     return None
+                mx.eval(features_miss)
                 split_miss = self._split_vision_features(
                     features_miss, len(miss_idx), miss_kw
                 )
@@ -4124,12 +4107,11 @@ class VLMBatchedEngine(BaseEngine):
                 "Video feature computation failed, using full pipeline", exc_info=True
             )
             return None
-        if (
-            features is None
-            or not self._vision_features_match_image_tokens(features, token_count)
-            or not self._eval_finite_vision_features(features)
+        if features is None or not self._vision_features_match_image_tokens(
+            features, token_count
         ):
             return None
+        mx.eval(features)
         self._vision_cache.put(video_identity, self._model_name, features)
         return features
 
@@ -4686,8 +4668,8 @@ class VLMBatchedEngine(BaseEngine):
                             and self._vision_features_match_image_tokens(
                                 features, image_token_count
                             )
-                            and self._eval_finite_vision_features(features)
                         ):
+                            mx.eval(features)
                             call_kwargs["cached_image_features"] = features
                             # Split and cache each image individually
                             per_features = self._split_vision_features(

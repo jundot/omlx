@@ -59,25 +59,6 @@ def _composite_hash(model_name: str, image_hash: str) -> str:
     ).hexdigest()
 
 
-def features_are_finite(features: Any) -> bool:
-    """Return True when ``features`` (an mx.array or list/tuple) has no NaN/Inf."""
-    if features is None:
-        return False
-    tensors = features if isinstance(features, (list, tuple)) else (features,)
-    if not tensors:
-        return False
-    flags = [
-        mx.all(mx.isfinite(t))
-        for t in tensors
-        if isinstance(t, mx.array) and mx.issubdtype(t.dtype, mx.floating)
-    ]
-    if not flags:
-        return True
-    if len(flags) == 1:
-        return bool(flags[0].item())
-    return bool(mx.all(mx.stack(flags)).item())
-
-
 @dataclass
 class VisionFeatureSSDEntry:
     """Metadata for a cached vision feature stored on SSD."""
@@ -215,8 +196,7 @@ class VisionFeatureSSDCache:
             features: Evaluated mx.array (or list of mx.array for multi-image).
             grid: Optional per-image patch grid ``[t, h, w]``.
         """
-        if not features_are_finite(features):
-            self._stats["errors"] += 1
+        if not self._features_finite(features):
             logger.warning(
                 "Refusing to cache non-finite vision features for %s (%s)",
                 model_name,
@@ -316,6 +296,11 @@ class VisionFeatureSSDCache:
         if isinstance(features, (list, tuple)):
             return sum(int(f.nbytes) for f in features)
         return int(features.nbytes)
+
+    @staticmethod
+    def _features_finite(features: mx.array | list[mx.array]) -> bool:
+        tensors = features if isinstance(features, (list, tuple)) else [features]
+        return mx.stack([mx.isfinite(t).all() for t in tensors]).all().item()
 
     # ── SSD persistence ─────────────────────────────────────────────
 
@@ -472,7 +457,7 @@ class VisionFeatureSSDCache:
                         )
                         return None
 
-            if not features_are_finite(features):
+            if not self._features_finite(features):
                 raise ValueError("cached vision features contain NaN or Inf")
 
             # Update access time
