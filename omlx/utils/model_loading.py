@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import json
 import logging
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx_vlm.utils as mlx_vlm_utils
 from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
@@ -30,6 +32,7 @@ _RUNTIME_TEXT_PREFIX = "language_model.model."
 _MATERIALIZE_EVAL_CHUNK = 8
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
+_vlm_trust_remote_code = ContextVar("omlx_vlm_trust_remote_code", default=False)
 
 _REMOTE_CODE_METADATA_PATTERNS = [
     "*.json",
@@ -57,6 +60,35 @@ def ensure_model_code_trusted(
             f"module ({model_file!r}) to build its architecture. This is disabled "
             "by default. Enable Trust Remote Code for this model if you trust it."
         )
+
+
+def _patch_mlx_vlm_model_file_trust() -> None:
+    get_model_and_args = mlx_vlm_utils.get_model_and_args
+    load_model = mlx_vlm_utils.load_model
+
+    def checked_get_model_and_args(config, model_path=None):
+        if model_path is not None:
+            ensure_model_code_trusted(
+                config,
+                model_path=model_path,
+                trust_remote_code=_vlm_trust_remote_code.get(),
+            )
+        return get_model_and_args(config, model_path=model_path)
+
+    def load_model_with_trust(model_path, *args, trust_remote_code=False, **kwargs):
+        token = _vlm_trust_remote_code.set(trust_remote_code)
+        try:
+            return load_model(
+                model_path, *args, trust_remote_code=trust_remote_code, **kwargs
+            )
+        finally:
+            _vlm_trust_remote_code.reset(token)
+
+    mlx_vlm_utils.get_model_and_args = checked_get_model_and_args
+    mlx_vlm_utils.load_model = load_model_with_trust
+
+
+_patch_mlx_vlm_model_file_trust()
 
 
 def preflight_text_remote_code(
