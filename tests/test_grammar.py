@@ -494,10 +494,8 @@ class TestCompileBareGrammar:
 
     @requires_xgrammar
     def test_json_schema_pattern_repeat_over_128(self):
-        """A caching compiler must build a `{0,240}` pattern (#5371)."""
         vocab = [chr(i) for i in range(32, 127)] + ["</s>"]
-        stop = len(vocab) - 1
-        compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(vocab, stop_token_ids=[stop]))
+        compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(vocab))
         schema = {
             "type": "object",
             "properties": {"z": {"type": "string", "pattern": "^[^#]{0,240}$"}},
@@ -506,13 +504,10 @@ class TestCompileBareGrammar:
         compiled = self._call(compiler, {"type": "json_schema", "json_schema": schema})
 
         matcher = xgr.GrammarMatcher(compiled)
-        for ch in '{"z":"' + "a" * 240:
-            assert matcher.accept_token(vocab.index(ch)), ch
-        assert not matcher.accept_token(vocab.index("a"))
-        for ch in '"}':
-            assert matcher.accept_token(vocab.index(ch)), ch
-        assert matcher.accept_token(stop)
-        assert matcher.is_terminated()
+        assert matcher.accept_string('{"z":"' + "a" * 240)
+        assert not matcher.accept_string("a")
+        assert matcher.accept_string('"}')
+        assert matcher.is_completed()
 
 
 # =========================================================================
@@ -948,6 +943,17 @@ class TestGrammarConstraintProcessor:
         result_np = np.array(result).flatten()
         assert result_np.shape[0] >= vocab_size
         assert np.any(result_np[:vocab_size] == -np.inf), "Should mask some tokens"
+
+    def test_stop_token_text_does_not_complete_grammar(self, compiler):
+        comp, vocab_size = compiler
+        proc = GrammarConstraintProcessor(comp.compile_regex(".+"), vocab_size)
+
+        logits = proc(mx.array([]), mx.zeros((1, vocab_size)))
+        assert logits[0, _STOP_TOKEN_ID].item() == -mx.inf
+
+        proc.accept_token(ord("{"))
+        logits = proc(mx.array([]), mx.zeros((1, vocab_size)))
+        assert logits[0, _STOP_TOKEN_ID].item() == 0
 
     def test_passthrough_after_termination(self, compiler):
         """After grammar terminates, logits should pass through unmodified."""
