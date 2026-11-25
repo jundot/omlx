@@ -11394,6 +11394,12 @@ class Scheduler:
                         block_table,
                         promote_to_hot_cache=not bypass_hot_cache,
                     )
+                    if reconstructed is None and self._gdn_split_active():
+                        retry = self._restore_shared_system_prefix(
+                            request, original_tokens, bypass_hot_cache
+                        )
+                        if retry is not None:
+                            block_table, reconstructed = retry
                 reconstruct_ms = (time.perf_counter() - reconstruct_started) * 1000.0
                 if block_table.num_tokens < minimum_prefix:
                     reconstructed = None
@@ -11557,6 +11563,41 @@ class Scheduler:
                 0, request.cached_tokens - request.requeue_reported_cached_tokens
             )
         self._prefix_cache_prepared.add(request.request_id)
+
+    def _restore_shared_system_prefix(
+        self,
+        request: Request,
+        matched_tokens: int,
+        bypass_hot_cache: bool,
+    ) -> tuple[Any, list[Any]] | None:
+        system_end = request.system_prefix_end
+        if not 0 < system_end < matched_tokens:
+            return None
+        self.paged_cache_manager.delete_block_table(request.request_id)
+        block_table, _ = self.block_aware_cache.fetch_cache(
+            request.request_id,
+            request.prompt_token_ids[:system_end],
+            extra_keys=request.vlm_extra_keys_for_cache,
+            extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+            extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+            record_stats=False,
+        )
+        if block_table is None:
+            return None
+        reconstructed = self.block_aware_cache.reconstruct_cache(
+            block_table,
+            promote_to_hot_cache=not bypass_hot_cache,
+        )
+        if reconstructed is None:
+            return None
+        logger.info(
+            "Split GDN restore for %s: no recurrent checkpoint on the %d-token "
+            "match; restored the shared system prefix (%d tokens) instead",
+            request.request_id,
+            matched_tokens,
+            block_table.num_tokens,
+        )
+        return block_table, reconstructed
 
     def _record_prefix_cache_result(self, request: Request) -> None:
         """Finalize ordinary prefix metrics after scheduling's fallback guards."""
