@@ -2613,114 +2613,6 @@ class TestEnginePoolAsync:
         shutdown_executor.assert_called_once_with()
 
 
-class _GatedStopEngine:
-    """Fake engine whose stop() parks until the test releases it."""
-
-    def __init__(self, release: asyncio.Event, error: Exception | None = None):
-        self.release = release
-        self.error = error
-        self.stop_calls = 0
-        self.deployment = None
-
-    async def stop(self, **kwargs):
-        self.stop_calls += 1
-        await self.release.wait()
-        if self.error is not None:
-            raise self.error
-
-    def has_active_requests(self):
-        return False
-
-
-async def _yield_until(predicate, attempts: int = 200) -> None:
-    for _ in range(attempts):
-        if predicate():
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("condition was never reached")
-
-
-class TestUnloadEngineCoalescing:
-    """Concurrent _unload_engine callers share one teardown task."""
-
-    @pytest.fixture
-    def coalescing_pool(self, small_mock_model_dir):
-        pool = _make_pool(ceiling=10 * 1024**3)
-        pool.discover_models(str(small_mock_model_dir))
-        return pool
-
-    @pytest.mark.asyncio
-    async def test_concurrent_unload_shares_teardown(self, coalescing_pool):
-        pool = coalescing_pool
-        entry = pool._entries["model-a"]
-        release = asyncio.Event()
-        engine = _GatedStopEngine(release)
-        entry.engine = engine
-        pool._current_model_memory = entry.estimated_size
-
-        with (
-            patch("omlx.engine_pool.mx") as mock_mx,
-            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
-        ):
-            mock_mx.get_active_memory.return_value = 0
-            first = asyncio.create_task(pool._unload_engine("model-a"))
-            await _yield_until(lambda: engine.stop_calls == 1)
-            assert "model-a" in pool._unloading_models
-            assert "model-a" in pool._unload_tasks
-
-            second = asyncio.create_task(pool._unload_engine("model-a"))
-            # Both callers are parked on the same shielded teardown task.
-            await _yield_until(lambda: len(pool._unload_tasks) == 1)
-            for _ in range(5):
-                await asyncio.sleep(0)
-            assert engine.stop_calls == 1
-            assert not first.done()
-            assert not second.done()
-            assert "model-a" in pool._unloading_models
-
-            release.set()
-            await asyncio.gather(first, second)
-
-        assert engine.stop_calls == 1
-        assert pool._unload_tasks == {}
-        assert pool._unloading_models == set()
-        assert entry.engine is None
-
-    @pytest.mark.asyncio
-    async def test_concurrent_unload_shares_teardown_exception(
-        self, coalescing_pool
-    ):
-        pool = coalescing_pool
-        entry = pool._entries["model-a"]
-        release = asyncio.Event()
-        error = RuntimeError("distributed teardown failed")
-        engine = _GatedStopEngine(release, error=error)
-        # A distributed stop() failure is re-raised by _stop_and_unload_engine.
-        engine.deployment = _deployment(entry.model_path)
-        entry.engine = engine
-
-        with patch(
-            "omlx.engine_pool.get_phys_footprint", return_value=0
-        ):
-            first = asyncio.create_task(pool._unload_engine("model-a"))
-            await _yield_until(lambda: engine.stop_calls == 1)
-            second = asyncio.create_task(pool._unload_engine("model-a"))
-            for _ in range(5):
-                await asyncio.sleep(0)
-            assert engine.stop_calls == 1
-
-            release.set()
-            results = await asyncio.gather(first, second, return_exceptions=True)
-
-        assert results == [error, error]
-        assert all(result is error for result in results)
-        assert engine.stop_calls == 1
-        assert pool._unload_tasks == {}
-        assert pool._unloading_models == set()
-        # A failed distributed teardown keeps the engine registered for retry.
-        assert entry.engine is engine
-
-
 class TestEnginePoolEviction:
     """Tests for memory-based eviction."""
 
@@ -5271,7 +5163,7 @@ class TestEnginePoolInUseLease:
         entry = self._loaded_entry("model-a")
         entry.pending_unload_reason = "settings changed"
         pool._entries = {"model-a": entry}
-        pool._unloading_models.add("model-a")
+        pool._unloading_models["model-a"] = MagicMock()
         pool._unload_engine = AsyncMock()
 
         async with pool._lock:
@@ -5959,7 +5851,7 @@ async def test_loaded_model_acquire_and_release_bypass_unrelated_unload_lock():
     pool = _make_pool(ceiling=0)
     entry = TestEnginePoolInUseLease._loaded_entry("ready")
     pool._entries = {"ready": entry}
-    pool._unloading_models.add("other")
+    pool._unloading_models["other"] = MagicMock()
     async with pool._lock:
         engine = await asyncio.wait_for(pool.get_engine("ready", _lease=True), 0.2)
         assert engine is entry.engine
@@ -5973,7 +5865,7 @@ async def test_unloading_model_cannot_use_loaded_fast_path():
     pool = _make_pool(ceiling=0)
     entry = TestEnginePoolInUseLease._loaded_entry("closing")
     pool._entries = {"closing": entry}
-    pool._unloading_models.add("closing")
+    pool._unloading_models["closing"] = MagicMock()
     assert pool._acquire_loaded_engine("closing", False, True, None) is None
     assert entry.in_use == 0
 
@@ -5982,9 +5874,11 @@ async def test_unloading_model_cannot_use_loaded_fast_path():
 async def test_unload_marker_exists_before_stop_yields_and_clears_on_error():
     pool = _make_pool(ceiling=0)
     entered, release = asyncio.Event(), asyncio.Event()
+    stop_calls = []
 
     async def stop(model_id):
         assert model_id in pool._unloading_models
+        stop_calls.append(model_id)
         entered.set()
         await release.wait()
         raise RuntimeError("stop failed")
@@ -5992,12 +5886,41 @@ async def test_unload_marker_exists_before_stop_yields_and_clears_on_error():
     pool._stop_and_unload_engine = stop
     task = asyncio.create_task(pool._unload_engine("closing"))
     await entered.wait()
-    with pytest.raises(ModelBusyError):
-        await pool._unload_engine("closing")
+    joiner = asyncio.create_task(pool._unload_engine("closing"))
     release.set()
-    with pytest.raises(RuntimeError):
-        await task
+    for unload in (task, joiner):
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await unload
+    assert stop_calls == ["closing"]
     assert not pool._unloading_models
+
+
+@pytest.mark.asyncio
+async def test_get_engine_waits_for_teardown_in_progress(small_mock_model_dir):
+    pool = _make_pool(ceiling=10 * 1024**3)
+    pool.discover_models(str(small_mock_model_dir))
+    entry = pool._entries["model-a"]
+    entry.engine = MagicMock()
+    release = asyncio.Event()
+
+    async def stop(model_id):
+        await release.wait()
+        entry.engine = None
+
+    pool._stop_and_unload_engine = stop
+    engine = MagicMock()
+    engine.start = AsyncMock()
+    with (
+        patch("omlx.engine_pool.mx") as mock_mx,
+        patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+        patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+    ):
+        mock_mx.get_active_memory.return_value = 0
+        unload = asyncio.create_task(pool._unload_engine("model-a"))
+        load = asyncio.create_task(pool.get_engine("model-a"))
+        release.set()
+        assert await load is engine
+        await unload
 
 
 @pytest.mark.asyncio

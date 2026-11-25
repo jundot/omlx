@@ -484,9 +484,7 @@ class EnginePool:
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
-        self._unloading_models: set[str] = set()
-        # Coalesces concurrent teardown callers onto one shielded task.
-        self._unload_tasks: dict[str, asyncio.Task[None]] = {}
+        self._unloading_models: dict[str, asyncio.Task[None]] = {}
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
@@ -2861,6 +2859,8 @@ class EnginePool:
         if ready is not None:
             return ready
         async with self._lock:
+            if model_id in self._unloading_models:
+                await self._unload_engine(model_id)
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
@@ -3837,45 +3837,22 @@ class EnginePool:
         return False
 
     async def _unload_engine(self, model_id: str, *, local_only: bool = False) -> None:
-        task = self._unload_tasks.get(model_id)
-        if task is not None:
-            # Another caller owns this teardown. Wait for it rather than
-            # failing, so a concurrent benchmark/load observes the clean
-            # engine instead of racing a stopped one; cancellation shields
-            # the shared task exactly like the creator path.
-            cancelled = False
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    cancelled = True
-            task.result()
-            if cancelled:
-                raise asyncio.CancelledError
-            return
-
-        self._unloading_models.add(model_id)
-        task = asyncio.create_task(
-            self._stop_and_unload_engine(
-                model_id, **({"local_only": True} if local_only else {})
+        task = self._unloading_models.get(model_id)
+        if task is None:
+            task = asyncio.create_task(
+                self._stop_and_unload_engine(
+                    model_id, **({"local_only": True} if local_only else {})
+                )
             )
-        )
-        # Register before the first await so concurrent callers coalesce.
-        self._unload_tasks[model_id] = task
+            self._unloading_models[model_id] = task
+            task.add_done_callback(lambda _: self._unloading_models.pop(model_id))
         cancelled = False
-        try:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    cancelled = True
-            task.result()
-        finally:
-            # Only the creator retires the shared task and admission marker,
-            # after completion, so waiters still see teardown in progress.
-            if self._unload_tasks.get(model_id) is task:
-                self._unload_tasks.pop(model_id, None)
-            self._unloading_models.discard(model_id)
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
         if cancelled:
             raise asyncio.CancelledError
 

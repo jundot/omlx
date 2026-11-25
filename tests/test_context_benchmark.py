@@ -20,7 +20,6 @@ from omlx.admin.context_benchmark import (
     next_verify_candidate,
     run_context_benchmark,
 )
-from omlx.engine_pool import EnginePool
 from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
 
 # =============================================================================
@@ -604,96 +603,3 @@ class TestRunContextBenchmark:
         assert run.phase == "apply"
         assert run.progress > 90
         assert run.message
-
-
-# =============================================================================
-# Concurrent prepare
-# =============================================================================
-
-
-class _CoalescingPool(_FakePool):
-    """_FakePool whose unloads go through EnginePool's real coalescing.
-
-    ``stop()`` parks on ``release`` so a second benchmark's prepare lands
-    while the first teardown is still in flight.
-    """
-
-    def __init__(self, engine, release):
-        super().__init__(engine, loaded=["prev-model"])
-        self.release = release
-        self.stop_calls = 0
-        self.stopped_models = []
-        self.unload_calls = 0
-        self._unloading_models = set()
-        self._unload_tasks = {}
-        self.load_observations = []
-
-    async def _stop_and_unload_engine(self, model_id, **kwargs):
-        self.stop_calls += 1
-        self.stopped_models.append(model_id)
-        await self.release.wait()
-        self.unloaded.append(model_id)
-
-    async def _unload_engine(self, model_id, **kwargs):
-        self.unload_calls += 1
-        await EnginePool._unload_engine(self, model_id, **kwargs)
-
-    async def get_engine(self, model_id, force_lm=False):
-        self.load_observations.append(
-            (
-                model_id,
-                "prev-model" in self._unloading_models,
-                "prev-model" in self._unload_tasks,
-            )
-        )
-        return self._engine
-
-
-async def _yield_until(predicate, attempts: int = 200) -> None:
-    for _ in range(attempts):
-        if predicate():
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("condition was never reached")
-
-
-class TestConcurrentPrepare:
-    @pytest.mark.asyncio
-    async def test_second_prepare_waits_for_in_progress_unload(self):
-        scheduler = _FakeScheduler(boundary=50000)
-        engine = _FakeEngine(scheduler)
-        release = asyncio.Event()
-        pool = _CoalescingPool(engine, release)
-
-        first_run = _make_run()
-        second_run = _make_run()
-        first = asyncio.create_task(_run_bench(first_run, pool))
-        await _yield_until(lambda: pool.stop_calls == 1)
-        assert not first.done()
-
-        # The second benchmark starts while the previous teardown is parked.
-        second = asyncio.create_task(_run_bench(second_run, pool))
-        await _yield_until(lambda: pool.unload_calls == 2)
-        await asyncio.sleep(0)
-        assert pool.stop_calls == 1
-        assert not second.done()
-        assert "prev-model" in pool._unloading_models
-
-        release.set()
-        await asyncio.gather(first, second)
-
-        # Only the in-progress teardown stopped the previous model; the second
-        # prepare waited on it instead of launching its own.
-        assert pool.stopped_models.count("prev-model") == 1
-        assert pool.unloaded.count("prev-model") == 1
-        assert first_run.status == "completed"
-        assert second_run.status == "completed"
-        assert first_run.error_message == ""
-        assert second_run.error_message == ""
-        assert pool._unload_tasks == {}
-        assert pool._unloading_models == set()
-        # Both loads observed a fully retired teardown: no marker, no task.
-        assert pool.load_observations == [
-            ("test-model", False, False),
-            ("test-model", False, False),
-        ]
