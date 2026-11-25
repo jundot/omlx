@@ -5392,18 +5392,30 @@ _BROKEN_JSON_CALL = _JSON_CALL.replace("}}", "}]")
     "parser,thinking,raw,calls,errors",
     [
         ("json_tools", "", _BROKEN_JSON_CALL, 0, ("malformed",)),
-        ("json_tools", "", "<tool_call> to write, or already </tool_call>", 0, ()),
+        ("mistral", "", '[TOOL_CALLS]write[ARGS]{"a": }', 0, ("malformed",)),
+        ("json_tools", "", "`<tool_call>`\n- read: a `</tool_call>` tag", 0, ()),
+        ("json_tools", "", f"`{_BROKEN_JSON_CALL}`", 0, ()),
+        ("mistral", "", 'The [TOOL_CALLS] marker, e.g. read("a")', 0, ()),
         ("json_tools", "", _JSON_CALL + _BROKEN_JSON_CALL, 1, ()),
         ("json_tools", _JSON_CALL, _BROKEN_JSON_CALL, 1, ()),
         ("pythonic", "", "<|tool_call_start|>write()<|tool_call_end|>", 1, ()),
     ],
-    ids=["lost", "prose", "sibling", "reasoning", "fallback"],
+    ids=[
+        "lost",
+        "lost-name-first",
+        "prose",
+        "quoted",
+        "prose-one-sided",
+        "sibling",
+        "reasoning",
+        "fallback",
+    ],
 )
 def test_final_native_rejection_reports_only_a_lost_call(
     parser, thinking, raw, calls, errors
 ):
     tok = _qwen_parser_tokenizer(f"mlx_lm.tool_parsers.{parser}")
-    tools = [{"function": {"name": name}} for name in ("read", "write")]
+    tools = [{"function": {"name": name}} for name in (5, "read", "write")]
     result = extract_tool_calls_with_thinking(
         thinking, raw, tok, tools, finish_reason="stop"
     )

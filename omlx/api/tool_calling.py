@@ -2277,10 +2277,11 @@ def _parse_tool_calls_impl(
                         cleaned_text = cleaned_text[:idx].strip()
                 return cleaned_text, tool_calls
 
-            if parse_errors is not None and any(
-                re.search(rf"(?<![\w-]){re.escape(name)}\s*[\"'(\[{{<:]", match)
-                for name in _extract_tool_names(tools or [])
-                for match in matches
+            if (
+                parse_errors is not None
+                and matches
+                and text.rstrip().endswith(tool_call_end or matches[-1].rstrip())
+                and _opens_call(matches[-1], tools)
             ):
                 parse_errors.append("malformed")
 
@@ -2380,9 +2381,16 @@ def _extract_tool_names(tools: List) -> set:
             func = tool.get("function", {})
             if isinstance(func, dict):
                 name = func.get("name")
-                if name:
+                if isinstance(name, str) and name:
                     names.add(name)
     return names
+
+
+def _opens_call(payload: str, tools: Optional[List]) -> bool:
+    return bool(re.match(r"\s*(?:[<{\[]|call:)", payload)) or any(
+        re.match(rf"\s*{re.escape(name)}\s*[(\[{{<:]", payload)
+        for name in _extract_tool_names(tools or [])
+    )
 
 
 def parse_qwen_tool_calls(
