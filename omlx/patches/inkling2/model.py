@@ -34,7 +34,7 @@ from .. import row_exact_gemv
 from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
-from . import kernels, verify_experts
+from . import kernels, loopcd, verify_experts
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -399,25 +399,28 @@ class Inkling2Experts(nn.Module):
         """The routed expert outputs [N, K, H] and their FP32 weights [N, K]
         (NVFP4 tensor scale included), before ``moe_sum``."""
         xe = mx.expand_dims(x, (-2, -3))
+        armed = is_row_exact_armed()
+        # The expert-order kernel repeats gather_qmm's one-pair arithmetic, so
+        # it takes every block gather_qmm runs pair by pair: a decode row, a
+        # row-exact verify block, and any block below gather_qmm's batched
+        # sorted kernel (four pairs per expert). Shared experts are read once.
+        experts = self.w13.weight.shape[0]
+        per_pair = inds.size < verify_experts.PAIRS_PER_EXPERT * experts
+        fused = (
+            (per_pair or (armed and inds.shape[0] <= verify_experts.MAX_ROWS))
+            and verify_experts.supported(self.w13, x.dtype)
+            and verify_experts.supported(self.w2, x.dtype)
+        )
         # Sorting regroups the pairs by expert and changes their arithmetic;
         # row-exact verify rows keep the per-pair gather of a decode step.
-        do_sort = inds.size >= 64 and not is_row_exact_armed()
+        do_sort = not fused and inds.size >= 64 and not armed
         idx = inds
         inv = None
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
-        # A row-exact verify block runs its pairs in expert order, so rows
-        # that share an expert read its weights once (same bits per pair).
-        order = None
-        if (
-            not do_sort
-            and 1 < inds.shape[0] <= verify_experts.MAX_ROWS
-            and is_row_exact_armed()
-            and verify_experts.supported(self.w13, x.dtype)
-            and verify_experts.supported(self.w2, x.dtype)
-        ):
+        if fused:
             pairs = inds.reshape(-1)
-            order = pair_order(pairs)
+            order = pair_order(pairs) if inds.shape[0] > 1 else None
             y = verify_experts.gather(
                 self.w13, x, pairs, inds.shape[-1], order
             ).reshape(*inds.shape, 1, -1)
@@ -429,7 +432,7 @@ class Inkling2Experts(nn.Module):
         act = _softcapped_swiglu(
             y[..., 0::2], y[..., 1::2], self._gcap, self._ucap, s13
         )
-        if order is not None:
+        if fused:
             z = verify_experts.gather(
                 self.w2, act.reshape(pairs.shape[0], -1), pairs, 1, order
             ).reshape(*inds.shape, 1, -1)
@@ -1135,6 +1138,8 @@ class Inkling2TextModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self._schedule = tuple(args.layer_schedule())
         self._core_start = args.loop_core.start if args.loop_config else None
+        self._reference_visits: tuple = ()
+        self._caches_thinking_flags = False
 
     @property
     def num_visits(self) -> int:
@@ -1143,13 +1148,16 @@ class Inkling2TextModel(nn.Module):
             return len(self.layers)
         return len(self._schedule)
 
+    def _visit_order(self) -> tuple:
+        return self._schedule[: self.num_visits] + self._reference_visits
+
     def cache_layout(self) -> list[tuple[int | None, int]]:
         """Where each layer visit's ``(KVCache, state)`` sit in a cache list.
 
         A sliding visit has no ``KVCache``; its one entry holds everything.
         """
         layout, entry = [], 0
-        for idx, _ in self._schedule[: self.num_visits]:
+        for idx, _ in self._visit_order():
             if self.layers[idx].sliding:
                 layout.append((None, entry))
                 entry += 1
@@ -1162,6 +1170,7 @@ class Inkling2TextModel(nn.Module):
         """``(KVCache or None, state)`` of every layer visit in ``cache``."""
         layout = self.cache_layout()
         entries = layout[-1][1] + 1 if layout else 0
+        entries += self._caches_thinking_flags
         if len(cache) != entries:
             # A per-layer cache would silently skip the later loop passes.
             raise ValueError(
@@ -1176,7 +1185,7 @@ class Inkling2TextModel(nn.Module):
             for kv, state in layout
         ]
 
-    def __call__(self, inputs, cache=None, input_embeddings=None, capture=None):
+    def __call__(self, inputs, cache, input_embeddings, capture):
         """``capture`` maps draft feature ids to fill: ``i`` < num visits is
         the partial block sum entering layer visit ``i``; ``num visits`` is
         the final-norm output."""
@@ -1184,16 +1193,22 @@ class Inkling2TextModel(nn.Module):
             h = input_embeddings
         else:
             h = self.embed_norm(self.embed(inputs))
-        visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
+        order = self._visit_order()
+        visits = [None] * len(order) if cache is None else self.visit_caches(cache)
         eval_every = _EVAL_EVERY if h.shape[1] <= _COMPILED_MAX_TOKENS else 0
         last = len(visits) - 1
         blocks: list = []
-        prelude = bank = tau = None
-        for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
+        prelude = bank = tau = first_pass = None
+        for visit, ((idx, loop_pass), c) in enumerate(zip(order, visits)):
             layer = self.layers[idx]
-            if idx == self._core_start and prelude is None:
+            if visit == self.num_visits:
+                out = self._readout(h, blocks)
+                h, blocks = first_pass
+            elif idx == self._core_start and prelude is None:
                 prelude = (h, list(blocks))
             elif idx == self._core_start:
+                if loop_pass == 1:
+                    first_pass = (h, blocks)
                 # The next pass restarts from the prelude output; the blocks
                 # the last pass wrote become its message bank.
                 bank = (
@@ -1201,7 +1216,7 @@ class Inkling2TextModel(nn.Module):
                     _unit_rms(h.astype(mx.float32)),
                 )
                 h, blocks = prelude[0], list(prelude[1])
-            if capture is not None and visit in capture:
+            if visit in capture:
                 capture[visit] = h
             if not layer.sliding and tau is None:
                 # The full-attention visits hold the same positions, so they
@@ -1216,6 +1231,15 @@ class Inkling2TextModel(nn.Module):
             )
             if eval_every and visit < last and (visit + 1) % eval_every == 0:
                 mx.async_eval(h)
+        if self._reference_visits:
+            capture[loopcd.REFERENCE] = self._readout(h, blocks)
+        else:
+            out = self._readout(h, blocks)
+        if self.num_visits in capture:
+            capture[self.num_visits] = out
+        return out
+
+    def _readout(self, h, blocks):
         _keep_fp32_weight(self.norm)
         norm_w = _fp32_norm_stack(self, (self.norm,), "final")
         fused = None
@@ -1235,8 +1259,6 @@ class Inkling2TextModel(nn.Module):
         else:
             x = self.final_input(blocks, _unit_rms(h.astype(mx.float32)))[:, :, 0]
             out = _norm(self.norm, x).astype(h.dtype)
-        if capture is not None and self.num_visits in capture:
-            capture[self.num_visits] = out
         return out
 
 
@@ -1279,6 +1301,34 @@ class Model(nn.Module):
             names = ("in_proj",) if attn.sliding else ("q_proj", "k_proj", "v_proj")
             linears += [getattr(attn, name) for name in names] + [attn.o_proj]
         return all(type(m) in (nn.Linear, nn.QuantizedLinear) for m in linears)
+
+    def enable_loopcd(self, skip_thinking: bool) -> bool:
+        args = self.args.text
+        coda = range(args.loop_core.stop, args.num_hidden_layers)
+        passes = int((args.loop_config or {}).get("num_passes", 1))
+        if passes < 2 or not coda:
+            return False
+        self.model._reference_visits = tuple((idx, 0) for idx in coda)
+        self.model._caches_thinking_flags = skip_thinking
+        return True
+
+    def _loopcd_logits(self, h, reference, inputs, cache):
+        thinking = None
+        if self.model._caches_thinking_flags:
+            before = cache[-1][0] if cache is not None else None
+            thinking = loopcd.thinking_flags(inputs, False if before is None else before)
+            if cache is not None:
+                cache[-1][0] = thinking[:, -1:]
+                cache[-1]._omlx_verify_xp = thinking
+        compiled = h.shape[-2] <= _COMPILED_MAX_TOKENS
+        guide = loopcd.guide_compiled if compiled else loopcd.guide
+        return guide(
+            _linear(self.lm_head, h),
+            _linear(self.lm_head, reference),
+            self._softcap,
+            self._vocab_bias,
+            thinking,
+        )
 
     def logits_from_hidden(self, h):
         # Decode and verify rows run the cast, softcap and vocab bias as one
@@ -1360,11 +1410,15 @@ class Model(nn.Module):
         )
         if observe:
             capture_layer_ids = list(drafter.target_layer_ids)
-        if not capture_layer_ids and not return_hidden:
-            return self.logits_from_hidden(self.model(inputs, cache, input_embeddings))
         capture = {int(i): None for i in capture_layer_ids or ()}
         h = self.model(inputs, cache, input_embeddings, capture=capture)
-        logits = self.logits_from_hidden(h)
+        if self.model._reference_visits:
+            reference = capture[loopcd.REFERENCE]
+            logits = self._loopcd_logits(h, reference, inputs, cache)
+        else:
+            logits = self.logits_from_hidden(h)
+        if not capture_layer_ids and not return_hidden:
+            return logits
         captures = [capture[int(i)] for i in capture_layer_ids or ()]
         if observe:
             drafter.observe(scope, captures)
@@ -1399,6 +1453,8 @@ class Model(nn.Module):
                 # A verify window is a few rows, so the state may stay a view.
                 conv[base + slot] = xp[:, keep : keep + width]
             conv._omlx_verify_xp = None
+        if self.model._caches_thinking_flags:
+            cache[-1][0] = cache[-1]._omlx_verify_xp[:, keep - 1 : keep]
         return True
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
@@ -1422,6 +1478,8 @@ class Model(nn.Module):
                 cache.append(windows.ArraysCache(window=window))
             else:
                 cache += [KVCache(), ArraysCache(4)]
+        if self.model._caches_thinking_flags:
+            cache.append(ArraysCache(1))
         return cache
 
     def restore_cache(self, cache: list) -> list:

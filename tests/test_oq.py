@@ -5473,6 +5473,91 @@ class TestEstimateBpwHeaderOnly:
             with_mtp["output_size_bytes"] - without["output_size_bytes"] == 64 * 64 * 2
         )
 
+    @pytest.mark.parametrize(
+        "draft",
+        [
+            "model.dfly_layers.0.proj.bias",
+            "language_model.dfly.layers.0.proj.bias",
+            "model.layers.2.nextn_proj.bias",
+        ],
+    )
+    def test_estimate_only_counts_draft_when_included(
+        self, tmp_path, monkeypatch, draft
+    ):
+        config = {
+            "model_type": "hy_v4_flash",
+            "num_hidden_layers": 2,
+            "num_nextn_predict_layers": 1,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        tensors = {
+            "model.layers.0.proj.bias": (bytes(8), [4], "BF16"),
+            draft: (bytes(16), [8], "BF16"),
+        }
+        _write_safetensors(str(tmp_path / "model.safetensors"), tensors)
+        monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: None)
+        off = estimate_bpw_and_size(str(tmp_path), 4)
+        on = estimate_bpw_and_size(str(tmp_path), 4, preserve_mtp=True)
+        assert off["output_size_bytes"] == 8
+        assert on["output_size_bytes"] == 24
+
+    def test_estimate_applies_text_only_and_media_dtype(self, tmp_path, monkeypatch):
+        (tmp_path / "config.json").write_text('{"model_type":"qwen3_5"}')
+        tensors = {
+            "model.layers.0.proj.weight": (bytes(36), [2, 9], "BF16"),
+            "model.layers.0.loop_a.bias": (bytes(4), [2], "BF16"),
+            "model.layers.0.loop_b.bias": (bytes(4), [2], "BF16"),
+            "vision_tower.proj.bias": (bytes(16), [8], "BF16"),
+            "audio_tower.proj.bias": (bytes(8), [4], "BF16"),
+        }
+        _write_safetensors(str(tmp_path / "model.safetensors"), tensors)
+
+        def sanitize(weights):
+            loop = [weights.pop(f"model.layers.0.loop_{s}.bias") for s in "ab"]
+            return {**weights, "model.layers.0.loop.bias": mx.concatenate(loop)}
+
+        sanitize._omlx_cast_predicate = lambda name: "loop" not in name
+        monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: sanitize)
+        bf16 = estimate_bpw_and_size(str(tmp_path), 4)
+        fp16 = estimate_bpw_and_size(str(tmp_path), 4, dtype="float16")
+        text = estimate_bpw_and_size(str(tmp_path), 4, dtype="float16", text_only=True)
+        assert bf16["output_size_bytes"] == 36 + 8 + 24
+        assert fp16["output_size_bytes"] == 36 + 8 + 48
+        assert text["output_size_bytes"] == 36 + 8
+
+    @pytest.mark.parametrize("family", ["gemma4", "qwen3_5"])
+    def test_estimate_adds_only_donated_head(self, tmp_path, monkeypatch, family):
+        source = tmp_path / "source"
+        donor = tmp_path / "donor"
+        source.mkdir()
+        donor.mkdir()
+        config = {"model_type": family, "num_hidden_layers": 2}
+        (source / "config.json").write_text(json.dumps(config))
+        _write_safetensors(
+            str(source / "model.safetensors"),
+            {"model.layers.0.proj.bias": (bytes(8), [4], "BF16")},
+        )
+        if family == "gemma4":
+            donor_config = {
+                "model_type": "gemma4_assistant",
+                "text_config": {"num_hidden_layers": 1},
+            }
+            weights = {"model.projector.bias": (bytes(16), [8], "BF16")}
+        else:
+            donor_config = {**config, "mtp_num_hidden_layers": 1}
+            weights = {
+                "mtp.fc.weight": (bytes(16), [2, 4], "BF16"),
+                "model.layers.0.proj.bias": (bytes(64), [32], "BF16"),
+            }
+            for model in (source, donor):
+                (model / "tokenizer.json").write_text("{}")
+        (donor / "config.json").write_text(json.dumps(donor_config))
+        _write_safetensors(str(donor / "model.safetensors"), weights)
+        monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: None)
+        off = estimate_bpw_and_size(str(source), 4)
+        on = estimate_bpw_and_size(str(source), 4, mtp_assistant_model_path=str(donor))
+        assert on["output_size_bytes"] - off["output_size_bytes"] == 16
+
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestQuantizeOqStreamingPassthroughDtypes:

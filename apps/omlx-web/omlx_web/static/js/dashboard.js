@@ -2360,6 +2360,8 @@
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
                     lora_adapter: isDiffusion ? '' : (s.lora_adapter || ''),
+                    loopcd_enabled: s.loopcd_enabled === true,
+                    loopcd_skip_thinking: s.loopcd_skip_thinking === true,
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     external_engine: s.external_engine || '',
@@ -3739,6 +3741,8 @@
                         ? parseInt(ms.vlm_mtp_draft_block_size)
                         : null,
                     lora_adapter: ms.lora_adapter || null,
+                    loopcd_enabled: !!ms.loopcd_enabled,
+                    loopcd_skip_thinking: !!ms.loopcd_skip_thinking,
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };
@@ -8250,6 +8254,20 @@
                 }
             },
 
+            oqOutputOptions() {
+                return {
+                    model_path: this.oqSelectedModelPath,
+                    oq_level: this.oqLevel,
+                    group_size: 64,
+                    text_only: this.oqTextOnly,
+                    dtype: this.oqDtype,
+                    preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp,
+                    mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
+                        ? this.oqMtpAssistantPath : '',
+                    preserve_ngram_table: this.oqPreservesNgram(),
+                };
+            },
+
             async startOQQuantization() {
                 if (!this.oqSelectedModelPath || this.oqStarting) return;
                 this.oqError = '';
@@ -8257,16 +8275,8 @@
                 this.oqStarting = true;
                 try {
                     const payload = {
-                        model_path: this.oqSelectedModelPath,
-                        oq_level: this.oqLevel,
-                        group_size: 64,
+                        ...this.oqOutputOptions(),
                         sensitivity_model_path: this.oqSensitivityModelPath,
-                        text_only: this.oqTextOnly,
-                        dtype: this.oqDtype,
-                        preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
-                        mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
-                            ? this.oqMtpAssistantPath : '',
-                        preserve_ngram_table: this.oqPreservesNgram(),
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -8478,6 +8488,7 @@
             },
 
             oqEstimate: null,
+            oqEstimateError: '',
             _oqEstimateTimer: null,
 
             oqEstimatedBpw() {
@@ -8488,27 +8499,30 @@
                 return this.oqEstimate?.output_size_formatted || '';
             },
 
-            oqRefreshEstimate() {
+            oqRefreshEstimate(options = this.oqOutputOptions()) {
                 // Debounce: wait 300ms after last change
                 if (this._oqEstimateTimer) clearTimeout(this._oqEstimateTimer);
-                if (!this.oqSelectedModelPath) {
-                    this.oqEstimate = null;
-                    return;
-                }
+                const revision = (this._oqEstimateRevision || 0) + 1;
+                this._oqEstimateRevision = revision;
+                this.oqEstimate = null;
+                this.oqEstimateError = '';
+                if (!options.model_path) return;
+                const params = new URLSearchParams(options);
                 this._oqEstimateTimer = setTimeout(async () => {
                     try {
-                        const params = new URLSearchParams({
-                            model_path: this.oqSelectedModelPath,
-                            oq_level: this.oqLevel,
-                            preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
-                            preserve_ngram_table: this.oqPreservesNgram() ? 'true' : 'false',
-                        });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
+                        const result = await resp.json();
+                        if (this._oqEstimateRevision !== revision) return;
                         if (resp.ok) {
-                            this.oqEstimate = await resp.json();
+                            this.oqEstimate = result;
+                        } else {
+                            this.oqEstimateError = result.detail || resp.statusText
+                                || window.t('js.error.connection_error');
                         }
                     } catch (e) {
-                        console.error('Failed to estimate oQ:', e);
+                        if (this._oqEstimateRevision === revision) {
+                            this.oqEstimateError = window.t('js.error.connection_error');
+                        }
                     }
                 }, 300);
             },

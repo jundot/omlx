@@ -18,10 +18,15 @@ from __future__ import annotations
 
 import functools
 import math
+import secrets
 from typing import Callable, List, Optional, Sequence
 
 import mlx.core as mx
 import numpy as np
+
+
+def seed_request_stream(seed: int | None) -> None:
+    mx.random.seed(secrets.randbits(64) if seed is None else seed)
 
 
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:

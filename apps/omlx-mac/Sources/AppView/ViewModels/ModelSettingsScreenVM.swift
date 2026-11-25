@@ -325,6 +325,9 @@ final class ModelSettingsScreenVM {
     /// when it is outside the UI range, as the web admin does.
     private var loadedMoeResidentFraction: Double = 0.25
 
+    var loopcdEnabled: Bool = false
+    var loopcdSkipThinking: Bool = false
+
     // Chat-template kwargs — entries are the editor's view of the
     // (chat_template_kwargs, forced_ct_kwargs) server pair.
     var chatTemplateEntries: [ChatTemplateKwargEntry] = []
@@ -568,6 +571,8 @@ final class ModelSettingsScreenVM {
                comment: "Error shown when the MoE resident expert percent is outside 5-95")
     }
 
+    var loopcdSupported: Bool { model?.configModelType == "inkling2_loop" }
+
     var embeddingAudioSupported: Bool { model?.embeddingAudioSupported == true }
     var gpuPowerLimitSupported: Bool { model?.gpuPowerLimitSupported == true }
     /// The watt value when it is in the range the server accepts.
@@ -793,6 +798,8 @@ final class ModelSettingsScreenVM {
                 self.guidedGrammar = s?.guidedGrammar ?? ""
                 self.moeExpertOffloadEnabled = m.moeExpertOffloadSupported == true
                     && (s?.moeExpertOffloadEnabled ?? false)
+                self.loopcdEnabled = s?.loopcdEnabled ?? false
+                self.loopcdSkipThinking = s?.loopcdSkipThinking ?? false
                 self.loadedMoeResidentFraction = s?.moeExpertOffloadResidentFraction ?? 0.25
                 self.moeExpertOffloadResidentPercent = Self.formatPct(self.loadedMoeResidentFraction * 100)
                 self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
@@ -1750,6 +1757,11 @@ final class ModelSettingsScreenVM {
                                     defaultValue: "IndexCache",
                                     comment: "Row label for the DSA IndexCache toggle"))
             }
+            if loopcdSupported && loopcdEnabled {
+                items.append(String(localized: "settings.experimental.loopcd.label",
+                                    defaultValue: "LoopCD",
+                                    comment: "Row label for the LoopCD toggle"))
+            }
             if specprefillEnabled {
                 items.append(String(localized: "settings.experimental.specprefill.label",
                                     defaultValue: "SpecPrefill",
@@ -1876,6 +1888,10 @@ final class ModelSettingsScreenVM {
                 if let fraction = moeExpertOffloadResidentFraction {
                     out[ProfileSettingsKey.moeExpertOffloadResidentFraction] = AnyCodable(fraction)
                 }
+            }
+            if loopcdSupported {
+                putBool(ProfileSettingsKey.loopcdEnabled, loopcdEnabled)
+                putBool(ProfileSettingsKey.loopcdSkipThinking, loopcdSkipThinking)
             }
             putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
             if turboquantKvEnabled {

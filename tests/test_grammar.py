@@ -31,6 +31,7 @@ from omlx.scheduler import Scheduler
 from omlx.server import (
     _compile_bare_grammar,
     _compile_with_structural_tag,
+    _grammar_reasoning_parser,
     _patch_output_format,
 )
 
@@ -453,6 +454,103 @@ class TestCompileWithStructuralTag:
         assert matcher.is_terminated()
 
 
+class TestInkling2StructuralTag:
+    _VOCAB = [
+        "<|message_model|>", "<|content_text|>", "<|content_thinking|>",
+        "<|end_message|>", "<|content_model_end_sampling|>",
+        "Ok", '{"', "name", '":"', "A", '"}',
+    ]
+    _SCHEMA = {
+        "type": "json_schema",
+        "json_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    }
+    _JSON = ['{"', "name", '":"', "A", '"}']
+    _END = ["<|end_message|>", "<|content_model_end_sampling|>"]
+
+    def _compile(self, chat_template_kwargs=None):
+        stop = self._VOCAB.index("<|content_model_end_sampling|>")
+        compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(self._VOCAB, stop_token_ids=[stop])
+        )
+        parser = _grammar_reasoning_parser(
+            SimpleNamespace(model_type="inkling2_loop"), None
+        )
+        return _compile_with_structural_tag(
+            compiler, self._SCHEMA, parser, chat_template_kwargs
+        )
+
+    def _allowed(self, matcher, token):
+        bitmask = np.full((1, 1), -1, dtype=np.int32)
+        matcher.fill_next_token_bitmask(bitmask)
+        return bool((bitmask[0, 0] >> self._VOCAB.index(token)) & 1)
+
+    def _accept(self, matcher, tokens):
+        for token in tokens:
+            assert matcher.accept_token(self._VOCAB.index(token)), token
+
+    @requires_xgrammar
+    def test_answer_opens_its_own_text_block(self):
+        matcher = xgr.GrammarMatcher(self._compile({"enable_thinking": False}))
+
+        assert self._allowed(matcher, "<|message_model|>")
+        self._accept(matcher, ["<|message_model|>"])
+        assert not self._allowed(matcher, "<|content_thinking|>")
+        self._accept(matcher, ["<|content_text|>", *self._JSON])
+        assert not self._allowed(matcher, "<|content_model_end_sampling|>")
+        self._accept(matcher, self._END)
+        assert matcher.is_terminated()
+
+    @requires_xgrammar
+    def test_header_rendered_by_the_template_is_accepted(self):
+        matcher = xgr.GrammarMatcher(self._compile({"enable_thinking": False}))
+
+        self._accept(matcher, [*self._JSON, *self._END])
+        assert matcher.is_terminated()
+
+    @requires_xgrammar
+    def test_thinking_block_stays_one_block(self):
+        matcher = xgr.GrammarMatcher(self._compile())
+
+        self._accept(matcher, ["<|message_model|>", "<|content_thinking|>", "Ok"])
+        assert not self._allowed(matcher, "<|content_text|>")
+        assert not self._allowed(matcher, "<|message_model|>")
+
+    @requires_xgrammar
+    @pytest.mark.parametrize(
+        "chat_template_kwargs,thinks",
+        [
+            ({"enable_thinking": False}, False),
+            ({"reasoning_effort": "0.0"}, False),
+            ({"reasoning_effort": "low", "enable_thinking": False}, True),
+        ],
+    )
+    def test_thinking_follows_the_template_effort(self, chat_template_kwargs, thinks):
+        compiled = self._compile(chat_template_kwargs)
+        matcher = xgr.GrammarMatcher(compiled)
+
+        self._accept(matcher, ["<|message_model|>"])
+        assert self._allowed(matcher, "<|content_thinking|>") is thinks
+        assert compiled._omlx_has_thinking_phase is thinks
+
+    @requires_xgrammar
+    def test_json_schema_keeps_the_whitespace_bound(self):
+        compiler = MagicMock()
+        fmt = {"type": "json_schema", "json_schema": {"type": "object"}}
+
+        _compile_with_structural_tag(
+            compiler, fmt, "inkling2", {"enable_thinking": False}
+        )
+
+        tag = compiler.compile_structural_tag.call_args[0][0]
+        answers = [block["content"] for block in tag["format"]["elements"]]
+        assert [answer["max_whitespace_cnt"] for answer in answers] == [32, 32]
+        assert "max_whitespace_cnt" not in fmt
+
+
 class TestCompileBareGrammar:
     """Tests for _compile_bare_grammar."""
 
@@ -491,6 +589,23 @@ class TestCompileBareGrammar:
         result = self._call(compiler, {"type": "grammar", "grammar": ebnf})
         assert result == "compiled_ebnf"
         compiler.compile_grammar.assert_called_once_with(ebnf)
+
+    @requires_xgrammar
+    def test_json_schema_pattern_repeat_over_128(self):
+        vocab = [chr(i) for i in range(32, 127)] + ["</s>"]
+        compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(vocab))
+        schema = {
+            "type": "object",
+            "properties": {"z": {"type": "string", "pattern": "^[^#]{0,240}$"}},
+            "required": ["z"],
+        }
+        compiled = self._call(compiler, {"type": "json_schema", "json_schema": schema})
+
+        matcher = xgr.GrammarMatcher(compiled)
+        assert matcher.accept_string('{"z":"' + "a" * 240)
+        assert not matcher.accept_string("a")
+        assert matcher.accept_string('"}')
+        assert matcher.is_completed()
 
 
 # =========================================================================
@@ -927,6 +1042,17 @@ class TestGrammarConstraintProcessor:
         assert result_np.shape[0] >= vocab_size
         assert np.any(result_np[:vocab_size] == -np.inf), "Should mask some tokens"
 
+    def test_stop_token_text_does_not_complete_grammar(self, compiler):
+        comp, vocab_size = compiler
+        proc = GrammarConstraintProcessor(comp.compile_regex(".+"), vocab_size)
+
+        logits = proc(mx.array([]), mx.zeros((1, vocab_size)))
+        assert logits[0, _STOP_TOKEN_ID].item() == -mx.inf
+
+        proc.accept_token(ord("{"))
+        logits = proc(mx.array([]), mx.zeros((1, vocab_size)))
+        assert logits[0, _STOP_TOKEN_ID].item() == 0
+
     def test_passthrough_after_termination(self, compiler):
         """After grammar terminates, logits should pass through unmodified."""
         from omlx.api.grammar import GrammarConstraintProcessor
@@ -1110,12 +1236,19 @@ _BUDGET_VOCAB = [bytes([i]) for i in range(256)] + [
     b"<ifm|arg_key>",
     b"<mm:think>",
     b"</mm:think>",
+    b"<|message_model|>",
+    b"<|content_thinking|>",
+    b"<|content_text|>",
+    b"<|end_message|>",
 ]
 _THINK_END, _THINK_START, _BUDGET_STOP = 256, 257, 258
 _MM_THINK_START, _MM_THINK_END = 265, 266
+_INK_MODEL, _INK_THINKING, _INK_TEXT, _INK_END = 267, 268, 269, 270
 
 
-def _budget_processors(compiled, think_end=_THINK_END, think_start=_THINK_START):
+def _budget_processors(
+    compiled, think_end=_THINK_END, think_start=_THINK_START, trailing=None
+):
     scheduler = MagicMock(spec=Scheduler)
     scheduler._xtc_special_tokens = set()
     scheduler._model_suppress_tokens = set()
@@ -1123,7 +1256,7 @@ def _budget_processors(compiled, think_end=_THINK_END, think_start=_THINK_START)
     scheduler._get_think_token_id.return_value = _THINK_START
     scheduler._resolve_think_end_token_ids.return_value = [think_end]
     scheduler._resolve_think_close_pattern.return_value = (None, None)
-    scheduler._resolve_output_parser_thinking_trailing_ids.return_value = None
+    scheduler._resolve_output_parser_thinking_trailing_ids.return_value = trailing
     scheduler._get_output_parser_thinking_end_text.return_value = (
         _BUDGET_VOCAB[think_end].decode()
     )
@@ -1255,6 +1388,34 @@ class TestGrammarThinkingBudget:
             ),
             [*expected, _BUDGET_STOP],
             preferred=lambda token: ord("x") if token == _MM_THINK_END else token,
+        )
+
+    @pytest.mark.parametrize(
+        "expected",
+        [
+            [_INK_MODEL, _INK_TEXT, *b"abc", _INK_END],
+            [
+                _INK_MODEL, _INK_THINKING, _INK_END,
+                _INK_MODEL, _INK_TEXT, *b"abc", _INK_END,
+            ],
+        ],
+    )
+    def test_inkling2_budget_close_opens_the_text_block(self, compiler, expected):
+        compiled = _compile_with_structural_tag(
+            compiler, {"type": "regex", "pattern": "abc"}, "inkling2", {}
+        )
+        first_end = iter([True] if _INK_THINKING in expected else [])
+        _sample_through(
+            _budget_processors(
+                compiled,
+                think_end=_INK_END,
+                think_start=_INK_THINKING,
+                trailing=[_INK_MODEL, _INK_TEXT],
+            ),
+            [*expected, _BUDGET_STOP],
+            preferred=lambda token: (
+                ord("x") if token == _INK_END and next(first_end, False) else token
+            ),
         )
 
     @pytest.mark.parametrize(

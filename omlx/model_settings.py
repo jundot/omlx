@@ -624,6 +624,9 @@ class ModelSettings:
     # The adapter is never served on its own; profiles can expose a variant.
     lora_adapter: Optional[str] = None
 
+    loopcd_enabled: bool = False
+    loopcd_skip_thinking: bool = False
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default

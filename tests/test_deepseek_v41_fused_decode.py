@@ -25,7 +25,7 @@ from omlx.oqh import quantize as oqh_quantize
 from omlx.oqh.modules import OqhSwitchLinear
 from omlx.patches.deepseek_v41 import decode_fused
 from omlx.patches.deepseek_v41.config import ModelConfig
-from omlx.patches.deepseek_v41.language import Block, LanguageModel
+from omlx.patches.deepseek_v41.language import Block, Indexer, LanguageModel
 from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan, OffloadedExpert
 from omlx.patches.deepseek_v41.quantization import QuantizedProjection, pack_activation
 from tests.test_deepseek_v41 import run_two_ranks
@@ -257,15 +257,35 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
         plan.close()
 
 
+@pytest.mark.parametrize("batch", [8, 12, 16])
+def test_batched_index_queries_match_each_request_alone(batch):
+    """At the checkpoint's sizes, where MLX takes qmm from 12 rows of a quantized projection."""
+    c = replace(config(), dim=5120, q_lora_rank=1280, index_n_heads=32)
+    idx = Indexer(c, 0)
+    rng = np.random.default_rng(5)
+    for name in ("wq_b", "weights_proj"):
+        weight = mx.array(rng.normal(0, 0.03, getattr(idx, name).weight.shape), mx.bfloat16)
+        packed, scales, biases = mx.quantize(weight, group_size=64, bits=4)
+        setattr(idx, name, QuantizedProjection(packed, scales, 4, "affine", biases=biases, group_size=64, quantize_input=True))
+    x, qr = (mx.array(rng.normal(size=(1, batch, n)), mx.bfloat16) for n in (c.dim, c.q_lora_rank))
+    positions = [9 + r * r % 7 for r in range(batch)]
+    q, w = decode_fused._index_queries(idx, x, qr, positions)
+    for r, p in enumerate(positions):
+        alone = decode_fused._index_queries(idx, x[:, r : r + 1], qr[:, r : r + 1], range(p, p + 1))
+        assert mx.array_equal(q[:, r : r + 1], alone[0]).item() and mx.array_equal(w[:, r : r + 1], alone[1]).item()
+
+
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-@pytest.mark.parametrize("batch", [3, 8, 17])   # odd: a tile lane holds half a vector pair
-def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
+# Irregular, equal and stepped positions; 3 and 17: a tile lane holds half a vector pair.
+@pytest.mark.parametrize("lengths", [[13, 20, 19], [14] * 4, [13 + r * r * 7 % 11 for r in range(8)], [13 + 2 * r for r in range(17)]])
+def test_batched_decode_matches_single_requests(monkeypatch, lengths, fmt):
     """On the row kernels (below decode_moe.MMA_MIN_BATCH requests without the drafter), B
     single-token requests through decode_block_nb give each request the logits it gets
     decoding alone (per-request arithmetic is the single-request kernels')."""
     from omlx.patches.deepseek_v41 import decode_moe
     from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 
+    batch = len(lengths)
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
     # Affine batches always run on matrix tiles; so do MXFP8 ones once the drafter verifies.
     model = verify_exact(build(fmt=fmt)) if fmt == "affine" else build(fmt=fmt)
@@ -288,7 +308,7 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
 
     monkeypatch.setattr(decode_fused, "batched_attention", counted_attention)
     rng = np.random.default_rng(11)
-    prompts = [rng.integers(3, 60, 13 + 2 * r).tolist() for r in range(batch)]   # different lengths
+    prompts = [rng.integers(3, 60, n).tolist() for n in lengths]
     singles, rows = [], []
     for p in prompts:
         for target in (singles, rows):

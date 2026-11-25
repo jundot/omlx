@@ -163,6 +163,7 @@ class _MTPResetBindingProxy:
         self._drafter = drafter
         self._target_proxy = target_proxy
         self.clear_before_replay = False
+        self.engine_stream: Any = None
 
     def __getattr__(self, name: str) -> Any:
         if name == "accept_verified_tokens" and self.clear_before_replay:
@@ -171,7 +172,8 @@ class _MTPResetBindingProxy:
 
     def _accept_verified_tokens(self, *args: Any, **kwargs: Any) -> Any:
         # Release the idle pool before replay and commit replace live cache state.
-        _sync_and_clear_cache(_vlm_generation_stream)
+        # mlx-vlm calls this on its own stream, which is the default here.
+        _sync_and_clear_cache(self.engine_stream)
         return self._drafter.accept_verified_tokens(*args, **kwargs)
 
     def reset(self, target_model: Any, *args: Any, **kwargs: Any) -> Any:
@@ -325,6 +327,7 @@ def run_vlm_mtp_decode(
         if not isinstance(drafter_model, _MTPResetBindingProxy):
             drafter_model = _MTPResetBindingProxy(drafter.model, None)
         drafter_model.clear_before_replay = True
+        drafter_model.engine_stream = mx.default_stream(mx.default_device())
 
     if is_batch:
         first_bonus_list = first_bonus.tolist()  # forces eval once

@@ -2839,6 +2839,27 @@ private struct ExperimentalSection: View {
                 }
             }
 
+            if vm.loopcdSupported {
+                Row(label: String(localized: "settings.experimental.loopcd.label",
+                                  defaultValue: "LoopCD",
+                                  comment: "Row label for the LoopCD toggle"),
+                    sublabel: String(localized: "settings.experimental.loopcd.sub",
+                                     defaultValue: "Contrast the last loop pass with the first to choose tokens. Can improve answers, but is slower and uses more memory.",
+                                     comment: "Sublabel describing LoopCD")) {
+                    RowSwitch(isOn: vm.bindProfile($vm.loopcdEnabled))
+                }
+                if vm.loopcdEnabled {
+                    Row(label: String(localized: "settings.experimental.loopcd.skip_thinking.label",
+                                      defaultValue: "Exclude Thinking Blocks",
+                                      comment: "Row label for the toggle that keeps LoopCD out of thinking blocks"),
+                        sublabel: String(localized: "settings.experimental.loopcd.skip_thinking.sub",
+                                         defaultValue: "Apply LoopCD only to the answer and tool calls. Recommended by its authors for coding agents.",
+                                         comment: "Sublabel for the toggle that keeps LoopCD out of thinking blocks")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.loopcdSkipThinking))
+                    }
+                }
+            }
+
             // SpecPrefill
             Row(label: String(localized: "settings.experimental.specprefill.label",
                               defaultValue: "SpecPrefill",

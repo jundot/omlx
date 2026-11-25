@@ -84,6 +84,7 @@ final class DTOFixtureTests: XCTestCase {
             textOnly: false,
             dtype: "bfloat16",
             preserveMtp: false,
+            preserveNgramTable: true,
             enhanced: true,
             hadamard: false,
             imatrixCachePath: "/Users/test/cache/imatrix.npz",
@@ -94,6 +95,7 @@ final class DTOFixtureTests: XCTestCase {
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let body = try JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
 
+        XCTAssertEqual(body?["preserve_ngram_table"] as? Bool, true)
         XCTAssertEqual(body?["enhanced"] as? Bool, true)
         XCTAssertEqual(body?["imatrix_cache_path"] as? String, "/Users/test/cache/imatrix.npz")
         XCTAssertEqual(body?["imatrix_reuse_cache"] as? Bool, true)

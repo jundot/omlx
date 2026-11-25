@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the in-memory hot cache tier in PagedSSDCacheManager."""
 
+import queue
 import threading
 import time
 from pathlib import Path
@@ -1666,6 +1667,20 @@ class TestHotCacheWriteThrough:
             with mgr._pending_write_hashes_lock:
                 assert block_hash not in mgr._pending_write_buffers
             assert Path(meta.file_path).exists()
+        finally:
+            mgr.close()
+
+    def test_inline_write_through_marks_the_entry_clean(self, tmp_path):
+        """A write-through that falls back to an inline write marks the
+        retained entry clean, so eviction does not write it again."""
+        mgr = self._make_manager(tmp_path, name="inline")
+        try:
+            block_hash = b"wt_inline_test_1"
+            with patch.object(mgr._write_queue, "put", side_effect=queue.Full):
+                assert self._save_block(mgr, block_hash) is True
+            assert mgr.get_stats().ssd_inline_write_fallbacks == 1
+            assert mgr._index.get(block_hash).file_path.exists()
+            assert not mgr._hot_cache[block_hash].get("dirty", True)
         finally:
             mgr.close()
 

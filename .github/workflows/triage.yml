@@ -3,6 +3,8 @@ name: Triage
 on:
   issue_comment:
     types: [created]
+  pull_request_target:
+    types: [opened, edited, reopened, ready_for_review]
   schedule:
     - cron: "0 19 * * *"
   workflow_dispatch:
@@ -11,7 +13,7 @@ concurrency:
   group: >-
     triage-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     && 'daily'
-    || format('issue-{0}', github.event.issue.number) }}
+    || format('issue-{0}', github.event.issue.number || github.event.pull_request.number) }}
 
 permissions:
   contents: read

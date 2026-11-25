@@ -7,6 +7,7 @@ to verify request/response formats without loading actual models.
 """
 
 import json
+import re
 import threading
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -138,9 +139,8 @@ class MockTokenizer:
         self.eos_token_id = 2
         self.bos_token_id = 1
 
-    def encode(self, text: str, add_special_tokens: bool | None = None) -> list[int]:
-        # Simple simulation: split by words
-        ids = [100 + i for i, _ in enumerate(text.split())]
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        ids = [100 + i for i, _ in enumerate(re.findall(r"\n|\S+", text))]
         return [self.bos_token_id, *ids] if add_special_tokens else ids
 
     def decode(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
@@ -1547,13 +1547,19 @@ class TestChatCompletionEndpoint:
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(
-    "text,reasoning_tokens",
-    [("<think>Need to reason.</think>Hello!", 3), ("Just an answer.", 0)],
+    "text,completion_tokens,reasoning_tokens",
+    [
+        ("<think>\nNeed to reason.</think>Hello!", 5, 3),
+        ("<think>\nNeed to reason.</think>Hello!", 2, 2),
+        ("Just an answer.", 5, 0),
+    ],
 )
 def test_chat_usage_reports_reasoning_tokens(
-    client, mock_llm_engine, stream, text, reasoning_tokens
+    client, mock_llm_engine, stream, text, completion_tokens, reasoning_tokens
 ):
-    output = MockGenerationOutput(text=text, new_text=text)
+    output = MockGenerationOutput(
+        text=text, new_text=text, completion_tokens=completion_tokens
+    )
     payload = {
         "model": "test-model",
         "messages": [{"role": "user", "content": "Hello"}],
@@ -3059,7 +3065,10 @@ class TestErrorHandling:
             },
         )
 
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 400
+        body = response.json()
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "invalid_request_error"
 
     def test_empty_messages(self, client):
         """Test error when messages is empty."""

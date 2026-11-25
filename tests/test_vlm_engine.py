@@ -11,6 +11,7 @@ Tests cover:
 """
 
 import base64
+import importlib
 import io
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -639,6 +640,33 @@ class TestVLMDiffusionLane:
         assert outputs[-1].text == "Hello"
         assert outputs[-1].finished is True
         assert outputs[-1].finish_reason == "length"
+
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    def test_diffusion_unseeded_request_after_seeded_request(self, monkeypatch):
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        draws = []
+
+        def fake_stream_diffusion_generate(*args, **kwargs):
+            draws.append(mx.random.randint(0, 2**30, (4,)).tolist())
+            return []
+
+        monkeypatch.setattr(
+            importlib.import_module("mlx_vlm.generate.diffusion"),
+            "stream_diffusion_generate",
+            fake_stream_diffusion_generate,
+        )
+
+        for seed in (1234, None, 1234, None):
+            list(
+                engine._iter_diffusion_outputs_sync(
+                    {"input_ids": None}, max_tokens=1, temperature=1.0, seed=seed
+                )
+            )
+
+        assert draws[0] == draws[2]
+        assert draws[1] != draws[3]
 
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
@@ -2269,6 +2297,22 @@ class TestFormatMessagesForVLMTemplate:
         )
 
         assert formatted[0]["content"] == "<|image_1|>Describe."
+
+    def test_phi3_numbers_images_across_turns(self):
+        engine = _make_loaded_engine(model_type="phi3_v")
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,a"}}
+        messages = [
+            {"role": "user", "content": [image, {"type": "text", "text": "One"}]},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": [image, {"type": "text", "text": "Two"}]},
+        ]
+
+        formatted, _ = engine._format_messages_for_vlm_template(
+            messages, num_images=2
+        )
+
+        assert formatted[0]["content"] == "<|image_1|>One"
+        assert formatted[2]["content"] == "<|image_2|>Two"
 
     def test_fallback_inserts_first_user_when_no_explicit_parts(self):
         """Legacy path: num_images without explicit image parts still injects once."""
