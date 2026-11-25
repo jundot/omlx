@@ -289,6 +289,7 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/rerank` | Document reranking |
 | `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
+| `GET /v1/models/{model_id}` | Retrieve one model |
 | `POST /v1/audio/transcriptions` | Speech-to-text, including speaker labels when supported |
 | `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`); embedding models take `prompt` only |
 

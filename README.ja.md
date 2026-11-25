@@ -236,6 +236,7 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/rerank` | ドキュメントリランキング |
 | `POST /v1/systemone` | Decision モデルまたはチャットモデルによる型付き判定 (TypeSafe System One) |
 | `GET /v1/models` | 利用可能なモデル一覧 |
+| `GET /v1/models/{model_id}` | モデルを1件取得 |
 | `POST /tokenize`, `POST /detokenize` | vLLM 互換トークナイザー API（`/v1` 配下でも利用可） |
 
 設定、モデル、ダウンロード、量子化、ベンチマークを扱う管理APIは、メインAPIキーをBearerトークンとして受け付け、headlessモードでも動作します。[Admin API](docs/admin-api.md)を参照してください。
