@@ -1687,19 +1687,17 @@ def test_inkling2_attn_res_fused_falls_back_when_threadgroup_rejected(monkeypatc
     assert out is not None
 
 
-def _dspark_head(quantized, vocab=8192, unpadded=8100, twins=None):
-    """A folded DSpark Markov head over a random LM head, and that head."""
+def test_inkling2_dspark_fold_dequantizes_the_head_in_chunks():
+    # Two 16384-row chunks of a quantized head give the folded bits of the
+    # whole-matrix dequantize.
     import mlx.nn as nn
 
     from omlx.patches.inkling2.dspark import Inkling2DSparkConfig, Inkling2MarkovHead
 
-    lm_head = nn.Linear(64, vocab, bias=False)
-    if twins:
-        weight = np.array(lm_head.weight)
-        weight[twins[1]] = weight[twins[0]]
-        lm_head.weight = mx.array(weight)
-    if quantized:
-        lm_head = nn.QuantizedLinear.from_linear(lm_head, group_size=64, bits=8)
+    vocab = 16896
+    lm_head = nn.QuantizedLinear.from_linear(
+        nn.Linear(64, vocab, bias=False), group_size=64, bits=8
+    )
     head = Inkling2MarkovHead(
         Inkling2DSparkConfig(
             hidden_size=64,
@@ -1716,30 +1714,18 @@ def _dspark_head(quantized, vocab=8192, unpadded=8100, twins=None):
             markov_rank=32,
             target_layer_ids=[1],
             vocab_size=vocab,
-            unpadded_vocab_size=unpadded,
+            unpadded_vocab_size=vocab,
             final_logit_softcapping=30.0,
         )
     )
     head._alpha = mx.array([1.0])
     head.fold(lm_head)
-    return head, lm_head
-
-
-def _dspark_weight(lm_head):
-    import mlx.nn as nn
-
-    if not isinstance(lm_head, nn.QuantizedLinear):
-        return lm_head.weight
-    return mx.dequantize(
-        lm_head.weight, lm_head.scales, lm_head.biases, lm_head.group_size, lm_head.bits
-    )
-
-
-def test_inkling2_dspark_fold_reads_a_quantized_head_in_chunks():
-    # 16896 rows span two 16384-row chunks.
-    head, lm_head = _dspark_head(True, vocab=16896, unpadded=16896)
-    weight = _dspark_weight(lm_head).astype(mx.float32)
-    folded = weight @ head.hidden_out.weight.astype(mx.float32)
-    bias = weight @ head.hidden_out.bias.astype(mx.float32)
-    for got, expected in ((head._fold_weight, folded), (head._fold_bias, bias)):
-        assert mx.allclose(got.astype(mx.float32), expected, rtol=0.02, atol=1e-3)
+    weight = mx.dequantize(lm_head.weight, lm_head.scales, lm_head.biases, 64, 8)
+    proj = head.hidden_out.weight.astype(mx.float32)
+    bias = head.hidden_out.bias.astype(mx.float32)
+    for start, end in ((0, 16384), (16384, vocab)):
+        rows = weight[start:end].astype(mx.float32)
+        expected = (rows @ proj).astype(mx.bfloat16)
+        assert mx.array_equal(head._fold_weight[start:end], expected)
+        expected = (rows @ bias).astype(mx.bfloat16)
+        assert mx.array_equal(head._fold_bias[start:end], expected)
