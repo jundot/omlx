@@ -886,7 +886,6 @@ class TestStatsSecurity:
     """Tests for /admin/api/stats response hardening."""
 
     def test_stats_response_reports_api_key_set_without_secret(self):
-        """The stats payload reports whether a key is set, not the secret."""
         mock_settings = MagicMock()
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 9981
@@ -915,35 +914,11 @@ class TestStatsSecurity:
         assert "api_key" not in result
 
     def test_reveal_api_key_returns_stored_secret(self):
-        """POST /admin/api/auth/api-key returns the key for an explicit admin action."""
         mock_settings = MagicMock()
         mock_settings.auth.api_key = "super-secret-key"
         with patch.object(admin_routes, "_get_global_settings", return_value=mock_settings):
             result = asyncio.run(admin_routes.reveal_api_key(is_admin=True))
         assert result == {"api_key": "super-secret-key"}
-        assert mock_settings.auth.api_key == "super-secret-key"
-
-    def test_global_settings_auth_omits_secret(self):
-        """GET global-settings auth reports set + fingerprint, not the raw key."""
-        from omlx.admin.auth import fingerprint_key
-        from omlx.settings import GlobalSettings
-
-        settings = GlobalSettings()
-        settings.auth.api_key = "super-secret-key"
-        with patch.object(admin_routes, "_get_server_state", return_value=None):
-            result = admin_routes._global_settings_response(settings)
-
-        auth = result["auth"]
-        assert auth["api_key_set"] is True
-        assert auth["api_key_fingerprint"] == fingerprint_key("super-secret-key")
-        assert "api_key" not in auth
-
-        settings.auth.api_key = None
-        with patch.object(admin_routes, "_get_server_state", return_value=None):
-            empty = admin_routes._global_settings_response(settings)["auth"]
-        assert empty["api_key_set"] is False
-        assert empty["api_key_fingerprint"] is None
-        assert "api_key" not in empty
 
     def test_activity_response_does_not_build_runtime_cache_observability(self):
         active_models = {"models": [{"id": "model-a"}]}

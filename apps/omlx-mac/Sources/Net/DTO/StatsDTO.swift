@@ -18,9 +18,6 @@ struct StatsDTO: Codable, Equatable, Sendable {
 
     let host: String?
     let port: Int?
-    /// Whether a master API key is configured. The secret itself is not in
-    /// this polled payload; Integrations fetches it on copy via
-    /// `POST /admin/api/auth/api-key`.
     let apiKeySet: Bool?
     /// Absolute CLI invocation prefix used for `omlx launch <tool>` strings.
     /// `nil` on older servers; callers fall back to the bare `"omlx"` token

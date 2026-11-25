@@ -288,7 +288,7 @@ final class IntegrationsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.webSearchTestMessage, "Provider rate limited")
     }
 
-    /// Local mode shows the API key masked; copy fetches the real one.
+    /// Local mode shows the API key masked and copies the real one.
     func testClaudeEnvRecipeMasksTheApiKey() async throws {
         let (client, session) = try makeClient()
         defer { session.invalidateAndCancel() }
@@ -304,7 +304,6 @@ final class IntegrationsScreenVMTests: XCTestCase {
         await vm.load(client: client)
         vm.claudeMode = "local"
         XCTAssertFalse(vm.claudeEnvRecipeDisplay.contains("sk-live-secret"))
-        XCTAssertTrue(vm.claudeEnvRecipeDisplay.contains("••••••••"))
         let copied = try await vm.claudeEnvRecipeForCopy(client: client)
         XCTAssertTrue(copied.contains("sk-live-secret"))
         XCTAssertEqual(

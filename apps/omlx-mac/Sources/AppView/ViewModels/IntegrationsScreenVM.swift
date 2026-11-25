@@ -175,23 +175,15 @@ final class IntegrationsScreenVM {
         "\(cliCommandPrefix) launch claude_desktop"
     }
 
-    /// On-screen env-var recipe with the API key masked. Mirrors
-    /// `claudeCodeCommandDisplay` in dashboard.js. Copy uses
-    /// `claudeEnvRecipeForCopy(client:)`, which fetches the key once.
-    var claudeEnvRecipeDisplay: String {
-        claudeEnvRecipe(authToken: serverApiKeySet ? "••••••••" : "")
+    func claudeEnvRecipeForCopy(client: OMLXClient) async throws -> String {
+        guard serverApiKeySet else { return claudeEnvRecipe(authToken: "") }
+        return try await claudeEnvRecipe(authToken: client.revealApiKey())
     }
 
-    /// Build the real Claude env recipe, fetching the master key only when
-    /// one is configured and the caller is about to copy it.
-    func claudeEnvRecipeForCopy(client: OMLXClient) async throws -> String {
-        let token: String
-        if serverApiKeySet {
-            token = try await client.revealApiKey()
-        } else {
-            token = ""
-        }
-        return claudeEnvRecipe(authToken: token)
+    /// `claudeEnvRecipe` with the API key masked, for display only. Mirrors
+    /// `claudeCodeCommandDisplay` in dashboard.js.
+    var claudeEnvRecipeDisplay: String {
+        claudeEnvRecipe(authToken: serverApiKeySet ? "••••••••" : "")
     }
 
     private func claudeEnvRecipe(authToken: String) -> String {
@@ -345,7 +337,6 @@ final class IntegrationsScreenVM {
             // Available models
             try await refreshModels(client: client)
 
-            // Stats — host/port/api_key_set/cli_prefix for the command builders.
             // Failure here is non-fatal: the screen still works against the
             // default `omlx` prefix and 127.0.0.1:8000.
             if let stats = try? await client.getStats() {

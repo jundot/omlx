@@ -170,8 +170,7 @@
                                                placeholder="{{ t('settings.auth.api_key_placeholder') }}"
                                                class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                         <button type="button" @click="toggleShowApiKey()"
-                                                :disabled="revealingApiKey"
-                                                class="p-2 rounded-lg hover:bg-neutral-100 transition-colors text-neutral-400 hover:text-neutral-600 disabled:opacity-50"
+                                                class="p-2 rounded-lg hover:bg-neutral-100 transition-colors text-neutral-400 hover:text-neutral-600"
                                                 title="{{ t('settings.auth.toggle_visibility_tooltip') }}">
                                             <template x-if="!showApiKey">
                                                 <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>

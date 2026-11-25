@@ -57,25 +57,19 @@ private struct APIKeySection: View {
 }
 
 private struct APIKeyEditorRow: View {
-    @Bindable var vm: SecurityScreenVM
+    var vm: SecurityScreenVM
     let client: OMLXClient
 
-    /// Draft of a new key the user is typing. Starts empty; the stored key
-    /// is not loaded into this field (GET /global-settings no longer returns it).
     @State private var draft: String = ""
-    /// One-shot reveal of the stored key for the eye toggle. Never treated as dirty.
     @State private var revealedStored: String = ""
     @State private var showKey: Bool = false
     @State private var copied: Bool = false
     @State private var saving: Bool = false
-    @State private var revealing: Bool = false
-
-    @FocusState private var focused: Bool
 
     @Environment(\.omlxTheme) private var theme
     @Environment(AppServices.self) private var services
 
-    private var isDirty: Bool { !draft.trimmingCharacters(in: .whitespaces).isEmpty }
+    private var isDirty: Bool { !trimmed.isEmpty }
     private var trimmed: String { draft.trimmingCharacters(in: .whitespaces) }
     /// Server-side rule: ≥ 4 printable chars, no whitespace. We mirror the
     /// admin route's `validate_api_key` so the Save button can't enable for
@@ -89,11 +83,7 @@ private struct APIKeyEditorRow: View {
 
     private var fieldText: Binding<String> {
         Binding(
-            get: {
-                if !draft.isEmpty { return draft }
-                if showKey { return revealedStored }
-                return ""
-            },
+            get: { draft.isEmpty && showKey ? revealedStored : draft },
             set: { newValue in
                 draft = newValue
                 revealedStored = ""
@@ -126,8 +116,7 @@ private struct APIKeyEditorRow: View {
                                           comment: "Tooltip on the eye button when the API key is visible")
                                 : String(localized: "security.api_key.show",
                                           defaultValue: "Show key",
-                                          comment: "Tooltip on the eye button when the API key is masked"),
-                           disabled: revealing) {
+                                          comment: "Tooltip on the eye button when the API key is masked")) {
                     Task { await toggleShowKey() }
                 }
                 iconButton(systemName: "arrow.triangle.2.circlepath",
@@ -161,13 +150,6 @@ private struct APIKeyEditorRow: View {
                 }
             }
         }
-        .task(id: vm.apiKeySet) {
-            if !focused {
-                draft = ""
-                revealedStored = ""
-                showKey = false
-            }
-        }
     }
 
     @ViewBuilder
@@ -196,9 +178,7 @@ private struct APIKeyEditorRow: View {
             revealedStored = ""
             return
         }
-        if draft.isEmpty && vm.apiKeySet && revealedStored.isEmpty {
-            revealing = true
-            defer { revealing = false }
+        if draft.isEmpty && vm.apiKeySet {
             do {
                 revealedStored = try await client.revealApiKey()
             } catch {
@@ -210,18 +190,14 @@ private struct APIKeyEditorRow: View {
     }
 
     private func copyToClipboard() async {
-        let value: String
-        if !draft.isEmpty {
-            value = draft
-        } else if vm.apiKeySet {
+        var value = draft
+        if value.isEmpty {
             do {
                 value = try await client.revealApiKey()
             } catch {
                 vm.lastError = error.omlxDescription
                 return
             }
-        } else {
-            return
         }
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -241,7 +217,6 @@ private struct APIKeyEditorRow: View {
             var updated = services.config
             updated.apiKey = next
             services.updateConfig(updated)
-            focused = false
             draft = ""
             revealedStored = ""
             showKey = false

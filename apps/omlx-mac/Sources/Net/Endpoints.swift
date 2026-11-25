@@ -89,7 +89,6 @@ enum AdminAPI {
 
     // PR 9
     static let setupApiKey     = "\(prefix)/setup-api-key"
-    /// One-shot reveal of the master key. Polled GETs only report api_key_set.
     static let revealApiKey    = "\(prefix)/auth/api-key"
     static let subKeys         = "\(prefix)/sub-keys"
 

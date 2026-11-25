@@ -10,24 +10,10 @@
 </button>
 {% endmacro %}
 
-{# copy_command lets a bar show a masked command and copy the real one.
-   copy_action is a full click expression when the copy needs an async fetch. #}
-{% macro command_bar(command, copy_command=None, copy_action=None) %}
+{% macro command_bar(command, copy_command=None) %}
 <div class="flex items-start gap-2 rounded-lg border border-neutral-200 bg-white py-1 pl-3 pr-1">
     <code class="min-w-0 flex-1 whitespace-pre-wrap pt-1.5 pb-1 font-mono text-xs leading-relaxed text-neutral-600 [overflow-wrap:anywhere]" x-text="{{ command }}"></code>
-    {% if copy_action %}
-    <button type="button" x-data="{ copied: false }"
-            @click="{{ copy_action }}; copied = true; setTimeout(() => copied = false, 2000)"
-            class="shrink-0 rounded-md p-1.5 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900"
-            :class="copied ? 'text-green-600' : 'text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700'"
-            :title="window.t('status.integrations.copy_command_tooltip')"
-            :aria-label="window.t('status.integrations.copy_command_tooltip')">
-        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-    </button>
-    {% else %}
     {{ copy_button(copy_command or command) }}
-    {% endif %}
 </div>
 {% endmacro %}
 
@@ -133,7 +119,7 @@
                     </div>
                     <div class="min-w-0 flex-1">
                         <div class="mb-1.5 text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('status.claude_code.command') }}</div>
-                        {{ command_bar('claudeCodeCommandDisplay', copy_action='await copyClaudeCodeCommand()') }}
+                        {{ command_bar('claudeCodeCommandDisplay', 'await claudeCodeCommand()') }}
                     </div>
                 </div>
 

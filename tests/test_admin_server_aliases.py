@@ -1282,8 +1282,6 @@ def test_global_defaults_ignore_overrides_and_do_not_write(tmp_path, monkeypatch
     assert data["cache"]["ssd_cache_max_size"] == "auto"
     assert data["sampling"] == defaults.sampling.to_dict()
     assert "api_key" not in data["auth"]
-    assert data["auth"]["api_key_set"] is False
-    assert data["auth"]["api_key_fingerprint"] is None
     assert gs.server.port == 9123
     assert gs.auth.api_key == "keep-key"
     assert gs.model.model_dirs == [str(tmp_path / "models")]

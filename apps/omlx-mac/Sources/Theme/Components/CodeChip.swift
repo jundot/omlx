@@ -49,8 +49,6 @@ struct CodeChip: View {
 
 struct CopyIconButton: View {
     let value: String
-    /// When set, the button awaits this loader for the clipboard text instead
-    /// of copying `value` (used when the secret is fetched on demand).
     var valueLoader: (() async throws -> String)? = nil
     var helpText = String(localized: "common.copy_model_id",
                           defaultValue: "Copy model ID",
@@ -74,18 +72,13 @@ struct CopyIconButton: View {
     }
 
     private func copy() {
-        if let valueLoader {
-            Task {
-                do {
-                    let text = try await valueLoader()
-                    await MainActor.run { paste(text) }
-                } catch {
-                    // Leave the button un-checked; the caller surfaces errors.
-                }
-            }
+        guard let valueLoader else {
+            paste(value)
             return
         }
-        paste(value)
+        Task {
+            if let text = try? await valueLoader() { paste(text) }
+        }
     }
 
     private func paste(_ text: String) {

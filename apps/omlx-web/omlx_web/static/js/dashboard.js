@@ -265,11 +265,8 @@
             managerSortOrder: localStorage.getItem('omlx_manager_sort_order') || MANAGER_SORT_DEFAULT.order,
             managerSearch: '',
 
-            // Auth UI state. The polled settings payload no longer carries the
-            // master key; reveal/copy fetch it once into revealedStoredApiKey.
             showApiKey: false,
             revealedStoredApiKey: '',
-            revealingApiKey: false,
             // Sub key management
             newSubKeyValue: '',
             newSubKeyName: '',
@@ -1317,13 +1314,7 @@
                             usage: { ...this.globalSettings.usage, ...data.usage },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
                             network: { ...this.globalSettings.network, ...data.network },
-                            // Do not keep a previously revealed key across reloads;
-                            // the GET no longer returns api_key (#5491).
-                            auth: {
-                                ...this.globalSettings.auth,
-                                ...data.auth,
-                                api_key: '',
-                            },
+                            auth: { ...this.globalSettings.auth, ...data.auth, api_key: '' },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
                             external_engines: { ...this.globalSettings.external_engines, ...data.external_engines },
@@ -4311,13 +4302,13 @@
                 return `${name}=${this.shellQuote(value)}`;
             },
 
-            // On-screen variant with the auth token masked, so the rendered
-            // dashboard never exposes the API key. Copy uses
-            // copyClaudeCodeCommand(), which fetches the key once.
+            async claudeCodeCommand() {
+                const authToken = this.stats.api_key_set ? await this.fetchStoredApiKey() : '';
+                return this._claudeCodeCommand(authToken);
+            },
+
             get claudeCodeCommandDisplay() {
-                return this._claudeCodeCommand(
-                    this.stats.api_key_set ? '••••••••' : ''
-                );
+                return this._claudeCodeCommand(this.stats.api_key_set ? '••••••••' : '');
             },
 
             _claudeCodeCommand(authToken) {
@@ -4347,10 +4338,7 @@
             },
 
             async fetchStoredApiKey() {
-                const response = await fetch('/admin/api/auth/api-key', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                });
+                const response = await fetch('/admin/api/auth/api-key', { method: 'POST' });
                 if (response.status === 401) {
                     window.location.href = '/admin';
                     return '';
@@ -4359,20 +4347,7 @@
                     throw new Error('Failed to fetch API key');
                 }
                 const data = await response.json();
-                return data.api_key || '';
-            },
-
-            async copyClaudeCodeCommand() {
-                let authToken = '';
-                if (this.stats.api_key_set) {
-                    try {
-                        authToken = await this.fetchStoredApiKey();
-                    } catch (err) {
-                        console.error('Failed to fetch API key for Claude Code command:', err);
-                        return;
-                    }
-                }
-                this.copyToClipboard(this._claudeCodeCommand(authToken));
+                return data.api_key;
             },
 
             async toggleShowApiKey() {
@@ -4381,33 +4356,14 @@
                     this.revealedStoredApiKey = '';
                     return;
                 }
-                if (
-                    !this.globalSettings.auth.api_key
-                    && this.globalSettings.auth.api_key_set
-                    && !this.revealedStoredApiKey
-                ) {
-                    this.revealingApiKey = true;
-                    try {
-                        this.revealedStoredApiKey = await this.fetchStoredApiKey();
-                    } catch (err) {
-                        console.error('Failed to reveal API key:', err);
-                        this.revealingApiKey = false;
-                        return;
-                    } finally {
-                        this.revealingApiKey = false;
-                    }
+                if (!this.globalSettings.auth.api_key && this.globalSettings.auth.api_key_set) {
+                    this.revealedStoredApiKey = await this.fetchStoredApiKey();
                 }
                 this.showApiKey = true;
             },
 
             get apiKeyInputDisplay() {
-                if (this.globalSettings.auth.api_key) {
-                    return this.globalSettings.auth.api_key;
-                }
-                if (this.showApiKey) {
-                    return this.revealedStoredApiKey;
-                }
-                return '';
+                return this.globalSettings.auth.api_key || (this.showApiKey ? this.revealedStoredApiKey : '');
             },
 
             async saveClaudeCodeSettings() {
@@ -5081,8 +5037,6 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.stats = { ...this.stats, ...data };
-                        // Drop any leftover secret from an older server response.
-                        delete this.stats.api_key;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -5101,7 +5055,6 @@
                     if (alltimeResponse.ok) {
                         const alltimeData = await alltimeResponse.json();
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
-                        delete this.alltimeStats.api_key;
                     }
                 } catch (err) {
                     console.error('Failed to load stats:', err);

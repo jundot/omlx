@@ -21,8 +21,7 @@ TOOL_COMMANDS = {
     "vibe": ["vibeCommand"],
     "copilot": ["copilotCommand"],
 }
-# Claude's bar shows the masked command and fetches the key on copy.
-DISPLAY_COPIES = {"claudeCodeCommandDisplay": "await copyClaudeCodeCommand()"}
+DISPLAY_COPIES = {"claudeCodeCommandDisplay": "await claudeCodeCommand()"}
 
 
 class _Card(HTMLParser):
@@ -46,10 +45,7 @@ class _Card(HTMLParser):
                 None,
             )
             self.bars.append([binding, panel, None])
-        elif tag == "button" and (
-            "copyToClipboard(" in attrs.get("@click", "")
-            or "copyClaudeCodeCommand(" in attrs.get("@click", "")
-        ):
+        elif tag == "button" and "copyToClipboard(" in attrs.get("@click", ""):
             self.bars[-1][2] = attrs["@click"]
         if tag != "img":
             self.stack.append((tag, attrs))
@@ -78,8 +74,4 @@ def test_each_command_renders_and_copies_in_its_own_panel():
         for binding in bindings
     )
     for binding, _, click in card.bars:
-        expected = DISPLAY_COPIES.get(binding)
-        if expected is not None:
-            assert expected in click
-        else:
-            assert f"copyToClipboard({binding})" in click
+        assert f"copyToClipboard({DISPLAY_COPIES.get(binding, binding)})" in click

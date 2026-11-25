@@ -108,10 +108,6 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
 
     struct AuthSettings: Codable, Equatable, Sendable {
         let apiKeySet: Bool
-        /// Present only on older servers. Current servers omit the secret
-        /// from this GET and expose it via `POST /admin/api/auth/api-key`.
-        let apiKey: String?
-        let apiKeyFingerprint: String?
         let skipApiKeyVerification: Bool?
         let allowUnauthenticatedInference: Bool?
         let subKeys: [SubKeyDTO]?
