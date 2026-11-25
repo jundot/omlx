@@ -81,8 +81,8 @@ _HF_MODEL_TYPES = {
 CONFIG_FILE = "config.json"
 _CHAT_TEMPLATE_FILE = "chat_template.jinja"
 _GENERATION_CONFIG_FILE = "generation_config.json"
-# Rebuild generated folders with Inkling 2's validated config and tokenizer.
-_FOLDER_LAYOUT = 5
+# Rebuild generated folders with Inkling 2's loop and attention metadata.
+_FOLDER_LAYOUT = 6
 
 # The qwen35 pre-tokenizer: Qwen2's letter class extended to combining
 # marks, then byte-level BPE.
@@ -131,8 +131,10 @@ _LAYER_ARRAYS = frozenset(
         "flint.attention.sliding_window_pattern",
         "inkling2.attention.head_count",
         "inkling2.attention.head_count_kv",
+        "inkling2.attention.sliding_window_pattern",
         "inkling2_loop.attention.head_count",
         "inkling2_loop.attention.head_count_kv",
+        "inkling2_loop.attention.sliding_window_pattern",
     }
 )
 
@@ -456,13 +458,22 @@ def derive_config(
     header_layers = layers
     hf_type = _HF_MODEL_TYPES.get(arch)
     inkling = hf_type == "inkling2_loop"
-    if arch == "inkling2" and layers is not None:
-        # Unsloth's original layout counts applications across all loop passes.
-        start = field("loop.core_start")
-        end = field("loop.core_end")
-        passes = field("num_loops")
+    loop = None
+    repeated = 0
+    if inkling and layers is not None:
+        original_layout = arch == "inkling2"
+        start = field("loop.core_start" if original_layout else "loop.start")
+        end = field("loop.core_end" if original_layout else "loop.end")
+        passes = field("num_loops" if original_layout else "loop.count")
         if start is not None and end is not None and passes is not None:
-            layers -= (passes - 1) * (end - start)
+            # Unsloth's original layout counts applications across all loop passes.
+            if original_layout:
+                repeated = (passes - 1) * (end - start)
+            if passes >= 1 and 0 <= start < end <= layers - repeated:
+                layers -= repeated
+                loop = {"core_start": start, "core_end": end, "num_passes": passes}
+            else:
+                layers = None
 
     tokens = metadata.get("tokenizer.ggml.tokens")
     if isinstance(tokens, ArrayInfo):
@@ -509,15 +520,21 @@ def derive_config(
         window
         and isinstance(pattern, list)
         and layers is not None
-        and len(pattern) >= layers
+        and header_layers is not None
+        and len(pattern) >= header_layers
         and all(isinstance(slides, bool) for slides in pattern)
     ):
-        # Only the full layers' KV grows with the context (Flint).
+        if loop is not None and repeated:
+            # Keep the first visit of each weight layer.
+            end = loop["core_end"]
+            pattern = pattern[:end] + pattern[end + repeated :]
         text["sliding_window"] = window
         text["layer_types"] = [
             "sliding_attention" if slides else "full_attention"
             for slides in pattern[:layers]
         ]
+    if loop is not None:
+        text["loop_config"] = loop
     text["model_type"] = f"{hf_type}_text" if hf_type else arch
     config: dict[str, Any] = {"model_type": hf_type or arch, "text_config": text}
     if projector is not None:

@@ -601,12 +601,38 @@ def _quantization_problem(config: dict, binary: SplashBinary) -> str:
     )
 
 
+def _inkling2_loop(text: dict) -> tuple[int, int, int] | None:
+    loop = text.get("loop_config")
+    if loop is None:
+        # The published Mini schedule also covers older generated GGUF configs.
+        return 6, 18, 3
+    if not isinstance(loop, dict):
+        return None
+    start, end, passes = (
+        loop.get(key) for key in ("core_start", "core_end", "num_passes")
+    )
+    layers = text.get("num_hidden_layers")
+    if (
+        type(layers) is int
+        and type(start) is int
+        and type(end) is int
+        and type(passes) is int
+        and 0 <= start < end <= layers
+        and passes >= 1
+    ):
+        return start, end, passes
+    return None
+
+
 def _is_splash_draft(draft: dict, text: dict) -> bool:
     architectures = draft.get("architectures") or []
     target_layers = text.get("num_hidden_layers")
     if text.get("model_type") == _INKLING2_TEXT_TYPE:
-        # The draft counts layer visits across the loop's three passes.
-        target_layers = 48
+        loop = _inkling2_loop(text)
+        if loop is None or target_layers is None:
+            return False
+        start, end, passes = loop
+        target_layers += (end - start) * (passes - 1)
     return (
         "DFlash2DraftModel" in architectures
         and draft.get("hidden_size") == text.get("hidden_size")
@@ -790,11 +816,27 @@ def _weight_bytes(path: Path) -> int:
 
 
 def _kv_bytes_per_token(text: dict, kv_format: str) -> int:
+    layer_types = text.get("layer_types") or []
     if text.get("model_type") == _INKLING2_TEXT_TYPE:
-        # Four full-attention weight layers, two inside the three-pass loop.
-        layers = 8
+        loop = _inkling2_loop(text)
+        full_layers = [5, 11, 17, 23]
+        if len(layer_types) == text["num_hidden_layers"]:
+            full_layers = [
+                index
+                for index, kind in enumerate(layer_types)
+                if kind == "full_attention"
+            ]
+        elif isinstance(local_layers := text.get("local_layer_ids"), list):
+            full_layers = [
+                index
+                for index in range(text["num_hidden_layers"])
+                if index not in local_layers
+            ]
+        layers = len(full_layers)
+        if loop is not None:
+            start, end, passes = loop
+            layers += sum(start <= index < end for index in full_layers) * (passes - 1)
     else:
-        layer_types = text.get("layer_types") or []
         layers = sum(1 for kind in layer_types if kind == "full_attention")
         if not layers:
             layers = text["num_hidden_layers"] // text.get("full_attention_interval", 1)

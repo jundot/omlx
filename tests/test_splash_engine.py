@@ -711,10 +711,20 @@ class TestGguf:
         metadata.update(invalid_fields)
         assert splash_mod.splash_family(derive_config(metadata)) is None
 
-    @pytest.mark.parametrize("arch, layers", [("inkling2", 48), ("inkling2_loop", 24)])
+    @pytest.mark.parametrize("arch", ["inkling2", "inkling2_loop"])
     def test_inkling2_gguf_discovers_and_resolves(
-        self, tmp_path, launchers, write_gguf, arch, layers
+        self, tmp_path, launchers, write_gguf, arch
     ):
+        # A two-pass loop distinguishes metadata-driven matching from the
+        # published Mini draft's 48 visits.
+        sliding = [True] * 5 + [False] + [True] * 5 + [False]
+        weight_pattern = sliding * 2
+        header_pattern = weight_pattern
+        if arch == "inkling2":
+            header_pattern = (
+                weight_pattern[:18] + weight_pattern[6:18] + weight_pattern[18:]
+            )
+        layers = len(header_pattern)
         vocab = sorted(pre_tokenizers.ByteLevel.alphabet()) + [
             "<|im_start|>",
             "<|im_end|>",
@@ -733,23 +743,38 @@ class TestGguf:
             "attention.head_count": [24] * layers,
             "attention.head_count_kv": [8] * layers,
             "attention.key_length": 128,
+            "attention.sliding_window": 1024,
+            "attention.sliding_window_pattern": header_pattern,
             "expert_count": 128,
             "expert_used_count": 8,
             "vocab_size": 201024,
         }
         if arch == "inkling2":
-            fields.update({"loop.core_start": 6, "loop.core_end": 18, "num_loops": 3})
+            fields.update({"loop.core_start": 6, "loop.core_end": 18, "num_loops": 2})
+        else:
+            fields.update({"loop.start": 6, "loop.end": 18, "loop.count": 2})
         metadata.update({f"{arch}.{key}": value for key, value in fields.items()})
         metadata["general.architecture"] = arch
         source = write_gguf(tmp_path / "models" / "Inkling-2-Mini-Q4.gguf", metadata)
-        draft = _write_draft(tmp_path / "draft", INKLING2_TEXT, target_layers=48)
+        draft = _write_draft(tmp_path / "draft", INKLING2_TEXT, target_layers=36)
+        wrong_draft = _write_draft(
+            tmp_path / "48-visits", INKLING2_TEXT, target_layers=48
+        )
 
         models = discover_models(tmp_path / "models", tmp_path / "gguf")
         folder = Path(models[source.stem].model_path)
         launchers("splash", version="1.7.2")
-        target, reason = resolve_splash_target(folder, None, [str(draft)])
+        target, reason = resolve_splash_target(
+            folder, None, [str(wrong_draft), str(draft)]
+        )
         assert reason == ""
         assert target.family == "Inkling-2-Mini"
+        assert target.draft_path == draft
+        assert (
+            splash_memory_estimate(folder, draft, 2, "bf16")
+            - splash_memory_estimate(folder, draft, 1, "bf16")
+            == 6 * 2 * 8 * 128 * 2
+        )
 
         tokenizer = AutoTokenizer.from_pretrained(folder)
         assert tokenizer.encode("123") == [vocab.index("123")]
