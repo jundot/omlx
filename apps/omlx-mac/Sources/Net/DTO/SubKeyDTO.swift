@@ -33,3 +33,7 @@ struct SetupApiKeyRequest: Encodable, Sendable {
     let apiKey: String
     let apiKeyConfirm: String
 }
+
+struct RevealApiKeyResponse: Decodable, Sendable {
+    let apiKey: String
+}

@@ -2170,6 +2170,15 @@ async def setup_api_key(
     return {"success": True, "message": "API key configured successfully"}
 
 
+@router.post("/api/auth/api-key")
+async def reveal_api_key(is_admin: bool = Depends(require_admin)):
+    """Return the main API key for an explicit copy or reveal action."""
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    return {"api_key": global_settings.auth.api_key or ""}
+
+
 @router.post("/api/logout")
 async def logout(response: Response):
     """
@@ -5092,7 +5101,6 @@ def _global_settings_response(global_settings):
         },
         "auth": {
             "api_key_set": bool(global_settings.auth.api_key),
-            "api_key": global_settings.auth.api_key or "",
             "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
             "allow_unauthenticated_inference": (
                 global_settings.auth.allow_unauthenticated_inference
@@ -7304,7 +7312,7 @@ async def get_server_stats(
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
     port = global_settings.server.port if global_settings else 8000
-    api_key = global_settings.auth.api_key if global_settings else ""
+    api_key_set = bool(global_settings and global_settings.auth.api_key)
 
     from ..utils.install import get_cli_prefix
 
@@ -7319,7 +7327,7 @@ async def get_server_stats(
         **snapshot,
         "host": host,
         "port": port,
-        "api_key": api_key or "",
+        "api_key_set": api_key_set,
         "cli_prefix": get_cli_prefix(),
         "engines": _get_engine_info(),
         "active_models": active_models_data,

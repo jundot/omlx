@@ -89,6 +89,7 @@ enum AdminAPI {
 
     // PR 9
     static let setupApiKey     = "\(prefix)/setup-api-key"
+    static let revealApiKey    = "\(prefix)/auth/api-key"
     static let subKeys         = "\(prefix)/sub-keys"
 
     // PR 12 — oQ Quantization

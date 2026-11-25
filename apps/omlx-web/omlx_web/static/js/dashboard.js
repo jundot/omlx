@@ -267,8 +267,8 @@
             managerSortOrder: localStorage.getItem('omlx_manager_sort_order') || MANAGER_SORT_DEFAULT.order,
             managerSearch: '',
 
-            // Auth UI state
             showApiKey: false,
+            revealedStoredApiKey: '',
             // Sub key management
             newSubKeyValue: '',
             newSubKeyName: '',
@@ -395,7 +395,7 @@
                 total_requests: 0,
                 host: '127.0.0.1',
                 port: 8000,
-                api_key: '',
+                api_key_set: false,
                 engines: {},
                 active_models: {
                     models: [],
@@ -1321,7 +1321,7 @@
                             usage: { ...this.globalSettings.usage, ...data.usage },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
                             network: { ...this.globalSettings.network, ...data.network },
-                            auth: { ...this.globalSettings.auth, ...data.auth },
+                            auth: { ...this.globalSettings.auth, ...data.auth, api_key: '' },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
                             external_engines: { ...this.globalSettings.external_engines, ...data.external_engines },
@@ -1329,6 +1329,8 @@
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = { language: 'en', dashboard_layout: null, ...(data.ui || {}) };
+                        this.showApiKey = false;
+                        this.revealedStoredApiKey = '';
                         const layoutLib = this._dashLayoutLib();
                         this.dashLayout = layoutLib
                             ? layoutLib.normalizeLayout(this.globalSettings.ui.dashboard_layout)
@@ -4316,15 +4318,13 @@
                 return `${name}=${this.shellQuote(value)}`;
             },
 
-            get claudeCodeCommand() {
-                return this._claudeCodeCommand(this.stats.api_key);
+            async claudeCodeCommand() {
+                const authToken = this.stats.api_key_set ? await this.fetchStoredApiKey() : '';
+                return this._claudeCodeCommand(authToken);
             },
 
-            // On-screen variant with the auth token masked (sub-key style), so
-            // the rendered dashboard never exposes the API key; the copy
-            // button still copies the real claudeCodeCommand.
             get claudeCodeCommandDisplay() {
-                return this._claudeCodeCommand(this.stats.api_key ? '••••••••' : '');
+                return this._claudeCodeCommand(this.stats.api_key_set ? '••••••••' : '');
             },
 
             _claudeCodeCommand(authToken) {
@@ -4351,6 +4351,35 @@
                 // re-prefills the whole conversation on a caching server (#2349).
                 parts.push('claude --disallowedTools LSP');
                 return parts.join(' ');
+            },
+
+            async fetchStoredApiKey() {
+                const response = await fetch('/admin/api/auth/api-key', { method: 'POST' });
+                if (response.status === 401) {
+                    window.location.href = '/admin';
+                    return '';
+                }
+                if (!response.ok) {
+                    throw new Error('Failed to fetch API key');
+                }
+                const data = await response.json();
+                return data.api_key;
+            },
+
+            async toggleShowApiKey() {
+                if (this.showApiKey) {
+                    this.showApiKey = false;
+                    this.revealedStoredApiKey = '';
+                    return;
+                }
+                if (!this.globalSettings.auth.api_key && this.globalSettings.auth.api_key_set) {
+                    this.revealedStoredApiKey = await this.fetchStoredApiKey();
+                }
+                this.showApiKey = true;
+            },
+
+            get apiKeyInputDisplay() {
+                return this.globalSettings.auth.api_key || (this.showApiKey ? this.revealedStoredApiKey : '');
             },
 
             async saveClaudeCodeSettings() {

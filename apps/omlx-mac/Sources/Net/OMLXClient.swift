@@ -436,6 +436,11 @@ final class OMLXClient: ObservableObject {
         ))
     }
 
+    func revealApiKey() async throws -> String {
+        let response: RevealApiKeyResponse = try await postEmpty(AdminAPI.revealApiKey)
+        return response.apiKey
+    }
+
     @discardableResult
     func createSubKey(key: String, name: String) async throws -> CreateSubKeyResponse {
         try await post(AdminAPI.subKeys, body: CreateSubKeyRequest(key: key, name: name))
