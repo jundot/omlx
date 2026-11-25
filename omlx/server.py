@@ -3327,6 +3327,15 @@ async def _with_json_keepalive(
                 )
             )
             return
+        except Exception as e:
+            handler = next(
+                app.exception_handlers[cls]
+                for cls in type(e).__mro__
+                if cls in app.exception_handlers
+            )
+            response = await handler(http_request, e)
+            yield response.body.decode()
+            return
         if result is not None:
             yield result
     finally:
