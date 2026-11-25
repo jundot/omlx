@@ -424,14 +424,10 @@ class TestRequestOutputCollectorMergeOutputs:
         assert result.tool_calls == [{"name": "test_tool", "arguments": "{}"}]
 
     def test_merge_keeps_every_field(self):
-        """A decode burst merges a request's final output into the previous
-        ones; no field of the newer output may fall back to its default (the
-        admin benchmark read its prefill trace from such an output)."""
         values = {bool: True, int: 7, str: "x"}
         new = RequestOutput(request_id="test-001")
         for f in fields(RequestOutput):
             if f.name != "request_id":
-                # Lists and optionals (None) both take a one-item list.
                 setattr(new, f.name, values.get(type(getattr(new, f.name)), [object()]))
         collector = RequestOutputCollector(aggregate=True)
 
