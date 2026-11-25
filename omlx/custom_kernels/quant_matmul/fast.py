@@ -229,6 +229,54 @@ def affine_q2_qmm_t(
     raise RuntimeError("affine_q2_qmm_t native kernel is unavailable")
 
 
+# mlx: with more 64x64 output tiles than this, the NAX qmm does not split K.
+_NAX_UNSPLIT_TILES = 128
+
+
+def _stock_nax_qmm_matches(x: mx.array, weight: mx.array) -> bool:
+    rows, out = x.shape[-2], weight.shape[0]
+    return (
+        rows >= 64
+        and (out // 64) * ((rows + 63) // 64) > _NAX_UNSPLIT_TILES
+        and is_nax_available()
+    )
+
+
+def _affine_qmm_t(
+    bits: int,
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    variant: int,
+    group_size: int,
+    stream,
+) -> mx.array:
+    name = f"affine_q{bits}_qmm_t"
+    if not has_symbol(name):
+        raise RuntimeError(f"{name} native kernel is unavailable")
+    if _stock_nax_qmm_matches(x, weight):
+        return mx.quantized_matmul(
+            x,
+            weight,
+            scales,
+            biases,
+            group_size=group_size,
+            bits=bits,
+            **_native_stream_kwargs(stream),
+        )
+    return getattr(_ext, name)(
+        x,
+        weight,
+        scales,
+        biases,
+        variant,
+        **_qmm_nax_kwargs(bits),
+        **_qmm_group_size_kwargs(group_size),
+        **_native_stream_kwargs(stream),
+    )
+
+
 def affine_q4_qmm_t(
     x: mx.array,
     weight: mx.array,
@@ -239,18 +287,7 @@ def affine_q4_qmm_t(
     *,
     stream=None,
 ) -> mx.array:
-    if _ext is not None and hasattr(_ext, "affine_q4_qmm_t"):
-        return _ext.affine_q4_qmm_t(
-            x,
-            weight,
-            scales,
-            biases,
-            variant,
-            **_qmm_nax_kwargs(4),
-            **_qmm_group_size_kwargs(group_size),
-            **_native_stream_kwargs(stream),
-        )
-    raise RuntimeError("affine_q4_qmm_t native kernel is unavailable")
+    return _affine_qmm_t(4, x, weight, scales, biases, variant, group_size, stream)
 
 
 def affine_q5_qmm_t(
@@ -263,18 +300,7 @@ def affine_q5_qmm_t(
     *,
     stream=None,
 ) -> mx.array:
-    if _ext is not None and hasattr(_ext, "affine_q5_qmm_t"):
-        return _ext.affine_q5_qmm_t(
-            x,
-            weight,
-            scales,
-            biases,
-            variant,
-            **_qmm_nax_kwargs(5),
-            **_qmm_group_size_kwargs(group_size),
-            **_native_stream_kwargs(stream),
-        )
-    raise RuntimeError("affine_q5_qmm_t native kernel is unavailable")
+    return _affine_qmm_t(5, x, weight, scales, biases, variant, group_size, stream)
 
 
 def affine_q6_qmm_t(
@@ -287,18 +313,7 @@ def affine_q6_qmm_t(
     *,
     stream=None,
 ) -> mx.array:
-    if _ext is not None and hasattr(_ext, "affine_q6_qmm_t"):
-        return _ext.affine_q6_qmm_t(
-            x,
-            weight,
-            scales,
-            biases,
-            variant,
-            **_qmm_nax_kwargs(6),
-            **_qmm_group_size_kwargs(group_size),
-            **_native_stream_kwargs(stream),
-        )
-    raise RuntimeError("affine_q6_qmm_t native kernel is unavailable")
+    return _affine_qmm_t(6, x, weight, scales, biases, variant, group_size, stream)
 
 
 def affine_q8_qmm_t(
@@ -311,18 +326,7 @@ def affine_q8_qmm_t(
     *,
     stream=None,
 ) -> mx.array:
-    if _ext is not None and hasattr(_ext, "affine_q8_qmm_t"):
-        return _ext.affine_q8_qmm_t(
-            x,
-            weight,
-            scales,
-            biases,
-            variant,
-            **_qmm_nax_kwargs(8),
-            **_qmm_group_size_kwargs(group_size),
-            **_native_stream_kwargs(stream),
-        )
-    raise RuntimeError("affine_q8_qmm_t native kernel is unavailable")
+    return _affine_qmm_t(8, x, weight, scales, biases, variant, group_size, stream)
 
 
 def moe_weighted_sum(
