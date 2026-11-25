@@ -408,16 +408,17 @@ class Inkling2Experts(nn.Module):
             xe, idx, inv = _gather_sort(xe, inds)
         # A row-exact verify block runs its pairs in expert order, so rows
         # that share an expert read its weights once (same bits per pair).
-        order = None
-        if (
+        # A one-row decode step takes the same kernel, also with its bits.
+        fused = (
             not do_sort
-            and 1 < inds.shape[0] <= verify_experts.MAX_ROWS
-            and is_row_exact_armed()
+            and inds.shape[0] <= verify_experts.MAX_ROWS
+            and (inds.shape[0] == 1 or is_row_exact_armed())
             and verify_experts.supported(self.w13, x.dtype)
             and verify_experts.supported(self.w2, x.dtype)
-        ):
+        )
+        if fused:
             pairs = inds.reshape(-1)
-            order = pair_order(pairs)
+            order = pair_order(pairs) if inds.shape[0] > 1 else None
             y = verify_experts.gather(
                 self.w13, x, pairs, inds.shape[-1], order
             ).reshape(*inds.shape, 1, -1)
@@ -429,7 +430,7 @@ class Inkling2Experts(nn.Module):
         act = _softcapped_swiglu(
             y[..., 0::2], y[..., 1::2], self._gcap, self._ucap, s13
         )
-        if order is not None:
+        if fused:
             z = verify_experts.gather(
                 self.w2, act.reshape(pairs.shape[0], -1), pairs, 1, order
             ).reshape(*inds.shape, 1, -1)

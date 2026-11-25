@@ -95,11 +95,14 @@ def _count_gathers(monkeypatch):
     "hidden, inter", [(304, 144), (272, 80), (2304, 1152)], ids=str
 )
 @pytest.mark.parametrize("rows", [2, 3, 5, 16])
-def test_verify_rows_keep_their_decode_step_bits(hidden, inter, rows, monkeypatch):
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
+def test_verify_rows_keep_their_decode_step_bits(
+    hidden, inter, rows, dtype, monkeypatch
+):
     mod = _experts(hidden, inter)
     calls = _count_gathers(monkeypatch)
     for seed in range(2):
-        x, inds, weights = _block(rows, hidden, seed)
+        x, inds, weights = _block(rows, hidden, seed, dtype)
         z, w = _armed(mod, x, inds, weights)
         # Each row alone, as its decode step runs it, and the block as
         # ``gather_qmm`` runs it (unarmed, 64 pairs and more are sorted by
@@ -115,20 +118,18 @@ def test_verify_rows_keep_their_decode_step_bits(hidden, inter, rows, monkeypatc
             ref_z, ref_w = mod.unreduced(x, inds, weights)
             assert mx.array_equal(z, ref_z)
             assert mx.array_equal(w, ref_w)
-    assert len(calls) == 4  # w13 and w2, twice
+    # w13 and w2 for the block and for each row alone, twice.
+    assert len(calls) == 2 * 2 * (1 + rows)
 
 
-@pytest.mark.parametrize(
-    "case", ["unarmed", "one_row", "wide", "float16", "mxfp8", "fast_k"]
-)
+@pytest.mark.parametrize("case", ["unarmed", "wide", "mxfp8", "fast_k"])
 def test_other_blocks_keep_gather_qmm(case, monkeypatch):
     # MXFP8 groups are 32 wide; K = 512 is MLX's fast one-row kernel.
     hidden, inter = {"fast_k": (512, 144), "mxfp8": (320, 160)}.get(case, (304, 144))
     mod = _experts(hidden, inter, "mxfp8" if case == "mxfp8" else "nvfp4")
     calls = _count_gathers(monkeypatch)
-    rows = {"one_row": 1, "wide": verify_experts.MAX_ROWS + 1}.get(case, 3)
-    dtype = mx.float16 if case == "float16" else mx.bfloat16
-    x, inds, weights = _block(rows, hidden, 5, dtype)
+    rows = {"wide": verify_experts.MAX_ROWS + 1}.get(case, 3)
+    x, inds, weights = _block(rows, hidden, 5)
     if case == "unarmed":
         z, _ = mod.unreduced(x, inds, weights)
     else:
@@ -136,3 +137,21 @@ def test_other_blocks_keep_gather_qmm(case, monkeypatch):
     mx.eval(z)
     assert not calls
     assert z.shape == (rows, _TOP_K, hidden)
+
+
+@pytest.mark.parametrize("table", [True, False], ids=["threadgroup", "plain"])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
+def test_both_code_decodes_keep_gather_qmm_bits(table, dtype, monkeypatch):
+    # M1/M2 decode the codes through a threadgroup table, later GPUs one value
+    # at a time; both must keep gather_qmm's bits on every host.
+    monkeypatch.setattr(verify_experts, "_threadgroup_table", lambda: table)
+    verify_experts._kernel.cache_clear()
+    try:
+        mod = _experts(2304, 1152)
+        x, inds, weights = _block(3, 2304, 13, dtype)
+        z, _ = _armed(mod, x, inds, weights)
+        monkeypatch.setattr(verify_experts, "supported", lambda proj, dt: False)
+        ref, _ = mod.unreduced(x, inds, weights)
+        assert mx.array_equal(z, ref)
+    finally:
+        verify_experts._kernel.cache_clear()
