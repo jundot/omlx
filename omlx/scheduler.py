@@ -133,7 +133,11 @@ from .utils.metal_sync import (
     unreleased_graphics_bytes,
 )
 from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
-from .utils.sampling import make_no_repeat_ngram_processor, select_logprobs
+from .utils.sampling import (
+    make_no_repeat_ngram_processor,
+    seed_request_stream,
+    select_logprobs,
+)
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.sampling import make_shared_sampler as omlx_make_shared_sampler
 from .utils.tokenizer import create_streaming_detokenizer
@@ -1506,6 +1510,20 @@ def _request_count(request: Any, name: str) -> int:
 def _requeue_row_state(request: Any) -> tuple | None:
     state = getattr(request, "requeue_row_state", None)
     return state if isinstance(state, tuple) else None
+
+
+def _start_request_stream(request: Request, requests: dict[str, Request]) -> None:
+    if _request_count(request, "requeued_output_tokens"):
+        return
+    seed = request.sampling_params.seed
+    if seed is None and any(
+        row.sampling_params.seed is not None
+        and row.generation_started_at is not None
+        and not row.is_finished()
+        for row in requests.values()
+    ):
+        return
+    seed_request_stream(seed)
 
 
 def _insert_max_tokens(request: Any) -> int:
@@ -7759,11 +7777,7 @@ class Scheduler:
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
-        # A requeued row keeps the random stream it was already sampling from.
-        if request.sampling_params.seed is not None and not _request_count(
-            request, "requeued_output_tokens"
-        ):
-            mx.random.seed(request.sampling_params.seed)
+        _start_request_stream(request, self.requests)
 
         # #2219: both chunked-completion paths (inline first chunk and
         # _advance_chunked_prefills) funnel through here, but external VLM MTP
@@ -14269,13 +14283,7 @@ class Scheduler:
             # Build per-request state machine for stop tokens
             sm = self._stop_sequences_for_insert(request)
 
-            # Set random seed for reproducible generation (best-effort).
-            # This affects global MLX random state, so concurrent requests
-            # may interfere. Matches OpenAI's best-effort seed semantics.
-            if request.sampling_params.seed is not None and not _request_count(
-                request, "requeued_output_tokens"
-            ):
-                mx.random.seed(request.sampling_params.seed)
+            _start_request_stream(request, self.requests)
 
             # TurboQuant KV is quantized at the end of _do_external_prefill
             # (fp16 prefill → quantize once); _merge_caches() turns the per

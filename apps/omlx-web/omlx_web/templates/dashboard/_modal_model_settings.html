@@ -1755,6 +1755,39 @@
                             </div>
                         </template>
 
+                        <template x-if="selectedModel?.config_model_type === 'inkling2_loop'">
+                            <div class="px-4 py-3.5 space-y-3">
+                                <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.loopcd') }}</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.loopcd_hint') }} (<a href="https://arxiv.org/abs/2610.02185" target="_blank" rel="noopener" class="text-neutral-700 hover:text-neutral-900 underline">arXiv</a>)</p>
+                                    </div>
+                                    <button type="button" @click="modelSettings.loopcd_enabled = !modelSettings.loopcd_enabled"
+                                            :class="modelSettings.loopcd_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="modelSettings.loopcd_enabled ? 'true' : 'false'"
+                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="modelSettings.loopcd_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div x-show="modelSettings.loopcd_enabled" x-transition class="flex items-start justify-between gap-3 pt-1">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.loopcd_skip_thinking') }}</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.loopcd_skip_thinking_hint') }}</p>
+                                    </div>
+                                    <button type="button" @click="modelSettings.loopcd_skip_thinking = !modelSettings.loopcd_skip_thinking"
+                                            :class="modelSettings.loopcd_skip_thinking ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="modelSettings.loopcd_skip_thinking ? 'true' : 'false'"
+                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="modelSettings.loopcd_skip_thinking ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                            </div>
+                        </template>
+
                         <!-- SpecPrefill -->
                         <div class="px-4 py-3.5 space-y-3">
                             <div class="flex items-start justify-between gap-3">

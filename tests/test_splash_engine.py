@@ -75,6 +75,17 @@ FLASH_NEXT_TEXT = {
     "num_experts": 512,
     "num_experts_per_tok": 10,
 }
+INKLING2_TEXT = {
+    "model_type": "inkling2_loop_text",
+    "hidden_size": 2304,
+    "num_hidden_layers": 24,
+    "vocab_size": 201024,
+    "n_routed_experts": 128,
+    "num_experts_per_tok": 8,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+}
 REPO_ID = splash_repo_id("Qwen3.8-27B-4bit")
 MLX_4BIT = {"mode": "affine", "bits": 4, "group_size": 64}
 GIB = 1024**3
@@ -94,7 +105,7 @@ def _write_model(path: Path, text_config=None, quantization=None) -> Path:
     return path
 
 
-def _write_draft(path: Path, text=None) -> Path:
+def _write_draft(path: Path, text=None, *, target_layers=None) -> Path:
     text = QWEN38_TEXT if text is None else text
     path.mkdir(parents=True)
     config = {
@@ -102,7 +113,7 @@ def _write_draft(path: Path, text=None) -> Path:
         "model_type": "qwen3",
         "hidden_size": text["hidden_size"],
         "vocab_size": text["vocab_size"],
-        "num_target_layers": text["num_hidden_layers"],
+        "num_target_layers": target_layers or text["num_hidden_layers"],
         "dflash_config": {"block_size": 8},
     }
     (path / "config.json").write_text(json.dumps(config))
@@ -421,6 +432,34 @@ class TestBinary:
 
 class TestCompatibility:
 
+    def test_inkling2_uses_its_loop_draft_on_splash_1_7_2(self, tmp_path, launchers):
+        model = _write_model(tmp_path / "Inkling-2-Mini", INKLING2_TEXT)
+        wrong = _write_draft(tmp_path / "24-layers", INKLING2_TEXT)
+        draft = _write_draft(tmp_path / "48-visits", INKLING2_TEXT, target_layers=48)
+
+        launchers("splash", version="1.7.1")
+        assert resolve_splash_target(model, None, [str(draft)]) == (
+            None,
+            "Inkling-2-Mini needs Splash 1.7.2 or later",
+        )
+
+        launchers("splash", version="1.7.2")
+        assert splash_mod.splash_draft_to_download(model, None, [str(wrong)]) == (
+            "incoai/Inkling-2-Mini-DFlash2"
+        )
+        target, reason = resolve_splash_target(model, None, [str(wrong), str(draft)])
+        assert reason == ""
+        assert target.draft_path == draft
+        assert target.max_context == target.native_context == 1010000
+        assert not splash_mod.splash_has_vision(
+            {"text_config": INKLING2_TEXT, "vision_config": {}}
+        )
+
+        def estimate(context):
+            return splash_memory_estimate(model, draft, context, "bf16")
+
+        assert estimate(2) - estimate(1) == 8 * 2 * 8 * 128 * 2
+
     def test_flash_next_mlx_checkpoint_explains_gguf_requirement(
         self, tmp_path, launchers
     ):
@@ -621,6 +660,44 @@ def _qwen38_gguf(vocab: list[str]) -> dict:
 
 
 class TestGguf:
+
+    @pytest.mark.parametrize("arch, layers", [("inkling2", 48), ("inkling2_loop", 24)])
+    def test_inkling2_gguf_discovers_and_resolves(
+        self, tmp_path, launchers, write_gguf, arch, layers
+    ):
+        vocab = sorted(pre_tokenizers.ByteLevel.alphabet()) + ["<|im_end|>", "123"]
+        metadata = {
+            key: value
+            for key, value in _qwen38_gguf(vocab).items()
+            if key.startswith("tokenizer.")
+        }
+        metadata["tokenizer.ggml.pre"] = "inkling2"
+        fields = {
+            "block_count": layers,
+            "embedding_length": 2304,
+            "attention.head_count": [24] * layers,
+            "attention.head_count_kv": [8] * layers,
+            "attention.key_length": 128,
+            "expert_count": 128,
+            "expert_used_count": 8,
+            "vocab_size": 201024,
+        }
+        if arch == "inkling2":
+            fields.update({"loop.core_start": 6, "loop.core_end": 18, "num_loops": 3})
+        metadata.update({f"{arch}.{key}": value for key, value in fields.items()})
+        metadata["general.architecture"] = arch
+        source = write_gguf(tmp_path / "models" / "Inkling-2-Mini-Q4.gguf", metadata)
+        draft = _write_draft(tmp_path / "draft", INKLING2_TEXT, target_layers=48)
+
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        folder = Path(models[source.stem].model_path)
+        launchers("splash", version="1.7.2")
+        target, reason = resolve_splash_target(folder, None, [str(draft)])
+        assert reason == ""
+        assert target.family == "Inkling-2-Mini"
+
+        tokenizer = AutoTokenizer.from_pretrained(folder)
+        assert tokenizer.encode("123") == [vocab.index("123")]
 
     @pytest.mark.parametrize("layout", ["single", "split", "variant"])
     def test_flash_next_gguf_discovery_draft_and_engine(

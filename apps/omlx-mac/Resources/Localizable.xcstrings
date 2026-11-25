@@ -40294,6 +40294,150 @@
         }
       }
     },
+    "settings.experimental.loopcd.label" : {
+      "comment" : "Row label for the LoopCD toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.skip_thinking.label" : {
+      "comment" : "Row label for the toggle that keeps LoopCD out of thinking blocks",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thinking-Blöcke ausnehmen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exclude Thinking Blocks"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escludi i blocchi di ragionamento"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Исключить блоки thinking"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "排除思考块"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.skip_thinking.sub" : {
+      "comment" : "Sublabel for the toggle that keeps LoopCD out of thinking blocks",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD nur auf Antwort und Tool-Aufrufe anwenden. Von den Autoren für Coding-Agenten empfohlen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply LoopCD only to the answer and tool calls. Recommended by its authors for coding agents."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applica LoopCD solo a risposta e chiamate agli strumenti. Consigliato dagli autori per gli agenti di programmazione."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Применять LoopCD только к ответу и вызовам инструментов. Авторы рекомендуют для агентов-программистов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅对回答和工具调用应用 LoopCD。作者建议编程智能体使用。"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.sub" : {
+      "comment" : "Sublabel describing LoopCD",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vergleicht bei der Tokenwahl den letzten Schleifendurchlauf mit dem ersten. Kann Antworten verbessern, ist aber langsamer und braucht mehr Speicher."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Contrast the last loop pass with the first to choose tokens. Can improve answers, but is slower and uses more memory."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Confronta l'ultimo passaggio del ciclo con il primo per scegliere i token. Può migliorare le risposte, ma è più lento e usa più memoria."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сопоставляет последний проход цикла с первым при выборе токенов. Может улучшить ответы, но медленнее и требует больше памяти."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择 token 时将最后一次循环与第一次对比。可能改善回答，但更慢且占用更多内存。"
+          }
+        }
+      }
+    },
     "settings.experimental.specprefill.draft.label" : {
       "comment" : "Row label for the SpecPrefill draft-model picker",
       "extractionState" : "manual",

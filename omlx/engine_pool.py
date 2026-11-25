@@ -39,7 +39,6 @@ from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.splash import (
     EXTERNAL_ENGINES,
-    SPLASH_NATIVE_CONTEXT,
     SplashEngine,
     SplashOptions,
     SplashTarget,
@@ -1509,6 +1508,11 @@ class EnginePool:
 
         add("lora_adapter", data.get("lora_adapter") or None)
 
+        loopcd_active = bool(data.get("loopcd_enabled", False))
+        add("loopcd_enabled", loopcd_active)
+        if loopcd_active:
+            add("loopcd_skip_thinking", data.get("loopcd_skip_thinking", False))
+
         return tuple(signature)
 
     def _wanted_specprefill_draft(
@@ -2276,8 +2280,8 @@ class EnginePool:
             return min(int(configured), target.max_context)
         native = entry.model_context_length
         policy = get_global_settings().sampling.max_context_window_policy
-        if native and policy:
-            return min(native, policy)
+        if native:
+            return min(native, policy or native, target.max_context)
         return native
 
     def _splash_wanted_bytes(
@@ -2300,9 +2304,9 @@ class EnginePool:
 
         context = self._splash_sizing_context(entry, model_settings, target)
         wanted = estimate(context)
-        if context and context > SPLASH_NATIVE_CONTEXT and 0 < room < wanted:
+        if context and context > target.native_context and 0 < room < wanted:
             # Splash keeps the native window then and must not reserve more.
-            wanted = estimate(SPLASH_NATIVE_CONTEXT)
+            wanted = estimate(target.native_context)
         return wanted
 
     def _splash_admission_target(self) -> int:
@@ -2463,13 +2467,13 @@ class EnginePool:
                 entry.model_id,
             )
             requested_context = None
-        if requested_context and requested_context > SPLASH_NATIVE_CONTEXT:
+        if requested_context and requested_context > target.native_context:
             logger.warning(
                 "Splash: the %d-token context of %s is past the native %d; "
                 "YaRN is on and changes answers at every length",
                 requested_context,
                 entry.model_id,
-                SPLASH_NATIVE_CONTEXT,
+                target.native_context,
             )
         return SplashEngine(
             model_name=entry.model_path,

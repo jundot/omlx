@@ -55,6 +55,7 @@ def _make_fixture(monkeypatch, drafter_returns_uid):
         model=SimpleNamespace(),  # no register_rope_delta attr -> skipped
         request_id_to_uid={},
         uid_to_request_id={},
+        requests={},
         running={},
         total_prompt_tokens=0,
     )
