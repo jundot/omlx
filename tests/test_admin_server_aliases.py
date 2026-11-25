@@ -1134,26 +1134,52 @@ class TestUpdateGlobalSettingsMaxConcurrentRequests:
 
 
 class TestUpdateGlobalSettingsGdnSidecarStateDtype:
-    """update_global_settings: GDN sidecar precision invariants.
+    """update_global_settings: GDN snapshot precision invariants and aliases."""
 
-    The split-disabled + reduced-dtype invariant is owned by the layers where
-    the operator states intent (settings validation and this route). The cache
-    manager/store constructors stay permissive: they are internal, and the
-    scheduler already coerces reduced -> fp32 when split is off.
-    """
-
-    def test_ignores_v060_request_field_name(self):
+    def test_accepts_canonical_field_and_precedence_over_aliases(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_snapshot_state_dtype = "fp32"
         request = GlobalSettingsRequest(
-            **{"gdn_sidecar_state_dtype": "rht_int16"}
+            gdn_snapshot_state_dtype="rht_int16",
+            gdn_sidecar_state_dtype="int8",
+            gdn_sidecar_precision="bf16",
         )
 
-        assert request.gdn_sidecar_precision is None
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_snapshot_state_dtype == "rht_int16"
+        gs.save.assert_called_once()
+
+    def test_accepts_legacy_sidecar_state_dtype_request_field(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = False
+        gs.cache.gdn_snapshot_state_dtype = "fp32"
+        request = GlobalSettingsRequest(
+            gdn_sidecar_state_dtype="rht_int16",
+            gdn_sidecar_precision="bf16",
+        )
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_snapshot_state_dtype == "rht_int16"
+        gs.save.assert_called_once()
 
     def test_accepts_rht_int8_with_split_enabled(self):
         gs = _make_global_settings()
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = True
-        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        gs.cache.gdn_snapshot_state_dtype = "fp32"
         request = GlobalSettingsRequest(gdn_sidecar_precision="rht_int8")
 
         with _patched_global_settings(gs):
@@ -1162,15 +1188,15 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
             )
 
         assert result["success"] is True
-        assert gs.cache.gdn_sidecar_state_dtype == "rht_int8"
+        assert gs.cache.gdn_snapshot_state_dtype == "rht_int8"
         gs.save.assert_called_once()
 
     def test_accepts_dormant_reduced_dtype_when_embedded(self):
         gs = _make_global_settings()
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = False
-        gs.cache.gdn_sidecar_state_dtype = "fp32"
-        request = GlobalSettingsRequest(gdn_sidecar_precision="rht_int8")
+        gs.cache.gdn_snapshot_state_dtype = "fp32"
+        request = GlobalSettingsRequest(gdn_snapshot_state_dtype="rht_int8")
 
         with _patched_global_settings(gs):
             result = asyncio.run(
@@ -1178,14 +1204,14 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
             )
 
         assert result["success"] is True
-        assert gs.cache.gdn_sidecar_state_dtype == "rht_int8"
+        assert gs.cache.gdn_snapshot_state_dtype == "rht_int8"
         gs.save.assert_called_once()
 
     def test_accepts_embedded_mode_while_a_reduced_dtype_is_dormant(self):
         gs = _make_global_settings()
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = True
-        gs.cache.gdn_sidecar_state_dtype = "rht_int8"
+        gs.cache.gdn_snapshot_state_dtype = "rht_int8"
         request = GlobalSettingsRequest(gdn_ssd_split_enabled=False)
 
         with _patched_global_settings(gs):
@@ -1195,7 +1221,7 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
 
         assert result["success"] is True
         assert gs.cache.gdn_ssd_split_enabled is False
-        assert gs.cache.gdn_sidecar_state_dtype == "rht_int8"
+        assert gs.cache.gdn_snapshot_state_dtype == "rht_int8"
         gs.save.assert_called_once()
 
     @pytest.mark.parametrize(
@@ -1205,8 +1231,8 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         gs = _make_global_settings()
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = True
-        gs.cache.gdn_sidecar_state_dtype = "fp32"
-        request = GlobalSettingsRequest(gdn_sidecar_precision=value)
+        gs.cache.gdn_snapshot_state_dtype = "fp32"
+        request = GlobalSettingsRequest(gdn_snapshot_state_dtype=value)
 
         with _patched_global_settings(gs):
             result = asyncio.run(
@@ -1214,15 +1240,15 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
             )
 
         assert result["success"] is True
-        assert gs.cache.gdn_sidecar_state_dtype == value.lower()
+        assert gs.cache.gdn_snapshot_state_dtype == value.lower()
 
     @pytest.mark.parametrize("value", ["fp8", "int4", "rht", "", "rht_int8 "])
     def test_rejects_unknown_dtype_without_mutating(self, value):
         gs = _make_global_settings()
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = True
-        gs.cache.gdn_sidecar_state_dtype = "int8"
-        request = GlobalSettingsRequest(gdn_sidecar_precision=value)
+        gs.cache.gdn_snapshot_state_dtype = "int8"
+        request = GlobalSettingsRequest(gdn_snapshot_state_dtype=value)
 
         with _patched_global_settings(gs):
             with pytest.raises(HTTPException) as exc_info:
@@ -1231,8 +1257,8 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
                 )
 
         assert exc_info.value.status_code == 400
-        assert "gdn_sidecar_precision" in exc_info.value.detail
-        assert gs.cache.gdn_sidecar_state_dtype == "int8"
+        assert "gdn_snapshot_state_dtype" in exc_info.value.detail
+        assert gs.cache.gdn_snapshot_state_dtype == "int8"
         gs.save.assert_not_called()
 
     def test_invalid_dtype_leaves_other_fields_in_the_same_request_untouched(self):
@@ -1240,7 +1266,7 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         gs = _make_global_settings()
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = True
-        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        gs.cache.gdn_snapshot_state_dtype = "fp32"
         gs.cache.gdn_ssd_pending_max_size = "512MB"
         gs.cache.enabled = True
         request = GlobalSettingsRequest(
@@ -1257,8 +1283,19 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
 
         assert gs.cache.enabled is True
         assert gs.cache.gdn_ssd_pending_max_size == "512MB"
-        assert gs.cache.gdn_sidecar_state_dtype == "fp32"
+        assert gs.cache.gdn_snapshot_state_dtype == "fp32"
         gs.save.assert_not_called()
+
+    def test_get_global_settings_returns_canonical_and_legacy_keys(self):
+        gs = _make_global_settings()
+        gs.cache.gdn_snapshot_state_dtype = "rht_int16"
+
+        with _patched_global_settings(gs):
+            payload = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+
+        assert payload["cache"]["gdn_snapshot_state_dtype"] == "rht_int16"
+        assert payload["cache"]["gdn_sidecar_state_dtype"] == "rht_int16"
+        assert payload["cache"]["gdn_sidecar_precision"] == "rht_int16"
 
 
 def test_global_defaults_ignore_overrides_and_do_not_write(tmp_path, monkeypatch):

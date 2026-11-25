@@ -501,6 +501,7 @@ class TestCacheSettings:
             "gdn_ssd_split_enabled": False,
             "gdn_snapshot_storage": "auto",
             "gdn_ssd_pending_max_size": "512MB",
+            "gdn_snapshot_state_dtype": "fp32",
             "gdn_sidecar_precision": "fp32",
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
@@ -646,6 +647,43 @@ class TestCacheSettings:
         restored = CacheSettings.from_dict(original.to_dict())
         assert restored.gdn_sidecar_state_dtype == "rht_int8"
         assert restored.to_dict() == original.to_dict()
+
+    def test_canonical_state_dtype_key_wins_over_legacy_keys(self):
+        settings = CacheSettings.from_dict(
+            {
+                "gdn_ssd_split_enabled": True,
+                "gdn_snapshot_state_dtype": "rht_int16",
+                "gdn_sidecar_precision": "int8",
+                "gdn_sidecar_state_dtype": "bf16",
+            }
+        )
+        assert settings.gdn_snapshot_state_dtype == "rht_int16"
+        assert settings.gdn_sidecar_state_dtype == "rht_int16"
+
+    def test_legacy_precision_key_loads_and_writes_both_public_keys(self):
+        settings = CacheSettings.from_dict(
+            {"gdn_ssd_split_enabled": True, "gdn_sidecar_precision": "rht_int8"}
+        )
+        assert settings.gdn_snapshot_state_dtype == "rht_int8"
+        stored = settings.to_dict()
+        assert stored["gdn_snapshot_state_dtype"] == "rht_int8"
+        assert stored["gdn_sidecar_precision"] == "rht_int8"
+        assert "gdn_sidecar_state_dtype" not in stored
+
+    def test_legacy_alias_setter_and_constructor_kwargs_work(self):
+        from dataclasses import replace
+
+        from omlx.scheduler import SchedulerConfig
+
+        settings = CacheSettings(gdn_sidecar_state_dtype="bf16")
+        assert settings.gdn_snapshot_state_dtype == "bf16"
+        assert replace(settings, gdn_sidecar_state_dtype="rht_int16").gdn_snapshot_state_dtype == "rht_int16"
+        settings.gdn_sidecar_state_dtype = "int8"
+        assert settings.gdn_snapshot_state_dtype == "int8"
+
+        sched_cfg = SchedulerConfig(gdn_sidecar_state_dtype="rht_int8")
+        assert sched_cfg.gdn_snapshot_state_dtype == "rht_int8"
+        assert replace(sched_cfg, gdn_sidecar_state_dtype="bf16").gdn_snapshot_state_dtype == "bf16"
 
     def test_from_dict_with_initial_cache_blocks(self):
         """Test creation from dictionary with initial_cache_blocks."""
@@ -1782,14 +1820,14 @@ class TestGlobalSettings:
         settings.cache.gdn_ssd_split_enabled = False
         settings.cache.gdn_sidecar_state_dtype = "int8"
         errors = settings.validate()
-        assert not any("gdn_sidecar_state_dtype" in e for e in errors)
+        assert not any("gdn_snapshot_state_dtype" in e for e in errors)
 
     def test_rht_int8_is_dormant_when_embedded(self):
         settings = GlobalSettings()
         settings.cache.gdn_ssd_split_enabled = False
         settings.cache.gdn_sidecar_state_dtype = "rht_int8"
         errors = settings.validate()
-        assert not any("gdn_sidecar_state_dtype" in e for e in errors)
+        assert not any("gdn_snapshot_state_dtype" in e for e in errors)
 
     @pytest.mark.parametrize("dtype", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"])
     def test_validate_accepts_every_dtype_with_split_enabled(self, dtype):
@@ -1798,7 +1836,7 @@ class TestGlobalSettings:
         settings.cache.hot_cache_only = False
         settings.cache.gdn_sidecar_state_dtype = dtype
         errors = settings.validate()
-        assert not any("gdn_sidecar_state_dtype" in e for e in errors)
+        assert not any("gdn_snapshot_state_dtype" in e for e in errors)
 
     @pytest.mark.parametrize("dtype", ["fp8", "int4", "", "none", "8"])
     def test_validate_rejects_unknown_dtype(self, dtype):
@@ -1814,7 +1852,7 @@ class TestGlobalSettings:
         settings.cache.gdn_ssd_split_enabled = False
         settings.cache.gdn_sidecar_state_dtype = "fp8"
         errors = settings.validate()
-        gdn_errors = [e for e in errors if "gdn_sidecar_state_dtype" in e]
+        gdn_errors = [e for e in errors if "gdn_snapshot_state_dtype" in e]
         assert len(gdn_errors) == 1
         assert "must be one of" in gdn_errors[0]
 
