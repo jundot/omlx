@@ -228,14 +228,15 @@ def test_hidden_favorite_still_excluded(tmp_path):
 
 def test_retrieve_returns_one_visible_model(tmp_path):
     state = _state([_model("chat-a")], tmp_path)
+    state.settings_manager.set_settings("chat-a", ModelSettings(model_alias="org/a"))
     with (
         patch("omlx.server._server_state", state),
         patch("omlx.server.get_max_context_window", return_value=None),
     ):
         client = TestClient(app, raise_server_exceptions=False)
-        response = client.get("/v1/models/chat-a")
+        response = client.get("/v1/models/org/a")
         missing = client.get("/v1/models/chat-b")
 
     assert response.status_code == 200
-    assert response.json()["id"] == "chat-a"
+    assert response.json()["id"] == "org/a"
     assert missing.status_code == 404

@@ -3784,7 +3784,6 @@ async def _create_markitdown_chat_completion(
 
 
 async def _list_visible_models() -> list[ModelInfo]:
-    """Build the visible model list shared by /v1/models and its retrieve route."""
     models = []
     favorite_ids: set[str] = set()
 
@@ -4012,7 +4011,7 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     return status
 
 
-@app.get("/v1/models/{model_id}", response_model=None)
+@app.get("/v1/models/{model_id:path}", response_model=None)
 async def retrieve_model(
     model_id: str, _: bool = Depends(verify_inference_api_key)
 ) -> JSONResponse:
