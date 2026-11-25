@@ -43,6 +43,18 @@ def _to_mlx_sconv_weight(v):
     return v
 
 
+def _to_mlx_conv(v):
+    """Upstream 0.8.1's conv transpose, imported by ``mlx_vlm.models.inkling2``.
+
+    The vendored module shadows upstream's ``inkling.inkling`` once the compat
+    patch is applied, so it must expose the symbol the newer Inkling 2 model
+    imports.
+    """
+    if getattr(v, "ndim", 0) == 3 and v.shape[-1] == 1:
+        return v
+    return v.transpose(0, 2, 1)
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
