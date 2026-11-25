@@ -11,7 +11,6 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-import mlx_vlm.utils as mlx_vlm_utils
 from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
@@ -20,6 +19,12 @@ from ..patches.inkling2.loopcd import apply_loopcd
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
+
+try:
+    import mlx_vlm.utils as mlx_vlm_utils
+except ImportError:
+    # mlx-vlm: absent from a CUDA cluster worker's venv (#4739).
+    mlx_vlm_utils = None
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +93,8 @@ def _patch_mlx_vlm_model_file_trust() -> None:
     mlx_vlm_utils.load_model = load_model_with_trust
 
 
-_patch_mlx_vlm_model_file_trust()
+if mlx_vlm_utils is not None:
+    _patch_mlx_vlm_model_file_trust()
 
 
 def preflight_text_remote_code(
