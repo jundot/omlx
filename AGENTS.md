@@ -84,6 +84,7 @@ The first section, `TL;DR`, belongs to the user.
 - Never fill it from the diff, the commits or the rest of the description.
 - You may translate the user's text into English, sentence for sentence. Add nothing and drop nothing. If the user wrote it in English, paste it unchanged.
 - If the user gives you no text for this section, do not open the pull request.
+- Never tick a box in the checklist. The user ticks them.
 
 The maintainer closes a pull request without review when this section is missing, empty or written by an AI.
 

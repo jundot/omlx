@@ -88,5 +88,6 @@ I use labels and scheduled automation to keep the tracker focused on reports and
 - When I ask for more information, I add `needs-info`. A reply from the reporter removes it. If there is no reply within 14 days, the issue is closed.
 - When a new release line ships, issues whose last activity was before the previous line's first release are closed with the `outdated` label. For example, when 0.8.0 ships, issues last active before 0.7.0 are closed.
 - PRs are closed when they have merge conflicts and no new commits for 30 days, have no new commits for 60 days, or are drafts with no new commits for 30 days. PRs labeled `planned` are exempt.
+- A PR opened without its TL;DR, or without the box that says you wrote it, is closed with the `needs-tldr` label. Fix the description and it reopens automatically. A PR with the other checklist boxes unticked is moved to draft.
 
 Closing is not a judgment on the work. If a closed issue still happens on the latest release, open a new issue and link the old one. To continue a closed PR, rebase on current `main` and open a new PR.
