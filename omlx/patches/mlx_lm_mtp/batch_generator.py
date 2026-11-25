@@ -13,11 +13,9 @@ Auto depth and parking use the measured cost of the whole active batch.
 from __future__ import annotations
 
 import contextlib
-import functools
 import inspect
 import logging
 import math
-import threading
 import time
 import weakref
 from collections import deque
@@ -184,8 +182,7 @@ def apply() -> bool:
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        with _spec_command_buffers(model):
-                            return _mtp_batch_next(self, batch_state)
+                        return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
                     if not _reconcile_mtp_batch_to_standard(self):
@@ -221,8 +218,7 @@ def apply() -> bool:
                                 state.queue.popleft()
                                 _bump_emit_stat(state, "init")
                                 first_sent = False
-                            with _spec_command_buffers(model):
-                                return _mtp_next(self, state)
+                            return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
                         active = getattr(self, "_omlx_mtp_state", None)
@@ -447,78 +443,6 @@ def _cluster_shared_token(gen_batch: Any, tok: Any) -> Tuple[Any, Optional[int]]
     mx.eval(tok)
     ids, seed = sync.share_tokens(tok.tolist() if sync.is_leader else None)
     return mx.array(ids, dtype=mx.uint32), seed
-
-
-# MLX commits a command buffer every ~50 ops or 50 MB of inputs, weights
-# included, and blocks eval at ten in flight, so a cycle could not queue the
-# next draft behind a running verify. Prefill keeps MLX's caps: larger ones
-# raise its peak memory.
-_SPEC_BUFFER_CAPS = (200, 512)
-
-# Target model types supported by the Qwen Lightning MTP/DFlash paths.
-_SPEC_CAPS_TARGET_TYPES = frozenset(
-    {
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_5_vl",
-        "qwen3_6",
-        "qwen3_6_moe",
-        "qwen4_exp",
-        "qwen4_exp_text",
-    }
-)
-
-
-def _spec_caps_target(model: Any) -> bool:
-    """Whether the loaded target belongs to the selected Qwen family."""
-    return getattr(model, "model_type", None) in _SPEC_CAPS_TARGET_TYPES
-
-
-@functools.lru_cache(maxsize=1)
-def _raises_spec_buffer_caps() -> bool:
-    """True on GPUs where the raised caps were measured: M5 and the M3 family."""
-    import mlx.core as mx
-
-    from omlx.custom_kernels.nax import is_nax_available
-
-    if is_nax_available():
-        return True
-    try:
-        architecture = str(mx.device_info().get("architecture", ""))
-    except Exception:
-        return False
-    return architecture.startswith("applegpu_g15")
-
-
-# The caps live on the MLX device, so engines running cycles at the same time
-# share one raise and the last one out restores MLX's values.
-_spec_caps_lock = threading.Lock()
-_spec_caps_holders = 0
-_spec_caps_previous: Optional[Tuple[int, int]] = None
-
-
-@contextlib.contextmanager
-def _spec_command_buffers(model: Any = None):
-    """Raise caps for supported Qwen targets and GPUs, then restore them."""
-    global _spec_caps_holders, _spec_caps_previous
-    if not _spec_caps_target(model) or not _raises_spec_buffer_caps():
-        yield
-        return
-
-    from omlx.custom_kernels.quant_matmul.fast import set_command_buffer_caps
-
-    with _spec_caps_lock:
-        if _spec_caps_holders == 0:
-            _spec_caps_previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
-        _spec_caps_holders += 1
-    try:
-        yield
-    finally:
-        with _spec_caps_lock:
-            _spec_caps_holders -= 1
-            if _spec_caps_holders == 0 and _spec_caps_previous is not None:
-                set_command_buffer_caps(*_spec_caps_previous)
-                _spec_caps_previous = None
 
 
 def _drafter_for(model: Any) -> Optional[Any]:

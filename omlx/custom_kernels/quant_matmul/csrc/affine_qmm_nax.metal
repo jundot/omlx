@@ -41,7 +41,7 @@
                                                                                \
     threadgroup T Ws[BN * BK_padded];                                          \
                                                                                \
-    qmm_t_nax_tgp_impl<T, group_size, bits, true, BM, BK, BN, WM, WN>(         \
+    qmm_t_nax_tgp_impl<T, group_size, bits, true, T, BM, BK, BN, WM, WN>(      \
         w,                                                                     \
         scales,                                                                \
         biases,                                                                \
@@ -51,6 +51,7 @@
         K,                                                                     \
         N,                                                                     \
         M,                                                                     \
+        K,                                                                     \
         tid,                                                                   \
         lid,                                                                   \
         simd_gid,                                                              \
@@ -150,7 +151,7 @@ instantiate_qwen35_q_affine_nax_variants(8, 128);
     threadgroup T Ws[BN * BK_padded];                                          \
                                                                                \
     const bool second = static_cast<int>(tid.x) * BN >= split_n;               \
-    qmm_t_nax_tgp_impl<T, group_size, bits, true, BM, BK, BN, WM, WN>(         \
+    qmm_t_nax_tgp_impl<T, group_size, bits, true, T, BM, BK, BN, WM, WN>(      \
         second ? w1 : w,                                                       \
         second ? scales1 : scales,                                             \
         second ? biases1 : biases,                                             \
@@ -160,6 +161,7 @@ instantiate_qwen35_q_affine_nax_variants(8, 128);
         K,                                                                     \
         N,                                                                     \
         M,                                                                     \
+        K,                                                                     \
         second ? uint3(tid.x - split_n / BN, tid.y, tid.z) : tid,              \
         lid,                                                                   \
         simd_gid,                                                              \
