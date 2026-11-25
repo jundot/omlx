@@ -33,6 +33,7 @@ import mlx.core as mx
 from .paged_ssd_cache import (
     _extract_tensor_bytes,
     _fsync_parent_dir,
+    _skip_uncommitted_cache_file,
     _unique_tmp_path,
     _write_safetensors_no_mx,
 )
@@ -487,6 +488,8 @@ class VisionFeatureSSDCache:
 
             for file_path in subdir_path.glob("*.safetensors"):
                 scanned += 1
+                if _skip_uncommitted_cache_file(file_path):
+                    continue
                 try:
                     _, metadata = mx.load(str(file_path), return_metadata=True)
                     image_hash = metadata.get("image_hash", "")

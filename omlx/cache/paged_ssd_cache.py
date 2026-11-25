@@ -73,7 +73,7 @@ _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
 # A stalled writer must not wedge a bounded store; past this it queues anyway.
 _PENDING_WRITE_SLOT_TIMEOUT_SECONDS = 30.0
-# Startup keeps unreadable tmp files newer than this; another manager may
+# Startup keeps temporary files newer than this; another manager may
 # still be writing them.
 _STALE_TMP_CLEANUP_SECONDS = 600.0
 
@@ -1063,6 +1063,18 @@ def _unique_tmp_path(file_path: Path) -> Path:
     )
 
 
+def _skip_uncommitted_cache_file(path: Path) -> bool:
+    """Skip staging files even when their safetensors contents are readable."""
+    stem = path.stem
+    if "_tmp_" not in stem and not stem.endswith("_tmp"):
+        return False
+    with contextlib.suppress(OSError):
+        if time.time() - path.stat().st_mtime > _STALE_TMP_CLEANUP_SECONDS:
+            path.unlink()
+            logger.debug("Removed abandoned cache staging file %s", path)
+    return True
+
+
 def _write_safetensors_no_mx(
     path: str,
     tensors_raw: dict[str, tuple[bytes, str, list[int]]],
@@ -1332,23 +1344,22 @@ class PagedSSDCacheIndex:
         with self._lock:
             return self._index.get(block_hash)
 
-    def remove(self, block_hash: bytes) -> PagedSSDBlockMetadata | None:
-        """
-        Remove a block from the index.
-
-        Args:
-            block_hash: Block content hash.
-
-        Returns:
-            Removed metadata if found, None otherwise.
-        """
+    def discard_entry(self, metadata: PagedSSDBlockMetadata) -> None:
+        """Discard this exact entry locally, retaining any shared file record."""
+        block_hash = metadata.block_hash
         with self._lock:
-            if block_hash not in self._index:
-                return None
+            if self._index.get(block_hash) is metadata:
+                del self._index[block_hash]
+                del self._lru[block_hash]
+                self._total_size -= metadata.file_size
 
-            metadata = self._index.pop(block_hash)
-            del self._lru[block_hash]
-            self._total_size -= metadata.file_size
+    def remove(self, block_hash: bytes) -> PagedSSDBlockMetadata | None:
+        """Remove a block and propagate the deletion to related indexes."""
+        with self._lock:
+            metadata = self._index.get(block_hash)
+            if metadata is None:
+                return None
+            self.discard_entry(metadata)
             if self._directory is not None:
                 self._directory.remove(block_hash)
             for view in self._views:
@@ -2555,7 +2566,6 @@ class PagedSSDCacheManager(CacheManager):
         skipped_incompatible = 0
         skipped_incompatible_bytes = 0
         errors = 0
-        orphaned_tmp_cleaned = 0
         unreadable_orphans = 0
         added: list[PagedSSDBlockMetadata] = []
 
@@ -2566,25 +2576,12 @@ class PagedSSDCacheManager(CacheManager):
 
             for file_path in subdir_path.glob("*.safetensors"):
                 scanned += 1
+                if _skip_uncommitted_cache_file(file_path):
+                    continue
                 try:
                     metadata = self._read_file_metadata(file_path)
                     if metadata is None:
-                        # An unreadable tmp file is a torn write. Skip recent
-                        # ones, which another manager may still be writing.
-                        stem = file_path.stem
-                        try:
-                            tmp_is_stale = (
-                                time.time() - file_path.stat().st_mtime
-                                > _STALE_TMP_CLEANUP_SECONDS
-                            )
-                        except OSError:
-                            tmp_is_stale = False
-                        if ("_tmp_" in stem or stem.endswith("_tmp")) and tmp_is_stale:
-                            with contextlib.suppress(OSError):
-                                file_path.unlink()
-                            orphaned_tmp_cleaned += 1
-                        else:
-                            unreadable_orphans += 1
+                        unreadable_orphans += 1
                         continue
                     known = self._directory_index.get(metadata.block_hash)
                     if known is not None:
@@ -2630,8 +2627,6 @@ class PagedSSDCacheManager(CacheManager):
             log_msg += f", skipped_gdn_sidecars={sidecars_skipped}"
         if sidecars_bytes > 0:
             log_msg += f", gdn_size={format_bytes(sidecars_bytes)}"
-        if orphaned_tmp_cleaned > 0:
-            log_msg += f", removed_torn_tmp={orphaned_tmp_cleaned}"
         if unreadable_orphans > 0:
             log_msg += (
                 f", unreadable_orphans={unreadable_orphans} "
@@ -4307,6 +4302,24 @@ class PagedSSDCacheManager(CacheManager):
             arrays[name] = _restore_tensor_from_bytes(raw, dtype_str, shape)
         return arrays
 
+    def _disk_block_matches_index(
+        self, indexed: PagedSSDBlockMetadata, file_metadata: dict[str, str]
+    ) -> bool:
+        # Another writer can replace this hash after we indexed it. Compare
+        # against the header that came with the loaded tensors before using
+        # the indexed signature or promoting the payload to the hot cache.
+        header = file_metadata or {}
+        if (
+            header.get("omlx_cache_format_version") in _READABLE_CACHE_FORMAT_VERSIONS
+            and header.get("cache_signature", "") == indexed.cache_signature
+        ):
+            return True
+
+        # Keep the file for the writer's configuration. Only drop the stale
+        # record we inspected, in case a local write updated the index too.
+        self._index.discard_entry(indexed)
+        return False
+
     def load_block(self, block_hash: bytes) -> list[Any] | None:
         """
         Load a KV cache block from SSD storage.
@@ -4404,16 +4417,7 @@ class PagedSSDCacheManager(CacheManager):
                 self._stats["misses"] += 1
                 return None
 
-            # Defensive: even if the index is stale (e.g. from a previous
-            # run that pre-dates the format version field), reject blocks
-            # without a readable version marker before they can poison
-            # the hot cache or downstream merge logic.
-            if (
-                file_metadata
-                and file_metadata.get("omlx_cache_format_version")
-                not in _READABLE_CACHE_FORMAT_VERSIONS
-            ):
-                self._index.remove(block_hash)
+            if not self._disk_block_matches_index(metadata, file_metadata):
                 self._stats["misses"] += 1
                 return None
 
@@ -4593,13 +4597,7 @@ class PagedSSDCacheManager(CacheManager):
             # See load_block() for rationale on removing the executor.
             arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
 
-            # Defensive version check, mirrors load_block().
-            if (
-                file_metadata
-                and file_metadata.get("omlx_cache_format_version")
-                not in _READABLE_CACHE_FORMAT_VERSIONS
-            ):
-                self._index.remove(block_hash)
+            if not self._disk_block_matches_index(block_metadata, file_metadata):
                 self._stats["misses"] += 1
                 return None, None
 
@@ -4797,11 +4795,7 @@ class PagedSSDCacheManager(CacheManager):
                 return False
             try:
                 arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
-                if (
-                    file_metadata
-                    and file_metadata.get("omlx_cache_format_version")
-                    not in _READABLE_CACHE_FORMAT_VERSIONS
-                ):
+                if not self._disk_block_matches_index(metadata, file_metadata):
                     return False
                 return self._promote_to_hot_cache(
                     block_hash, arrays, file_metadata, metadata
@@ -5035,23 +5029,31 @@ class PagedSSDCacheManager(CacheManager):
         with self._lock:
             removed = self._hot_cache_remove(block_hash) is not None
 
-            with self._write_commit_lock, self._pending_write_hashes_lock:
-                pending = self._pending_write_buffers.pop(block_hash, None)
-                self._pending_write_hashes.discard(block_hash)
+            with self._write_commit_lock:
+                with self._pending_write_hashes_lock:
+                    pending = self._pending_write_buffers.pop(block_hash, None)
+                    self._pending_write_hashes.discard(block_hash)
 
-            metadata = self._index.remove(block_hash)
-            if pending is not None or metadata is not None:
-                removed = True
-            if pending is not None and metadata is not None:
-                # The cancelled write leaves only an older file, if any.
-                try:
-                    metadata.file_size = metadata.file_path.stat().st_size
-                except OSError:
-                    metadata = None
-            if metadata is not None:
-                self._directory_index.add(metadata)
+                with self._index._lock:
+                    metadata = self._index.get(block_hash)
+                    if metadata is not None:
+                        self._index.discard_entry(metadata)
+                    if pending is not None:
+                        # A cancelled write can leave an older file. Adjust its
+                        # shared size record only if it tracks the cancelled entry.
+                        queued = pending["block_metadata"]
+                        shared = self._directory_index.get(block_hash)
+                        if shared is not None and shared.created_at == queued.created_at:
+                            try:
+                                file_size = shared.file_path.stat().st_size
+                            except OSError:
+                                self._directory_index.remove(block_hash)
+                            else:
+                                self._directory_index.update_file_size(
+                                    block_hash, file_size
+                                )
 
-            return removed
+            return removed or pending is not None or metadata is not None
 
     def delete_block(self, block_hash: bytes) -> bool:
         """

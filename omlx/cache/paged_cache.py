@@ -1173,14 +1173,13 @@ class PagedCacheManager(CacheManager):
             tails[tail_hash] = token_count
             if shared:
                 self._shared_tails.add(tail_hash)
-            while len(tails) > _TAIL_INDEX_PER_PARENT:
-                shared = [h for h in tails if h in self._shared_tails]
-                if len(tails) - len(shared) > _TAIL_INDEX_PER_PARENT:
-                    victim = next(h for h in tails if h not in self._shared_tails)
-                elif len(shared) > _TAIL_INDEX_PER_PARENT // 2:
-                    victim = shared[0]
-                else:
-                    break
+            is_shared = tail_hash in self._shared_tails
+            limit = _TAIL_INDEX_PER_PARENT // 2 if is_shared else _TAIL_INDEX_PER_PARENT
+            if len(tails) <= limit:
+                return
+            same_kind = [h for h in tails if (h in self._shared_tails) == is_shared]
+            if len(same_kind) > limit:
+                victim = same_kind[0]
                 del tails[victim]
                 self._shared_tails.discard(victim)
 
