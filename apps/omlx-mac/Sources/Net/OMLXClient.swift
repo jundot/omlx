@@ -460,7 +460,9 @@ final class OMLXClient: ObservableObject {
         modelPath: String,
         oqLevel: Double,
         preserveMtp: Bool = false,
-        preserveNgramTable: Bool = false
+        preserveNgramTable: Bool = false,
+        textOnly: Bool = false,
+        dtype: String = "bfloat16"
     ) async throws -> OQEstimateResponse {
         // `oq_level` accepts ints and fractional levels. Send it without a
         // trailing `.0` so the server parses an int when the user picked one.
@@ -472,6 +474,8 @@ final class OMLXClient: ObservableObject {
             URLQueryItem(name: "oq_level", value: levelStr),
             URLQueryItem(name: "preserve_mtp", value: preserveMtp ? "true" : "false"),
             URLQueryItem(name: "preserve_ngram_table", value: preserveNgramTable ? "true" : "false"),
+            URLQueryItem(name: "text_only", value: textOnly ? "true" : "false"),
+            URLQueryItem(name: "dtype", value: dtype),
         ])
     }
 

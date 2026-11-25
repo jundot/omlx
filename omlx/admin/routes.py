@@ -10134,6 +10134,9 @@ async def estimate_oq(
     oq_level: float,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
+    text_only: bool = False,
+    dtype: str = "bfloat16",
+    mtp_assistant_model_path: str = "",
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -10144,9 +10147,11 @@ async def estimate_oq(
             estimate_bpw_and_size,
             model_path,
             oq_level,
-            64,  # group_size (default)
-            preserve_mtp,
-            preserve_ngram_table,
+            preserve_mtp=preserve_mtp,
+            preserve_ngram_table=preserve_ngram_table,
+            text_only=text_only,
+            dtype=dtype,
+            mtp_assistant_model_path=mtp_assistant_model_path,
         )
         return result
     except Exception as e:
