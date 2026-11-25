@@ -275,7 +275,8 @@ class _CapacityMethods:
                 self._right_padding = None
                 return
             padding = self._right_padding
-            max_shift = max(padding.tolist())
+            rows = padding.tolist()
+            max_shift = max(rows)
             self._settle_extracts()
             # Roll only the stock width; the zero tail stays in place.
             # Spare rows roll too, with no shift, so the bank keeps them.
@@ -291,7 +292,10 @@ class _CapacityMethods:
                 self._values, shifts[:, None], width, axis=2, max_shift=max_shift
             )
             self.offset -= padding
-            self.left_padding += padding
+            self.left_padding = mx.array(
+                [p + r for p, r in zip(self.left_padding.tolist(), rows)],
+                dtype=mx.result_type(self.left_padding, padding),
+            )
             self._right_padding = None
 
     def filter(self, batch_indices):
