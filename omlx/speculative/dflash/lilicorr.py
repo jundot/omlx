@@ -149,6 +149,9 @@ class LiLiCorrConfig(DFlashConfig):
     num_target_layers: int = 0
     conv_kernel_size: int = 2
     conv_group_size: int = 16
+    # mlx-vlm 0.8.1's DFlash2DecoderLayer reads this from the config; the
+    # LiLiCorr backbone ropes every layer.
+    no_rope_layers: list[int] = field(default_factory=list)
     lilicorr_hidden_size: int = 1024
     lilicorr_candidate_topk: int = 8
     lilicorr_num_heads: int = 8
