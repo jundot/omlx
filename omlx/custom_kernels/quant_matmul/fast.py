@@ -29,17 +29,6 @@ def has_symbol(name: str) -> bool:
     return hasattr(_ext, name)
 
 
-def set_command_buffer_caps(ops: int, mb: int) -> tuple[int, int] | None:
-    """Set MLX's per-command-buffer caps and return the previous pair.
-
-    Returns None when the native extension is unavailable; MLX keeps its caps.
-    """
-    setter = getattr(_ext, "set_command_buffer_caps", None)
-    if setter is None:
-        return None
-    return tuple(setter(int(ops), int(mb)))
-
-
 def share_command_queue(stream) -> int | None:
     """Move the calling thread's encoder for ``stream`` onto the shared queue.
 

@@ -23,7 +23,6 @@ from mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
 from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
-from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.model_settings import ModelSettings
 from omlx.patches import batched_decode_qmm, mlx_lm_mtp, qwen35_verify_qmm
 from omlx.patches.laguna import laguna_model
@@ -6586,116 +6585,6 @@ def test_coarse_draft_head_splits_qwen4_logits_source_from_chain_hidden():
     ids, _ = head.candidates(source)
     exact = lang.lm_head(source[:, -1, :])
     assert mx.argmax(exact).item() in ids.tolist()[0]
-
-
-@pytest.mark.parametrize("raised", [True, False])
-def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
-    """Speculative steps raise MLX's buffer caps where measured and always restore them."""
-    from omlx.custom_kernels.quant_matmul import fast
-
-    caps = [(50, 50)]
-
-    def fake_set(ops, mb):
-        previous = caps[-1]
-        caps.append((ops, mb))
-        return previous
-
-    target = SimpleNamespace(model_type="qwen3_5")
-    monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
-    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: raised)
-    with pytest.raises(RuntimeError), bg._spec_command_buffers(target):
-        inside = caps[-1]
-        raise RuntimeError("step failed")
-    assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
-    assert caps[-1] == (50, 50)
-
-
-def test_spec_command_buffers_overlapping_engines_restore_mlx_caps(monkeypatch):
-    """Two engines whose cycles overlap must leave MLX's caps, not the raised ones."""
-    caps = [(50, 50)]
-
-    def fake_set(ops, mb):
-        previous = caps[-1]
-        caps.append((ops, mb))
-        return previous
-
-    target = SimpleNamespace(model_type="qwen3_5")
-    monkeypatch.setattr(quant_fast, "set_command_buffer_caps", fake_set)
-    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: True)
-    monkeypatch.setattr(bg, "_spec_caps_holders", 0)
-    monkeypatch.setattr(bg, "_spec_caps_previous", None)
-    # The second cycle starts inside the first and ends after it.
-    with contextlib.ExitStack() as second_cycle:
-        with bg._spec_command_buffers(target):
-            second_cycle.enter_context(bg._spec_command_buffers(target))
-        assert caps[-1] == bg._SPEC_BUFFER_CAPS
-    assert caps[-1] == (50, 50)
-
-
-@pytest.mark.parametrize(
-    "model_type,raised", [("qwen3_5_moe", True), ("qwen3_5", False)]
-)
-def test_plain_moe_decode_steps_run_under_the_raised_caps(
-    monkeypatch, model_type, raised
-):
-    import omlx.scheduler as scheduler
-
-    caps = [(50, 50)]
-
-    def fake_set(ops, mb):
-        previous = caps[-1]
-        caps.append((ops, mb))
-        return previous
-
-    seen = []
-    monkeypatch.setattr(quant_fast, "set_command_buffer_caps", fake_set)
-    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: True)
-    monkeypatch.setattr(bg, "_spec_caps_holders", 0)
-    monkeypatch.setattr(bg, "_spec_caps_previous", None)
-    monkeypatch.setattr(
-        scheduler, "_original_generation_batch_step", lambda b: seen.append(caps[-1])
-    )
-    batch = SimpleNamespace(
-        model=SimpleNamespace(model_type=model_type),
-        uids=[7],
-        logits_processors=[[]],
-        samplers=[None],
-        _next_tokens=None,
-    )
-    scheduler._patched_generation_batch_step(batch)
-    assert seen == [bg._SPEC_BUFFER_CAPS if raised else (50, 50)]
-    assert caps[-1] == (50, 50)
-
-
-@pytest.mark.parametrize(
-    "model_type,gpu,enabled,detected",
-    [
-        ("qwen3_5_moe", True, True, True),
-        ("glm5_next", True, False, False),
-        (None, True, False, False),
-        ("qwen3_5", False, False, True),
-    ],
-)
-def test_spec_caps_target(monkeypatch, model_type, gpu, enabled, detected):
-    from omlx.custom_kernels.quant_matmul import fast
-
-    target = SimpleNamespace(model_type=model_type)
-    calls, detections = [], []
-
-    def fake_set(ops, mb):
-        calls.append((ops, mb))
-        return (50, 50)
-
-    def fake_gpu():
-        detections.append(True)
-        return gpu
-
-    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", fake_gpu)
-    monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
-    with bg._spec_command_buffers(target):
-        assert calls == ([bg._SPEC_BUFFER_CAPS] if enabled else [])
-    assert calls == ([bg._SPEC_BUFFER_CAPS, (50, 50)] if enabled else [])
-    assert bool(detections) is detected
 
 
 def test_batch_park_verdict_outlives_its_cohort():
