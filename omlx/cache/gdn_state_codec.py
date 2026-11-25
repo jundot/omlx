@@ -404,6 +404,11 @@ def decode_state(
 ) -> Any:
     """Restore an fp32 recurrent tensor as an unevaluated MLX graph."""
     if encoding.codec == BF16_CODEC:
+        if getattr(payload, "dtype", None) != mx.bfloat16:
+            raise ValueError(
+                f"invalid GDN bf16 payload dtype: "
+                f"expected bfloat16, got {getattr(payload, 'dtype', None)}"
+            )
         return payload.astype(mx.float32)
     if encoding.codec in INTEGER_CODECS:
         if scale is None:

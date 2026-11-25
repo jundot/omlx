@@ -9276,7 +9276,9 @@ class Scheduler:
         )
         return bool(callable(supported) and supported(layer_types))
 
-    def _should_encode_staged_boundary(self) -> bool:
+    def _should_encode_staged_boundary(
+        self, snapshot_cache: list[Any] | None = None
+    ) -> bool:
         # Encode ephemeral SSD staging snapshots only when they will be promoted
         # to durable sidecars; fallback embedded layouts encode in save_block().
         manager = self.paged_ssd_cache_manager
@@ -9284,6 +9286,21 @@ class Scheduler:
             manager, "_expected_layer_cache_types", None
         ) is not None:
             return self._gdn_split_active()
+        if snapshot_cache and self.block_aware_cache is not None:
+            supported = getattr(
+                self.block_aware_cache, "_gdn_split_layout_supported", None
+            )
+            if callable(supported):
+                layer_types = [
+                    type(cache).__name__
+                    for cache in snapshot_cache
+                    if cache is not None
+                ]
+                if layer_types:
+                    return bool(
+                        getattr(self.config, "gdn_ssd_split_enabled", False)
+                        and supported(layer_types)
+                    )
         return bool(getattr(self.config, "gdn_ssd_split_enabled", False))
 
     def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
@@ -9397,7 +9414,9 @@ class Scheduler:
                     snapshot_cache,
                     self._extract_snapshot_cache_states,
                     block_size=snapshot_block_size,
-                    encode_gdn_state=self._should_encode_staged_boundary(),
+                    encode_gdn_state=self._should_encode_staged_boundary(
+                        snapshot_cache
+                    ),
                 )
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
@@ -9820,7 +9839,9 @@ class Scheduler:
                     snapshot_cache,
                     self._extract_snapshot_cache_states,
                     block_size=snapshot_block_size,
-                    encode_gdn_state=self._should_encode_staged_boundary(),
+                    encode_gdn_state=self._should_encode_staged_boundary(
+                        snapshot_cache
+                    ),
                 )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None

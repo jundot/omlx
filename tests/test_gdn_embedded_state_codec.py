@@ -494,6 +494,27 @@ def test_mixed_layout_auto_fallback_encodes_block_once_and_skips_placeholders(tm
         manager.close()
 
 
+def test_invalid_bf16_payload_dtype_fails_closed(tmp_path):
+    manager = _manager(tmp_path, "bf16")
+    try:
+        assert _save(manager, b"h" * 20, [_kv_layer(), _gdn_layer()])
+        header = _block_header(manager, b"h" * 20)
+        arrays = {
+            name: mx.zeros(
+                tuple(spec["shape"]),
+                dtype=mx.int8 if name.endswith("__q") else mx.float32,
+            )
+            for name, spec in header.items()
+            if name != "__metadata__"
+        }
+        metadata = dict(header["__metadata__"])
+        assert manager._reconstruct_cache_data(arrays, metadata, 2, LAYER_TYPES) is None
+        assert manager.gdn_state_decode_failures == 1
+        assert manager.gdn_state_dequantizations == 0
+    finally:
+        manager.close()
+
+
 def test_scheduler_auto_fallback_disables_staging_encoding_for_mixed_layout():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.config = SchedulerConfig(
@@ -517,3 +538,19 @@ def test_scheduler_auto_fallback_disables_staging_encoding_for_mixed_layout():
         _expected_layer_cache_types=["ArraysCache", "CacheList"]
     )
     assert scheduler._should_encode_staged_boundary() is False
+
+    # Even before _expected_layer_cache_types is populated, passing the live
+    # snapshot_cache detects mixed layouts on the very first prefill.
+    class ArraysCache:
+        pass
+
+    class CacheList:
+        pass
+
+    scheduler.paged_ssd_cache_manager = SimpleNamespace(
+        _expected_layer_cache_types=None
+    )
+    assert scheduler._should_encode_staged_boundary([ArraysCache(), None]) is True
+    assert (
+        scheduler._should_encode_staged_boundary([ArraysCache(), CacheList()]) is False
+    )
