@@ -15,6 +15,8 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from omlx.patches.inkling2 import loopcd
+
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
 
@@ -504,9 +506,19 @@ _TINY_LOOP = dict(
     formats=("mxfp8",) * 18,
     loop_config=dict(core_start=6, core_end=12, num_passes=3, gate_rank=64),
 )
+_TINY_LOOPCD = dict(_TINY_LOOP, skip_thinking=True)
+_FIRST_CONTROL, _OPEN_THINKING, _END_BLOCK = 290, 291, 299
 
 
-def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None, **dims):
+@pytest.fixture(autouse=True)
+def tiny_control_tokens(monkeypatch):
+    monkeypatch.setattr(loopcd, "FIRST_CONTROL_TOKEN", _FIRST_CONTROL)
+    monkeypatch.setattr(loopcd, "THINKING_TOKEN", _OPEN_THINKING)
+
+
+def _inkling2_tiny(
+    formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None, skip_thinking=None, **dims
+):
     from mlx.utils import tree_flatten
 
     from omlx.patches.inkling2 import model as inkling2
@@ -554,6 +566,8 @@ def _inkling2_tiny(formats=("mxfp8",) * 6 + ("nvfp4",) * 6, vision=None, **dims)
                 noise = noise.astype(mx.bfloat16)
             weights.append((name, noise.astype(value.dtype)))
     model.load_weights(weights)
+    if skip_thinking is not None:
+        assert model.enable_loopcd(skip_thinking)
     return model
 
 
@@ -572,6 +586,67 @@ def test_inkling2_incremental_and_chunked_match_full_forward(dims):
     model(ids[:, :11], cache=chunked)
     tail = model(ids[:, 11:], cache=chunked)[..., :300]
     assert mx.abs(full[:, 11:] - tail).max().item() < 1e-3
+
+
+def _unguided_and_guided_logits(ids):
+    one_pass = dict(_TINY_LOOP["loop_config"], num_passes=1)
+    first = _inkling2_tiny(**{**_TINY_LOOP, "loop_config": one_pass})(ids)[..., :300]
+    final = _inkling2_tiny(**_TINY_LOOP)(ids)[..., :300]
+    return final, final + 0.5 * (final - first)
+
+
+def test_inkling2_loopcd_contrasts_with_the_one_pass_model():
+    ids = mx.random.randint(0, 300, (2, 26))
+    _, expected = _unguided_and_guided_logits(ids)
+    model = _inkling2_tiny(**_TINY_LOOP, skip_thinking=False)
+    out = model(ids, capture_layer_ids=[30], return_hidden=True)
+    assert mx.abs(out.logits[..., :300] - expected).max().item() < 1e-4
+    assert (out.logits[..., 300:] == -mx.inf).all()
+    assert mx.array_equal(out.hidden_states[0], out.hidden_states[1])
+
+
+@pytest.mark.parametrize("change", [dict(num_passes=1), dict(core_end=18)])
+def test_inkling2_loopcd_needs_a_second_pass_and_a_coda(change):
+    loop = dict(_TINY_LOOP["loop_config"], **change)
+    model = _inkling2_tiny(**{**_TINY_LOOP, "loop_config": loop})
+    assert not model.enable_loopcd(False)
+
+
+def test_inkling2_loopcd_strength_follows_the_top_two_margin():
+    tie, clear_winner = [3.0, 3.0, 0.0], [4.0, 1.0, 0.0]
+    first = mx.array([[1.0, 2.0, 0.0], [2.0, 2.0, 0.0]])
+    got = loopcd.guide(mx.array([tie, clear_winner]), first, 1e3, None, None)
+    expected = mx.array([[4.0, 3.5, 0.0], [4.1104, 0.9448, 0.0]])
+    assert mx.allclose(got, expected, atol=1e-3)
+
+
+def test_inkling2_loopcd_skip_thinking_keeps_control_probabilities(monkeypatch):
+    monkeypatch.setattr(loopcd, "FIRST_CONTROL_TOKEN", 2)
+    final, first = mx.array([[[3.0, 2.0, 2.5]]]), mx.array([[[0.0, 2.0, 1.0]]])
+    guided = loopcd.guide(final, first, 1e3, None, mx.array([[False]]))
+    p, base = mx.softmax(guided[0, 0]), mx.softmax(final[0, 0])
+    assert p[2].item() == pytest.approx(base[2].item(), abs=1e-4)
+    assert p[0].item() > base[0].item() + 0.05
+
+
+def test_inkling2_loopcd_can_skip_thinking_blocks():
+    ids = mx.random.randint(0, _FIRST_CONTROL, (1, 32))
+    ids[0, 20], ids[0, 25] = _OPEN_THINKING, _END_BLOCK
+    final, guided = _unguided_and_guided_logits(ids)
+    model = _inkling2_tiny(**_TINY_LOOPCD)
+    full = model(ids)[..., :300]
+    assert mx.abs(full[0, 20:25] - final[0, 20:25]).max().item() < 1e-4
+    for t in (19, 25, 31):
+        text, want = (mx.softmax(x[0, t, :_FIRST_CONTROL]) for x in (full, guided))
+        assert mx.abs(text - want).max().item() < 1e-6
+
+    cache = model.make_cache()
+    model(ids[:, :18], cache=cache)
+    model(ids[:, 18:26], cache=cache)
+    assert model.mtp_partial_rollback(cache, 3, 7)
+    for t in range(22, 28):
+        step = model(ids[:, t : t + 1], cache=cache)[0, 0, :300]
+        assert mx.abs(step - full[0, t]).max().item() < 1e-3
 
 
 def test_inkling2_full_attention_visits_share_one_log_scaling(monkeypatch):
@@ -775,7 +850,7 @@ def test_inkling2_sliding_state_matches_a_cache_of_every_key(dims, monkeypatch):
 def test_inkling2_rows_with_different_windows_decode_together():
     from omlx.patches.inkling2 import cache as windows
 
-    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOP)
+    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOPCD)
     ids = mx.random.randint(0, 300, (2, 60))
     lengths = (41, 9)
     alone, expected = [], []
@@ -830,7 +905,7 @@ def test_inkling2_restored_state_decodes_and_joins_like_the_live_one():
     )
     from omlx.cache.type_handlers import SizedArraysCache
 
-    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOP)
+    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOPCD)
     ids = mx.random.randint(0, 300, (1, 50))
     live = model.make_cache()
     model(ids[:, :40], cache=live)
@@ -872,7 +947,9 @@ def test_inkling2_restored_state_decodes_and_joins_like_the_live_one():
 
 @pytest.mark.parametrize("proj", ["quantized", "dense"])
 @pytest.mark.parametrize("width", [8, 16])
-@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+@pytest.mark.parametrize(
+    "dims", [{}, _TINY_LOOP, _TINY_LOOPCD], ids=["plain", "looped", "loopcd"]
+)
 def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width, proj):
     """With quantized projections, or BF16 dense ones as in the release, each
     verify row has the bits of the serial decode step for its token, also when

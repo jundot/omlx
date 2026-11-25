@@ -519,6 +519,8 @@ class ModelSettingsRequest(BaseModel):
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None
     lora_adapter: str | None = None
+    loopcd_enabled: bool | None = None
+    loopcd_skip_thinking: bool | None = None
     reasoning_parser: str | None = None
     guided_grammar_enabled: bool | None = None
     guided_grammar: str | None = None
@@ -3622,6 +3624,12 @@ async def update_model_settings(
         current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
+    if "loopcd_enabled" in sent:
+        current_settings.loopcd_enabled = bool(
+            request.loopcd_enabled and entry.config_model_type == "inkling2_loop"
+        )
+    if "loopcd_skip_thinking" in sent:
+        current_settings.loopcd_skip_thinking = bool(request.loopcd_skip_thinking)
     touched = set(sent)
     if "lora_adapter" in sent:
         new_adapter = None if is_diffusion_model else request.lora_adapter or None

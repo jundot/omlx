@@ -2360,6 +2360,8 @@
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
                     lora_adapter: isDiffusion ? '' : (s.lora_adapter || ''),
+                    loopcd_enabled: s.loopcd_enabled === true,
+                    loopcd_skip_thinking: s.loopcd_skip_thinking === true,
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     external_engine: s.external_engine || '',
@@ -3739,6 +3741,8 @@
                         ? parseInt(ms.vlm_mtp_draft_block_size)
                         : null,
                     lora_adapter: ms.lora_adapter || null,
+                    loopcd_enabled: !!ms.loopcd_enabled,
+                    loopcd_skip_thinking: !!ms.loopcd_skip_thinking,
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };

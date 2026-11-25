@@ -166,6 +166,21 @@ async def test_lora_adapter_is_checked_when_it_changes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_loopcd_needs_a_looped_checkpoint_and_reloads_it():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+    request = admin_routes.ModelSettingsRequest(loopcd_enabled=True)
+    await _update_settings(pool, settings, request)
+    assert settings.loopcd_enabled is False
+    entry.config_model_type = "inkling2_loop"
+    await _update_settings(pool, settings, request)
+    assert settings.loopcd_enabled is True
+    loaded = pool._engine_runtime_signature(entry.model_id, settings)
+    settings.loopcd_skip_thinking = True
+    assert pool._engine_runtime_signature(entry.model_id, settings) != loaded
+
+
+@pytest.mark.asyncio
 async def test_load_time_setting_change_clears_cached_failure():
     pool, entry = _failed_pool()
     settings = ModelSettings(trust_remote_code=False)
