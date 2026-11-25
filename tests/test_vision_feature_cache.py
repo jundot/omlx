@@ -226,6 +226,27 @@ class TestSSDCache:
         assert mx.allclose(result, features, atol=1e-5)
         cache2.close()
 
+    def test_startup_ignores_uncommitted_vision_features(self, tmp_cache_dir):
+        writer = VisionFeatureSSDCache(cache_dir=tmp_cache_dir)
+        try:
+            writer.put("img_hash", "model_a", mx.ones((4, 8)))
+            final_path = writer._file_path_for_key(
+                _composite_key("model_a", "img_hash")
+            )
+            assert _wait_until(final_path.exists)
+        finally:
+            writer.close()
+
+        staged = final_path.with_name(f"{final_path.stem}_tmp_deadbeef.safetensors")
+        final_path.rename(staged)
+
+        reader = VisionFeatureSSDCache(cache_dir=tmp_cache_dir)
+        try:
+            assert reader.get("img_hash", "model_a") is None
+            assert staged.exists()
+        finally:
+            reader.close()
+
     def test_numerics_revision_isolates_ssd_features(self, tmp_cache_dir):
         features = mx.ones((4, 8))
         mx.eval(features)

@@ -64,6 +64,7 @@ from omlx.oq import (
     _LazyTensorIndex,
     _mandatory_head_bits,
     _load_builtin_calibration,
+    _load_hf_calibration,
     _measure_sensitivity,
     _measure_sensitivity_from_model,
     _measure_sensitivity_from_quantized_model,
@@ -3418,6 +3419,54 @@ class TestOQECalibrationData:
         assert multilingual_share >= 0.25
         assert shares["tool_calling"] <= 0.18
         assert max(shares.values()) <= 0.18
+
+    @pytest.mark.parametrize(
+        ("dataset", "sources"),
+        [
+            ("c4", [("allenai/c4", "en", 16)]),
+            ("code", [("bigcode/starcoderdata", "python", 16)]),
+            (
+                "multilingual",
+                [
+                    ("uonlp/CulturaX", lang, 2)
+                    for lang in ("en", "ko", "zh", "ja", "de", "fr", "es")
+                ],
+            ),
+            (
+                "code_multilingual",
+                [("bigcode/starcoderdata", "python", 8)]
+                + [("uonlp/CulturaX", lang, 2) for lang in ("en", "ko", "zh", "ja")],
+            ),
+        ],
+    )
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_hf_calibration_reads_only_the_requested_prefix(
+        self, monkeypatch, dataset, sources
+    ):
+        limits = {(name, variant): limit for name, variant, limit in sources}
+        expected = [
+            f"{variant}-{index}"
+            for _, variant, limit in sources
+            for index in range(limit)
+        ]
+
+        def load_dataset(name, variant, *, split, streaming):
+            assert streaming is True
+            for index in range(limits[name, variant]):
+                line = f"{variant}-{index}"
+                yield {"text": line, "content": line}
+            pytest.fail(f"Read past the calibration sample limit for {variant}")
+
+        monkeypatch.setitem(
+            sys.modules, "datasets", MagicMock(load_dataset=load_dataset)
+        )
+        tokenizer = MagicMock()
+        tokenizer.encode.return_value = [1, 2]
+
+        samples = _load_hf_calibration(tokenizer, dataset, num_samples=8, seq_length=2)
+
+        assert samples.tolist() == [[1, 2]]
+        tokenizer.encode.assert_called_once_with("\n".join(expected))
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

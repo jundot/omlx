@@ -4606,6 +4606,125 @@ class TestLayerSignatureSweep:
         assert mgr._signature_sweep_completed is True
 
 
+@pytest.mark.parametrize("recent", [True, False])
+def test_startup_ignores_uncommitted_block_files(tmp_path, recent):
+    mx = pytest.importorskip("mlx.core")
+    cache_dir = tmp_path / "ssd_cache"
+    block_hash = b"uncommitted_block"
+    writer = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1 << 30)
+    try:
+        state = [("__nstate__", "KVCache", [mx.ones((1, 1, 2, 4))] * 2)]
+        assert writer.save_block(block_hash, state, 2, "test-model", ["KVCache"])
+        assert writer.wait_for_pending_writes(5)
+        final_path = writer.get_block_metadata(block_hash).file_path
+    finally:
+        writer.close()
+
+    staged = final_path.with_name(f"{final_path.stem}_tmp_deadbeef.safetensors")
+    final_path.rename(staged)
+    if not recent:
+        old = time.time() - 3600
+        os.utime(staged, (old, old))
+
+    reader = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1 << 30)
+    try:
+        assert not reader.has_block(block_hash)
+        assert staged.exists() is recent
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("read_path", ["load", "load_with_metadata", "preload"])
+def test_disk_read_rejects_replaced_cache_signature(tmp_path, read_path):
+    mx = pytest.importorskip("mlx.core")
+    cache_dir = tmp_path / "ssd_cache"
+    hashes = [f"stale_signature_{i}".encode() for i in range(4)]
+    layers = ["KVCache"]
+
+    writer = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1 << 30)
+    try:
+        writer.set_expected_layer_signature(layers, numerics="ced-prefill-1")
+        state = [("__nstate__", "KVCache", [mx.ones((1, 1, 2, 4))] * 2)]
+        for block_hash in hashes:
+            assert writer.save_block(block_hash, state, 2, "test-model", layers)
+        assert writer.wait_for_pending_writes(5)
+    finally:
+        writer.close()
+
+    reader = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=1 << 30,
+        hot_cache_max_bytes=1 << 20,
+    )
+    try:
+        reader.set_expected_layer_signature(layers, numerics="ced-prefill-1")
+        replaced = hashes[0]
+        old_metadata = reader.get_block_metadata(replaced)
+        assert old_metadata is not None
+
+        # Write outside the reader's shared in-process index, then emulate
+        # the atomic replacement made by another oMLX process.
+        writer = PagedSSDCacheManager(
+            cache_dir=tmp_path / "other_process", max_size_bytes=1 << 30
+        )
+        try:
+            writer.set_expected_layer_signature(layers)
+            state = [("__nstate__", "KVCache", [mx.zeros((1, 1, 2, 4))] * 2)]
+            assert writer.save_block(replaced, state, 2, "test-model", layers)
+            assert writer.wait_for_pending_writes(5)
+            replacement = writer.get_block_metadata(replaced)
+            assert replacement.cache_signature != old_metadata.cache_signature
+            replacement.file_path.replace(old_metadata.file_path)
+        finally:
+            writer.close()
+
+        compatible = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1 << 30)
+        try:
+            compatible.set_expected_layer_signature(layers)
+            if read_path == "load":
+                assert reader.load_block(replaced) is None
+            elif read_path == "load_with_metadata":
+                assert reader.load_block_with_metadata(replaced) == (None, None)
+            else:
+                assert reader.preload_matched_blocks(hashes) == 3
+            assert not reader.has_block(replaced)
+            assert compatible.load_block(replaced) is not None
+            assert reader.load_block(hashes[1]) is not None
+        finally:
+            compatible.close()
+    finally:
+        reader.close()
+
+
+def test_signature_sweep_preserves_other_managers_views(tmp_path):
+    mx = pytest.importorskip("mlx.core")
+    cache_dir = tmp_path / "ssd_cache"
+    block_hash = b"shared-directory-block"
+    layers = ["KVCache"]
+    matching = PagedSSDCacheManager(
+        cache_dir=cache_dir, max_size_bytes=1 << 30, expected_model_name="test-model"
+    )
+    try:
+        matching.set_expected_layer_signature(layers, numerics="ced-prefill-1")
+        state = [("__nstate__", "KVCache", [mx.ones((1, 1, 2, 4))] * 2)]
+        assert matching.save_block(block_hash, state, 2, "test-model", layers)
+        assert matching.wait_for_pending_writes(5)
+        incompatible = PagedSSDCacheManager(
+            cache_dir=cache_dir, max_size_bytes=1 << 30, expected_model_name="test-model"
+        )
+        try:
+            assert incompatible.has_block(block_hash)
+            incompatible.set_expected_layer_signature(layers)
+            assert incompatible.invalidate_stale_layer_signature() == 1
+            assert not incompatible.has_block(block_hash)
+            assert matching.load_block(block_hash) is not None
+            assert matching._directory_index.count == 1
+        finally:
+            incompatible.close()
+    finally:
+        matching.close()
+
+
 class TestNumericsSignature:
     """Blocks computed before a model's numerics changed must not be reused.
 

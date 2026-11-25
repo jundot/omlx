@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import struct
+import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -812,7 +813,9 @@ class TestHFUploaderReadme:
 
         def upload(**kwargs):
             assert original.read_text() == "Original local card"
-            assert "Llama 3B Instruct" in readme.read_text()
+            assert readme.is_symlink()
+            uploaded_readme = Path(kwargs["folder_path"]) / "README.md"
+            assert "Llama 3B Instruct" in uploaded_readme.read_text()
 
         with patch("huggingface_hub.HfApi") as api:
             api.return_value.upload_folder.side_effect = upload
@@ -827,6 +830,66 @@ class TestHFUploaderReadme:
         assert readme.is_symlink()
         assert readme.resolve() == original
         assert original.read_text() == "Original local card"
+
+    @pytest.mark.asyncio
+    async def test_cancel_keeps_readme_available_to_upload_worker(self, model_dirs):
+        root = Path(model_dirs[0])
+        model_path = root / "Llama-3B-oQ4"
+        source_path = root / "Llama-3B-Instruct"
+        readme = model_path / "README.md"
+        readme.write_text("Original local card")
+        nested = model_path / "dspark" / "config.json"
+        nested.parent.mkdir()
+        nested.write_text("{}")
+
+        loop = asyncio.get_running_loop()
+        upload_started = loop.create_future()
+        upload_files = loop.create_future()
+        release = threading.Event()
+
+        def upload(**kwargs):
+            folder = Path(kwargs["folder_path"])
+            loop.call_soon_threadsafe(upload_started.set_result, None)
+            try:
+                if not release.wait(timeout=5):
+                    raise TimeoutError("Upload was not released")
+                files = (
+                    (folder / "README.md").read_bytes(),
+                    (folder / "dspark" / "config.json").read_bytes(),
+                    (folder / "model.safetensors").read_bytes(),
+                )
+            except Exception as exc:
+                loop.call_soon_threadsafe(upload_files.set_exception, exc)
+            else:
+                loop.call_soon_threadsafe(upload_files.set_result, files)
+
+        uploader = HFUploader(model_dirs)
+        with patch("huggingface_hub.HfApi") as api:
+            api.return_value.upload_folder.side_effect = upload
+            task = await uploader.start_upload(
+                str(model_path),
+                "user/model",
+                "hf_token",
+                readme_source_path=str(source_path),
+            )
+            worker = uploader._active_tasks[task.task_id]
+            await asyncio.wait_for(upload_started, timeout=5)
+            try:
+                original_during_upload = readme.read_text()
+                assert await uploader.cancel_upload(task.task_id)
+                await worker
+            finally:
+                release.set()
+            files = await asyncio.wait_for(upload_files, timeout=5)
+
+        assert task.status == UploadStatus.CANCELLED
+        assert files == (
+            (source_path / "README.md").read_bytes(),
+            nested.read_bytes(),
+            (model_path / "model.safetensors").read_bytes(),
+        )
+        assert original_during_upload == "Original local card"
+        assert readme.read_text() == "Original local card"
 
     @pytest.mark.asyncio
     async def test_readme_source_is_upload_directory(self, model_dirs):

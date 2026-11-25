@@ -1060,10 +1060,12 @@ class TestPagedCacheManager:
         shared = [bytes([100 + i]) * 4 for i in range(_TAIL_INDEX_PER_PARENT)]
         for tail_hash in shared:
             manager.register_tail_block(None, tail_hash, 4, shared=True)
-        for i in range(_TAIL_INDEX_PER_PARENT + 2):
-            manager.register_tail_block(None, bytes([i]) * 4, i + 4)
         tails = manager._tail_index[None]
         half = _TAIL_INDEX_PER_PARENT // 2
+        assert [h for h in tails if manager.is_shared_tail(h)] == shared[-half:]
+
+        for i in range(_TAIL_INDEX_PER_PARENT + 2):
+            manager.register_tail_block(None, bytes([i]) * 4, i + 4)
         assert len(tails) == _TAIL_INDEX_PER_PARENT + half
         assert [h for h in tails if manager.is_shared_tail(h)] == shared[-half:]
 

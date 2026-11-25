@@ -423,6 +423,18 @@ class TestHFDownloader:
     # --- Cancel Download ---
 
     @pytest.mark.asyncio
+    async def test_cancel_before_download_worker_starts(self, downloader):
+        task = await downloader.start_download("owner/model")
+        worker = downloader._active_tasks[task.task_id]
+
+        assert await downloader.cancel_download(task.task_id)
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+        assert task.status == DownloadStatus.CANCELLED
+        assert task.task_id not in downloader._active_tasks
+
+    @pytest.mark.asyncio
     async def test_cancel_download(self, downloader, model_dir, blocked_worker):
         target = model_dir / "owner" / "model"
         staging = target / ".cache" / "huggingface" / "download"

@@ -15,9 +15,11 @@ import struct
 import threading
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
 import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
@@ -828,6 +830,59 @@ class TestTTSLFM3Speech:
             assert engine.has_active_requests() is False
         finally:
             executor.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_speech_keeps_audio_and_engine_until_worker_finishes(
+        self, tmp_path, monkeypatch
+    ):
+        from omlx.engine.lfm3_speech import LFM3Speech
+
+        clip = tmp_path / "clip.wav"
+        clip.write_bytes(DUMMY_WAV)
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        finish = threading.Event()
+
+        with ThreadPoolExecutor(1) as executor:
+            engine = SimpleNamespace(
+                _speech_active=0,
+                _engine=SimpleNamespace(_mlx_executor=executor),
+                model_name="lfm3-audio",
+            )
+            speech = LFM3Speech(engine)
+            heard = []
+
+            def run(system, text, audio, generation_mode, **kwargs):
+                loop.call_soon_threadsafe(started.set)
+                assert finish.wait(5), "test did not release the speech worker"
+                heard.append(Path(audio).read_bytes())
+                return SimpleNamespace(text="hi", prompt_tokens=1, generation_tokens=1)
+
+            monkeypatch.setattr(speech, "_run", run)
+
+            async def request(scope):
+                with scope:
+                    try:
+                        await speech.transcribe(str(clip))
+                    finally:
+                        clip.unlink()
+
+            scope = anyio.CancelScope()
+            task = asyncio.create_task(request(scope))
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                scope.cancel()
+                await asyncio.sleep(0)
+                assert engine._speech_active == 1
+                assert clip.exists()
+                assert not task.done()
+            finally:
+                finish.set()
+                await asyncio.wait_for(task, 2)
+
+            assert heard == [DUMMY_WAV]
+            assert engine._speech_active == 0
+            assert not clip.exists()
 
     def test_tts_prompt_names_the_locale_and_voice(self):
         from omlx.engine.lfm3_speech import tts_prompt
