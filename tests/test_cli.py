@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from omlx._version import __version__
-from omlx.cli import _migrate_saved_network_auth
+from omlx.cli import _migrate_saved_network_auth, serve_command
 from omlx.settings import GlobalSettings
 
 
@@ -1354,9 +1354,6 @@ class TestServeCommandFunctions:
     def test_serve_logs_cli_flags_saved_to_settings(
         self, tmp_path, monkeypatch, caplog
     ):
-        """A flag that changes settings.json is logged once server.log exists (#3828)."""
-        from omlx.cli import serve_command
-
         listener = self._reserve_port()
         host, port = listener.getsockname()
         settings = self._make_settings(tmp_path, host=host, port=port)
@@ -1386,8 +1383,6 @@ class TestServeCommandFunctions:
             ):
                 serve_command(args)
 
-            # The save runs before file logging is configured. A report logged
-            # at that point would not reach server.log.
             assert reported_before_file_logging == []
             assert len(reported()) == 1
         finally:
