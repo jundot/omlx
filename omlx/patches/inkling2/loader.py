@@ -83,6 +83,8 @@ def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
     """Returns the mapped weights and the routed-expert format per layer."""
     if is_mlx_vlm_layout(weights):
         return sanitize_mlx_vlm_weights(model, weights), {}
+    if is_mlx_lm_layout(weights):
+        return sanitize_mlx_lm_weights(model, weights)
     if not is_original_layout(weights):
         return weights, {}
     args = model.args.text
@@ -487,3 +489,124 @@ def sanitize_mlx_vlm_weights(model, weights: dict) -> dict:
     for idx, d in per_layer.items():
         _vlm_layer(d, idx, args, quant, out)
     return out
+
+
+_LM_TEXT = "model.language_model."
+_LM_LAYER = _LM_TEXT + "layers."
+_LM_VISION = "model.vision_tower."
+_LM_VISION_RENAMES = (
+    ("merger.linear_1.", "proj_in."),
+    ("merger.linear_2.", "proj_out."),
+    ("embeddings.position_embedding.weight", "embeddings.position_embedding"),
+)
+_LM_LOOP_GATES = (("q", "attn"), ("k", "k"), ("v", "v"), ("mlp", "mlp"))
+_LM_LOOP_PARTS = (
+    ("down_proj", "down"),
+    ("message_gate_proj", "gain"),
+    ("forget_gate_proj", "forget"),
+)
+
+
+def is_mlx_lm_layout(weights: dict) -> bool:
+    return any(k.startswith(_LM_LAYER) for k in weights)
+
+
+def _lm_layer(d: dict, idx: int, args, spec: dict, out: dict) -> str:
+    pre = f"model.layers.{idx}."
+    a = "self_attn."
+    hidden, k = args.hidden_size, args.sconv_kernel_size
+    if args.is_sliding(idx):
+        parts = [_pop_linear(d, a + n) for n in _VLM_SLIDING_IN_PROJ]
+        _fuse_rows(parts, spec, pre + "attn.in_proj", out)
+        for n in ("k", "v"):
+            conv = d.pop(a + f"{n}_sconv.conv1d.weight")
+            out[pre + f"attn.{n}_conv"] = conv.reshape(-1, k)
+        out[pre + "attn_norm.weight"] = d.pop("input_layernorm.weight")
+    else:
+        parts = [_pop_linear(d, a + n) for n in _VLM_GLOBAL_Q_PROJ]
+        _fuse_rows(parts, spec, pre + "attn.q_proj", out)
+        for n in ("k", "v"):
+            parts = [
+                _pop_linear(d, a + f"{n}_proj"),
+                _pop_linear(d, a + f"{n}_sconv.weight_proj"),
+            ]
+            _fuse_rows(parts, spec, pre + f"attn.{n}_proj", out)
+            out[pre + f"attn.{n}_static"] = d.pop(a + f"{n}_sconv.static_weight")
+        for n in ("q", "k", "v"):
+            out[pre + f"{n}_input_norm.weight"] = d.pop(f"{n}_input_layernorm.weight")
+    for suffix, value in _pop_linear(d, a + "o_proj").items():
+        out[pre + "attn.o_proj." + suffix] = value
+    out[pre + "attn.q_scale"] = d.pop(a + "q_l2_clip.scale")
+    out[pre + "attn.r_scale"] = d.pop(a + "rel_l2_clip.scale")
+    out[pre + "attn.rel_proj"] = d.pop(a + "rel_logits_proj.proj")
+    attn_conv = d.pop("post_attention_convolution.conv1d.weight")
+    out[pre + "attn_conv"] = attn_conv.reshape(hidden, k)
+    mlp_conv = d.pop("post_mlp_convolution.conv1d.weight")
+    out[pre + "mlp_conv"] = mlp_conv.reshape(hidden, k)
+    out[pre + "mlp_norm.weight"] = d.pop("post_attention_layernorm.weight")
+    out[pre + "mlp.router_weight"] = d.pop("mlp.gate.weight").astype(mx.float32)
+    out[pre + "mlp.router_bias"] = d.pop("mlp.gate.e_score_correction_bias").astype(
+        mx.float32
+    )
+    for src, dst in (("attention_input", "attn_input"), ("mlp_input", "mlp_input")):
+        if f"{src}.query" in d:
+            out[pre + f"{dst}.query"] = (
+                d.pop(f"{src}.query").reshape(-1, hidden).astype(mx.float32)
+            )
+    for src, dst in (("gate_up_proj", "w13"), ("down_proj", "w2")):
+        for name in [n for n in d if n.startswith(f"mlp.experts.{src}.")]:
+            out[f"{pre}mlp.experts.{dst}.{name.rsplit('.', 1)[1]}"] = d.pop(name)
+    controllers = {
+        f"controllers.{dst}.{part}_weight": d.pop(f"{src}_message_gate.{name}.weight")
+        for src, dst in _LM_LOOP_GATES
+        for name, part in _LM_LOOP_PARTS
+        if f"{src}_message_gate.{name}.weight" in d
+    }
+    if controllers:
+        _loop_controllers(controllers, out, pre)
+    if d:
+        raise ValueError(f"Unmapped Inkling 2 tensors in layer {idx}: {sorted(d)}")
+    return "nvfp4" if f"{pre}mlp.experts.w13.global_scale" in out else "mxfp8"
+
+
+def sanitize_mlx_lm_weights(model, weights: dict) -> tuple[dict, dict]:
+    """Map an mlx-lm-layout Inkling 2 checkpoint to the runtime layout."""
+    args = model.args.text
+    quant = model.args.quantization or {}
+    spec = {n: quant[n] for n in ("group_size", "bits", "mode") if n in quant}
+    has_vision = getattr(model, "vision_tower", None) is not None
+    hidden = args.hidden_size
+    out: dict = {}
+    per_layer: dict[int, dict] = {}
+    for key, value in weights.items():
+        if key.startswith(_LM_VISION):
+            if has_vision:
+                name = _VLM_VISION + key[len(_LM_VISION) :]
+                for old, new in _LM_VISION_RENAMES:
+                    name = name.replace(old, new)
+                out[_vlm_vision_name(name)] = value
+            continue
+        if key.startswith(_LM_LAYER):
+            idx, rest = key[len(_LM_LAYER) :].split(".", 1)
+            per_layer.setdefault(int(idx), {})[rest] = value
+            continue
+        name = key.removeprefix(_LM_TEXT)
+        if key.startswith("lm_head."):
+            out[key] = value
+        elif name.startswith("embed_tokens."):
+            out["model.embed." + name.rsplit(".", 1)[1]] = value
+        elif name in ("embed_norm.weight", "norm.weight"):
+            out["model." + name] = value
+        elif name == "final_input.query":
+            out["model.final_input.query"] = value.reshape(-1, hidden).astype(
+                mx.float32
+            )
+        elif name == "message_input.query":
+            for i, idx in enumerate(args.loop_core):
+                out[f"model.layers.{idx}.loop_message.query"] = value[i].astype(
+                    mx.float32
+                )
+        else:
+            raise ValueError(f"Unmapped Inkling 2 tensor: {key}")
+    formats = {idx: _lm_layer(d, idx, args, spec, out) for idx, d in per_layer.items()}
+    return out, formats

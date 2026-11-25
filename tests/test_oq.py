@@ -10236,6 +10236,135 @@ def test_inkling2_mlx_vlm_quantization_is_rewritten_once(
     assert cfg["quantization"] == once
 
 
+_MLX_LM_INK2_LAYER = {
+    "attn.wq_du.weight": "self_attn.q_proj.weight",
+    "attn.wk_dv.weight": "self_attn.k_proj.weight",
+    "attn.wv_dv.weight": "self_attn.v_proj.weight",
+    "attn.wr_du.weight": "self_attn.r_proj.weight",
+    "attn.wo_ud.weight": "self_attn.o_proj.weight",
+    "attn.gate_attn.weight": "self_attn.gate_proj.weight",
+    "attn.attn_sink_proj.weight": "self_attn.sink_proj.weight",
+    "attn.q_l2_clip.scale": "self_attn.q_l2_clip.scale",
+    "attn.rel_l2_clip.scale": "self_attn.rel_l2_clip.scale",
+    "attn.rel_logits_proj.proj": "self_attn.rel_logits_proj.proj",
+    "attn_sconv.weight": "post_attention_convolution.conv1d.weight",
+    "mlp_sconv.weight": "post_mlp_convolution.conv1d.weight",
+    "attn_norm.weight": "input_layernorm.weight",
+    "mlp_norm.weight": "post_attention_layernorm.weight",
+    "mlp.gate.weight": "mlp.gate.weight",
+    "mlp.gate.bias": "mlp.gate.e_score_correction_bias",
+    **{f"{n}_input_norm.weight": f"{n}_input_layernorm.weight" for n in "qkv"},
+    **{f"attn.{n}_sconv.weight": f"self_attn.{n}_sconv.conv1d.weight" for n in "kv"},
+    **{f"attn.{n}_sconv.static_w": f"self_attn.{n}_sconv.static_weight" for n in "kv"},
+    **{
+        f"attn.{n}_sconv.weight_proj": f"self_attn.{n}_sconv.weight_proj.weight"
+        for n in "kv"
+    },
+    **{
+        f"controllers.{m}.{part}_weight": f"{gate}_message_gate.{name}.weight"
+        for m, gate in (("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "mlp"))
+        for part, name in (
+            ("down", "down_proj"),
+            ("gain", "message_gate_proj"),
+            ("forget", "forget_gate_proj"),
+        )
+    },
+}
+_MLX_LM_INK2_VISION = (
+    ("model.visual.proj_in.", "model.vision_tower.merger.linear_1."),
+    ("model.visual.proj_out.", "model.vision_tower.merger.linear_2."),
+    ("model.visual.backbone.", "model.vision_tower."),
+    ("embeddings.position_embedding", "embeddings.position_embedding.weight"),
+    ("ln_pre.", "pre_layernorm."),
+    ("ln_1.", "layernorm_before."),
+    ("ln_2.", "layernorm_after."),
+    ("ls_1.gamma", "lambda_1"),
+    ("ls_2.gamma", "lambda_2"),
+    ("mlp.c_fc.", "mlp.fc1."),
+    ("mlp.c_proj.", "mlp.fc2."),
+)
+
+
+def _mlx_lm_inkling2(source, dest):
+    shutil.copytree(source, dest, ignore=shutil.ignore_patterns("model.safetensors"))
+    config = json.loads((source / "config.json").read_text())
+    src = mx.load(str(source / "model.safetensors"))
+    lm = "model.language_model."
+    out = {
+        "lm_head.weight": src.pop("model.llm.unembed.weight"),
+        lm + "embed_tokens.weight": src.pop("model.llm.embed.weight"),
+        lm + "embed_norm.weight": src.pop("model.llm.embed_norm.weight"),
+        lm + "norm.weight": src.pop("model.llm.norm.weight"),
+        lm + "final_input.query": src.pop("model.llm.attn_res.output_query"),
+    }
+    for i in range(config["text_config"]["num_hidden_layers"]):
+        pre, dst = f"model.llm.layers.{i}.", f"{lm}layers.{i}."
+        out[dst + "mlp_input.query"] = src.pop(f"model.llm.attn_res.mlp_queries.{i}")
+        if i:
+            query = src.pop(f"model.llm.attn_res.attn_queries.{i - 1}")
+            out[dst + "attention_input.query"] = query
+        for which, name in (("w13", "gate_up_proj"), ("w2", "down_proj")):
+            ex, experts = f"{pre}mlp.experts.{which}_weight", f"{dst}mlp.experts.{name}"
+            out[experts + ".weight"] = src.pop(ex).view(mx.uint32)
+            out[experts + ".scales"] = src.pop(ex + "_scale")
+            if ex + "_amax" in src:
+                denom = src.pop(ex + "_outer_scale_denominator").astype(mx.float32)
+                amax = src.pop(ex + "_amax").astype(mx.float32)
+                out[experts + ".global_scale"] = amax * (6.0 * 448.0 / denom)
+        for old, new in _MLX_LM_INK2_LAYER.items():
+            if pre + old in src:
+                value = src.pop(pre + old)
+                conv = new.endswith("conv1d.weight")
+                out[dst + new] = value.swapaxes(1, 2) if conv else value
+    if "model.llm.middle_cycle_cross_pass_queries" in src:
+        h = config["text_config"]["hidden_size"]
+        q = src.pop("model.llm.middle_cycle_cross_pass_queries").reshape(-1, 2, h)
+        kv = src.pop("model.llm.middle_cycle_cross_pass_kv_queries").reshape(-1, 2, h)
+        out[lm + "message_input.query"] = mx.concatenate(
+            [q[:, :1], kv, q[:, 1:]], axis=1
+        )
+    for key, value in src.items():
+        for old, new in _MLX_LM_INK2_VISION:
+            key = key.replace(old, new)
+        out[key] = value
+    for key in list(out):
+        attention = ".self_attn." in key and key.startswith(lm + "layers.")
+        embedding = key in ("lm_head.weight", lm + "embed_tokens.weight")
+        if embedding or (attention and key.endswith("_proj.weight")):
+            base = key.removesuffix(".weight")
+            q = mx.quantize(out.pop(key), group_size=64, bits=4)
+            out.update(zip((key, f"{base}.scales", f"{base}.biases"), q))
+    config["quantization"] = {"group_size": 64, "bits": 4, "mode": "affine"}
+    config["quantization_config"] = config["quantization"]
+    (dest / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(dest / "model.safetensors"), out, {"format": "mlx"})
+    return dest
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+@pytest.mark.parametrize("looped", [False, True], ids=["plain", "looped"])
+def test_inkling2_mlx_lm_layout_loads_like_published_layout(
+    request, tmp_path, looped, patched_load_config
+):
+    source = request.getfixturevalue(
+        "inkling2_loop_source" if looped else "inkling2_source"
+    )
+    converted = _mlx_lm_inkling2(source, tmp_path / "mlx_lm")
+
+    expected = dict(tree_flatten(_inkling2_model(source).parameters()))
+    loaded = dict(tree_flatten(_inkling2_model(converted).parameters()))
+
+    for key, value in expected.items():
+        base = key.removesuffix(".weight")
+        if f"{base}.biases" in loaded:
+            want = mx.quantize(value, group_size=64, bits=4)
+            have = [loaded[f"{base}.{s}"] for s in ("weight", "scales", "biases")]
+            assert all(mx.array_equal(w, h).item() for w, h in zip(want, have)), key
+        else:
+            assert loaded[key].dtype == value.dtype, key
+            assert mx.array_equal(loaded[key], value, equal_nan=True).item(), key
+
+
 class TestGemma4AudioConfigSanitize:
     """Gemma 4 E2B/E4B sanitize reads audio_config.subsampling_conv_channels.
 

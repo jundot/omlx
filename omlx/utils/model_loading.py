@@ -522,6 +522,25 @@ def normalize_inkling2_mlx_vlm_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_inkling2_expert_quant(cfg: dict) -> dict:
+    """Keep mlx-lm from quantizing the Inkling 2 expert carriers.
+
+    The Inkling 2 model builds its expert carriers from the checkpoint. mlx-lm
+    infers a spec for a quantized module the config does not name, and that
+    fails on the native NVFP4 and MXFP8 experts that mlx-lm conversions keep.
+    """
+    if cfg.get("model_type") not in INKLING2_MODEL_TYPES:
+        return cfg
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict):
+        return cfg
+    layers = TextArgs.from_dict(cfg.get("text_config") or {}).num_hidden_layers
+    for idx in range(layers):
+        for which in ("w13", "w2"):
+            quant.setdefault(f"model.layers.{idx}.mlp.experts.{which}", False)
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -542,6 +561,7 @@ def _patch_mlx_lm_load_config() -> None:
         # Cluster ranks load MiniMax through mlx-lm, not the patched mlx-vlm.
         adopt_expert_global_scales(cfg)
         normalize_inkling2_mlx_vlm_quant(cfg)
+        normalize_inkling2_expert_quant(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
