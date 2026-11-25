@@ -10,7 +10,7 @@ It suits a large model that fits on one Mac with fast memory (good for decoding)
 
 | Family | `model_type` | Notes |
 |---|---|---|
-| DeepSeek V4.1 | `deepseek_v41` | Engram rows are read on this Mac and sent with each chunk |
+| DeepSeek V4.1 | `deepseek_v41` | Checkpoints converted by oMLX (any oQ level), not the original one. Engram rows are read on this Mac and sent with each chunk |
 | GLM-5.3 Flash | `glm5_next` | Works with a DFlash drafter |
 | Qwen3.8 Flash-Next | `qwen4_exp` | PLE rows are read on this Mac and sent with each chunk |
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | Works with the DSpark drafter |

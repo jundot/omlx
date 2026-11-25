@@ -870,6 +870,15 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         )
     }
 
+    func testLoopCDIsSentOnlyForLoopedModels() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "m", configModelType: "inkling2")
+        XCTAssertNil(vm.workingSettingsBody()[ProfileSettingsKey.loopcdEnabled])
+        vm.model = makeModel(id: "m", configModelType: "inkling2_loop")
+        vm.loopcdEnabled = true
+        XCTAssertEqual(vm.workingSettingsBody()[ProfileSettingsKey.loopcdEnabled]?.value as? Bool, true)
+    }
+
     func testGPUPowerLimitSendsZeroWhenOff() throws {
         let vm = ModelSettingsScreenVM()
         XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 0)

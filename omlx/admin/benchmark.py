@@ -405,6 +405,8 @@ _UPLOADED_SETTING_FIELDS = (
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
+    "loopcd_enabled",
+    "loopcd_skip_thinking",
     "qwen35_ane_prefill_enabled",
     "qwen35_ane_prefill_sequence_length",
     "qwen35_ane_prefill_tail_padding_min_tokens",
@@ -520,6 +522,8 @@ def _setting_feature_flags(
         flags.append(
             {"key": "qwen4_wide_decode", "label": "Qwen4 Extended Fused Decode"}
         )
+    if getattr(model_settings, "loopcd_enabled", False):
+        flags.append({"key": "loopcd", "label": "LoopCD"})
     if getattr(model_settings, "activation_fp16_enabled", False):
         flags.append({"key": "activation_fp16", "label": "Float16 Activations"})
     return flags

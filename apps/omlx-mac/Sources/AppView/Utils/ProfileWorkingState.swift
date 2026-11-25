@@ -189,6 +189,8 @@ enum ProfileSettingsKey {
     static let vlmMtpDraftModel = "vlm_mtp_draft_model"
     static let vlmMtpDraftBlockSize = "vlm_mtp_draft_block_size"
     static let loraAdapter = "lora_adapter"
+    static let loopcdEnabled = "loopcd_enabled"
+    static let loopcdSkipThinking = "loopcd_skip_thinking"
 }
 
 /// Resolves the *display* scope for the model's currently active profile.

@@ -1509,6 +1509,11 @@ class EnginePool:
 
         add("lora_adapter", data.get("lora_adapter") or None)
 
+        loopcd_active = bool(data.get("loopcd_enabled", False))
+        add("loopcd_enabled", loopcd_active)
+        if loopcd_active:
+            add("loopcd_skip_thinking", data.get("loopcd_skip_thinking", False))
+
         return tuple(signature)
 
     def _wanted_specprefill_draft(

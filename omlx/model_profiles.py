@@ -89,6 +89,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_threshold",
     "index_cache_freq",
     "lora_adapter",
+    "loopcd_enabled",
+    "loopcd_skip_thinking",
 )
 
 # Excluded — never stored in a profile or template.
