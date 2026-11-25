@@ -1431,7 +1431,6 @@ class TestStreaming:
         assert body["prompt"] == "12 + 30 =" and "messages" not in body
         assert body["max_tokens"] == 2 and body["stop"] == ["\n"]
         assert body["ignore_eos"] is True
-        # Splash returns 400 for a thinking budget on text completions.
         assert "thinking_token_budget" not in body
 
 

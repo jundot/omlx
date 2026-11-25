@@ -1087,7 +1087,6 @@ class _StreamState:
     def add_choice(self, choice: dict[str, Any]) -> tuple[str, bool]:
         """Apply one streamed choice; returns (new text, produced output)."""
         self.finish_reason = choice.get("finish_reason") or self.finish_reason
-        # A text completion streams its text in place of a delta.
         delta = choice.get("delta") or {"content": choice.get("text")}
         piece = ""
         if delta.get("reasoning_content"):
@@ -1760,8 +1759,6 @@ class SplashEngine(BaseEngine):
         )
 
     # -- plain completions -----------------------------------------------------------
-    # Splash added /v1/completions in 1.2.0, below MIN_SPLASH_VERSION, so every
-    # supported release has it and no version check is needed.
 
     async def stream_generate(
         self,
@@ -1785,8 +1782,6 @@ class SplashEngine(BaseEngine):
             presence_penalty,
             kwargs,
         )
-        # Splash generates the raw text with no reasoning split, and refuses a
-        # thinking budget there; oMLX's comes from the model settings as well.
         body.pop("thinking_token_budget", None)
         body["prompt"] = prompt
         async for output in self._stream(
