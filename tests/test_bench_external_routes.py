@@ -57,12 +57,10 @@ def _clean_bench_state():
 
     benchmark._benchmark_runs.clear()
     benchmark.clear_queue()
-    benchmark._queue_task = None
     accuracy_benchmark._queue.clear()
     yield
     benchmark._benchmark_runs.clear()
     benchmark.clear_queue()
-    benchmark._queue_task = None
     accuracy_benchmark._queue.clear()
 
 

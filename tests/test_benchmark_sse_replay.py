@@ -22,6 +22,7 @@ from typing import Optional
 import pytest
 
 from omlx.admin import accuracy_benchmark
+from omlx.admin import benchmark as bench_module
 from omlx.admin.benchmark import (
     BenchmarkRequest,
     BenchmarkRun,
@@ -356,11 +357,8 @@ def bench_client(monkeypatch):
 
     from omlx.admin import routes as admin_routes
 
-    from omlx.admin import benchmark as bench_module
-
     _benchmark_runs.clear()
     clear_queue()
-    monkeypatch.setattr(bench_module, "_queue_task", None)
     monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: _FakePool())
 
     async def _fake_require_admin():
@@ -409,10 +407,6 @@ class TestActiveBenchEndpoint:
 
 
 class TestConcurrentStartQueueing:
-    """Server never starts a second throughput bench while one is
-    running — two concurrent runs on the same engine produce mutually-
-    corrupted measurements — so the second request waits in the queue."""
-
     def test_start_queues_when_already_running(self, bench_client):
         # Seed a running run in the registry.
         existing = BenchmarkRun(
@@ -436,16 +430,10 @@ class TestConcurrentStartQueueing:
         assert body["queue"] == [
             {"queue_id": body["queue_id"], "model_id": "model-x", "external": False}
         ]
-        # The registry still has only the original run — the queued
-        # request starts after it, not alongside it.
         assert len(_benchmark_runs) == 1
         assert get_queue() == body["queue"]
 
-    def test_start_queues_while_finished_run_uploads(self, bench_client, monkeypatch):
-        # The run is "completed" but its queue task is still uploading and
-        # will start the next queued request: a new start must wait too.
-        from omlx.admin import benchmark as bench_module
-
+    def test_start_queues_while_finished_run_uploads(self, bench_client):
         class _Pending:
             def done(self):
                 return False
@@ -457,7 +445,6 @@ class TestConcurrentStartQueueing:
         uploading.status = "completed"
         uploading.task = _Pending()
         _benchmark_runs[uploading.bench_id] = uploading
-        monkeypatch.setattr(bench_module, "_queue_task", uploading.task)
 
         r = bench_client.post(
             "/admin/api/bench/start",
@@ -467,16 +454,21 @@ class TestConcurrentStartQueueing:
         assert r.json()["status"] == "queued"
         assert len(_benchmark_runs) == 1
 
-        # Cancel still reaches the queue behind the uploading run.
         r = bench_client.post("/admin/api/bench/bench-uploading/cancel")
         assert r.status_code == 200, r.text
         assert get_queue() == []
         assert uploading.status == "completed"
 
+    def test_other_benchmarks_refuse_while_runs_are_queued(self, bench_client):
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-x", prompt_lengths=[1024])
+        )
+        for path in ("/admin/api/bench/context/start", "/admin/api/bench/ane-tune/start"):
+            r = bench_client.post(path, json={"model_id": "model-x"})
+            assert r.status_code == 409, r.text
+
     @pytest.mark.asyncio
     async def test_queue_runs_after_the_current_run(self, bench_client, monkeypatch):
-        from omlx.admin import benchmark as bench_module
-
         ran = []
 
         async def _fake_run(run, pool):
@@ -496,8 +488,6 @@ class TestConcurrentStartQueueing:
 
     @pytest.mark.asyncio
     async def test_queue_drains_when_a_run_raises(self, bench_client, monkeypatch):
-        from omlx.admin import benchmark as bench_module
-
         ran = []
 
         async def _fake_run(run, pool):
@@ -514,7 +504,6 @@ class TestConcurrentStartQueueing:
             BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
         )
         await bench_module.run_queue(first, None)
-        # A failing run is reported on that run, and the next one still runs.
         assert ran == ["model-a", "model-b"]
         assert first.error_message == "engine exploded"
         assert first.terminal is True
@@ -527,8 +516,6 @@ class TestConcurrentStartQueueing:
     async def test_queue_drops_idle_power_cap_per_promoted_run(
         self, bench_client, monkeypatch
     ):
-        from omlx.admin import benchmark as bench_module
-
         drops = []
 
         async def _fake_run(run, pool):
@@ -544,8 +531,6 @@ class TestConcurrentStartQueueing:
         bench_module.add_to_queue(
             BenchmarkRequest(model_id="model-c", prompt_lengths=[1024])
         )
-        # The caller drops the cap for the first run itself; the queue has to
-        # do it for every run it promotes.
         await bench_module.run_queue(first, None, on_start=lambda: drops.append(1))
         assert drops == [1, 1]
         assert get_queue() == []
@@ -554,16 +539,11 @@ class TestConcurrentStartQueueing:
     async def test_queue_still_runs_what_arrived_after_a_cancel(
         self, bench_client, monkeypatch
     ):
-        from omlx.admin import benchmark as bench_module
-
         ran = []
 
         async def _fake_run(run, pool):
             ran.append(run.request.model_id)
             if run.request.model_id == "model-a":
-                # Mirrors the cancel route: the run is cancelled and the
-                # queue cleared, then the user queues another request
-                # before the task gets to exit.
                 run.status = "cancelled"
                 bench_module.clear_queue()
                 bench_module.add_to_queue(
@@ -581,11 +561,32 @@ class TestConcurrentStartQueueing:
         assert get_queue() == []
 
     @pytest.mark.asyncio
+    async def test_queue_stops_when_the_pool_shuts_down(
+        self, bench_client, monkeypatch
+    ):
+        ran = []
+        pool = _FakePool()
+
+        async def _fake_run(run, engine_pool):
+            ran.append(run.request.model_id)
+            engine_pool._shutting_down = True
+            run.status = "cancelled"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        await bench_module.run_queue(first, pool)
+        assert ran == ["model-a"]
+        assert get_queue() == []
+
+    @pytest.mark.asyncio
     async def test_queue_is_not_left_waiting_without_a_task(
         self, bench_client, monkeypatch
     ):
-        from omlx.admin import benchmark as bench_module
-
         async def _never_finishes(run, pool):
             raise asyncio.CancelledError
 
@@ -596,7 +597,6 @@ class TestConcurrentStartQueueing:
         bench_module.add_to_queue(
             BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
         )
-        # Cancelling the queue task must not leave entries that nothing runs.
         with pytest.raises(asyncio.CancelledError):
             await bench_module.run_queue(first, None)
         assert get_queue() == []
@@ -630,16 +630,7 @@ class TestConcurrentStartQueueing:
 
 
 class TestQueueDelete:
-    """`DELETE /api/bench/queue/{queue_id}` removes one entry by id.
-
-    Ids stay stable while the queue advances, so a delete cannot hit a
-    different request after the queue moved between the UI poll and the
-    click.
-    """
-
     def test_remove_by_queue_id(self, bench_client):
-        from omlx.admin import benchmark as bench_module
-
         bench_module.add_to_queue(
             BenchmarkRequest(model_id="model-x", prompt_lengths=[1024])
         )
@@ -654,8 +645,6 @@ class TestQueueDelete:
         assert "not found" in r.json()["detail"]
 
     def test_remove_keeps_the_other_entries(self, bench_client):
-        from omlx.admin import benchmark as bench_module
-
         bench_module.add_to_queue(
             BenchmarkRequest(model_id="model-x", prompt_lengths=[1024])
         )
@@ -664,6 +653,6 @@ class TestQueueDelete:
         )
         first, second = bench_module.get_queue()
 
-        r = bench_client.delete(f"/admin/api/bench/queue/{first['queue_id']}")
+        r = bench_client.delete(f"/admin/api/bench/queue/{second['queue_id']}")
         assert r.status_code == 200, r.text
-        assert r.json()["queue"] == [second]
+        assert r.json()["queue"] == [first]

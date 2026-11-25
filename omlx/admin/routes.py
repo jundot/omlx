@@ -151,6 +151,8 @@ from .benchmark import (
     _sanitize_upload_error,
     _upload_model_name,
 )
+from .benchmark import get_active_run as get_active_throughput_run
+from .benchmark import get_queue as get_throughput_queue
 from .hf_downloader import MODEL_FORMATS, _is_repo_id
 from .recipe import (
     ALL_FIELDS,
@@ -9356,6 +9358,11 @@ async def start_ane_tuning(
             status_code=409,
             detail=f"A throughput benchmark is already running ({throughput.bench_id}).",
         )
+    if get_throughput_queue():
+        raise HTTPException(
+            status_code=409,
+            detail="Throughput benchmarks are waiting in the queue.",
+        )
     context = get_active_context_run()
     if context is not None:
         raise HTTPException(
@@ -9500,6 +9507,11 @@ async def start_context_benchmark(
                 f"(bench_id={throughput_active.bench_id}, "
                 f"model_id={throughput_active.request.model_id})."
             ),
+        )
+    if get_throughput_queue():
+        raise HTTPException(
+            status_code=409,
+            detail="Throughput benchmarks are waiting in the queue.",
         )
     from .ane_tuning import get_active_run as get_active_ane_tuning
 
@@ -9738,7 +9750,6 @@ async def start_benchmark(
     engine produce mutually-corrupted measurements, so a request that
     arrives while a throughput bench is running waits in the queue.
     """
-    from . import benchmark as bench_module
     from .benchmark import (
         BenchmarkRequest,
         add_to_queue,
@@ -9799,8 +9810,6 @@ async def start_benchmark(
                 detail=f"Model {bench_request.model_id} is not a supported model (type: {entry.model_type})",
             )
 
-    # The queue task stays alive while a finished run uploads its results,
-    # and it starts the next queued request afterwards.
     if queue_busy() or get_active_run() is not None:
         queue_id = add_to_queue(bench_request)
         return {
@@ -9817,12 +9826,9 @@ async def start_benchmark(
     total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
 
     _drop_idle_gpu_power_cap()
-    # Queued runs start inside the previous run's release delay, so the
-    # queue gets the same power-cap drop as a direct start.
     run.task = asyncio.create_task(
         run_queue(run, engine_pool, on_start=_drop_idle_gpu_power_cap)
     )
-    bench_module._queue_task = run.task
 
     logger.info(
         f"Benchmark started: {run.bench_id} model={bench_request.model_id} "
@@ -9920,9 +9926,8 @@ async def cancel_benchmark(
     if run is None:
         raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
 
-    # A finished run that is still uploading keeps its result; only the
-    # queue behind it is dropped.
-    if run.status == "completed" and run.task is not None and not run.task.done():
+    uploading = run.task is not None and not run.task.done()
+    if run.status == "completed" and uploading and get_active_throughput_run() is None:
         clear_queue()
         return {"status": "cancelled", "bench_id": bench_id}
 

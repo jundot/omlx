@@ -188,8 +188,6 @@ class BenchmarkRun:
 
     bench_id: str
     request: BenchmarkRequest
-    # Queue entry this run came from, so a client that queued it can tell
-    # when its own request is the one running. None for a direct start.
     queue_id: Optional[str] = None
     status: str = "running"  # running, completed, cancelled, error
     events: list[dict] = field(default_factory=list)
@@ -640,17 +638,14 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
             del _benchmark_runs[bid]
 
 
-# Requests waiting for the running benchmark, oldest first, each with the
-# id handed back to the client that queued it.
 _queue: list[tuple[str, BenchmarkRequest]] = []
-# Task running `run_queue`. It outlives a run's "running" status while that
-# run uploads its results, and it starts the next queued request afterwards.
-_queue_task: Optional[asyncio.Task] = None
 
 
 def queue_busy() -> bool:
-    """True while a `run_queue` task is alive, including during uploads."""
-    return _queue_task is not None and not _queue_task.done()
+    """True while a run's `run_queue` task is alive, including during uploads."""
+    return any(
+        r.task is not None and not r.task.done() for r in _benchmark_runs.values()
+    )
 
 
 def add_to_queue(request: BenchmarkRequest) -> str:
@@ -691,31 +686,22 @@ async def run_queue(
 ) -> None:
     """Run `run`, then each queued request in turn until the queue is empty.
 
-    Cancel stops the chain by clearing the queue, so the queue itself is
-    the end condition: a request queued after a cancel still runs instead
-    of dying with the task.
-
-    `on_start` runs before each request the queue promotes, because a
-    promoted run begins inside the previous run's release delay (the
-    caller uses it to drop a GPU power cap left over from the last run).
+    Cancel ends the chain by clearing the queue, so a request queued after
+    the cancel still runs. `on_start` runs before each promoted request.
     """
     try:
         while True:
             try:
                 await run_benchmark(run, engine_pool)
             except Exception as e:  # noqa: BLE001
-                # One failing run must not strand the rest of the queue.
                 logger.error(
                     f"Benchmark queue: run {run.bench_id} raised: {e}", exc_info=True
                 )
                 run.status = "error"
                 run.error_message = str(e)
-                # `run_benchmark` reports its own failures, but an exception
-                # that escapes it would leave subscribers waiting for a
-                # terminal event. Send one unless the run already ended.
                 if not run.terminal:
                     await _send_event(run, {"type": "error", "message": str(e)})
-            if not _queue:
+            if not _queue or getattr(engine_pool, "_shutting_down", False):
                 return
             cleanup_old_runs()
             queue_id, request = _queue.pop(0)
@@ -724,7 +710,6 @@ async def run_queue(
             if on_start is not None:
                 on_start()
     finally:
-        # Nothing may stay queued once the task that would run it is gone.
         _queue.clear()
 
 

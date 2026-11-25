@@ -706,13 +706,11 @@
             // that is NOT the one this tab is displaying. Drives the "another
             // bench is running" banner.
             benchOtherActive: null,
-            // Requests waiting behind the running bench (server queue mirror).
             benchQueue: [],
             // One follow loop at a time; a second would double-poll.
             benchFollowing: false,
             // Config of the run on screen; the form may already describe a queued one.
             benchRun: null,
-            // Text exports of earlier runs, newest first (this session only).
             benchCompleted: [],
 
             // Bench sub-tab & dropdown
@@ -5478,7 +5476,6 @@
                     external: this.benchExternalEnabled ? this.externalRequestBody() : null,
                 });
 
-                // A run is in progress: the server queues this one behind it.
                 if (this.benchRunning) {
                     try {
                         const response = await fetch('/admin/api/bench/start', {
@@ -5572,7 +5569,6 @@
                 }
             },
 
-            // Keep the text export of a run whose results are about to leave the page.
             _benchArchive() {
                 if (!this.benchSingleResults.length && !this.benchBatchResults.length) return;
                 let text;
@@ -5586,10 +5582,6 @@
                 this.benchCompleted = [{ model_id: model, text }, ...this.benchCompleted].slice(0, 10);
             },
 
-            // The server starts the next queued run once this one has finished.
-            // A finished run keeps its queue task busy while it uploads, and the
-            // upload can outlast the run by a while, so wait as long as entries
-            // are still waiting (two minutes at 500 ms is the safety net).
             async _benchFollowQueue() {
                 if (this.benchFollowing) return;
                 this.benchFollowing = true;
@@ -6196,7 +6188,6 @@
             // Restore the config UI from an active run discovered via
             // /api/bench/active. External model ids aren't in the local
             // dropdown, so the external flag drives which controls light up.
-            // With keepForm, only the run on screen changes, not the form.
             _restoreBenchRunSource(data, keepForm = false) {
                 const profile = data.context_profile || 'code_python';
                 this.benchRun = {

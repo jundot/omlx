@@ -278,8 +278,6 @@ final class ThroughputBenchScreenVM {
                     self.currentBenchId = benchId
                     self.pollResults(client: client)
                 } else {
-                    // Queued behind the active run: watch the queue until
-                    // this request is the one running.
                     self.running = false
                     self.pendingQueueId = resp.queueId
                     self.queuedAhead = Self.position(
@@ -305,12 +303,7 @@ final class ThroughputBenchScreenVM {
             }
             return
         }
-        guard let benchId = currentBenchId else {
-            // Nothing to cancel server-side — flip the UI back regardless
-            // so we don't strand the screen in "Running…" forever.
-            running = false
-            return
-        }
+        guard running, let benchId = currentBenchId else { return }
         Task { [weak self] in
             do {
                 _ = try await client.cancelBench(benchId: benchId)
@@ -354,10 +347,6 @@ final class ThroughputBenchScreenVM {
                     return
                 }
                 guard let ahead = Self.position(of: queueId, in: active.queue) else {
-                    // The entry is gone without ever running — removed from
-                    // the web UI, or lost with a server restart. Stop waiting
-                    // instead of polling forever and cancelling by a stale
-                    // index.
                     self.pendingQueueId = nil
                     self.queuedAhead = nil
                     self.running = false
