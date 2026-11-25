@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from types import SimpleNamespace
 
 import pytest
@@ -941,95 +940,3 @@ def test_minimax_batch_verify_rollback_keeps_each_rows_accepted_prefix():
                 got.index_keys[..., : got.index_offset, :],
                 want.index_keys[..., : want.index_offset, :],
             ).item()
-
-
-_MM3_NS = "]<]minimax[>["
-_MM3_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "validate_policy",
-            "parameters": {
-                "type": "object",
-                "properties": {"policy": {"type": "object"}},
-                "required": ["policy"],
-            },
-        },
-    }
-]
-
-
-def _minimax_policy_call(key: str) -> str:
-    ns = _MM3_NS
-    return (
-        f'{ns}<tool_call>{ns}<invoke name="validate_policy">{ns}<policy>'
-        f"{ns}<Version>2012-10-17{ns}</Version>"
-        f"{ns}<Condition>{ns}<StringEquals>{ns}<{key}>true{ns}</{key}>"
-        f"{ns}</StringEquals>{ns}</Condition>"
-        f"{ns}</policy>{ns}</invoke>{ns}</tool_call>"
-    )
-
-
-@pytest.mark.parametrize(
-    "key",
-    [
-        "aws:SourceAccount",
-        "aws:ResourceTag/team",
-        "aws:RequestTag/${TagKey}",
-        "application/json",
-    ],
-)
-def test_minimax_m3_parser_accepts_argument_keys_with_slashes(key):
-    from omlx.patches.mlx_vlm_minimax_m3_compat import (
-        apply_mlx_vlm_minimax_m3_compat_patch,
-    )
-
-    apply_mlx_vlm_minimax_m3_compat_patch()
-
-    from mlx_vlm.tools.parsers.minimax_m3 import parse_tool_call
-
-    parsed = parse_tool_call(_minimax_policy_call(key), _MM3_TOOLS)
-
-    arguments = json.loads(parsed["arguments"])
-    assert arguments["policy"]["Condition"]["StringEquals"] == {key: "true"}
-
-
-@pytest.mark.parametrize("tag", ["", "a b", "a<b"])
-def test_minimax_m3_parser_still_rejects_structural_tags(tag):
-    from omlx.patches.mlx_vlm_minimax_m3_compat import (
-        apply_mlx_vlm_minimax_m3_compat_patch,
-    )
-
-    apply_mlx_vlm_minimax_m3_compat_patch()
-
-    from mlx_vlm.tools.parsers.minimax_m3 import parse_tool_call
-
-    with pytest.raises(ValueError, match="invalid tag"):
-        parse_tool_call(_minimax_policy_call(tag), _MM3_TOOLS)
-
-
-def test_minimax_m3_parse_failure_is_logged_at_warning(caplog):
-    from omlx.adapter.output_parser import MiniMaxM3OutputParserSession
-
-    class StubTokenizer:
-        def decode(self, ids, skip_special_tokens=False):
-            return ""
-
-    session = MiniMaxM3OutputParserSession(StubTokenizer())
-    # Truncated invoke: the stream filter has already hidden this block, so the
-    # only signal left is the log record.
-    session._raw_text = (
-        f'{_MM3_NS}<tool_call>{_MM3_NS}<invoke name="validate_policy">'
-        f"{_MM3_NS}<policy>"
-    )
-
-    with caplog.at_level(logging.WARNING, logger="omlx.adapter.output_parser"):
-        result = session.finalize()
-
-    assert result.tool_calls == []
-    assert result.finish_reason is None
-    messages = [record.getMessage() for record in caplog.records]
-    assert any(
-        "MiniMax M3 tool-call parse failed for 'validate_policy'" in message
-        for message in messages
-    ), messages

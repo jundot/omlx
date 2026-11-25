@@ -9,11 +9,7 @@ tool_call_end = "]<]minimax[>[</tool_call>"
 _NS_TOKEN = "]<]minimax[>["
 _ELEMENT_START = f"{_NS_TOKEN}<"
 _ELEMENT_END_START = f"{_NS_TOKEN}</"
-# Element boundaries come from the namespace token and the literal closing tag,
-# so the name rule only has to keep out structural characters. Argument keys such
-# as AWS IAM "aws:ResourceTag/<key>" or MIME types ("application/json") contain
-# "/" and must round-trip instead of failing the whole call.
-_TAG_NAME_RE = re.compile(r"[^\s<>]+")
+_TAG_NAME_RE = re.compile(r"[^<>]+")
 _INVOKE_RE = re.compile(
     rf"{re.escape(_NS_TOKEN)}<invoke\b(?P<attrs>[^>]*)>"
     rf"(?P<body>.*?){re.escape(_NS_TOKEN)}</invoke>",
@@ -268,9 +264,7 @@ def _node_to_value(node, schema=None, schema_context=False):
 
 
 def _parse_open_tag(body, pos):
-    if not body.startswith(_ELEMENT_START, pos) or body.startswith(
-        _ELEMENT_END_START, pos
-    ):
+    if not body.startswith(_ELEMENT_START, pos):
         raise ValueError("MiniMax M3 tool invocation expected an opening tag.")
 
     name_start = pos + len(_ELEMENT_START)
@@ -300,9 +294,7 @@ def _parse_element(body, pos):
 
         if body.startswith(close_tag, pos):
             return node, pos + len(close_tag)
-        if body.startswith(_ELEMENT_START, pos) and not body.startswith(
-            _ELEMENT_END_START, pos
-        ):
+        if body.startswith(_ELEMENT_START, pos):
             child, pos = _parse_element(body, pos)
             node["children"].append(child)
             continue
@@ -323,9 +315,7 @@ def _parse_nodes(body):
         if pos >= length:
             break
 
-        if body.startswith(_ELEMENT_START, pos) and not body.startswith(
-            _ELEMENT_END_START, pos
-        ):
+        if body.startswith(_ELEMENT_START, pos):
             child, pos = _parse_element(body, pos)
             children.append(child)
             continue

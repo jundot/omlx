@@ -12,7 +12,6 @@ from __future__ import annotations
 import importlib
 import json
 import logging
-import re
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -185,9 +184,6 @@ _MINIMAX_EOS_TOKEN = "[e~["
 _MINIMAX_SPECIAL_TOKENS = (_MINIMAX_EOS_TOKEN, "]~b]", "]~!b[", "]!p~[", "]!d~[")
 _MINIMAX_TOOL_CALL_START = "]<]minimax[>[<tool_call>"
 _MINIMAX_TOOL_CALL_END = "]<]minimax[>[</tool_call>"
-_MINIMAX_INVOKE_NAME_RE = re.compile(
-    r"""<invoke\b[^>]*?\bname\s*=\s*(?:(["'])(?P<quoted>.*?)\1|(?P<bare>[^\s>]+))"""
-)
 _DEEPSEEK_V4_TOOL_CALL_START = "<｜DSML｜tool_calls>"
 _DEEPSEEK_V4_TOOL_CALL_END = "</｜DSML｜tool_calls>"
 _BAILING_HYBRID_MODEL_TYPE = "bailing_hybrid"
@@ -698,13 +694,6 @@ class DeepSeekV4OutputParserSession:
         )
 
 
-def _minimax_invoke_name(raw_text: str) -> str | None:
-    match = _MINIMAX_INVOKE_NAME_RE.search(raw_text)
-    if not match:
-        return None
-    return match.group("quoted") or match.group("bare")
-
-
 class MiniMaxM3OutputParserSession:
     """Parser session for MiniMax M3 XML-style tool calls."""
 
@@ -824,15 +813,7 @@ class MiniMaxM3OutputParserSession:
                     if isinstance(call, dict) and call.get("name")
                 ]
             except Exception as e:  # noqa: BLE001
-                # The tool-call text is already hidden from the stream, so a
-                # failed parse used to end the turn as "stop" with no tool call
-                # and nothing above DEBUG. Name the call so operators can see it.
-                tool_name = _minimax_invoke_name(self._raw_text)
-                logger.warning(
-                    "MiniMax M3 tool-call parse failed%s: %s",
-                    f" for {tool_name!r}" if tool_name else "",
-                    e,
-                )
+                logger.warning("MiniMax M3 tool-call parse failed: %s", e)
 
         return OutputParserFinalizeResult(
             stream_text=stream_text,
