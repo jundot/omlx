@@ -39,6 +39,7 @@ const PR_CLOSE_TAIL =
 
 const TEMPLATE_URL = 'https://github.com/jundot/omlx/blob/main/.github/pull_request_template.md';
 const TLDR_SINCE = Date.parse('2026-11-25T08:08:53Z');
+const TLDR_GRACE_MS = 5 * 60 * 1000;
 const TLDR_LABEL = 'needs-tldr';
 const TLDR_BOX = 'I wrote the TL;DR myself. No AI wrote or edited it.';
 const TLDR_CLOSE_TAIL =
@@ -190,9 +191,18 @@ module.exports = async ({ github, context, core }) => {
     labelNames(pr).some((l) => PR_EXEMPT_LABELS.includes(l));
 
   async function onPullRequest() {
-    const data = await github.graphql(PR_QUERY, { owner, repo, number: context.payload.pull_request.number });
-    const pr = data.repository.pullRequest;
-    if (pr.state === 'MERGED' || prExempt(pr) || Date.parse(pr.createdAt) < TLDR_SINCE) return;
+    const { number } = context.payload.pull_request;
+    const fetchPr = async () => (await github.graphql(PR_QUERY, { owner, repo, number })).repository.pullRequest;
+    const skipped = (pr) => pr.state === 'MERGED' || prExempt(pr) || Date.parse(pr.createdAt) < TLDR_SINCE;
+
+    let pr = await fetchPr();
+    const wait = Date.parse(pr.createdAt) + TLDR_GRACE_MS - Date.now();
+    if (wait > 0 && !skipped(pr)) {
+      core.info(`PR #${number} was just opened, checking it in ${Math.ceil(wait / 1000)} s`);
+      await sleep(wait);
+      pr = await fetchPr();
+    }
+    if (skipped(pr)) return;
     const body = pr.body.replace(/\r\n/g, '\n');
 
     const problem = tldrProblem(body);
