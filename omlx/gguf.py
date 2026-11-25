@@ -81,8 +81,8 @@ _HF_MODEL_TYPES = {
 CONFIG_FILE = "config.json"
 _CHAT_TEMPLATE_FILE = "chat_template.jinja"
 _GENERATION_CONFIG_FILE = "generation_config.json"
-# Rebuild generated folders with Inkling 2's config and tokenizer.
-_FOLDER_LAYOUT = 4
+# Rebuild generated folders with Inkling 2's validated config and tokenizer.
+_FOLDER_LAYOUT = 5
 
 # The qwen35 pre-tokenizer: Qwen2's letter class extended to combining
 # marks, then byte-level BPE.
@@ -453,6 +453,7 @@ def derive_config(
     if layers is not None:
         # MTP layers are not part of the model the engines run.
         layers -= field("nextn_predict_layers") or 0
+    header_layers = layers
     hf_type = _HF_MODEL_TYPES.get(arch)
     inkling = hf_type == "inkling2_loop"
     if arch == "inkling2" and layers is not None:
@@ -468,10 +469,19 @@ def derive_config(
         vocab_size = tokens.length
     else:
         vocab_size = len(tokens) if isinstance(tokens, list) else None
+    if inkling:
+        padded = field("vocab_size")
+        vocab_size = (
+            padded
+            if padded is not None and vocab_size is not None and padded >= vocab_size
+            else None
+        )
 
     def head_count(name: str) -> int | None:
         value = metadata.get(f"{arch}.attention.{name}")
-        if inkling and isinstance(value, list) and value:
+        if inkling and isinstance(value, list):
+            if not value or len(value) != header_layers:
+                return None
             first = _int(value[0])
             return first if all(_int(count) == first for count in value) else None
         return _int(value)
@@ -486,7 +496,7 @@ def derive_config(
         "full_attention_interval": field("full_attention_interval"),
         "num_experts": field("expert_count"),
         "num_experts_per_tok": field("expert_used_count"),
-        "vocab_size": field("vocab_size") if inkling else vocab_size,
+        "vocab_size": vocab_size,
     }
     if inkling:
         sizes["n_routed_experts"] = sizes.pop("num_experts")

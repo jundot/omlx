@@ -57,6 +57,7 @@ from omlx.engine.splash import (
 )
 from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.exceptions import InvalidRequestError, ModelLoadingError
+from omlx.gguf import ArrayInfo, derive_config
 from omlx.model_discovery import discover_models
 from omlx.model_settings import ModelSettings
 from omlx.settings import GlobalSettings
@@ -682,6 +683,33 @@ def _qwen38_gguf(vocab: list[str]) -> dict:
 
 
 class TestGguf:
+
+    @pytest.mark.parametrize(
+        "invalid_fields",
+        [
+            {"inkling2_loop.attention.head_count": [24]},
+            {"inkling2_loop.attention.head_count_kv": [8] * 23},
+            {"tokenizer.ggml.tokens": ArrayInfo(length=201025)},
+        ],
+        ids=["short-head-array", "short-kv-head-array", "undersized-padded-vocab"],
+    )
+    def test_inkling2_gguf_inconsistent_geometry_is_incompatible(self, invalid_fields):
+        metadata = {
+            "general.architecture": "inkling2_loop",
+            "inkling2_loop.block_count": 24,
+            "inkling2_loop.context_length": 1048576,
+            "inkling2_loop.embedding_length": 2304,
+            "inkling2_loop.attention.head_count": [24] * 24,
+            "inkling2_loop.attention.head_count_kv": [8] * 24,
+            "inkling2_loop.attention.key_length": 128,
+            "inkling2_loop.expert_count": 128,
+            "inkling2_loop.expert_used_count": 8,
+            "inkling2_loop.vocab_size": 201024,
+            "tokenizer.ggml.tokens": ArrayInfo(length=200058),
+        }
+        assert splash_mod.splash_family(derive_config(metadata)) == "Inkling-2-Mini"
+        metadata.update(invalid_fields)
+        assert splash_mod.splash_family(derive_config(metadata)) is None
 
     @pytest.mark.parametrize("arch, layers", [("inkling2", 48), ("inkling2_loop", 24)])
     def test_inkling2_gguf_discovers_and_resolves(
