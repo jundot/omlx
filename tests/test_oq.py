@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for oQ (oMLX Universal Dynamic Quantization)."""
 
+import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -10121,13 +10122,35 @@ def _store_affine(tensors, quant, path, weight, group_size, bits):
     quant[path] = {"group_size": group_size, "bits": bits, "mode": "affine"}
 
 
+# mlx-vlm: inkling2 imports models.inkling, which the Inkling compat patch shadows.
+_MLX_VLM_INKLING2_SANITIZE = """
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import mlx.core as mx
+from mlx_vlm.models.inkling2.inkling2 import Model
+
+source = Path(sys.argv[1])
+text = json.loads((source / "config.json").read_text())["text_config"]
+owner = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(**text)))
+weights = Model.sanitize(owner, mx.load(str(source / "model.safetensors")))
+mx.save_safetensors(sys.argv[2], weights)
+"""
+
+
 def _mlx_vlm_inkling2(source, dest, *, attention_bits=None, expert_bits=()):
-    inkling2 = pytest.importorskip("mlx_vlm.models.inkling2.inkling2")
+    if importlib.util.find_spec("mlx_vlm.models.inkling2") is None:
+        pytest.skip("mlx-vlm has no inkling2 model")
+    sanitized = source.parent / "mlx_vlm.safetensors"
+    if not sanitized.exists():
+        script = [sys.executable, "-c", _MLX_VLM_INKLING2_SANITIZE]
+        subprocess.run([*script, str(source), str(sanitized)], check=True)
     shutil.copytree(source, dest, ignore=shutil.ignore_patterns("model.safetensors"))
     config = json.loads((source / "config.json").read_text())
     text = config["text_config"]
-    owner = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(**text)))
-    tensors = inkling2.Model.sanitize(owner, mx.load(str(source / "model.safetensors")))
+    tensors = mx.load(str(sanitized))
     quant = dict(TestInkling2OQ.NVFP4)
     for key in [k for k in tensors if ".switch_mlp." in k and k.endswith(".weight")]:
         path = key.removesuffix(".weight")
