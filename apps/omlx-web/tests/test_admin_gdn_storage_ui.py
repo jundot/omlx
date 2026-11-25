@@ -13,14 +13,14 @@ GDN_I18N_KEYS = {
     "settings.advanced.gdn_snapshot_storage_embedded",
     "settings.advanced.gdn_pending_write_limit",
     "settings.advanced.gdn_pending_write_limit_hint",
-    "settings.advanced.gdn_sidecar_state_precision",
-    "settings.advanced.gdn_sidecar_state_precision_hint",
-    "settings.advanced.gdn_sidecar_state_precision_warning",
-    "settings.advanced.gdn_sidecar_state_precision_rht_int16",
-    "settings.advanced.gdn_sidecar_state_precision_fp32",
-    "settings.advanced.gdn_sidecar_state_precision_bf16",
-    "settings.advanced.gdn_sidecar_state_precision_int8",
-    "settings.advanced.gdn_sidecar_state_precision_rht_int8",
+    "settings.advanced.gdn_snapshot_state_precision",
+    "settings.advanced.gdn_snapshot_state_precision_hint",
+    "settings.advanced.gdn_snapshot_state_precision_warning",
+    "settings.advanced.gdn_snapshot_state_precision_rht_int16",
+    "settings.advanced.gdn_snapshot_state_precision_fp32",
+    "settings.advanced.gdn_snapshot_state_precision_bf16",
+    "settings.advanced.gdn_snapshot_state_precision_int8",
+    "settings.advanced.gdn_snapshot_state_precision_rht_int8",
 }
 
 
@@ -39,8 +39,16 @@ def test_settings_template_exposes_gdn_storage_policy_and_codecs():
     assert 'value="rht_int16"' in template
     assert 'value="fp32"' in template
     assert 'value="rht_int8"' in template
-    assert "globalSettings.cache.gdn_sidecar_precision !== 'fp32'" in template
+    assert "globalSettings.cache.gdn_snapshot_state_dtype !== 'fp32'" in template
     assert "text-red-600" in template
+    # Precision selector must stay enabled in embedded / hot-cache-only modes.
+    select_start = template.index(
+        'x-model="globalSettings.cache.gdn_snapshot_state_dtype"'
+    )
+    select_tag = template[select_start : template.index(">", select_start)]
+    assert ':disabled="!globalSettings.cache.enabled"' in select_tag
+    assert "embedded" not in select_tag
+    assert "hot_cache_only" not in select_tag
 
 
 def test_gdn_cache_policy_i18n_keys_exist_in_every_locale():
@@ -50,6 +58,9 @@ def test_gdn_cache_policy_i18n_keys_exist_in_every_locale():
         translations = json.loads(locale_path.read_text())
         missing_keys = GDN_I18N_KEYS - translations.keys()
         assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
+        # FP32 is the exact default; no locale may label a lossy option as recommended.
+        rht16 = translations["settings.advanced.gdn_snapshot_state_precision_rht_int16"]
+        assert rht16 == "RHT + int16", f"{locale_path.name}: {rht16!r}"
 
 
 def test_dashboard_posts_canonical_gdn_fields_only():
@@ -59,7 +70,8 @@ def test_dashboard_posts_canonical_gdn_fields_only():
     payload = script[payload_start:payload_end]
 
     assert "gdn_snapshot_storage:" in payload
-    assert "gdn_sidecar_precision:" in payload
+    assert "gdn_snapshot_state_dtype:" in payload
+    assert "gdn_sidecar_precision:" not in payload
     assert "gdn_sidecar_state_dtype:" not in payload
     assert "gdn_ssd_pending_max_size:" in payload
     assert "gdn_ssd_split_enabled:" not in payload
