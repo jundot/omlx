@@ -399,23 +399,25 @@ class Inkling2Experts(nn.Module):
         """The routed expert outputs [N, K, H] and their FP32 weights [N, K]
         (NVFP4 tensor scale included), before ``moe_sum``."""
         xe = mx.expand_dims(x, (-2, -3))
+        armed = is_row_exact_armed()
+        # The expert-order kernel repeats gather_qmm's one-pair arithmetic, so
+        # it takes every block gather_qmm runs pair by pair: a decode row, a
+        # row-exact verify block, and any block below gather_qmm's batched
+        # sorted kernel (four pairs per expert). Shared experts are read once.
+        experts = self.w13.weight.shape[0]
+        per_pair = inds.size < verify_experts.PAIRS_PER_EXPERT * experts
+        fused = (
+            (per_pair or (armed and inds.shape[0] <= verify_experts.MAX_ROWS))
+            and verify_experts.supported(self.w13, x.dtype)
+            and verify_experts.supported(self.w2, x.dtype)
+        )
         # Sorting regroups the pairs by expert and changes their arithmetic;
         # row-exact verify rows keep the per-pair gather of a decode step.
-        do_sort = inds.size >= 64 and not is_row_exact_armed()
+        do_sort = not fused and inds.size >= 64 and not armed
         idx = inds
         inv = None
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
-        # A row-exact verify block runs its pairs in expert order, so rows
-        # that share an expert read its weights once (same bits per pair).
-        # A one-row decode step takes the same kernel, also with its bits.
-        fused = (
-            not do_sort
-            and inds.shape[0] <= verify_experts.MAX_ROWS
-            and (inds.shape[0] == 1 or is_row_exact_armed())
-            and verify_experts.supported(self.w13, x.dtype)
-            and verify_experts.supported(self.w2, x.dtype)
-        )
         if fused:
             pairs = inds.reshape(-1)
             order = pair_order(pairs) if inds.shape[0] > 1 else None

@@ -29,6 +29,9 @@ import mlx.core as mx
 
 # Lightning MTP verifies up to 16 rows.
 MAX_ROWS = 16
+# MLX 0.32.4's gather_qmm runs sorted one-row pairs one at a time below four
+# pairs per expert.
+PAIRS_PER_EXPERT = 4
 
 _HEADER = r"""
 using namespace metal;
