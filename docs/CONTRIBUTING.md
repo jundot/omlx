@@ -67,6 +67,8 @@ Hardware-specific improvements are welcome. If you cannot run representative ben
 
 AI-assisted contributions are welcome. You are responsible for the change however it was produced: understand it, be able to explain it in review, and show how you validated it.
 
+The one part you write yourself is the TL;DR at the top of the PR. Write 1 to 3 sentences in any language. An AI may translate it into English and do nothing else to it. I close PRs without review when the TL;DR is missing, empty or written by an AI. The code rules in [AGENTS.md](../AGENTS.md) apply to every change, however it was written.
+
 ## Submit for Review
 
 Describe the problem, your approach, related issues, and validation results. Update documentation for user-facing changes. Keep unfinished work in Draft; mark it ready when you want review, or ask a specific question for early feedback.
