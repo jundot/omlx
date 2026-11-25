@@ -17,9 +17,12 @@ kernel repeating that arithmetic, so rerun
 tests/test_inkling2_verify_experts.py after an MLX pin change.
 
 A one-row decode step takes it too: with no shared experts it still beats
-``gather_qmm``'s launch for the same pairs, and the bits do not change. With
-float16 activations the NVFP4 tensor scale is applied in the epilogue, as
-``gather_qmm`` does when it is passed ``global_scale``.
+``gather_qmm``'s launch for the same pairs, and the bits do not change. So does
+any block below ``gather_qmm``'s switch to its batched sorted kernel, such as
+a short prompt suffix after a prefix cache hit: there ``gather_qmm`` also runs
+each pair on its own. With float16 activations the NVFP4 tensor scale is
+applied in the epilogue, as ``gather_qmm`` does when it is passed
+``global_scale``.
 """
 
 from __future__ import annotations
@@ -30,6 +33,9 @@ import mlx.core as mx
 
 # Lightning MTP verifies up to 16 rows.
 MAX_ROWS = 16
+# MLX 0.32.4's gather_qmm takes its batched kernel for sorted one-row pairs
+# from four pairs per expert on; below that it runs each pair on its own.
+PAIRS_PER_EXPERT = 4
 
 _HEADER = r"""
 using namespace metal;
