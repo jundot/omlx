@@ -14,7 +14,9 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
+from ..patches.inkling2.loader import is_mlx_vlm_quantization, mlx_vlm_quantization
 from ..patches.inkling2.loopcd import apply_loopcd
+from ..patches.inkling2.model import TextArgs
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
@@ -464,6 +466,24 @@ def normalize_inkling2_modelopt_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_inkling2_mlx_vlm_quant(cfg: dict) -> dict:
+    """Move an mlx-vlm-layout Inkling 2 quantization onto runtime paths.
+
+    Checkpoints quantized through mlx-vlm key ``quantization`` by mlx-vlm's
+    module names (``language_model.model.layers.N.self_attn.q_proj``). The
+    runtime fuses some of those modules, and mlx-lm applies the per-path specs
+    to the runtime module tree, so the keys are rewritten before it does.
+    """
+    if cfg.get("model_type") not in INKLING2_MODEL_TYPES:
+        return cfg
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict) or not is_mlx_vlm_quantization(quant):
+        return cfg
+    text = TextArgs.from_dict(cfg.get("text_config") or {})
+    cfg["quantization"] = mlx_vlm_quantization(quant, text)
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -483,6 +503,7 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_hy_v3_rope_config(cfg)
         # Cluster ranks load MiniMax through mlx-lm, not the patched mlx-vlm.
         adopt_expert_global_scales(cfg)
+        normalize_inkling2_mlx_vlm_quant(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
