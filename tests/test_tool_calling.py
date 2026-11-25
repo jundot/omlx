@@ -4494,8 +4494,8 @@ class TestQwen3CoderMarkerInArguments:
 
         for shape in (wrapped_evil, naked_loose, fake_terminators):
             for run in (stream, stream_chunked, parse, _wrap_naked_function_calls):
-                small = max(count(run, shape(100)), 1)
-                large = count(run, shape(400))
+                small = max(count(run, shape(40)), 1)
+                large = count(run, shape(160))
                 # 4x the input: linear is ~4x, quadratic ~16x.
                 assert large / small < 6, (
                     f"{shape.__name__}/{run.__name__}: {small=} {large=}"

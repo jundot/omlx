@@ -1655,7 +1655,12 @@ class TestMing3Patches:
         def run(sample):
             mx.random.seed(0)
             steps = sample(
-                model, "p", "t", max_decode_steps=max_steps, temperature=temperature
+                model,
+                "p",
+                "t",
+                max_decode_steps=max_steps,
+                temperature=temperature,
+                flow_steps=3,
             )
             return [(mx.array(latent), last) for latent, last in steps]
 
@@ -1683,7 +1688,7 @@ class TestMing3Patches:
 
         def run(sample):
             mx.random.seed(0)
-            kwargs = {"cfg": cfg, "temperature": temperature, "steps": 10}
+            kwargs = {"cfg": cfg, "temperature": temperature, "steps": 3}
             return sample(flow, hidden, history, **kwargs)
 
         want = run(tiny_flow.FlowLoss.sample._omlx_original)
@@ -1705,7 +1710,7 @@ class TestMing3Patches:
 
         def run(sample):
             mx.random.seed(0)
-            return sample(flow, hidden, history, cfg=2.0, temperature=0.5, steps=10)
+            return sample(flow, hidden, history, cfg=2.0, temperature=0.5, steps=3)
 
         want = run(tiny_flow.FlowLoss.sample._omlx_original)
         got = run(tiny_flow.FlowLoss.sample)

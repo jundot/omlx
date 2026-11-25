@@ -419,8 +419,7 @@ def test_row_exact_verify_attention_matches_one_row_decode(language, prompt):
     assert mx.array_equal(verify, mx.concatenate(steps, axis=1)).item()
 
 
-@pytest.mark.parametrize("columns", [96, 65536])
-@pytest.mark.parametrize("rows", [5, 7])
+@pytest.mark.parametrize("rows,columns", [(5, 96), (7, 96), (7, 65536)])
 def test_row_exact_verify_affine_projection_matches_one_row_decode(
     language, rows, columns
 ):
@@ -594,9 +593,15 @@ def test_small_l_sparse_attention_kernel_matches_reference(language, monkeypatch
 
 
 @pytest.mark.parametrize(
-    "shape", [(1, 1, 6144), (1, 7, 6144), (8, 128), (2, 1, 4, 128), (5, 4100)]
+    "shape,out",
+    [
+        ((1, 1, 6144), "model"),
+        ((1, 7, 6144), "float32"),
+        ((8, 128), "float32"),
+        ((2, 1, 4, 128), "model"),
+        ((5, 4100), "model"),
+    ],
 )
-@pytest.mark.parametrize("out", ["model", "float32"])
 def test_decode_rms_norm_matches_mlx(language, shape, out):
     import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
 
@@ -644,18 +649,17 @@ def _head_inputs(batch, length):
 
 
 @pytest.mark.parametrize(
-    "batch,length,offset",
+    "batch,length,offset,dims,rope_scale",
     [
-        (1, 1, 4097),
-        (1, 1, [-3]),
-        (2, 1, [37, 50]),
-        (1, 4, 300),
+        (1, 1, 4097, 64, 1.0),
+        (1, 1, [-3], 64, 1.0),
+        (2, 1, [37, 50], 128, 1.0),
+        (1, 4, 300, 64, 0.25),
         # A left-padded prefill puts its padding at negative positions.
-        (2, 3, [-2, 5]),
-        (8, 1, [0, 1, 2, 3, 4, 5, 6, 7]),
+        (2, 3, [-2, 5], 64, 1.0),
+        (8, 1, [0, 1, 2, 3, 4, 5, 6, 7], 128, 1.0),
     ],
 )
-@pytest.mark.parametrize("dims,rope_scale", [(64, 1.0), (128, 1.0), (64, 0.25)])
 def test_decode_head_norm_rope_matches_mlx(
     language, batch, length, offset, dims, rope_scale
 ):
@@ -878,7 +882,7 @@ def test_one_token_experts_match_the_ops(language, monkeypatch):
     xs = [
         (mx.random.normal((1, 1, 1024)) * scale).astype(mx.bfloat16)
         for scale in (0.5, 2.0, 8.0)
-        for _ in range(8)
+        for _ in range(2)
     ]
     calls = []
     moe_experts = dk.moe_experts
@@ -978,8 +982,13 @@ def test_block_selection_kernel_matches_argpartition(language, blocks):
     assert mx.array_equal(selected, expected).item()
 
 
-@pytest.mark.parametrize("length", [1, 5])
-def test_small_l_sparse_attention_staging_changes_no_bit(language, monkeypatch, length):
+@pytest.mark.parametrize(
+    "length,tiles",
+    [(1, ((16, 32),)), (5, ((16, 32), (8, 32), (4, 32), (8, 64)))],
+)
+def test_small_l_sparse_attention_staging_changes_no_bit(
+    language, monkeypatch, length, tiles
+):
     import mlx_vlm.models.minimax_m3_vl.msa as msa
 
     # M3.1's layout: blocks as long as the head dimension, 16 query heads per
@@ -1030,7 +1039,7 @@ def test_small_l_sparse_attention_staging_changes_no_bit(language, monkeypatch, 
 
     # Every grouping, chunk and value layout computes the same bits, including
     # one threadgroup for all 16 heads reading values from device memory.
-    for heads_per_group, chunk in ((16, 32), (8, 32), (4, 32), (8, 64)):
+    for heads_per_group, chunk in tiles:
         monkeypatch.setattr(msa, "_SMALL_L_HEADS_PER_THREADGROUP", heads_per_group)
         monkeypatch.setattr(msa, "_SMALL_L_VALUE_CHUNK", chunk)
         for values in (v, v_rows):

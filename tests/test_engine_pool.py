@@ -5476,7 +5476,10 @@ class TestLoadRefusalNamesBindingCeiling:
             tier="safe",
         )
 
-        with pytest.raises(ModelTooLargeError) as exc_info:
+        with (
+            patch("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0),
+            pytest.raises(ModelTooLargeError) as exc_info,
+        ):
             asyncio.run(pool.get_engine("model-a"))
 
         message = str(exc_info.value)
@@ -5540,6 +5543,7 @@ class TestLoadRefusalNamesBindingCeiling:
         mock_engine.start = AsyncMock()
 
         with (
+            patch("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0),
             patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
             patch("omlx.engine_pool.get_phys_footprint", return_value=2000),
             patch("omlx.engine_pool.mx.get_active_memory", return_value=0),

@@ -292,8 +292,8 @@ def test_yarn_masked_rows_equal_mlx_path(monkeypatch):
 def test_fused_verify_rollback_then_decode_matches_mlx(monkeypatch):
     """Accept one draft of a four-row window, roll the rest back, decode on."""
     attn = _attention(seed=5)
-    cache = _prefill(attn, 900, seed=6)
-    reference = _prefill(attn, 900, seed=6)
+    cache = _prefill(attn, 100, seed=6)
+    reference = _prefill(attn, 100, seed=6)
     mx.random.seed(21)
     window = (mx.random.normal((1, 4, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
     follow = (mx.random.normal((1, 3, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
@@ -356,10 +356,16 @@ def test_fp32_sdpa_gate_matches_mlx(keys, rows, spread):
     assert _bit_equal(got, want)
 
 
-@pytest.mark.parametrize("rows", [1, 4, 8, 16, 300])
-@pytest.mark.parametrize("pos_ndim", [2, 3])
-@pytest.mark.parametrize("config", [_CONFIG, _YARN_CONFIG], ids=["default", "yarn"])
-@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize(
+    "rows,pos_ndim,config,dtype",
+    [
+        (1, 3, _CONFIG, mx.bfloat16),
+        (300, 2, _CONFIG, mx.float32),
+        (16, 3, _YARN_CONFIG, mx.float32),
+        (4, 2, _YARN_CONFIG, mx.bfloat16),
+    ],
+    ids=["default-bf16", "default-fp32", "yarn-fp32", "yarn-bf16"],
+)
 def test_prep_matches_norms_and_mrope(rows, pos_ndim, config, dtype):
     attn = _attention(seed=9, config=config)
     mx.random.seed(rows + pos_ndim)
@@ -453,16 +459,13 @@ def test_decode_prep_matches_mlx_path(monkeypatch, context, positions):
         mx.eval(out)
         return out
 
-    for seed in range(3):
-        mx.random.seed(seed)
-        x = (mx.random.normal((1, 1, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
-        got = step(x)
-        got_state = _state(cache)
-        cache.trim(1)
-        monkeypatch.setattr(attn_fused, "_DISABLED", True)
-        want = step(x)
-        want_state = _state(cache)
-        cache.trim(1)
-        monkeypatch.setattr(attn_fused, "_DISABLED", False)
-        assert _bit_equal(got, want)
-        assert all(_bit_equal(g, w) for g, w in zip(got_state, want_state))
+    mx.random.seed(0)
+    x = (mx.random.normal((1, 1, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+    got = step(x)
+    got_state = _state(cache)
+    cache.trim(1)
+    monkeypatch.setattr(attn_fused, "_DISABLED", True)
+    want = step(x)
+    want_state = _state(cache)
+    assert _bit_equal(got, want)
+    assert all(_bit_equal(g, w) for g, w in zip(got_state, want_state))

@@ -35,6 +35,11 @@ from omlx.utils.network import (
 # =============================================================================
 
 
+@pytest.fixture(autouse=True)
+def answered_reverse_lookup(monkeypatch):
+    monkeypatch.setattr(network.socket, "getfqdn", lambda: "mac.example")
+
+
 def _make_global_settings(
     server_aliases: list[str] | None = None, host: str = "127.0.0.1"
 ):

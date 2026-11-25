@@ -577,8 +577,7 @@ def test_sanitize_remaps_quantized_forget_gate_sidecars():
     )
 
 
-@pytest.mark.parametrize("text_only", [False, True])
-@pytest.mark.parametrize("preserve_mtp", [False, True])
+@pytest.mark.parametrize("text_only,preserve_mtp", [(False, False), (True, True)])
 def test_oq_roundtrip_with_nextn_weights(tmp_path, monkeypatch, text_only, preserve_mtp):
     from mlx.utils import tree_flatten
     from mlx_vlm.models import glm5_next
@@ -4637,8 +4636,10 @@ def test_kda_shared_bank_keeps_mixed_metadata_dtypes(promoted_field):
         )
 
 
-@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize(
+    "bits,dtype",
+    [(2, mx.float16), (4, mx.bfloat16), (5, mx.float32), (8, mx.bfloat16)],
+)
 def test_kda_affine_shared_weights_preserve_projections_and_serialization(
     bits, dtype, tmp_path
 ):

@@ -59,7 +59,7 @@ def test_k2_uses_standard_oq_policy(level, budgeted):
         ), path
 
 
-@pytest.fixture(params=["dense", "moe", "mova"])
+@pytest.fixture
 def k2_checkpoint(tmp_path, request):
     from mlx.utils import tree_flatten
 
@@ -89,7 +89,14 @@ def k2_checkpoint(tmp_path, request):
     return source
 
 
-@pytest.mark.parametrize("level", sorted(OQ_LEVELS))
+@pytest.mark.parametrize(
+    "k2_checkpoint, level",
+    [
+        (("dense", "moe", "mova")[i % 3], level)
+        for i, level in enumerate(sorted(OQ_LEVELS))
+    ],
+    indirect=["k2_checkpoint"],
+)
 def test_every_oq_level_converts_and_reloads_k2(k2_checkpoint, tmp_path, level):
     from mlx_lm.models.cache import make_prompt_cache
     from mlx_lm.utils import load_model

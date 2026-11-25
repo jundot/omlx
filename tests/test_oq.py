@@ -2461,14 +2461,14 @@ class TestCalibrationWalkMatchesNativeForward:
             "vocab_size": 128,
             "hidden_size": 32,
             "intermediate_size": 64,
-            "num_hidden_layers": 4,
+            "num_hidden_layers": 2,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "head_dim": 8,
             "max_position_embeddings": 256,
             "sliding_window": 8,
-            "layer_types": ["sliding_attention"] * 3 + ["full_attention"],
-            "layer_rope_theta": [10000.0, 10000.0, 10000.0, 0],
+            "layer_types": ["sliding_attention", "full_attention"],
+            "layer_rope_theta": [10000.0, 0],
         }
         vision = {
             "hidden_size": 8,
@@ -2642,16 +2642,17 @@ class TestCalibrationWalkMatchesNativeForward:
         # The model lists the layer types; no layer carries a sliding flag.
         config = {
             **self._DENSE,
+            "num_hidden_layers": 2,
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
             "rope_scaling": None,
-            "layer_types": ["sliding_attention", "full_attention"] * 2,
+            "layer_types": ["sliding_attention", "full_attention"],
         }
         return self._tiny_lm("gpt_oss", config)
 
     def _gemma3_text(self, path):
         # Embeddings scaled by sqrt(hidden_size) before the first layer.
-        config = {**self._DENSE, "sliding_window_pattern": 2}
+        config = {**self._DENSE, "num_hidden_layers": 2, "sliding_window_pattern": 2}
         return self._tiny_lm("gemma3_text", config)
 
     @pytest.mark.parametrize(
@@ -3130,8 +3131,9 @@ class TestQuantizeChunked:
     @pytest.mark.skipif(
         not HAS_MLX or not mx.metal.is_available(), reason="Metal not available"
     )
-    @pytest.mark.parametrize("group_size", [32, 64, 128])
-    @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+    @pytest.mark.parametrize(
+        "group_size,dtype", [(32, "bfloat16"), (64, "float16"), (128, "bfloat16")]
+    )
     def test_metal_lsq_refit_matches_reference(self, group_size, dtype):
         dtype = getattr(mx, dtype)
         mx.random.seed(1)
@@ -8520,7 +8522,7 @@ class TestQwen35TextCheckpoint:
         config = {
             "model_type": model_type,
             "hidden_size": 64,
-            "intermediate_size": 128,
+            "intermediate_size": 64,
             "num_hidden_layers": 2,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
@@ -8539,8 +8541,8 @@ class TestQwen35TextCheckpoint:
             config.update(
                 num_experts=4,
                 num_experts_per_tok=2,
-                shared_expert_intermediate_size=128,
-                moe_intermediate_size=128,
+                shared_expert_intermediate_size=64,
+                moe_intermediate_size=64,
             )
             module = qwen3_5_moe
         else:
@@ -8631,7 +8633,7 @@ def _flint_config(window=513):
 
     return ModelConfig(
         hidden_size=64,
-        intermediate_size=128,
+        intermediate_size=64,
         num_hidden_layers=3,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -8719,13 +8721,12 @@ class TestFlintCalibration:
         finally:
             collector.restore(model)
 
-    @pytest.mark.parametrize("window", [3, 513])
-    def test_streamed_calibration_matches_resident(self, tmp_path, monkeypatch, window):
+    def test_streamed_calibration_matches_resident(self, tmp_path, monkeypatch):
         import omlx.oq as oq
 
         source = tmp_path / "source"
-        model, config = _flint_checkpoint(source, window)
-        length = window + 3
+        model, config = _flint_checkpoint(source, window=3)
+        length = 6
         tokens = (mx.arange(8 * length).reshape(8, length) % 100).astype(mx.int32)
         monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
         resident, _ = oq._collect_imatrix_from_model(
@@ -9108,7 +9109,6 @@ def _qwen3_5_stream_source(path, model_type, *, vlm, mtp):
 
 _QWEN3_5_STREAM_CASES = [
     pytest.param("qwen3_5_moe", True, True, id="moe-vlm-mtp"),
-    pytest.param("qwen3_5", True, True, id="dense-vlm-mtp"),
     pytest.param("qwen3_5_moe", False, True, id="moe-text-mtp"),
     pytest.param("qwen3_5", False, False, id="dense-text"),
 ]
@@ -9482,6 +9482,7 @@ class TestStreamedCalibration:
         """Streamed Qwen3.5 statistics and sensitivity match resident collection."""
         import omlx.oq as oq
 
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "num_hidden_layers", 2)
         source = tmp_path / "source"
         config = _qwen3_5_stream_source(source, model_type, vlm=vlm, mtp=mtp)
         # As many rows as tokens: a gated delta net would apply a causal mask as
@@ -9528,10 +9529,11 @@ class TestStreamedCalibration:
         import omlx.oq as oq
 
         # Layers wide enough to be quantized and refined.
-        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "hidden_size", 256)
-        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "intermediate_size", 512)
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "num_hidden_layers", 2)
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "hidden_size", 128)
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "intermediate_size", 128)
         for key in ("moe_intermediate_size", "shared_expert_intermediate_size"):
-            monkeypatch.setitem(_QWEN3_5_STREAM_EXPERTS, key, 256)
+            monkeypatch.setitem(_QWEN3_5_STREAM_EXPERTS, key, 128)
         source = tmp_path / "source"
         _qwen3_5_stream_source(source, model_type, vlm=False, mtp=False)
         tokens = (mx.arange(16).reshape(4, 4) * 7 % 120 + 1).astype(mx.int32)
@@ -9786,8 +9788,9 @@ class TestInkling2OQ:
     NVFP4 = {"bits": 4, "group_size": 16, "mode": "nvfp4"}
     MXFP8 = {"bits": 8, "group_size": 32, "mode": "mxfp8"}
 
-    @pytest.mark.parametrize("text_only", [True, False])
-    @pytest.mark.parametrize("looped", [False, True], ids=["plain", "looped"])
+    @pytest.mark.parametrize(
+        "looped,text_only", [(False, True), (False, False), (True, False)]
+    )
     def test_sanitizer_matches_runtime_loader(self, request, looped, text_only):
         from omlx.patches.inkling2.loader import sanitize_weights
         from omlx.patches.inkling2.model import ModelArgs

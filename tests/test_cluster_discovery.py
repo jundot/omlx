@@ -1254,8 +1254,9 @@ def test_multicast_loop_rebuilds_wedged_socket():
         service.stop()
 
 
-def test_spawned_thread_restarts_after_crash():
+def test_spawned_thread_restarts_after_crash(monkeypatch):
     service, _ = _service()
+    monkeypatch.setattr(service._stop, "wait", lambda _timeout: None)
     calls = []
 
     def flaky():

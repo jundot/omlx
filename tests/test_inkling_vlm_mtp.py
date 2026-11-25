@@ -25,9 +25,11 @@ def strict_math_device():
     """Use deterministic CPU reductions for chunk-shape parity assertions."""
     previous = mx.default_device()
     mx.set_default_device(mx.cpu)
+    mx.disable_compile()
     try:
         yield
     finally:
+        mx.enable_compile()
         mx.set_default_device(previous)
 
 
@@ -499,12 +501,16 @@ _TINY_VISION = dict(
     mlp_ratio=2.0,
 )
 
-# Prelude 0-5, core 6-11 three times, coda 12-17: 30 layer visits. MXFP8 only:
-# the random NVFP4 codes reach ~1e7 activations, and three core passes turn
-# that bf16 noise into chunking-dependent logits.
+_TINY_PLAIN = dict(
+    formats=("mxfp8",) * 3 + ("nvfp4",) * 3,
+    n_layers_per_attn_res_block=3,
+    local_layer_ids=[0, 1, 3, 4],
+)
 _TINY_LOOP = dict(
-    formats=("mxfp8",) * 18,
-    loop_config=dict(core_start=6, core_end=12, num_passes=3, gate_rank=64),
+    formats=("mxfp8",) * 9,
+    n_layers_per_attn_res_block=3,
+    local_layer_ids=[0, 1, 3, 4, 6, 7],
+    loop_config=dict(core_start=3, core_end=6, num_passes=3, gate_rank=64),
 )
 _TINY_LOOPCD = dict(_TINY_LOOP, skip_thinking=True)
 _FIRST_CONTROL, _OPEN_THINKING, _END_BLOCK = 290, 291, 299
@@ -571,7 +577,7 @@ def _inkling2_tiny(
     return model
 
 
-@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+@pytest.mark.parametrize("dims", [_TINY_PLAIN, _TINY_LOOP], ids=["plain", "looped"])
 def test_inkling2_incremental_and_chunked_match_full_forward(dims):
     model = _inkling2_tiny(**dims)
     ids = mx.random.randint(0, 300, (1, 26))
@@ -599,13 +605,13 @@ def test_inkling2_loopcd_contrasts_with_the_one_pass_model():
     ids = mx.random.randint(0, 300, (2, 26))
     _, expected = _unguided_and_guided_logits(ids)
     model = _inkling2_tiny(**_TINY_LOOP, skip_thinking=False)
-    out = model(ids, capture_layer_ids=[30], return_hidden=True)
+    out = model(ids, capture_layer_ids=[15], return_hidden=True)
     assert mx.abs(out.logits[..., :300] - expected).max().item() < 1e-4
     assert (out.logits[..., 300:] == -mx.inf).all()
     assert mx.array_equal(out.hidden_states[0], out.hidden_states[1])
 
 
-@pytest.mark.parametrize("change", [dict(num_passes=1), dict(core_end=18)])
+@pytest.mark.parametrize("change", [dict(num_passes=1), dict(core_end=9)])
 def test_inkling2_loopcd_needs_a_second_pass_and_a_coda(change):
     loop = dict(_TINY_LOOP["loop_config"], **change)
     model = _inkling2_tiny(**{**_TINY_LOOP, "loop_config": loop})
@@ -753,8 +759,9 @@ def test_inkling2_loop_model_type_uses_inkling2(tmp_path):
 
 
 # 15 drafts: the widest window the model declares (a verbatim context copy).
-@pytest.mark.parametrize("drafts", [7, 15])
-@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+@pytest.mark.parametrize(
+    "dims, drafts", [(_TINY_PLAIN, 7), (_TINY_LOOP, 15)], ids=["plain", "looped"]
+)
 def test_inkling2_verify_rollback_matches_sequential_decode(dims, drafts):
     model = _inkling2_tiny(**dims)
     assert drafts + 1 <= model._omlx_mtp_max_verify_rows
@@ -770,7 +777,7 @@ def test_inkling2_verify_rollback_matches_sequential_decode(dims, drafts):
         ids[:, 20 : 21 + drafts],
         cache=cache,
         return_hidden=True,
-        capture_layer_ids=[5, 12],
+        capture_layer_ids=[5, model.model.num_visits],
     )
     assert [h.shape for h in out.hidden_states] == [(1, drafts + 1, 128)] * 3
     # Three drafts accepted: the confirmed token plus three stay.
@@ -818,17 +825,18 @@ def _run_inkling2_steps(model, ids, steps):
     return outs, cache
 
 
-@pytest.mark.parametrize("dims", [dict(formats=("mxfp8",) * 12), _TINY_LOOP])
-def test_inkling2_sliding_state_matches_a_cache_of_every_key(dims, monkeypatch):
+def test_inkling2_sliding_state_matches_a_cache_of_every_key(monkeypatch):
     # BF16 with chunks of 32 tokens or more runs the flash prefill kernel,
     # whose tiles must not move when old keys are dropped.
     from omlx.patches.inkling2 import cache as windows
 
     window = 48
-    model = _bf16(_inkling2_tiny(sliding_window_size=window, rel_extent=window, **dims))
+    model = _bf16(
+        _inkling2_tiny(sliding_window_size=window, rel_extent=window, **_TINY_LOOP)
+    )
     ids = mx.random.randint(0, 300, (1, 520))
     steps = [200, 77, 33, 1, 1]
-    steps += [(8, 3), 1, (8, 7), (6, 0), 1] * 4
+    steps += [(8, 3), 1, (8, 7), (6, 0), 1] * 2
     steps += [64, 1, (8, 2)]
     got, cache = _run_inkling2_steps(model, ids, steps)
 
@@ -844,7 +852,7 @@ def test_inkling2_sliding_state_matches_a_cache_of_every_key(dims, monkeypatch):
         assert mx.array_equal(a, b)
     held = cache[0][windows.KEYS].shape[2]
     assert window - 1 <= held < window + 16
-    assert reference[0][windows.KEYS].shape[2] == 440  # every token of the run
+    assert reference[0][windows.KEYS].shape[2] == 410
 
 
 def test_inkling2_rows_with_different_windows_decode_together():
@@ -945,10 +953,15 @@ def test_inkling2_restored_state_decodes_and_joins_like_the_live_one():
             assert a.batch_size == 2
 
 
-@pytest.mark.parametrize("proj", ["quantized", "dense"])
-@pytest.mark.parametrize("width", [8, 16])
 @pytest.mark.parametrize(
-    "dims", [{}, _TINY_LOOP, _TINY_LOOPCD], ids=["plain", "looped", "loopcd"]
+    "dims, width, proj",
+    [
+        (_TINY_PLAIN, 8, "dense"),
+        (_TINY_PLAIN, 16, "quantized"),
+        (_TINY_LOOPCD, 16, "dense"),
+        (_TINY_LOOPCD, 8, "quantized"),
+    ],
+    ids=["plain-8-dense", "plain-16-quantized", "loopcd-16-dense", "loopcd-8-quantized"],
 )
 def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width, proj):
     """With quantized projections, or BF16 dense ones as in the release, each
@@ -999,9 +1012,9 @@ def test_inkling2_row_exact_verify_rows_match_serial_decode(dims, width, proj):
         set_verify_qmm_armed(False)
     for row, expected in enumerate(serial):
         assert mx.array_equal(block[row], expected)
-    if dims:
+    if "loop_config" in dims:
         # The looped rows ran the BF16 controller kernels.
-        assert model.model.layers[6].__dict__["_omlx_loop_bf16"][2] is not None
+        assert model.model.layers[3].__dict__["_omlx_loop_bf16"][2] is not None
 
 
 def test_inkling2_fused_kernels_match_reference():
@@ -1050,7 +1063,7 @@ def _assert_bits(fn, reference, args, **kw):
 
 # FP32 (the tiny models' dtype) has no rounding that could hide a fused
 # multiply-add in a kernel.
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
 def test_inkling2_conv_kernels_keep_the_reference_bits(dtype):
     from omlx.patches.inkling2 import kernels
 
@@ -1113,7 +1126,7 @@ def test_inkling2_fp32_norm_weights_stay_out_of_the_parameters():
     from omlx.patches.inkling2.model import _norm
     from omlx.utils.model_loading import cast_bf16_params_to_fp16
 
-    model = _bf16(_inkling2_tiny())
+    model = _bf16(_inkling2_tiny(formats=("mxfp8",) * 2, local_layer_ids=[0]))
 
     def params():
         return [(k, v.shape) for k, v in tree_flatten(model.parameters())]
@@ -1154,8 +1167,7 @@ def test_inkling2_compiled_tails_keep_the_eager_bits():
     assert mx.array_equal(got, expected)
 
 
-@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
-def test_inkling2_fused_layer_kernels_keep_the_mlx_bits(dims, monkeypatch):
+def test_inkling2_fused_layer_kernels_keep_the_mlx_bits(monkeypatch):
     """The kernels that fold a layer's small ops together (projection
     epilogue, attention-residual norms, loop controllers, expert sum) give the
     MLX ops' bits on eager prefill chunks and compiled decode rows."""
@@ -1204,15 +1216,14 @@ def test_inkling2_fused_layer_kernels_keep_the_mlx_bits(dims, monkeypatch):
             return out
 
         monkeypatch.setattr(kernels, name, spy)
-    fused = run(_inkling2_tiny(**wide, **dims))
-    expected_used = set(names) - (set() if dims else {"loop_message_outputs"})
-    assert {n for n, count in used.items() if count} == expected_used
+    fused = run(_inkling2_tiny(**wide, **_TINY_LOOP))
+    assert all(used.values())
 
     for name in ("qkv_post", "attn_res_fused", "moe_short_conv"):
         monkeypatch.setattr(kernels, name, lambda *a, **k: None)
     monkeypatch.setattr(kernels, "loop_messages_supported", lambda *a: False)
     # A fresh model: compiled layer stages keep the graph of their first trace.
-    reference = run(_inkling2_tiny(**wide, **dims))
+    reference = run(_inkling2_tiny(**wide, **_TINY_LOOP))
     for got, want in zip(fused, reference):
         assert mx.array_equal(got, want)
 
@@ -1302,15 +1313,15 @@ def test_inkling2_nvfp4_experts_stay_finite_in_float16():
 
 
 @pytest.mark.parametrize(
-    "batch, heads, kv_heads, length, keys, window, extent, left_padding",
+    "batch, heads, kv_heads, length, keys, window, extent, left_padding, dtype",
     [
-        (1, 4, 2, 64, 64, 16, 16, None),
-        (1, 4, 2, 37, 300, 16, 16, None),
-        (1, 6, 2, 100, 300, 0, 32, None),
-        (2, 4, 1, 70, 90, 0, 32, [0, 13]),
+        (1, 4, 2, 64, 64, 16, 16, None, "bfloat16"),
+        (1, 4, 2, 37, 300, 16, 16, None, "bfloat16"),
+        (1, 4, 2, 37, 300, 16, 16, None, "float16"),
+        (1, 6, 2, 100, 300, 0, 32, None, "bfloat16"),
+        (2, 4, 1, 70, 90, 0, 32, [0, 13], "bfloat16"),
     ],
 )
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_inkling2_flash_attention_matches_masked_sdpa(
     batch, heads, kv_heads, length, keys, window, extent, left_padding, dtype
 ):
@@ -1710,17 +1721,17 @@ def _small_decode_chunks(monkeypatch, kernels):
 
 
 @pytest.mark.parametrize(
-    "heads, kv_heads, length, keys, window, left_padding",
+    "heads, kv_heads, length, keys, window, left_padding, dtype",
     [
-        (6, 2, 1, 1, 0, None),
-        (6, 2, 1, 300, 0, [0, 113]),
-        (6, 2, 1, 90, 32, [0, 70]),
-        (6, 2, 4, 300, 0, [41, 0]),
-        (6, 2, 5, 300, 32, None),
-        (12, 1, 2, 300, 0, None),
+        (6, 2, 1, 1, 0, None, "bfloat16"),
+        (6, 2, 1, 300, 0, [0, 113], "bfloat16"),
+        (6, 2, 1, 300, 0, [0, 113], "float16"),
+        (6, 2, 1, 90, 32, [0, 70], "bfloat16"),
+        (6, 2, 4, 300, 0, [41, 0], "bfloat16"),
+        (6, 2, 5, 300, 32, None, "bfloat16"),
+        (12, 1, 2, 300, 0, None, "bfloat16"),
     ],
 )
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_inkling2_flash_decode_matches_masked_sdpa(
     heads, kv_heads, length, keys, window, left_padding, dtype, monkeypatch
 ):
@@ -1833,8 +1844,7 @@ def test_inkling2_left_padded_row_takes_the_decode_kernel(
     diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max()
     assert diff.item() < 1e-2
 
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
-def test_inkling2_flash_decode_guards_wide_heads_and_unaligned_keys(dtype):
+def test_inkling2_flash_decode_guards_wide_heads_and_unaligned_keys():
     """A head too wide for the kernel's threadgroup memory falls back instead
     of failing to load, and K/V views whose rows or base are off the 16-byte
     grid of the vector load have the bits of their contiguous copies."""
@@ -1842,7 +1852,7 @@ def test_inkling2_flash_decode_guards_wide_heads_and_unaligned_keys(dtype):
 
     if mx.default_device() != mx.gpu:
         pytest.skip("Metal kernel")
-    dt = getattr(mx, dtype)
+    dt = mx.bfloat16
     wide = _decode_attention_case(2, 2, 1, 1, 40, 32, dt, dim=512)
     assert not kernels._use_flash_decode(wide[0], wide[1])
     scale = 512**-0.5

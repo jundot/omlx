@@ -150,7 +150,7 @@ def _same(a, b):
         # the first stage, or the second stage runs only part of its layers.
         {"layers": 2},
         {"layers": 5, "feed": True},
-        {"feed": True, "late": 0.1},
+        {"feed": True, "late": 0.03},
     ],
     ids=[
         "capture",

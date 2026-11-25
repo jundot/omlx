@@ -1,3 +1,4 @@
+import gc
 import os
 import struct
 import subprocess
@@ -158,6 +159,11 @@ def pytest_collection_modifyitems(config, items):
         # With --no-loadscope-reorder, groups start in collection order; start
         # the long serial group first.
         items.sort(key=lambda item: not _gpu_serial(item))
+
+
+def pytest_collection_finish():
+    gc.collect()
+    gc.freeze()
 
 
 @pytest.fixture

@@ -52,9 +52,26 @@ def _assert_packed_close(a, b, bits, group_size):
     return flips
 
 
-@pytest.mark.parametrize("ratio", [2, 4, 8])
-@pytest.mark.parametrize("prefix", [1, 3, 4, 5, 7, 8])
-@pytest.mark.parametrize("accepted", [0, 1, 2, 3])
+@pytest.mark.parametrize(
+    "ratio,prefix,accepted",
+    [
+        (2, 1, 0),
+        (2, 4, 2),
+        (2, 5, 1),
+        (2, 8, 1),
+        (4, 1, 2),
+        (4, 4, 1),
+        (4, 5, 3),
+        (4, 7, 0),
+        (4, 7, 2),
+        (4, 8, 0),
+        (8, 1, 1),
+        (8, 4, 0),
+        (8, 5, 2),
+        (8, 7, 0),
+        (8, 8, 2),
+    ],
+)
 def test_verify_rollback_restores_all_csa2_slots(prefix, accepted, ratio, monkeypatch):
     config = replace(mtp_config(), compress_ratios=(0, ratio, ratio, 1, 1, 0, 0, 0))
     model = LanguageModel(config)

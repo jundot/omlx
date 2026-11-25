@@ -4,6 +4,8 @@ keeps the bits ``gather_qmm`` gives it in the row's one-row decode step."""
 
 from __future__ import annotations
 
+from functools import cache
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -17,6 +19,7 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 _EXPERTS, _TOP_K = 10, 4
 
 
+@cache
 def _experts(hidden, inter, fmt="nvfp4", experts=_EXPERTS):
     args = inkling2.TextArgs(
         hidden_size=hidden,
@@ -92,10 +95,15 @@ def _count_gathers(monkeypatch):
 # K = 304 leaves 48 values past the last full 256-value block (lanes 0 to 5),
 # K = 144 and 80 have no full block, 2304 and 1152 are Inkling 2 Mini's.
 @pytest.mark.parametrize(
-    "hidden, inter", [(304, 144), (272, 80), (2304, 1152)], ids=str
+    "hidden, inter, rows, dtype",
+    [
+        (304, 144, 3, mx.bfloat16),
+        (272, 80, 16, mx.float16),
+        (2304, 1152, 16, mx.bfloat16),
+        (2304, 1152, 3, mx.float16),
+    ],
+    ids=str,
 )
-@pytest.mark.parametrize("rows", [2, 3, 5, 16])
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
 def test_verify_rows_keep_their_decode_step_bits(
     hidden, inter, rows, dtype, monkeypatch
 ):

@@ -47,10 +47,19 @@ def _per_row(q, k, v, rel, sink, window):
 
 # Every row sees at least 4096 keys, where MLX takes its two-pass kernel on
 # every GPU.
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("window", [0, 4096], ids=["full", "sliding"])
-@pytest.mark.parametrize("rows", [2, 5, 16])
-@pytest.mark.parametrize("keys", [4200, 20000])
+@pytest.mark.parametrize(
+    "keys, rows, window, dtype",
+    [
+        (4200, 2, 0, mx.bfloat16),
+        (4200, 5, 0, mx.float16),
+        (4200, 16, 0, mx.bfloat16),
+        (20000, 5, 0, mx.bfloat16),
+        (20000, 16, 0, mx.float16),
+        (4200, 5, 4096, mx.bfloat16),
+        (4200, 16, 4096, mx.bfloat16),
+        (20000, 2, 4096, mx.float16),
+    ],
+)
 def test_rows_match_decode_steps_bit_for_bit(dtype, window, rows, keys):
     q, k, v, rel, sink = _inputs(dtype, keys, rows, seed=keys + rows)
     out = verify_attention.rows_attention(

@@ -130,7 +130,6 @@ def test_wide_affine_prefetch_keeps_rows_and_enforces_bound(
 
     monkeypatch.setattr(disk, "_read_rows", observe)
     try:
-        expected = read(unique_ids)
         with prefetch.forward():
             prefetch.submit(disk, ids)
             assert (prefetch._pending is not None) is admitted
@@ -138,12 +137,12 @@ def test_wide_affine_prefetch_keeps_rows_and_enforces_bound(
                 actual = prefetch._pending[1].result(timeout=10)
                 np.testing.assert_array_equal(disk._prefetched[0], unique_ids)
                 assert threads == ["v41-engram_0"]
+                expected = read(unique_ids)
+                for (got, got_dtype), (want, want_dtype) in zip(actual, expected):
+                    assert got_dtype == want_dtype
+                    np.testing.assert_array_equal(got, want)
             else:
                 assert threads == []
-                actual = disk._read_rows(unique_ids)
-            for (got, got_dtype), (want, want_dtype) in zip(actual, expected):
-                assert got_dtype == want_dtype
-                np.testing.assert_array_equal(got, want)
         assert prefetch._pending is None and disk._prefetched is None
     finally:
         prefetch.close()

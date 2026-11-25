@@ -13,6 +13,7 @@ import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.base import create_causal_mask
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from omlx.engine import batched as batched_engine
 from omlx.patches.mimo_v2 import decode_fast as df
@@ -1499,8 +1500,8 @@ def test_decode_expert_kernels_match_gather_qmm(layout):
 
 def test_decode_expert_kind_rejects_wrapped_switch_modules():
     """An expert-offload style wrapper is not a stock SwitchGLU."""
-    model = _decode_model(seed=14)
-    sw = model.model.layers[1].mlp.switch_mlp
+    sw = SwitchGLU(128, 64, 2)
+    nn.quantize(sw, group_size=32, bits=4, mode="mxfp4")
 
     class OffloadSwitchGLU(nn.Module):
         def __init__(self, glu):

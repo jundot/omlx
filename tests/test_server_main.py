@@ -14,12 +14,9 @@ single module instance by construction.
 
 import json
 import os
-import socket
 import subprocess
 import sys
-import time
-import urllib.error
-import urllib.request
+import textwrap
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -192,71 +189,74 @@ def test_admin_api_key_setup_succeeds(module_entry):
     assert server._server_state.api_key == "test-key-1234"
 
 
-def test_module_entry_api_key_setup_end_to_end(tmp_path):
-    # The double-import layer of #2282 only exists when the module runs
-    # as ``__main__``, so this must be a real ``python -m omlx.server``
-    # subprocess; every in-process test is structurally blind to it.
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
+MODULE_ENTRY_PROBE = textwrap.dedent("""
+    import inspect
+    import json
+    import runpy
+    import sys
 
+    import uvicorn
+    from fastapi.testclient import TestClient
+
+    KEY = "e2e-key-1234"
+    run_signature = inspect.signature(uvicorn.run)
+
+
+    def probe(app, **kwargs):
+        run_signature.bind(app, **kwargs)
+        setup = TestClient(app, client=("127.0.0.1", 50000)).post(
+            "/admin/api/setup-api-key",
+            json={"api_key": KEY, "api_key_confirm": KEY},
+        )
+        client = TestClient(app, follow_redirects=False)
+        html = {"Accept": "text/html"}
+        status = {
+            "setup": [setup.status_code, setup.json().get("success")],
+            "login_page": client.get("/admin", headers=html).status_code,
+            "dashboard": client.get("/admin/dashboard", headers=html).status_code,
+            "static": client.get("/admin/static/favicon.svg").status_code,
+            "auto_login": client.get(
+                "/admin/auto-login", params={"key": KEY}
+            ).status_code,
+            "api_html_no_session": client.get(
+                "/admin/api/global-settings", headers=html
+            ).status_code,
+        }
+        client.post("/admin/api/login", json={"api_key": KEY})
+        status["api_with_session"] = client.get(
+            "/admin/api/global-settings"
+        ).status_code
+        print(json.dumps(status))
+
+
+    uvicorn.run = probe
+    runpy.run_module("omlx.server", run_name="__main__", alter_sys=True)
+    """)
+
+
+def test_headless_module_entry_end_to_end(tmp_path):
     model_dir = tmp_path / "models"
     model_dir.mkdir()
-    env = os.environ.copy()
-    env["HOME"] = str(tmp_path)
+    env = {**os.environ, "OMLX_HEADLESS": "1", "HOME": str(tmp_path)}
     env["OMLX_BASE_PATH"] = str(tmp_path / "base")
-
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omlx.server",
-            "--model-dir",
-            str(model_dir),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ],
+    result = subprocess.run(
+        [sys.executable, "-c", MODULE_ENTRY_PROBE, "--model-dir", str(model_dir)],
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        capture_output=True,
         text=True,
+        timeout=120,
     )
-    base = f"http://127.0.0.1:{port}"
-    try:
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                pytest.fail(f"server exited early:\n{proc.stdout.read()}")
-            try:
-                urllib.request.urlopen(f"{base}/health", timeout=1)
-                break
-            except (urllib.error.URLError, OSError):
-                time.sleep(0.25)
-        else:
-            pytest.fail("server did not become healthy within 60s")
-
-        req = urllib.request.Request(
-            f"{base}/admin/api/setup-api-key",
-            data=json.dumps(
-                {"api_key": "e2e-key-1234", "api_key_confirm": "e2e-key-1234"}
-            ).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            resp = urllib.request.urlopen(req, timeout=10)
-        except urllib.error.HTTPError as e:
-            pytest.fail(f"setup-api-key returned {e.code}: {e.read().decode()}")
-        assert resp.status == 200
-        assert json.load(resp).get("success") is True
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=15)
+    assert result.returncode == 0, result.stderr
+    status = json.loads(result.stdout.strip().splitlines()[-1])
+    assert status == {
+        "setup": [200, True],
+        "login_page": 404,
+        "dashboard": 404,
+        "static": 404,
+        "auto_login": 404,
+        "api_html_no_session": 401,
+        "api_with_session": 200,
+    }
 
 
 @pytest.fixture
@@ -316,7 +316,10 @@ def test_download_queues_are_wired_for_restart_resume(wired_downloaders):
 
     hf.restore_tasks = AsyncMock()
     ms.restore_tasks = AsyncMock()
-    with TestClient(server.app):
+    with (
+        patch("omlx.utils.network.detect_server_aliases", return_value=[]),
+        TestClient(server.app),
+    ):
         pass
 
     hf.restore_tasks.assert_awaited_once()

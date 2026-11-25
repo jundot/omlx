@@ -1557,6 +1557,7 @@ FAKE_SERVER = textwrap.dedent("""\
 @pytest.fixture
 def lifecycle(tmp_path, monkeypatch, launchers):
     monkeypatch.setattr(splash_mod, "STARTUP_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(splash_mod, "WATCHDOG_POLL_SECONDS", 0.05)
     monkeypatch.setattr(
         SplashEngine,
         "_load_tokenizer",
@@ -1622,21 +1623,28 @@ class TestLifecycle:
     async def test_stop_waits_for_splash_and_kills_a_stuck_one(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(splash_mod, "STOP_TIMEOUT_SECONDS", 1)
+        monkeypatch.setattr(splash_mod, "STOP_TIMEOUT_SECONDS", 0.5)
+        ready = tmp_path / "ready"
         # A Splash stand-in that outlives SIGTERM; the watchdog shell does not.
         stuck = [
             sys.executable,
             "-c",
-            "import signal, time\n"
+            "import pathlib, signal, sys, time\n"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "pathlib.Path(sys.argv[1]).touch()\n"
             "while True: time.sleep(0.1)",
+            str(ready),
         ]
         engine = _engine(tmp_path)
         engine._process = subprocess.Popen(
             splash_mod._watchdog_command(stuck), start_new_session=True
         )
         group = engine._process.pid
-        await asyncio.sleep(0.5)
+        for _ in range(500):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.02)
+        assert ready.exists()
 
         await engine.stop()
 
