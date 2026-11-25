@@ -149,6 +149,8 @@ def apply_xtc(
     xtc_probability: float,
     xtc_threshold: float,
     xtc_special_tokens: List[int],
+    *,
+    key: mx.array | None = None,
 ) -> mx.array:
     """XTC sampling — with ``xtc_probability``, mask out all but the lowest
     above-threshold token to encourage diversity."""
@@ -169,7 +171,7 @@ def apply_xtc(
         mask[..., xtc_special_tokens] = False
 
     return mx.where(
-        mx.random.uniform(0, 1) > xtc_probability,
+        mx.random.uniform(0, 1, key=key) > xtc_probability,
         logits,
         mx.where(mask, -mx.inf, logits),
     )
@@ -204,10 +206,12 @@ def make_no_repeat_ngram_processor(
     return no_repeat_ngram_processor
 
 
-def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
+def categorical_sampling(
+    logits: mx.array, temp: float, *, key: mx.array | None = None
+) -> mx.array:
     """Sample a token id from the categorical distribution defined by
     ``logits / temp``. RNG state is advanced through ``mx.random.categorical``."""
-    return mx.random.categorical(logits * (1 / temp))
+    return mx.random.categorical(logits * (1 / temp), key=key)
 
 
 def make_sampler(
@@ -219,12 +223,24 @@ def make_sampler(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: Optional[List[int]] = None,
+    *,
+    random_key: mx.array | None = None,
 ) -> Callable[[mx.array], mx.array]:
     """Build a sampler callable matching ``mlx_lm.sample_utils.make_sampler``.
 
     Returns ``argmax`` when ``temp == 0``; otherwise composes optional
     top-p / min-p / xtc / top-k filters and finishes with categorical sampling.
     """
+    owns_random_key = random_key is not None
+
+    def next_key():
+        nonlocal random_key
+        if random_key is None:
+            return None
+        keys = mx.random.split(random_key)
+        random_key = keys[0]
+        return keys[1]
+
     if xtc_special_tokens is None:
         xtc_special_tokens = []
     if temp == 0:
@@ -243,7 +259,11 @@ def make_sampler(
             if xtc_probability > 0.0:
                 sampling_methods.append(
                     lambda x: apply_xtc(
-                        x, xtc_probability, xtc_threshold, xtc_special_tokens
+                        x,
+                        xtc_probability,
+                        xtc_threshold,
+                        xtc_special_tokens,
+                        key=next_key(),
                     )
                 )
             if top_k > 0:
@@ -252,7 +272,7 @@ def make_sampler(
         def sampler(logprobs: mx.array) -> mx.array:
             for method in sampling_methods:
                 logprobs = method(logprobs)
-            return categorical_sampling(logprobs, temp)
+            return categorical_sampling(logprobs, temp, key=next_key())
 
     if temp > 0 and xtc_probability == 0:
 
@@ -267,19 +287,19 @@ def make_sampler(
             if rowwise:
                 token = mx.concatenate(
                     [
-                        mx.random.categorical(scaled[row : row + 1])
+                        mx.random.categorical(scaled[row : row + 1], key=next_key())
                         for row in range(scaled.shape[0])
                     ]
                 )
             else:
-                token = mx.random.categorical(scaled)
+                token = mx.random.categorical(scaled, key=next_key())
             density = scaled.astype(mx.float32)
             density = density - mx.logsumexp(density, axis=-1, keepdims=True)
             return token, density
 
         sampler._mtp_sampling_logits = sampling_logits
         sampler.sample_with_logprobs = sample_with_logprobs
-        if 0 < top_p < 1 or min_p > 0 or top_k > 0:
+        if not owns_random_key and (0 < top_p < 1 or min_p > 0 or top_k > 0):
             sampler._mtp_batch_sampling_key = (
                 temp,
                 top_p,

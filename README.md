@@ -280,6 +280,8 @@ Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the 
 
 Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), llama.cpp-style prefill progress (`return_progress`), Anthropic adaptive thinking, and vision inputs (images as base64 or URL, video as base64).
 
+For models configured for ordinary decoding, `seed` sets the request's sampling random stream. Sampling can still produce different text if batching changes the model scores. Models configured with MTP, DFlash, DSpark, or an external VLM drafter use the shared random stream.
+
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/chat/completions` | Chat completions (streaming) |

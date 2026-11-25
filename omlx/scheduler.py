@@ -17,6 +17,7 @@ import gc
 import importlib
 import inspect
 import logging
+import secrets
 import threading
 import time
 from array import array
@@ -75,6 +76,7 @@ from .patches.inkling2.kernels import (
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
+from .patches.mlx_lm_mtp.batch_generator import _model_mtp_decode_enabled
 from .patches.mlx_lm_mtp.batch_generator import (
     _spec_command_buffers as _decode_command_buffers,
 )
@@ -7759,11 +7761,7 @@ class Scheduler:
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
-        # A requeued row keeps the random stream it was already sampling from.
-        if request.sampling_params.seed is not None and not _request_count(
-            request, "requeued_output_tokens"
-        ):
-            mx.random.seed(request.sampling_params.seed)
+        Scheduler._seed_legacy_request_sampling(self, request)
 
         # #2219: both chunked-completion paths (inline first chunk and
         # _advance_chunked_prefills) funnel through here, but external VLM MTP
@@ -8716,13 +8714,44 @@ class Scheduler:
         )
         _mtp_priming.capture_tail_boundary(self.model, request.request_id, total_tokens)
 
+    def _seed_legacy_request_sampling(self, request: Request) -> None:
+        seed = request.sampling_params.seed
+        if (
+            seed is not None
+            and not _request_count(request, "requeued_output_tokens")
+            and Scheduler._uses_legacy_sampling_rng(self)
+        ):
+            mx.random.seed(seed)
+
+    def _uses_legacy_sampling_rng(self) -> bool:
+        # An attached drafter can take over after ordinary decode starts.
+        # Keep its sampler and admission seed on the same existing path.
+        model = getattr(self, "model", None)
+        return (
+            getattr(self, "_vlm_mtp_drafter", None) is not None
+            or _model_mtp_decode_enabled(model)
+        )
+
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams, request: Any = None
     ) -> tuple[Callable[[mx.array], mx.array], list[Callable]]:
         """Build per-request sampler and logits processors."""
         # omlx.utils.sampling.make_sampler carries the fused top-p/top-k and
         # MTP acceptance metadata that mlx_lm.sample_utils does not.
-        sampler = omlx_make_shared_sampler(
+        sampler_factory = omlx_make_shared_sampler
+        rng_kwargs = {}
+        if (
+            request is not None
+            and sampling_params.temperature != 0
+            and not Scheduler._uses_legacy_sampling_rng(self)
+        ):
+            seed = sampling_params.seed
+            if seed is None:
+                seed = secrets.randbits(63)
+            sampler_factory = omlx_make_sampler
+            rng_kwargs["random_key"] = mx.random.key(seed)
+
+        sampler = sampler_factory(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
@@ -8730,6 +8759,7 @@ class Scheduler:
             xtc_probability=sampling_params.xtc_probability,
             xtc_threshold=sampling_params.xtc_threshold,
             xtc_special_tokens=self._xtc_special_tokens,
+            **rng_kwargs,
         )
         logits_processors = make_logits_processors(
             repetition_penalty=(
@@ -14269,13 +14299,7 @@ class Scheduler:
             # Build per-request state machine for stop tokens
             sm = self._stop_sequences_for_insert(request)
 
-            # Set random seed for reproducible generation (best-effort).
-            # This affects global MLX random state, so concurrent requests
-            # may interfere. Matches OpenAI's best-effort seed semantics.
-            if request.sampling_params.seed is not None and not _request_count(
-                request, "requeued_output_tokens"
-            ):
-                mx.random.seed(request.sampling_params.seed)
+            Scheduler._seed_legacy_request_sampling(self, request)
 
             # TurboQuant KV is quantized at the end of _do_external_prefill
             # (fp16 prefill → quantize once); _merge_caches() turns the per

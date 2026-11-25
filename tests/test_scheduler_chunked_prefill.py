@@ -987,6 +987,35 @@ class TestScheduleWaitingChunkedFork:
         mock_ep.assert_called_once()
         mock_bp.assert_not_called()
 
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("speculative", [False, True])
+    def test_admission_only_seeds_legacy_speculative_rng(self, chunked, speculative):
+        sched, req = self._setup(n_tokens=10 if chunked else 3, chunked=chunked)
+        sched.model._omlx_mtp_decode_enabled = speculative
+        sched.model.language_model = None
+        sched.model._language_model = None
+        req.sampling_params.seed = 7
+        req.sampling_params.temperature = 0.8
+        mx.random.seed(7 if speculative else 97)
+        expected_state = mx.random.state[0].tolist()
+        mx.random.seed(97)
+
+        if chunked:
+            state = _make_prefill_state(sched, req, n_remaining=1)
+            with (
+                patch.object(sched, "_begin_prefill", return_value=state),
+                patch.object(sched, "_step_prefill_chunk", return_value=True),
+                patch.object(sched, "_emit_final_boundary_if_needed"),
+                patch("omlx.scheduler._sync_and_clear_cache"),
+            ):
+                sched._schedule_waiting()
+        else:
+            with patch.object(sched, "_do_external_prefill", return_value=([], [0])):
+                sched._schedule_waiting()
+
+        assert req.request_id in sched.running
+        assert mx.random.state[0].tolist() == expected_state
+
     def test_non_chunked_path_runtime_error_cleans_up_and_rejects(self):
         """RuntimeError from _do_external_prefill in the non-chunked path
         must pop self.requests, drop the temp uid mappings, remove the
