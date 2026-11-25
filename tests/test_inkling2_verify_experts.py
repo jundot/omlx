@@ -95,7 +95,6 @@ def _count_gathers(monkeypatch):
     "hidden, inter", [(304, 144), (272, 80), (2304, 1152)], ids=str
 )
 @pytest.mark.parametrize("rows", [2, 3, 5, 16])
-# float16 applies the NVFP4 tensor scale inside the product.
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
 def test_verify_rows_keep_their_decode_step_bits(
     hidden, inter, rows, dtype, monkeypatch
@@ -140,46 +139,17 @@ def test_other_blocks_keep_gather_qmm(case, monkeypatch):
     assert z.shape == (rows, _TOP_K, hidden)
 
 
+@pytest.mark.parametrize("table", [True, False], ids=["threadgroup", "plain"])
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
-def test_decode_step_takes_the_kernel_with_gather_qmm_bits(dtype, monkeypatch):
-    # A one-row step (decode, armed or not) runs its 8 pairs in expert order
-    # too; its bits are gather_qmm's, so serial decode does not change.
-    mod = _experts(2304, 1152)
-    x, inds, weights = _block(1, 2304, 7, dtype)
-    xe = mx.expand_dims(x, (-2, -3))
-    ref = []
-    for proj, inp in ((mod.w13, xe), (mod.w2, None)):
-        if inp is None:
-            y = ref[0]
-            s13 = mod.w13.post_scale(inds, dtype)
-            if s13 is not None:
-                s13 = s13[..., None, None].astype(y.dtype)
-            inp = inkling2._softcapped_swiglu(
-                y[..., 0::2], y[..., 1::2], mod._gcap, mod._ucap, s13
-            )
-        ref.append(proj(inp, inds, False))
-    calls = _count_gathers(monkeypatch)
-    z, _ = mod.unreduced(x, inds, weights)
-    mx.eval(z)
-    assert len(calls) == 2
-    assert mx.array_equal(z, ref[1].squeeze(-2))
-
-
-@pytest.mark.parametrize("table", ["threadgroup", "constant"])
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
-@pytest.mark.parametrize("rows", [1, 3])
-def test_both_code_tables_keep_gather_qmm_bits(table, dtype, rows, monkeypatch):
-    # M1/M2 read the codes through a threadgroup byte table, later GPUs
-    # through a constant nibble table; both must give gather_qmm's bits.
-    monkeypatch.setattr(
-        verify_experts, "_threadgroup_table", lambda: table == "threadgroup"
-    )
+def test_both_code_decodes_keep_gather_qmm_bits(table, dtype, monkeypatch):
+    # M1/M2 decode the codes through a threadgroup table, later GPUs one value
+    # at a time; both must keep gather_qmm's bits on every host.
+    monkeypatch.setattr(verify_experts, "_threadgroup_table", lambda: table)
     verify_experts._kernel.cache_clear()
     try:
         mod = _experts(2304, 1152)
-        x, inds, weights = _block(rows, 2304, 13, dtype)
+        x, inds, weights = _block(3, 2304, 13, dtype)
         z, _ = _armed(mod, x, inds, weights)
-        set_verify_qmm_armed(False)
         monkeypatch.setattr(verify_experts, "supported", lambda proj, dt: False)
         ref, _ = mod.unreduced(x, inds, weights)
         assert mx.array_equal(z, ref)

@@ -418,7 +418,6 @@ class Inkling2Experts(nn.Module):
         )
         if fused:
             pairs = inds.reshape(-1)
-            # One row's top-k experts are distinct: no order to impose.
             order = pair_order(pairs) if inds.shape[0] > 1 else None
             y = verify_experts.gather(
                 self.w13, x, pairs, inds.shape[-1], order
