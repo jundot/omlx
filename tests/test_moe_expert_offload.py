@@ -1688,3 +1688,44 @@ def test_staging_lease_outlives_lazy_graph(tmp_path):
         mx.synchronize()
         gc.collect()
         assert staging.pool.stats()["busy"] == 0
+
+
+def test_slice_futures_of_a_merged_read_drain_and_fail_cleanly():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omlx.patches.moe_expert_offload import _drain, _SliceFuture
+
+    pool = ThreadPoolExecutor(1)
+    try:
+        started, release = threading.Event(), threading.Event()
+
+        def merged():
+            started.set()
+            release.wait(5)
+            return b"abcdef"
+
+        running = pool.submit(merged)
+        started.wait(5)
+        a, b = _SliceFuture(running, 0, 3), _SliceFuture(running, 3, 3)
+        threading.Timer(0.05, release.set).start()
+        _drain({0: [("w", 0, None, a), ("w", 1, None, b)]})
+        assert running.done() and a.cancelled() and b.cancelled()
+
+        assert bytes(_SliceFuture(pool.submit(lambda: b"xyz123"), 3, 3).result()) == (
+            b"123"
+        )
+
+        release.clear()
+        blocker = pool.submit(release.wait, 5)
+        queued = pool.submit(lambda: b"q")
+        c = _SliceFuture(queued, 0, 1)
+        _drain({0: [("w", 0, None, c)]})
+        assert queued.cancelled() and c.cancelled()
+        release.set()
+        blocker.result()
+
+        failed = _SliceFuture(pool.submit(lambda: 1 / 0), 0, 1)
+        assert isinstance(failed.exception(5), ZeroDivisionError)
+    finally:
+        pool.shutdown()

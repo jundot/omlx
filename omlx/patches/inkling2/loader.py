@@ -8,6 +8,8 @@ viewed as MLX ``uint32`` carriers without re-rounding.
 
 from __future__ import annotations
 
+import re
+
 import mlx.core as mx
 
 _PREFIX = "model.llm."
@@ -19,6 +21,10 @@ _LOOP_QUERIES = (
 )
 # Runtime order of the loop message inputs (see ``Inkling2Layer``).
 _LOOP_INPUTS = ("attn", "k", "v", "mlp")
+_PER_EXPERT_RE = re.compile(
+    r"^(?P<pre>model\.layers\.\d+\.mlp\.experts)\.(?P<e>\d+)\."
+    r"(?P<rest>(?:w13|w2)\.(?:weight|scales|biases))$"
+)
 
 
 def _vision_name(key: str) -> str:
@@ -79,10 +85,26 @@ def _loop_message_queries(queries: dict, core: range, out: dict) -> None:
         )
 
 
+def stack_per_expert(weights: dict, num_experts: int) -> dict:
+    """Stack ``experts.<e>.<proj>.<field>`` tensors into ``experts.<proj>.<field>``.
+
+    The offload repack stores each expert's tensors back to back, so a miss is
+    one read; the resident model keeps the stacked layout."""
+    groups: dict[str, dict[int, mx.array]] = {}
+    for key in [k for k in weights if _PER_EXPERT_RE.match(k)]:
+        m = _PER_EXPERT_RE.match(key)
+        groups.setdefault(f"{m['pre']}.{m['rest']}", {})[int(m["e"])] = weights.pop(key)
+    for key, parts in groups.items():
+        if sorted(parts) != list(range(num_experts)):
+            raise ValueError(f"Inkling 2 checkpoint is missing experts of {key}")
+        weights[key] = mx.stack([parts[e] for e in range(num_experts)])
+    return weights
+
+
 def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
     """Returns the mapped weights and the routed-expert format per layer."""
     if not is_original_layout(weights):
-        return weights, {}
+        return stack_per_expert(weights, model.args.text.n_routed_experts), {}
     args = model.args.text
     has_vision = getattr(model, "vision_tower", None) is not None
     hidden = args.hidden_size

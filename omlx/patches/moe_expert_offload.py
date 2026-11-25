@@ -39,7 +39,7 @@ import struct
 import threading
 import time
 from collections import Counter, namedtuple
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import mlx.core as mx
@@ -294,6 +294,10 @@ def _shutdown_io_pool() -> None:
 _SCORE_DECAY = 0.7
 _SCORE_DECAY_EVERY = 4
 
+# Bytes of gather outputs a direct-read cache keeps alive until its next
+# miss (see qmm). Decode outputs are tens of KB; prefill chunks are larger.
+_MAX_READER_BYTES = 64 << 20
+
 # Poll interval while the overlap path waits on reads (see _GpuKeepalive).
 _KEEPALIVE_PERIOD_S = 50e-6
 _KEEPALIVE_LOCAL = threading.local()
@@ -346,8 +350,81 @@ def _drain(pending: dict) -> None:
     futures = [f for group in pending.values() for _, _, _, f in group]
     for future in futures:
         future.cancel()
+    # A slice is done once cancelled; its merged read may still be running.
+    futures += {f.parent for f in futures if isinstance(f, _SliceFuture)}
     if futures:
         wait(futures)
+
+
+class _SliceFuture(Future):
+    """One tensor's bytes out of a merged read of back-to-back tensors.
+
+    Cancelling it cancels the merged read, which its siblings share."""
+
+    def __init__(self, parent: Future, start: int, nbytes: int):
+        super().__init__()
+        self.parent = parent
+        self._range = (start, start + nbytes)
+        parent.add_done_callback(self._finish)
+
+    def _finish(self, parent: Future) -> None:
+        if self.done():  # cancelled while the merged read ran
+            return
+        if parent.cancelled():
+            self._cancel()
+        elif parent.exception() is not None:
+            self.set_exception(parent.exception())
+        else:
+            self.set_result(memoryview(parent.result())[slice(*self._range)])
+
+    def _cancel(self) -> bool:
+        # No executor runs this future, so notify here: ``wait`` counts a
+        # cancelled future as done only once it is notified.
+        if not Future.cancel(self):
+            return self.cancelled()
+        self.set_running_or_notify_cancel()
+        return True
+
+    def cancel(self) -> bool:
+        if self.parent.cancel():  # its done callback cancels this slice
+            return self.cancelled()
+        return self._cancel()
+
+
+def _merge_reads(plans: list) -> list:
+    """Group ``(name, field, plan)`` items whose bytes sit back to back in a shard.
+
+    Returns ``(read plan, items)`` runs in order. A per-expert checkpoint
+    written expert by expert reads a whole expert as one run."""
+    runs: list = []
+    for item in plans:
+        plan = item[2]
+        if runs:
+            head, items = runs[-1]
+            if plan.fd == head.fd and plan.offset == head.offset + head.nbytes:
+                runs[-1] = (head._replace(nbytes=head.nbytes + plan.nbytes), items)
+                items.append(item)
+                continue
+        runs.append((plan, [item]))
+    return runs
+
+
+def _preadv_into(plan: _ReadPlan, rows: list) -> None:
+    """Fill ``rows`` (writable buffers, in order) from the plan's byte range."""
+    bufs = [memoryview(r).cast("B") for r in rows]
+    if sum(b.nbytes for b in bufs) != plan.nbytes:
+        raise ValueError("slot rows do not match the planned read")
+    offset = plan.offset
+    while bufs:
+        n = os.preadv(plan.fd, bufs, offset)
+        if n <= 0:
+            raise OSError(f"short read of {plan.nbytes} bytes at {plan.offset}")
+        offset += n
+        while bufs and n >= bufs[0].nbytes:
+            n -= bufs[0].nbytes
+            bufs.pop(0)
+        if n:
+            bufs[0] = bufs[0][n:]
 
 
 class ExpertCache:
@@ -372,7 +449,15 @@ class ExpertCache:
         floor: int = 1,
         *,
         projections: tuple[str, ...] = _PROJS,
+        direct_reads: bool = False,
+        overlap_grace_s: float | None = None,
     ):
+        # Read misses straight into their slots (:meth:`_ensure_direct`). A
+        # failed read then leaves the claimed slots free and their evicted
+        # experts gone, instead of the cache unchanged.
+        self.direct_reads = direct_reads
+        # None follows ``_OVERLAP_GRACE_S``.
+        self.overlap_grace_s = overlap_grace_s
         self.n_experts = getattr(experts, projections[0])["weight"].shape[0]
         self.full_capacity = min(capacity, self.n_experts)
         # The capacity release_slots() shrinks to: the routing top-k floor.
@@ -380,6 +465,13 @@ class ExpertCache:
         self.projs = projections
         self.disk = disk
         self._staging = None
+        self._host: dict | None = None  # (proj, field) -> writable host view
+        # Gathers built on the slots since the last direct read: a host write
+        # into a slot row is not ordered after queued GPU work, so these are
+        # evaluated first (already done in decode, where the routing
+        # readback waits on them). Tracked only with ``direct_reads``.
+        self._readers: list = []
+        self._readers_bytes = 0
         self._slot_specs = {
             name: [
                 None if lin.get(f) is None else (lin[f].shape[1:], lin[f].dtype)
@@ -408,6 +500,7 @@ class ExpertCache:
 
     def _allocate(self, capacity: int) -> None:
         """Replace the slots with ``capacity`` empty ones, dropping every expert."""
+        self._host = None
         self.capacity = capacity
         self.resident: dict[str, list] = {
             name: [
@@ -456,6 +549,7 @@ class ExpertCache:
             expert_map,
             *(a for triple in resident.values() for a in triple if a is not None),
         )
+        self._host = None
         self.resident = resident
         self.map = expert_map
         self.capacity = capacity
@@ -498,12 +592,30 @@ class ExpertCache:
         return out
 
     def _submit(self, pool, e: int) -> list:
-        """Start reading expert ``e``; a task per tensor keeps its reads parallel."""
-        read = self._staging.read if self._staging else CheckpointExpertStore.read
-        return [
-            (name, field, plan, pool.submit(read, plan))
-            for name, field, plan in self._plans(e)
-        ]
+        """Start reading expert ``e``: one task per run of back-to-back tensors.
+
+        Staging leases are sized per tensor, so staging keeps a read each."""
+        if self._staging:
+            return [
+                (name, field, plan, pool.submit(self._staging.read, plan))
+                for name, field, plan in self._plans(e)
+            ]
+        out = []
+        for run, items in _merge_reads(self._plans(e)):
+            whole = pool.submit(CheckpointExpertStore.read, run)
+            if len(items) == 1:
+                out.append((*items[0], whole))
+                continue
+            for name, field, plan in items:
+                out.append(
+                    (
+                        name,
+                        field,
+                        plan,
+                        _SliceFuture(whole, plan.offset - run.offset, plan.nbytes),
+                    )
+                )
+        return out
 
     def _reserve(self, protected=frozenset()) -> int:
         """Claim a slot, evicting the lowest-count expert outside ``protected``."""
@@ -523,6 +635,7 @@ class ExpertCache:
 
     def _write(self, slot: int, payload: list) -> None:
         """Copy one expert's fetched bytes into ``slot``."""
+        self._host = None  # a lazy slot update replaces the arrays' buffers
         convert = self._staging.to_mx if self._staging else CheckpointExpertStore.to_mx
         for name, field, plan, raw in payload:
             self.resident[name][field][slot] = convert(plan, raw)
@@ -531,8 +644,17 @@ class ExpertCache:
         self, e: int, payload: list | None = None, protected=frozenset()
     ) -> int:
         if payload is None:
-            read = self._staging.read if self._staging else CheckpointExpertStore.read
-            payload = [(n, f, pl, read(pl)) for n, f, pl in self._plans(e)]
+            if self._staging:
+                read = self._staging.read
+                payload = [(n, f, pl, read(pl)) for n, f, pl in self._plans(e)]
+            else:
+                payload = []
+                for run, items in _merge_reads(self._plans(e)):
+                    raw = memoryview(CheckpointExpertStore.read(run))
+                    payload += [
+                        (n, f, pl, raw[pl.offset - run.offset :][: pl.nbytes])
+                        for n, f, pl in items
+                    ]
         slot = self._reserve(protected)
         try:
             self._write(slot, payload)
@@ -576,6 +698,94 @@ class ExpertCache:
                 out[e] = self._submit(pool, e)
         return out
 
+    def _grace(self) -> float:
+        """How long the first miss may take before the overlap path starts."""
+        if self.overlap_grace_s is None:
+            return _OVERLAP_GRACE_S
+        return self.overlap_grace_s
+
+    def _forget_readers(self, start: int) -> None:
+        """Drop the gathers tracked from ``start`` on, once they are evaluated."""
+        del self._readers[start:]
+        self._readers_bytes = sum(r.nbytes for r in self._readers)
+
+    def _host_views(self) -> dict:
+        """Writable host views of the slot arrays, which share their memory.
+
+        Valid until the arrays are replaced (resize) or updated lazily
+        (:meth:`_write`), both of which drop the cache."""
+        if self._host is None:
+            views = {}
+            for name, triple in self.resident.items():
+                for field, a in enumerate(triple):
+                    if a is None:
+                        continue
+                    if a.dtype == mx.bfloat16:
+                        a = a.view(mx.uint16)  # numpy has no bfloat16
+                    views[(name, field)] = np.asarray(a)
+            self._host = views
+        return self._host
+
+    def _ensure_direct(self, misses: list, protected, on_slow_read) -> bool:
+        """Read every miss straight into its slot: one ``preadv`` per run.
+
+        Slots are claimed before the reads start. Each read targets a slot
+        row that no queued GPU work references: hits are ``protected``, and
+        the gathers built since the last miss are evaluated first (in decode,
+        the routing readback already waited on them). The rows are live
+        memory of the resident arrays, so an install is a host write with no
+        copy and no update kernel. The first miss's reads get the overlap
+        grace; if they are not done by then, ``on_slow_read()`` dispatches
+        the resident routes.
+        """
+        pool = _io_pool()
+        if self._readers:
+            mx.eval(self._readers)
+            self._readers, self._readers_bytes = [], 0
+        views = self._host_views()
+        claimed = []
+        futures = []
+        try:
+            for e in misses:
+                slot = self._reserve(protected)
+                # Recorded now so the next claim cannot evict it.
+                self.slot_of[e] = slot
+                self.slot_expert[slot] = e
+                claimed.append((e, slot))
+                group = []
+                for run, items in _merge_reads(self._plans(e)):
+                    rows = [views[(name, field)][slot] for name, field, _ in items]
+                    group.append(pool.submit(_preadv_into, run, rows))
+                futures.append(group)
+            slow = False
+            if on_slow_read is not None:
+                timeout = max(0.0, self._grace())
+                if wait(futures[0], timeout=timeout).not_done:
+                    slow = True
+                    on_slow_read()
+                    _gpu_keepalive().wait([f for g in futures for f in g])
+            for group in futures:
+                for f in group:
+                    f.result()
+        except BaseException:
+            for group in futures:
+                for f in group:
+                    f.cancel()
+            wait([f for g in futures for f in g])
+            # Claimed slots hold partial bytes: free them, and the evicted
+            # experts stay gone.
+            for e, slot in claimed:
+                del self.slot_of[e]
+                self.slot_expert[slot] = -1
+                self.free.append(slot)
+            raise
+        for e, slot in claimed:
+            self.misses += 1
+            self.map[e] = slot
+            self.fetched_bytes += self.expert_bytes
+        self.warm = len(self.slot_of) == self.n_experts
+        return slow
+
     def _ensure_ids(self, ids, on_slow_read=None, pending=None) -> bool:
         """:meth:`ensure` for routes already read back from the device.
 
@@ -603,6 +813,13 @@ class ExpertCache:
         if not misses:
             _drain(pending)
             return False
+        if (
+            self.direct_reads
+            and not pending
+            and self._staging is None
+            and _io_pool() is not None
+        ):
+            return self._ensure_direct(misses, frozenset(needed), on_slow_read)
         protected = frozenset(needed)
         pool = _io_pool()
         window = _io_batch()
@@ -622,7 +839,7 @@ class ExpertCache:
 
         try:
             prefetch(window)
-            deadline = time.perf_counter() + _OVERLAP_GRACE_S
+            deadline = time.perf_counter() + self._grace()
             for done, e in enumerate(misses):
                 self.misses += 1
                 # Count the current payload in the window until its writes finish.
@@ -666,7 +883,7 @@ class ExpertCache:
         # the numerics — matches the path the resident model would take.
         rw, rs, rb = self.resident[name]
         group_size, bits, mode = self.qparams[name]
-        return mx.gather_qmm(
+        out = mx.gather_qmm(
             x,
             rw,
             rs,
@@ -678,6 +895,16 @@ class ExpertCache:
             mode=mode,
             sorted_indices=sorted_indices,
         )
+        if self.direct_reads:
+            # Bound the outputs kept alive between direct reads. Only the
+            # earlier ones are evaluated (usually already done: prefill
+            # evaluates each chunk), never the one being built.
+            if self._readers and self._readers_bytes + out.nbytes > _MAX_READER_BYTES:
+                mx.eval(self._readers)
+                self._readers, self._readers_bytes = [], 0
+            self._readers.append(out)
+            self._readers_bytes += out.nbytes
+        return out
 
 
 # The stock SwitchGLU sorts routes from this many on (prefill); decode is below.
@@ -863,6 +1090,7 @@ class _OffloadExpertRoutes(nn.Module):
                     )
                 slots = mx.take(c.map, mx.array(chunk_ids, dtype=mx.int32))
                 slots = slots.reshape(-1, 1)
+                mark = len(c._readers)
                 t_idx = mx.array(token_ids, dtype=mx.int32)
                 xe = mx.expand_dims(mx.take(flat_x, t_idx, axis=0), (-2, -3))
                 inv = None
@@ -878,6 +1106,7 @@ class _OffloadExpertRoutes(nn.Module):
                         np.unique(sorted_ids[s1:e1]).tolist(), _io_batch()
                     )
                 mx.eval(o)
+                c._forget_readers(mark)  # the chunk's gathers are done
                 outs.append(o)
         finally:
             _drain(ahead)

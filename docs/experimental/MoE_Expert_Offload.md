@@ -45,7 +45,7 @@ Measured on an M3 Ultra with the ceiling held at 12 GiB (balanced tier), each mo
 
 The prompt line here is 11.9 GB. Prompt memory depends on the model and the prompt length, so 4 GB is a starting point rather than a guarantee. Longer prompts or several concurrent requests need a lower percent.
 
-Missing experts are read by 12 threads, with at most 48 experts' reads in flight, which bounds the host memory the pipeline holds ahead of the slot writes. In decode, when a step's reads are slow, the GPU stays busy while they finish: it computes the resident routes, stays clocked for the rest of the read, and dispatches each layer's output as soon as it is built. Steps whose reads arrive within 0.5 ms keep the serial order: read, then compute. None of this changes what is computed.
+Missing experts are read by 12 threads, with at most 48 experts' reads in flight, which bounds the host memory the pipeline holds ahead of the slot writes. In decode, when a step's reads are slow, the GPU stays busy while they finish: it computes the resident routes, stays clocked for the rest of the read, and dispatches each layer's output as soon as it is built. Steps whose reads arrive within 0.5 ms keep the serial order: read, then compute (Inkling 2 overlaps every step with a miss; see Supported models). None of this changes what is computed.
 
 ## Performance
 
@@ -112,9 +112,66 @@ In decode, a slow read no longer leaves the GPU idle. The routing readback class
 
 ## Supported models
 
-The experimental toggle is available for `deepseek_v41`, `deepseek_v4`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, `olmoe`, `glm_moe_dsa`, and `glm5_next` checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.
+The experimental toggle is available for `deepseek_v41`, `deepseek_v4`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, `olmoe`, `glm_moe_dsa`, `glm5_next`, and Inkling 2 checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.
 
 Qwen3.5/3.6 supports stacked expert projections under `language_model.model.layers.*.mlp.switch_mlp` and `model.layers.*.mlp.switch_mlp`. The offload adapter resolves the original checkpoint path after the loader normalizes the text-only naming layout.
+
+Inkling 2 (`inkling2` and `inkling2_loop`) supports affine-quantized
+checkpoints with stacked `w13` and `w2` expert projections, including
+mixed-bit conversions. Each physical layer shares its cache across loop
+passes. Lightning MTP can use the checkpoint's separate DSpark draft with
+offload enabled. Disable VLM MTP and DFlash before enabling offload.
+
+Inkling 2 reads each miss straight into its slot. The slot arrays are
+materialized once, and a miss's bytes are read with `os.preadv` into the
+slot's rows of the weight, scales and biases arrays: no host copy, and no
+update kernel per tensor. The cache claims the slots before the reads start.
+Hits are protected, and the cache evaluates any gather it built since its
+last miss before the first write, so no queued GPU work reads a row being
+written. In decode that gather is already done: the routing readback waited
+on it. A failed read frees the claimed slots; the experts they evicted are
+not restored. The slot update kernels this replaces were the larger cost:
+besides the host copy, they slowed the GPU work that followed the install.
+Inkling 2 also dispatches its resident routes as soon as routing is known
+(no 0.5 ms grace), since a miss no longer costs an install afterwards.
+
+`scripts/repack_inkling2_experts.py` rewrites a converted Inkling 2
+checkpoint with each expert's six tensors stored back to back, as
+`model.layers.<i>.mlp.experts.<e>.{w13,w2}.{weight,scales,biases}`. Offload
+then reads a miss with one `preadv` instead of six reads; the expert bytes
+are copied unchanged, and the loader stacks them again when offload is off.
+Older oMLX releases cannot load the repacked layout. The script also
+requantizes the token embedding (default 4-bit) and, with
+`--lm-head-bits 4`, the vocabulary head, and quantizes the vision tower
+linears to 8-bit with group size 32. Against an FP32 reference over eight
+images, the BF16 tower's image features differ by 4.4% and the 8-bit tower's
+by 5.0%.
+
+Measured on `Inkling-2-Mini-oQ2.5e-mtp` on an M4 MacBook Air 16 GB, internal
+SSD: 1,426-token prompt, 48 greedy decode tokens without MTP, configurations
+alternated over four rounds with a 45 s cooldown before each run, medians.
+Decode throughput:
+
+| layout and runtime | resident fraction | decode | peak memory |
+|---|---|---|---|
+| stacked checkpoint, before | 0.25 | 4.36 tok/s | 5.30 GiB |
+| repacked, direct reads, 0.5 ms grace | 0.25 | 7.92 tok/s | 4.81 GiB |
+| repacked, direct reads, no grace | 0.25 | 8.31 tok/s | 4.81 GiB |
+| repacked, direct reads, no grace | 0.3125 | 8.79 tok/s | 5.25 GiB |
+
+In those runs, the embedding was 4-bit and the vocabulary head 8-bit. A
+4-bit vocabulary head measured 7.88 against 7.31 tok/s at 0.25, alternated
+over four rounds on the same expert files: decode then spends about 2.7 ms
+less per token outside the experts. Perplexity on 1,024-token English, code,
+Chinese and Japanese texts rose by 0.2% to 0.6%. At a resident fraction of 0.5,
+with 4-bit embedding and vocabulary head, decode ran 9.55 to 9.77 tok/s over
+three runs. The expert hit rate was 70.4%, decode read 77 MiB of experts per
+token, and peak memory was 6.57 GiB. The logits match the stacked checkpoint's
+top-1 token at every step with the 8-bit vocabulary head, and at 47 of 48 steps
+with the 4-bit one. Time to first token is unchanged. When two checkpoints
+share the machine, compare them on the same expert files: each one evicts the
+other's from the page cache, and the run after a switch reads up to 1.5 times
+as much from the SSD.
 
 The common adapter supports stacked `[num_experts, ...]` quantized
 `SwitchGLU` projections and the per-expert layout used by OLMoE conversions.
