@@ -10,7 +10,6 @@ import enum
 import json
 import logging
 import math
-import shutil
 import struct
 import tempfile
 import time
@@ -18,7 +17,6 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Optional
 
 from ..model_discovery import CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS
 from ..oq import (
@@ -67,6 +65,28 @@ def _has_meaningful_readme(path: Path) -> bool:
         # Only opening --- or unclosed frontmatter
         return False
     return True
+
+
+def _upload_model_folder(api, model_path: Path, readme: bytes | None, **kwargs) -> None:
+    if readme is None:
+        api.upload_folder(folder_path=str(model_path), **kwargs)
+        return
+
+    # The upload thread may outlive its cancelled asyncio task. Keep its
+    # replacement README in a temporary folder owned by that thread, with
+    # links to the model files so large checkpoints do not have to be copied.
+    with tempfile.TemporaryDirectory(prefix="omlx-upload-") as directory:
+        staging = Path(directory)
+        model_path = model_path.resolve()
+        for source in model_path.glob("**/*"):
+            relative = source.relative_to(model_path)
+            if relative == Path("README.md") or not source.is_file():
+                continue
+            destination = staging / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.symlink_to(source)
+        (staging / "README.md").write_bytes(readme)
+        api.upload_folder(folder_path=str(staging), **kwargs)
 
 
 def _is_oq_model(name: str) -> bool:
@@ -683,8 +703,6 @@ class HFUploader:
         from huggingface_hub import HfApi
 
         task = self._tasks[task_id]
-        tmp_readme: Optional[Path] = None
-        readme_backup: Optional[Path] = None
 
         try:
             async with self._upload_sem:
@@ -710,8 +728,7 @@ class HFUploader:
                     return
 
                 # Handle README
-                readme_in_model = model_path / "README.md"
-                readme_bytes: Optional[bytes] = None
+                readme_bytes: bytes | None = None
                 if readme_source_path:
                     source_readme = Path(readme_source_path) / "README.md"
                     if source_readme.exists():
@@ -729,16 +746,6 @@ class HFUploader:
                         redownload_notice=redownload_notice,
                     ).encode("utf-8")
 
-                if readme_bytes is not None:
-                    if readme_in_model.exists() or readme_in_model.is_symlink():
-                        # Keep the local card outside the uploaded folder.
-                        readme_backup = (
-                            Path(tempfile.mkdtemp(prefix="omlx-readme-")) / "README.md"
-                        )
-                        shutil.move(readme_in_model, readme_backup)
-                    tmp_readme = readme_in_model
-                    readme_in_model.write_bytes(readme_bytes)
-
                 if task_id in self._cancelled:
                     return
 
@@ -747,8 +754,10 @@ class HFUploader:
                 task.progress = 10.0  # Signal that upload has started
 
                 await asyncio.to_thread(
-                    api.upload_folder,
-                    folder_path=str(model_path),
+                    _upload_model_folder,
+                    api,
+                    model_path,
+                    readme_bytes,
                     repo_id=task.repo_id,
                     token=token,
                     commit_message=f"Upload {task.model_name} via oMLX",
@@ -778,14 +787,4 @@ class HFUploader:
                 task.error = str(e)
                 logger.error(f"Upload failed for {task.model_name}: {e}")
         finally:
-            if tmp_readme is not None:
-                try:
-                    tmp_readme.unlink(missing_ok=True)
-                    if readme_backup is not None:
-                        shutil.move(readme_backup, tmp_readme)
-                        readme_backup.parent.rmdir()
-                except OSError:
-                    logger.exception(
-                        f"Could not restore {tmp_readme} from {readme_backup}"
-                    )
             self._active_tasks.pop(task_id, None)

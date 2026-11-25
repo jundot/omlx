@@ -1866,8 +1866,13 @@ class HFDownloader(_QueuePersistenceMixin):
         if progress_task and not progress_task.done():
             progress_task.cancel()
 
-        # The task stays in _active_tasks until its worker stops writing.
-        active_task = self._active_tasks.get(task_id)
+        # Keep the in-flight writer registered until it stops. A pending
+        # coroutine may be cancelled before it can run its own cleanup.
+        active_task = (
+            self._active_tasks.get(task_id)
+            if was_downloading
+            else self._active_tasks.pop(task_id, None)
+        )
         if active_task and not active_task.done():
             active_task.cancel()
 
