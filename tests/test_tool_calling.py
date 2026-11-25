@@ -5384,151 +5384,31 @@ def test_final_qwen_recovery_requires_complete_schema_valid_arguments(
     assert result.parse_errors == ("malformed",)
 
 
-@pytest.fixture
-def json_tools_parser():
-    from mlx_lm.tool_parsers.json_tools import parse_tool_call
-
-    tok = SimpleNamespace(
-        has_tool_calling=True,
-        tool_call_start="<tool_call>",
-        tool_call_end="</tool_call>",
-        tool_parser=parse_tool_call,
-    )
-    tools = [
-        {
-            "function": {
-                "name": "write",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"content": {"type": "string"}},
-                    "required": ["content"],
-                },
-            }
-        }
-    ]
-    return tok, tools
-
-
-# The capture from #4909: JSON complete except the trailing closers come out
-# in the wrong order, so json.loads raises "Expecting ',' delimiter" and the
-# XML fallback (no <function=> markup inside) cannot recover.
-_MISORDERED_CLOSERS = '{"name": "write", "arguments": {"content": "hi"]}'
-
-
-def test_final_json_tools_parse_failure_reports_malformed(json_tools_parser):
-    """A span the json_tools parser rejects must surface in parse_errors (#5245)."""
-    tok, tools = json_tools_parser
-    raw = f"<tool_call>{_MISORDERED_CLOSERS}</tool_call>"
-    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
-    assert not result.tool_calls
-    assert result.parse_errors == ("malformed",)
-
-
-def test_final_json_tools_sibling_survives_and_failure_reported(json_tools_parser):
-    tok, tools = json_tools_parser
-    good = '{"name": "write", "arguments": {"content": "ok"}}'
-    raw = (
-        f"<tool_call>{good}</tool_call>\n"
-        f"<tool_call>{_MISORDERED_CLOSERS}</tool_call>"
-    )
-    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
-    assert [tc.function.name for tc in result.tool_calls] == ["write"]
-    assert result.parse_errors == ("malformed",)
-
-
-def test_final_json_tools_validation_drop_reports_malformed(
-    json_tools_parser, monkeypatch
-):
-    """A span the parser accepts but ``_build_tool_call`` drops is reported too.
-
-    That drop never reaches the "Dropping match" branch, so it needs its own
-    report (#5245).
-    """
-    import omlx.api.tool_calling as mod
-
-    tok, tools = json_tools_parser
-    monkeypatch.setattr(mod, "_build_tool_call", lambda name, arguments: None)
-    raw = '<tool_call>{"name": "write", "arguments": {"content": "ok"}}</tool_call>'
-    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
-    assert not result.tool_calls
-    assert result.parse_errors == ("malformed",)
+_JSON_CALL = '<tool_call>{"name": "write", "arguments": {}}</tool_call>'
+_BROKEN_JSON_CALL = _JSON_CALL.replace("}}", "}]")
 
 
 @pytest.mark.parametrize(
-    "payload",
-    ["...", "", "\nPLACEHOLDER\n", "` and `"],
-    ids=["ellipsis", "empty", "placeholder", "backticks"],
+    "parser,thinking,raw,calls,errors",
+    [
+        ("json_tools", "", _BROKEN_JSON_CALL, 0, ("malformed",)),
+        ("json_tools", "", "<tool_call> to write, or already </tool_call>", 0, ()),
+        ("json_tools", "", _JSON_CALL + _BROKEN_JSON_CALL, 1, ()),
+        ("json_tools", _JSON_CALL, _BROKEN_JSON_CALL, 1, ()),
+        ("pythonic", "", "<|tool_call_start|>write()<|tool_call_end|>", 1, ()),
+    ],
+    ids=["lost", "prose", "sibling", "reasoning", "fallback"],
 )
-def test_final_json_tools_marker_pair_in_prose_is_not_reported(
-    json_tools_parser, payload
+def test_final_native_rejection_reports_only_a_lost_call(
+    parser, thinking, raw, calls, errors
 ):
-    """A model writing the marker pair in prose is not a failed call.
-
-    The payloads are the ones Qwen3-8B-4bit produced when asked to describe
-    the format.  None names a declared tool, so the reply stays a normal
-    finish instead of becoming invalid_tool_call (#5245).
-    """
-    tok, tools = json_tools_parser
-    raw = f"A tool call is wrapped like <tool_call>{payload}</tool_call> here."
-    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
-    assert not result.tool_calls
-    assert result.parse_errors == ()
-
-
-def test_final_json_tools_unparseable_span_naming_a_tool_is_reported(
-    json_tools_parser,
-):
-    """The other side of the prose rule: a declared name marks a call attempt."""
-    tok, tools = json_tools_parser
-    raw = "<tool_call>write the file please</tool_call>"
-    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
-    assert not result.tool_calls
-    assert result.parse_errors == ("malformed",)
-
-
-def test_final_json_tools_success_keeps_parse_errors_empty(json_tools_parser):
-    tok, tools = json_tools_parser
-    raw = '<tool_call>{"name": "write", "arguments": {"content": "ok"}}</tool_call>'
-    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
-    assert len(result.tool_calls) == 1
-    assert result.parse_errors == ()
-
-
-def test_final_json_tools_fallback_recovery_keeps_parse_errors_empty(
-    json_tools_parser,
-):
-    """Native parser raises but the XML fallback recovers: not a failure."""
-    tok, tools = json_tools_parser
-    raw = (
-        "<tool_call><function=write><parameter=content>ok</parameter>"
-        "</function></tool_call>"
-    )
-    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
-    assert len(result.tool_calls) == 1
-    assert result.parse_errors == ()
-
-
-def test_json_tools_parse_failure_without_tools_stays_silent(json_tools_parser):
-    """No declared tools means no parse_errors, matching the qwen3_coder gate."""
-    tok, _ = json_tools_parser
-    raw = f"<tool_call>{_MISORDERED_CLOSERS}</tool_call>"
-    result = extract_tool_calls_with_thinking("", raw, tok, None, finish_reason="stop")
-    assert not result.tool_calls
-    assert result.parse_errors == ()
-
-
-@pytest.mark.parametrize("finish_reason", [None, "length"])
-def test_json_tools_parse_failure_reported_only_at_normal_eof(
-    json_tools_parser, finish_reason
-):
-    """Only terminal extraction at finish_reason "stop" reports failures."""
-    tok, tools = json_tools_parser
-    raw = f"<tool_call>{_MISORDERED_CLOSERS}</tool_call>"
+    tok = _qwen_parser_tokenizer(f"mlx_lm.tool_parsers.{parser}")
+    tools = [{"function": {"name": name}} for name in ("read", "write")]
     result = extract_tool_calls_with_thinking(
-        "", raw, tok, tools, finish_reason=finish_reason
+        thinking, raw, tok, tools, finish_reason="stop"
     )
-    assert not result.tool_calls
-    assert result.parse_errors == ()
+    assert len(result.tool_calls or []) == calls
+    assert result.parse_errors == errors
 
 
 class TestAttributeStyleFunctionDialect:

@@ -2050,13 +2050,8 @@ def parse_tool_calls(
         text: Raw model output text
         tokenizer: mlx-lm's TokenizerWrapper (required)
         tools: Tool definitions for type conversion (optional)
-        parse_errors: Optional accumulator. When provided, a marker span
-            that the native parser rejects and the XML fallback cannot
-            recover appends "malformed" instead of only logging, so the
-            caller can distinguish a dropped call from no call (#5245).
-            Callers that run their own envelope accounting
-            (parse_qwen_tool_calls) must not pass it, or a failed
-            envelope would be reported twice.
+        parse_errors: Collects "malformed" when the native parser yields no
+            call from a span that calls a declared tool (optional)
 
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
@@ -2119,9 +2114,7 @@ def _parse_tool_calls_impl(
             pos = span[1]
         if attr_calls:
             remainder = cleaned_text[pos:]
-            tail, calls = _parse_tool_calls_impl(
-                remainder, tokenizer, tools, parse_errors
-            )
+            tail, calls = _parse_tool_calls_impl(remainder, tokenizer, tools)
             prose.append(remainder[: len(remainder) - len(remainder.lstrip())] + tail)
             return "".join(prose).strip(), attr_calls + (calls or [])
 
@@ -2204,12 +2197,6 @@ def _parse_tool_calls_impl(
                         _built = _build_tool_call(name, arguments)
                         if _built is not None:
                             tool_calls.append(_built)
-                        elif parse_errors is not None:
-                            # The parser accepted the span but validation
-                            # dropped the call, which never reaches the
-                            # "Dropping match" branch below.  Same outcome
-                            # for the client, so same report (#5245).
-                            parse_errors.append("malformed")
                 except (
                     ValueError,
                     json.JSONDecodeError,
@@ -2240,8 +2227,6 @@ def _parse_tool_calls_impl(
                                 _built = _build_tool_call(name, arguments)
                                 if _built is not None:
                                     tool_calls.append(_built)
-                                elif parse_errors is not None:
-                                    parse_errors.append("malformed")
                             gemma4_handled = True
                         except (
                             ValueError,
@@ -2278,15 +2263,6 @@ def _parse_tool_calls_impl(
                             primary_err,
                             match[:200],
                         )
-                        # Report only a span that names a declared tool.  A
-                        # broken call keeps its name and breaks in the
-                        # arguments; a model writing the marker pair in
-                        # prose ("wrapped like <tool_call>...</tool_call>")
-                        # does not, and must stay a normal reply (#5245).
-                        if parse_errors is not None and any(
-                            name in match for name in _extract_tool_names(tools or [])
-                        ):
-                            parse_errors.append("malformed")
                     continue
 
             if tool_calls:
@@ -2300,6 +2276,13 @@ def _parse_tool_calls_impl(
                     if idx >= 0:
                         cleaned_text = cleaned_text[:idx].strip()
                 return cleaned_text, tool_calls
+
+            if parse_errors is not None and any(
+                re.search(rf"(?<![\w-]){re.escape(name)}\s*[\"'(\[{{<:]", match)
+                for name in _extract_tool_names(tools or [])
+                for match in matches
+            ):
+                parse_errors.append("malformed")
 
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if "<tool_call>" in cleaned_text:
@@ -2546,6 +2529,7 @@ def extract_tool_calls_with_thinking(
       of whether regular text was also produced.
     """
     parse_errors = ()
+    rejected: list[str] = []
     parser = getattr(tokenizer, "tool_parser", None)
     if (
         finish_reason is not None
@@ -2560,25 +2544,9 @@ def extract_tool_calls_with_thinking(
             regular_content, tokenizer, tools, finish_reason
         )
     else:
-        # Report parse failures only at terminal extraction with declared
-        # tools, like the qwen3_coder branch above. Without this, a span the
-        # parser rejects is dropped with nothing but a server-side warning,
-        # so the client gets an empty success (finish_reason "stop", no
-        # calls, span gone from streamed content) instead of
-        # _tool_call_failure (#5245). Restricted to finish_reason "stop":
-        # paired-marker truncation never reaches the native parser
-        # (_marker_payloads yields complete spans only) and is already
-        # handled as "incomplete" by the withheld-payload path, but a
-        # one-sided marker cut by a length stop would misreport here as
-        # "malformed".
-        failed: Optional[List[str]] = (
-            [] if finish_reason == "stop" and tools else None
-        )
         cleaned_text, tool_calls = parse_tool_calls(
-            regular_content, tokenizer, tools, parse_errors=failed
+            regular_content, tokenizer, tools, rejected
         )
-        if failed:
-            parse_errors = tuple(failed)
 
     dsml_start = getattr(tokenizer, "tool_call_start", None)
     if (
@@ -2605,6 +2573,7 @@ def extract_tool_calls_with_thinking(
             cleaned_text = visible.strip()
             errors.append("incomplete")
         parse_errors = tuple(errors)
+        rejected = []
 
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer, tools=tools)
     tool_calls_from_thinking = False
@@ -2658,8 +2627,13 @@ def extract_tool_calls_with_thinking(
                     tool_calls = None
                     tool_calls_from_thinking = False
 
-    if tools and finish_reason == "tool_calls" and not tool_calls and not parse_errors:
+    if (
+        tools
+        and not tool_calls
+        and not parse_errors
         # A remote backend can consume the call span and still report this finish.
+        and (finish_reason == "tool_calls" or (finish_reason == "stop" and rejected))
+    ):
         parse_errors = ("malformed",)
 
     return ToolCallExtraction(
