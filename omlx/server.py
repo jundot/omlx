@@ -1024,62 +1024,21 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
     }
 
 
-_ANTHROPIC_ERROR_TYPES = {
-    400: "invalid_request_error",
-    401: "authentication_error",
-    403: "permission_error",
-    404: "not_found_error",
-    413: "request_too_large",
-    429: "rate_limit_error",
-    500: "api_error",
-    503: "overloaded_error",
-    529: "overloaded_error",
-}
-
-
-def _is_anthropic_route(request) -> bool:
-    """True for the Anthropic-compatible ``/v1/messages`` endpoints.
-
-    Match the route and its subpaths, not a longer path that merely starts with
-    the same text (``/v1/messagesXYZ`` is an unmatched OpenAI-compatible path).
-    """
-    path = request.url.path
-    return path == "/v1/messages" or path.startswith("/v1/messages/")
-
-
-def _anthropic_error_body(message, status_code: int) -> dict:
-    """Build an Anthropic-compatible error response body.
-
-    A status the table does not name (405, 409, 422, …) still gets a type from
-    its class, so a client that branched on ``invalid_request_error`` is not
-    handed ``api_error`` for a 4xx.
-    """
-    error_type = _ANTHROPIC_ERROR_TYPES.get(status_code)
-    if error_type is None:
-        error_type = "invalid_request_error" if 400 <= status_code < 500 else "api_error"
-    return {
-        "type": "error",
-        "error": {
-            "type": error_type,
-            "message": str(message),
-        },
-    }
+def _is_anthropic_route(request: FastAPIRequest) -> bool:
+    return request.url.path.startswith("/v1/messages")
 
 
 def _error_body_for(
-    request, message, status_code: int, *, param=None, code=None
+    request: FastAPIRequest, message, status_code: int, *, param=None, code=None
 ) -> dict:
-    """Pick the error envelope that matches the request's surface.
-
-    Anthropic routes get ``{"type": "error", "error": {...}}``, the rest of
-    ``/v1/*`` keeps OpenAI's ``{"error": {...}}``, and admin/UI paths keep
-    FastAPI's ``{"detail": ...}``.
-    """
+    if not _is_api_route(request):
+        return {"detail": message}
+    content = _openai_error_body(message, status_code, param=param, code=code)
     if _is_anthropic_route(request):
-        return _anthropic_error_body(message, status_code)
-    if _is_api_route(request):
-        return _openai_error_body(message, status_code, param=param, code=code)
-    return {"detail": message}
+        content["type"] = "error"
+        if status_code >= 500:
+            content["error"]["type"] = "api_error"
+    return content
 
 
 @app.exception_handler(HTTPException)
@@ -1112,19 +1071,6 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
 async def starlette_http_exception_handler(
     request: FastAPIRequest, exc: StarletteHTTPException
 ):
-    """Shape routing errors (unknown routes, method not allowed) like the API.
-
-    FastAPI's own ``HTTPException`` handler above only covers errors raised by
-    route code. Starlette raises its base class for unmatched routes, which
-    previously escaped as ``{"detail": "Not Found"}`` even on ``/v1/*``.
-    """
-    logger.debug(
-        "%s %s → %d: %s",
-        request.method,
-        request.url.path,
-        exc.status_code,
-        exc.detail,
-    )
     content = _error_body_for(request, exc.detail, exc.status_code)
     return JSONResponse(
         status_code=exc.status_code, content=content, headers=exc.headers
@@ -1144,15 +1090,6 @@ async def validation_exception_handler(
         status_code,
         exc.errors(),
     )
-    if _is_anthropic_route(request):
-        errors = exc.errors()
-        parts = []
-        for err in errors:
-            loc = " -> ".join(str(x) for x in err.get("loc", []))
-            msg = err.get("msg", "")
-            parts.append(f"{loc}: {msg}" if loc else msg)
-        content = _anthropic_error_body("; ".join(parts) or "Invalid request", 400)
-        return JSONResponse(status_code=400, content=content)
     if _is_api_route(request):
         errors = exc.errors()
         parts = []
@@ -1162,10 +1099,10 @@ async def validation_exception_handler(
             parts.append(f"{loc}: {msg}" if loc else msg)
         detail_str = "; ".join(parts)
         param = errors[0].get("loc", [None])[-1] if errors else None
-        content = _openai_error_body(detail_str, 422, param=param)
+        content = _error_body_for(request, detail_str, status_code, param=param)
     else:
         content = {"detail": jsonable_encoder(exc.errors())}
-    return JSONResponse(status_code=422, content=content)
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @app.exception_handler(InvalidRequestError)

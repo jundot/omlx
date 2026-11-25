@@ -667,7 +667,6 @@ class TestUnauthenticatedInference:
         response = client.post(
             path, json={}, headers={"Authorization": "Bearer management-key"}
         )
-        # Anthropic-shaped routes report invalid bodies as 400.
         expected = 400 if path.startswith("/v1/messages") else 422
         assert response.status_code == expected
         settings.auth.allow_unauthenticated_inference = True
