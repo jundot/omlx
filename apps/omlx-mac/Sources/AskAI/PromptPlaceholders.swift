@@ -28,11 +28,16 @@ enum PromptPlaceholders {
 
     /// Replaces known tokens; other braces, such as JSON in a prompt, stay as written.
     static func fill(_ template: String, context: PromptContext) -> String {
-        var out = template
-        for placeholder in PromptPlaceholder.allCases where out.contains(placeholder.token) {
-            out = out.replacingOccurrences(of: placeholder.token, with: value(of: placeholder, context: context))
+        var values: [PromptPlaceholder: String] = [:]
+        return template.replacing(#/\{([a-z]+)\}/#) { match in
+            guard let placeholder = PromptPlaceholder(rawValue: String(match.1)) else {
+                return String(match.0)
+            }
+            if let cached = values[placeholder] { return cached }
+            let replacement = value(of: placeholder, context: context)
+            values[placeholder] = replacement
+            return replacement
         }
-        return out
     }
 
     static func value(of placeholder: PromptPlaceholder, context: PromptContext) -> String {
