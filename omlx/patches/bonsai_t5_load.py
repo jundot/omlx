@@ -35,10 +35,10 @@ import mlx_lm.utils as mlx_lm_utils
 from mlx.utils import tree_flatten, tree_unflatten
 
 from omlx.custom_kernels.lowbit.fast import (
+    has_native,
+    t5_qmm,
     t5_qmv,
     t5_qmv_wide,
-    t5_qmm,
-    has_native,
 )
 
 # M threshold below which qmv kernels are used; above this t5_qmm is used.
@@ -168,7 +168,8 @@ def _t5_quantized_matmul(
     """mx.quantized_matmul replacement that handles t5 uint8 weights.
 
     When *w* is uint8 (t5 base-3 packed):
-      - M=1: route to qmv_fast Metal kernel (single-vector decode).
+      - M=1: use qmv_fast, with a wide variant for FP16 batches of four
+        with group size 128.
       - M≥2: route to qmv_wide Metal kernel (arbitrary M via tiling; reads each
         weight byte once across all M vectors — no float weight materialisation).
       The dequant+matmul fallback below is only reached when the native extension
@@ -200,6 +201,19 @@ def _t5_quantized_matmul(
         # scales dtype coercion is handled by the C++ ensure_dtype layer.
         if M >= 2:
             return t5_qmv_wide(x, w, scales)
+        if (
+            M == 1
+            and x.ndim == 3
+            and x.shape[0] == 4
+            and x.dtype == mx.float16
+            and transpose
+            and w.ndim == 2
+            and scales.ndim == 2
+            and scales.shape[-1] > 0
+            and w.shape[-1] == 26 * scales.shape[-1]
+            and x.shape[-1] == 128 * scales.shape[-1]
+        ):
+            return t5_qmv(x, w, scales, batch4=True)
         return t5_qmv(x, w, scales)
 
     if has_native():

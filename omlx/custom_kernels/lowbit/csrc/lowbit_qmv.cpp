@@ -146,6 +146,7 @@ void dispatch_qmv_wide_t5(
     array& out,
     int M, int N, int K,
     int group_size,
+    bool batch4_lut,
     metal::Device& d,
     const Stream& s) {
 
@@ -157,6 +158,9 @@ void dispatch_qmv_wide_t5(
 
     std::string kname = qmv_wide_t5_kname(
         type_str(x.dtype()), group_size, vecs_per_tg, k_lanes);
+    if (batch4_lut) {
+        kname += "_batch4_lut";
+    }
 
     auto kernel = get_lowbit_kernel(d, kname);
     auto& enc = metal::get_command_encoder(s);
@@ -185,11 +189,12 @@ void dispatch_qmv_wide_t5(
 //   inputs[2] = scales ((N, n_groups) scale per group; no biases)
 class T5QmvPrimitive : public Primitive {
  public:
-    explicit T5QmvPrimitive(Stream s, bool wide)
-        : Primitive(s), wide_(wide) {}
+    explicit T5QmvPrimitive(Stream s, bool wide, bool batch4_lut = false)
+        : Primitive(s), wide_(wide), batch4_lut_(batch4_lut) {}
 
  private:
     bool wide_;
+    bool batch4_lut_;
 
     void eval_cpu(
         const std::vector<array>& /* inputs */,
@@ -217,7 +222,7 @@ class T5QmvPrimitive : public Primitive {
 
         if (wide_) {
             dispatch_qmv_wide_t5(x, w, scales, out,
-                                 M, N, K, group_size, d, s);
+                                 M, N, K, group_size, batch4_lut_, d, s);
         } else {
             dispatch_qmv_fast_t5(x, w, scales, out,
                                  M, N, K, group_size, d, s);
@@ -332,11 +337,12 @@ array t5_qmv(
         {x_c, w, sc});
 }
 
-array t5_qmv_wide(
+static array make_t5_qmv_wide(
     const array& x,
     const array& w,
     const array& scales,
-    StreamOrDevice s_) {
+    StreamOrDevice s_,
+    bool batch4_lut) {
     auto s = to_stream(s_);
     auto x_c = ensure_row_contiguous(x, s);
     auto sc  = ensure_dtype(scales, x_c.dtype(), s);
@@ -344,8 +350,36 @@ array t5_qmv_wide(
     auto out_shape = x_c.shape();
     out_shape.back() = N;
     return array(out_shape, x_c.dtype(),
-        std::make_shared<T5QmvPrimitive>(s, /*wide=*/true),
+        std::make_shared<T5QmvPrimitive>(s, /*wide=*/true, batch4_lut),
         {x_c, w, sc});
+}
+
+array t5_qmv_wide(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s) {
+    return make_t5_qmv_wide(x, w, scales, s, /*batch4_lut=*/false);
+}
+
+array t5_qmv_wide_batch4(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s) {
+    if (x.ndim() != 3 || x.shape(0) != 4 || x.shape(1) != 1 ||
+        x.dtype() != float16 || w.dtype() != uint8 ||
+        w.ndim() != 2 || scales.ndim() != 2 ||
+        w.shape(0) != scales.shape(0) || scales.shape(1) <= 0 ||
+        w.shape(1) != scales.shape(1) * 26 ||
+        x.shape(-1) != scales.shape(-1) * 128) {
+        throw std::invalid_argument(
+            "t5 batch4 requires FP16 [4, 1, K] and matching group-128 weights and scales");
+    }
+    auto stream = to_stream(s);
+    return make_t5_qmv_wide(
+        x, ensure_row_contiguous(w, stream), ensure_row_contiguous(scales, stream),
+        stream, /*batch4_lut=*/true);
 }
 
 array t5_qmm(

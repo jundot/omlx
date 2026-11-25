@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -26,6 +27,7 @@ from mlx.utils import tree_flatten
 from mlx_vlm.quantization.one_bit import OneBitEmbedding, OneBitLinear
 
 import omlx.patches.bonsai_t5_load as bonsai_t5_load
+from omlx.custom_kernels.lowbit import fast as lowbit_fast
 from omlx.models.vlm import restore_bonsai_quantized_modules
 from omlx.patches.bonsai_t5_load import (
     _is_t5_weight_replacement,
@@ -687,3 +689,70 @@ def test_vlm_one_bit_modules_match_stock_mlx():
     for x, ref in zip(xs, expected, strict=True):
         assert mx.allclose(model.linear(x), ref, atol=1e-2, rtol=1e-2).item()
     assert mx.array_equal(model.embedding(ids), expected_rows).item()
+
+
+@pytest.mark.parametrize(
+    "batch,group_size,dtype,transpose,wide_available,expected",
+    [
+        (4, 128, mx.float16, True, True, 1),
+        (8, 128, mx.float16, True, True, 0),
+        (4, 64, mx.float16, True, True, 0),
+        (4, 128, mx.bfloat16, True, True, 0),
+        (4, 128, mx.float16, False, True, 0),
+        (4, 128, mx.float16, True, False, 0),
+    ],
+)
+def test_t5_batch4_routing(
+    monkeypatch, batch, group_size, dtype, transpose, wide_available, expected
+):
+    def fast(x, w, scales, stream=None):
+        return mx.zeros((batch, 1, 1), dtype=dtype)
+
+    def wide(x, w, scales, stream=None):
+        return mx.ones((batch, 1, 1), dtype=dtype)
+
+    extension = SimpleNamespace(t5_qmv=fast)
+    if wide_available:
+        extension.t5_qmv_wide_batch4 = wide
+    monkeypatch.setattr(lowbit_fast, "_ext", extension)
+    apply_bonsai_t5_load_patch()
+
+    x = mx.zeros((batch, 1, group_size), dtype=dtype)
+    w = mx.zeros((1, (group_size + 4) // 5), dtype=mx.uint8)
+    scales = mx.ones((1, 1), dtype=dtype)
+    result = mx.quantized_matmul(
+        x, w, scales, transpose=transpose, group_size=group_size, bits=2
+    )
+    np.testing.assert_array_equal(np.asarray(result.astype(mx.float32)), expected)
+
+
+def test_t5_batch4_native_matches_dense():
+    if not lowbit_fast.has_symbol("t5_qmv_wide_batch4"):
+        pytest.skip("native t5 batch4 kernel unavailable")
+
+    rng = np.random.default_rng(382)
+    x_np = rng.integers(-2, 3, size=(256, 1, 4)).astype(np.float16)
+    codes = rng.integers(0, 3, size=(17, 256), dtype=np.uint8)
+    packed = pack_t5(codes, group_size=128)
+    scales_np = rng.choice([0.5, 1.0, 2.0], size=(2, 17)).astype(np.float16)
+    x = mx.array(x_np).transpose(2, 1, 0)
+    w = mx.array(packed.T.copy()).T
+    scales = mx.array(scales_np).T
+
+    apply_bonsai_t5_load_patch()
+    result = mx.quantized_matmul(x, w, scales, group_size=128, bits=2)
+    dense = (codes.astype(np.float64) - 1) * np.repeat(scales_np.T, 128, axis=1)
+    expected = (x_np.transpose(2, 1, 0).astype(np.float64) @ dense.T).astype(np.float16)
+    assert result.dtype == mx.float16
+    np.testing.assert_array_equal(np.asarray(result), expected)
+
+
+def test_t5_batch4_native_rejects_mismatched_scales():
+    if not lowbit_fast.has_symbol("t5_qmv_wide_batch4"):
+        pytest.skip("native t5 batch4 kernel unavailable")
+
+    x = mx.zeros((4, 1, 128), dtype=mx.float16)
+    w = mx.zeros((17, 26), dtype=mx.uint8)
+    scales = mx.ones((16, 1), dtype=mx.float16)
+    with pytest.raises(ValueError, match="matching group-128 weights and scales"):
+        lowbit_fast.t5_qmv(x, w, scales, batch4=True)

@@ -31,6 +31,11 @@ NB_MODULE(_ext, m) {
       "x"_a, "w"_a, "scales"_a,
       "stream"_a = nb::none());
   m.def(
+      "t5_qmv_wide_batch4",
+      &omlx::lowbit::t5_qmv_wide_batch4,
+      "x"_a, "w"_a, "scales"_a,
+      "stream"_a = nb::none());
+  m.def(
       "t5_qmm",
       &omlx::lowbit::t5_qmm,
       "x"_a, "w"_a, "scales"_a,

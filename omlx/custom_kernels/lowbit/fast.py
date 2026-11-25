@@ -58,6 +58,8 @@ def t5_qmv(
     w: mx.array,
     scales: mx.array,
     stream=None,
+    *,
+    batch4: bool = False,
 ) -> mx.array:
     """t5 base-3 ternary decode (M=1, ~1.585 bpw, I-D).
 
@@ -66,7 +68,10 @@ def t5_qmv(
     x      : [..., K]                   activations (float16 or bfloat16)
     w      : [..., N, n_groups*bpg]     uint8 t5 weight bytes
     scales : [..., N, n_groups]         scale per group (float16 or bfloat16)
+    batch4 : use the wide kernel for FP16 [4, 1, K] with group size 128
     """
+    if batch4 and has_symbol("t5_qmv_wide_batch4"):
+        return _ext.t5_qmv_wide_batch4(x, w, scales, stream=stream)
     if _ext is not None and has_symbol("t5_qmv"):
         return _ext.t5_qmv(x, w, scales, stream=stream)
     raise RuntimeError(
