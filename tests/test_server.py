@@ -749,8 +749,7 @@ class TestExceptionHandlers:
         """Test that exception handlers return proper JSON responses."""
         response = client.get("/v1/nonexistent-endpoint")
         assert response.status_code == 404
-        data = response.json()
-        assert "detail" in data or "error" in data
+        assert response.json()["error"]["type"] == "not_found_error"
 
     def test_api_validation_error_openai_format(self, client):
         """Test that /v1/* validation errors use OpenAI-compatible format."""
@@ -805,7 +804,40 @@ class TestExceptionHandlers:
             headers={"content-type": "application/json"},
         )
         assert response.status_code == 400
-        assert response.json()["error"]["param"] == param
+        body = response.json()
+        assert body["error"]["param"] == param
+        assert ("type" in body) == path.startswith("/v1/messages")
+
+    def test_anthropic_method_not_allowed(self, client):
+        response = client.get("/v1/messages")
+        assert response.status_code == 405
+        assert response.headers["allow"] == "POST"
+        assert response.json()["type"] == "error"
+
+    @pytest.mark.parametrize(
+        ("exc", "status", "code"),
+        [
+            (srv.SchedulerQueueFullError(current_depth=32, max_depth=32), 503, None),
+            (srv.DistributedInferenceError("rank 1 is down"), 503, None),
+            (RuntimeError("boom"), 500, None),
+            (srv._ToolCallGenerationError({"message": "m", "code": "bad"}), 500, "bad"),
+        ],
+    )
+    def test_anthropic_server_errors(self, client, monkeypatch, exc, status, code):
+        monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(side_effect=exc))
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == status
+        body = response.json()
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "api_error"
+        assert body["error"]["code"] == code
 
     def test_non_api_validation_error_with_value_error_ctx_returns_422(self):
         """A ValueError-raising validator on a non-/v1/ route must 422, not 500.
@@ -1652,6 +1684,7 @@ class TestRequestBodySizeLimit:
             "/echo", content=b"x" * 4096, headers={"content-type": "application/json"}
         )
         assert response.status_code == 413
+        assert response.json()["type"] == "error"
         assert response.json()["error"]["type"] == "request_too_large"
 
     def test_content_length_under_limit_reaches_handler(self, client):

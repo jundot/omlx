@@ -66,6 +66,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from omlx._version import __version__
 
@@ -1008,6 +1009,23 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
     }
 
 
+def _is_anthropic_route(request: FastAPIRequest) -> bool:
+    return request.url.path.startswith("/v1/messages")
+
+
+def _error_body_for(
+    request: FastAPIRequest, message, status_code: int, *, param=None, code=None
+) -> dict:
+    if not _is_api_route(request):
+        return {"detail": message}
+    content = _openai_error_body(message, status_code, param=param, code=code)
+    if _is_anthropic_route(request):
+        content["type"] = "error"
+        if status_code >= 500:
+            content["error"]["type"] = "api_error"
+    return content
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
@@ -1026,12 +1044,19 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.status_code,
             exc.detail,
         )
-    if _is_api_route(request):
-        content = _openai_error_body(
-            exc.detail, exc.status_code, code=getattr(exc, "code", None)
-        )
-    else:
-        content = {"detail": exc.detail}
+    content = _error_body_for(
+        request, exc.detail, exc.status_code, code=getattr(exc, "code", None)
+    )
+    return JSONResponse(
+        status_code=exc.status_code, content=content, headers=exc.headers
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(
+    request: FastAPIRequest, exc: StarletteHTTPException
+):
+    content = _error_body_for(request, exc.detail, exc.status_code)
     return JSONResponse(
         status_code=exc.status_code, content=content, headers=exc.headers
     )
@@ -1041,11 +1066,13 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
 async def validation_exception_handler(
     request: FastAPIRequest, exc: RequestValidationError
 ):
-    """Log request validation errors (422) before returning the response."""
+    """Log request validation errors (422, or 400 on Anthropic routes)."""
+    status_code = 400 if _is_anthropic_route(request) else 422
     logger.warning(
-        "%s %s → 422: %s",
+        "%s %s → %d: %s",
         request.method,
         request.url.path,
+        status_code,
         exc.errors(),
     )
     if _is_api_route(request):
@@ -1057,27 +1084,24 @@ async def validation_exception_handler(
             parts.append(f"{loc}: {msg}" if loc else msg)
         detail_str = "; ".join(parts)
         param = errors[0].get("loc", [None])[-1] if errors else None
-        content = _openai_error_body(detail_str, 422, param=param)
+        content = _error_body_for(request, detail_str, status_code, param=param)
     else:
         content = {"detail": jsonable_encoder(exc.errors())}
-    return JSONResponse(status_code=422, content=content)
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @app.exception_handler(InvalidRequestError)
 async def invalid_request_error_handler(
     request: FastAPIRequest, exc: InvalidRequestError
 ):
-    """Map internal request validation failures to OpenAI-compatible 400s."""
+    """Map internal request validation failures to the route's 400 envelope."""
     logger.warning(
         "%s %s -> 400: %s",
         request.method,
         request.url.path,
         exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body(str(exc), 400, param=exc.field)
-    else:
-        content = {"detail": str(exc)}
+    content = _error_body_for(request, str(exc), 400, param=exc.field)
     return JSONResponse(status_code=400, content=content)
 
 
@@ -1104,10 +1128,7 @@ async def scheduler_queue_full_handler(
         f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
         f"Try again shortly."
     )
-    if _is_api_route(request):
-        content = _openai_error_body(detail, 503)
-    else:
-        content = {"detail": detail}
+    content = _error_body_for(request, detail, 503)
     return JSONResponse(
         status_code=503,
         content=content,
@@ -1133,10 +1154,7 @@ async def distributed_unavailable_handler(
         request.url.path,
         exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body(str(exc), 503)
-    else:
-        content = {"detail": str(exc)}
+    content = _error_body_for(request, str(exc), 503)
     return JSONResponse(status_code=503, content=content)
 
 
@@ -1256,10 +1274,7 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
         exc,
         exc_info=exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body("Internal server error", 500)
-    else:
-        content = {"detail": "Internal server error"}
+    content = _error_body_for(request, "Internal server error", 500)
     return JSONResponse(status_code=500, content=content)
 
 

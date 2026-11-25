@@ -3065,7 +3065,10 @@ class TestErrorHandling:
             },
         )
 
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 400
+        body = response.json()
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "invalid_request_error"
 
     def test_empty_messages(self, client):
         """Test error when messages is empty."""
