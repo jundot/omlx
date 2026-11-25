@@ -1457,9 +1457,58 @@ class TestStreaming:
                 pass
         assert engine.get_live_requests() == {"prefilling": [], "generating": []}
 
-    async def test_plain_completions_are_rejected(self, tmp_path):
-        with pytest.raises(InvalidRequestError, match="chat requests only"):
-            await _engine(tmp_path).generate("Once upon a time")
+    async def test_text_completions_go_to_splash_completions(self, tmp_path):
+        seen = {}
+
+        def handler(request):
+            seen["path"] = request.url.path
+            seen["body"] = json.loads(request.content)
+            progress = {"total": 5, "cache": 4, "processed": 5, "time_ms": 1.0}
+            usage = {
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "prompt_tokens_details": {"cached_tokens": 4},
+            }
+            return httpx.Response(
+                200,
+                content=_sse(
+                    {"choices": [{"text": ""}], "prompt_progress": progress},
+                    {"choices": [{"text": " 4"}]},
+                    {"choices": [{"text": "2"}]},
+                    {"choices": [{"text": "", "finish_reason": "length"}]},
+                    {"choices": [], "usage": usage},
+                ),
+            )
+
+        engine = _engine(tmp_path, version="1.3.2")
+        engine._client = httpx.AsyncClient(
+            base_url="http://splash", transport=httpx.MockTransport(handler)
+        )
+        outputs = [
+            o
+            async for o in engine.stream_generate(
+                "12 + 30 =",
+                max_tokens=2,
+                stop=["\n"],
+                ignore_eos=True,
+                thinking_budget=512,
+            )
+        ]
+
+        assert [o.new_text for o in outputs] == [" 4", "2", ""]
+        final = outputs[-1]
+        assert (final.text, final.finish_reason) == (" 42", "length")
+        assert (final.prompt_tokens, final.completion_tokens, final.cached_tokens) == (
+            5,
+            2,
+            4,
+        )
+        assert seen["path"] == "/v1/completions"
+        body = seen["body"]
+        assert body["prompt"] == "12 + 30 =" and "messages" not in body
+        assert body["max_tokens"] == 2 and body["stop"] == ["\n"]
+        assert body["ignore_eos"] is True
+        assert "thinking_token_budget" not in body
 
 
 # -- process lifecycle -------------------------------------------------------------

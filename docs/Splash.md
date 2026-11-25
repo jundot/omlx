@@ -46,7 +46,7 @@ Splash finds models by Hugging Face repository ID in a Hugging Face cache. oMLX 
 
 On the first start Splash hashes the model files once (about one full read of the weights); later starts only check their sizes and times. A model folder that is itself a Hugging Face cache snapshot skips the hashing. Splash keeps its own selection links under `~/Library/Application Support/Splash/models/omlx/`.
 
-Loading the model starts `splash serve` from the selected launcher on a free loopback port with a random API key, which travels in the environment rather than on the command line. Requests are forwarded to Splash's OpenAI-compatible API. Reasoning comes back inside `<think>` tags for oMLX's reasoning parser, and tool calls come back structured, so chat completions, the Responses API and the Anthropic Messages API all work. The dashboard's active-models card shows Splash requests live (prefill progress from Splash's progress events, then generation speed), and the cache block lists Splash models next to MLX ones with Splash's own counters.
+Loading the model starts `splash serve` from the selected launcher on a free loopback port with a random API key, which travels in the environment rather than on the command line. Requests are forwarded to Splash's OpenAI-compatible API. Reasoning comes back inside `<think>` tags for oMLX's reasoning parser, and tool calls come back structured, so chat completions, the Responses API and the Anthropic Messages API all work. Text completions (`/v1/completions`) go to Splash's own text completions endpoint. The dashboard's active-models card shows Splash requests live (prefill progress from Splash's progress events, then generation speed), and the cache block lists Splash models next to MLX ones with Splash's own counters.
 
 Unloading the model stops the Splash process. Splash runs in its own process group under a small watchdog shell: if oMLX exits without unloading, even from `kill -9`, the watchdog stops Splash within two seconds. Splash's log is in oMLX's log directory under `splash/`.
 
@@ -86,6 +86,6 @@ The admin benchmark runs on Splash models through Splash's chat API, with thinki
 
 ## Limits
 
-- Splash serves chat requests only. `/v1/completions` returns HTTP 400.
+- Text completions send the prompt as raw text, without the chat template. Nothing splits reasoning out of the reply, so the thinking budget does not apply to them.
 - Image input works for checkpoints with a vision tower (`vision_config` in `config.json`): oMLX passes image parts through to Splash, in chat completions, the Responses API and the Anthropic Messages API. Flint, Inkling-2-Mini and checkpoints without a vision tower start with `--language-only`. Splash does not read video or audio input.
 - The other acceleration settings (MTP, DFlash, TurboQuant, ANE prefill, and so on) configure oMLX's MLX engines and do not apply while Splash serves the model.

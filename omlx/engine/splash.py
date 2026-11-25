@@ -1113,7 +1113,7 @@ class _StreamState:
     def add_choice(self, choice: dict[str, Any]) -> tuple[str, bool]:
         """Apply one streamed choice; returns (new text, produced output)."""
         self.finish_reason = choice.get("finish_reason") or self.finish_reason
-        delta = choice.get("delta") or {}
+        delta = choice.get("delta") or {"content": choice.get("text")}
         piece = ""
         if delta.get("reasoning_content"):
             piece += ("" if self.in_think else "<think>") + delta["reasoning_content"]
@@ -1593,7 +1593,13 @@ class SplashEngine(BaseEngine):
             "repetition_penalty": repetition_penalty,
             "presence_penalty": presence_penalty,
         }
-        for key in ("frequency_penalty", "stop", "seed", "response_format"):
+        for key in (
+            "frequency_penalty",
+            "stop",
+            "seed",
+            "response_format",
+            "ignore_eos",
+        ):
             if kwargs.get(key) is not None:
                 body[key] = kwargs[key]
         # oMLX's resolved budget (request over model settings); the in-process
@@ -1604,9 +1610,12 @@ class SplashEngine(BaseEngine):
         return body
 
     async def _stream(
-        self, body: dict[str, Any], request_id: str | None = None
+        self,
+        body: dict[str, Any],
+        request_id: str | None = None,
+        path: str = "/v1/chat/completions",
     ) -> AsyncIterator[GenerationOutput]:
-        """POST a streaming chat request to Splash and yield oMLX outputs.
+        """POST a streaming request to Splash and yield oMLX outputs.
 
         Timestamps use time.perf_counter(), the clock oMLX measures time to
         first token and generation speed with.
@@ -1626,9 +1635,7 @@ class SplashEngine(BaseEngine):
         self._active += 1
         self._requests += 1
         try:
-            async with self._client.stream(
-                "POST", "/v1/chat/completions", json=body
-            ) as response:
+            async with self._client.stream("POST", path, json=body) as response:
                 if response.status_code != 200:
                     detail = (await response.aread()).decode(errors="replace")
                     if 400 <= response.status_code < 500:
@@ -1780,14 +1787,33 @@ class SplashEngine(BaseEngine):
     # -- plain completions -----------------------------------------------------------
 
     async def stream_generate(
-        self, prompt: str | list[int], **kwargs
+        self,
+        prompt: str | list[int],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
-        # oMLX forwards chat requests only; there is no plain text path.
-        raise InvalidRequestError(
-            "Splash models serve chat requests only; use /v1/chat/completions, "
-            "/v1/responses or /v1/messages"
+        body = self._request_body(
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            kwargs,
         )
-        yield  # pragma: no cover - makes this an async generator
+        body.pop("thinking_token_budget", None)
+        body["prompt"] = prompt
+        async for output in self._stream(
+            body, kwargs.get("_request_id"), "/v1/completions"
+        ):
+            yield output
 
     async def generate(self, prompt: str | list[int], **kwargs) -> GenerationOutput:
         return await self._collect(self.stream_generate(prompt, **kwargs))
