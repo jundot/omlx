@@ -3,9 +3,11 @@
 
 import json
 import os
+import shutil
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -10099,6 +10101,139 @@ class TestInkling2OQ:
             assert logits.shape == reference.shape
             assert mx.isfinite(logits).all().item()
             assert mx.array_equal(model.encode_image(pixels, grid), features).item()
+
+
+@pytest.fixture
+def patched_load_config(monkeypatch):
+    monkeypatch.setattr(model_loading, "_MLX_LM_LOAD_CONFIG_PATCHED", False)
+    monkeypatch.setattr(mlx_lm_utils, "load_config", mlx_lm_utils.load_config)
+    model_loading._patch_mlx_lm_load_config()
+
+
+def _store_affine(tensors, quant, path, weight, group_size, bits):
+    q, scales, biases = mx.quantize(weight, group_size=group_size, bits=bits)
+    tensors.update(
+        {f"{path}.weight": q, f"{path}.scales": scales, f"{path}.biases": biases}
+    )
+    quant[path] = {"group_size": group_size, "bits": bits, "mode": "affine"}
+
+
+def _mlx_vlm_inkling2(source, dest, *, attention_bits=None, expert_bits=()):
+    inkling2 = pytest.importorskip("mlx_vlm.models.inkling2.inkling2")
+    shutil.copytree(source, dest, ignore=shutil.ignore_patterns("model.safetensors"))
+    config = json.loads((source / "config.json").read_text())
+    text = config["text_config"]
+    owner = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(**text)))
+    tensors = inkling2.Model.sanitize(owner, mx.load(str(source / "model.safetensors")))
+    quant = dict(TestInkling2OQ.NVFP4)
+    for key in [k for k in tensors if ".switch_mlp." in k and k.endswith(".weight")]:
+        path = key.removesuffix(".weight")
+        nvfp4 = f"{path}.weight_scale_2" in tensors
+        quant[path] = TestInkling2OQ.NVFP4 if nvfp4 else TestInkling2OQ.MXFP8
+    for layer in range(_INK2_LAYERS):
+        base = f"language_model.model.layers.{layer}."
+        for name in ("q", "k", "v", "r", "gate", "o") if attention_bits else ():
+            path = f"{base}self_attn.{name}_proj"
+            weight = tensors.pop(f"{path}.weight")
+            _store_affine(tensors, quant, path, weight, 64, attention_bits)
+        for name, bits in expert_bits:
+            path = f"{base}mlp.switch_mlp.{name}_proj"
+            for suffix in ("scales", "weight_scale_2"):
+                tensors.pop(f"{path}.{suffix}", None)
+            in_dims = text["intermediate_size" if name == "down" else "hidden_size"]
+            shape = tensors.pop(f"{path}.weight").shape[:-1] + (in_dims,)
+            weight = mx.random.normal(shape, key=mx.random.key(layer)) * 0.05
+            _store_affine(tensors, quant, path, weight.astype(mx.bfloat16), 32, bits)
+    config["quantization"] = config["quantization_config"] = quant
+    (dest / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(dest / "model.safetensors"), tensors, {"format": "mlx"})
+    return dest
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+@pytest.mark.parametrize("looped", [False, True], ids=["plain", "looped"])
+def test_inkling2_mlx_vlm_layout_loads_like_published_layout(
+    request, tmp_path, looped, patched_load_config
+):
+    source = request.getfixturevalue(
+        "inkling2_loop_source" if looped else "inkling2_source"
+    )
+    vlm = _mlx_vlm_inkling2(source, tmp_path / "mlx_vlm")
+
+    expected = dict(tree_flatten(_inkling2_model(source).parameters()))
+    loaded = dict(tree_flatten(_inkling2_model(vlm).parameters()))
+
+    assert loaded.keys() == expected.keys()
+    for key, value in expected.items():
+        assert loaded[key].dtype == value.dtype, key
+        if key.endswith(".global_scale"):
+            assert mx.allclose(loaded[key], value, rtol=1e-6).item(), key
+        else:
+            assert mx.array_equal(loaded[key], value, equal_nan=True).item(), key
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+def test_inkling2_mlx_vlm_quantized_build_keeps_its_codes(
+    inkling2_loop_source, tmp_path, patched_load_config
+):
+    gate, up, down = 2, 3, 4
+    vlm = _mlx_vlm_inkling2(
+        inkling2_loop_source,
+        tmp_path / "mlx_vlm",
+        attention_bits=8,
+        expert_bits=(("gate", gate), ("up", up), ("down", down)),
+    )
+    tensors = mx.load(str(vlm / "model.safetensors"))
+    reference = _inkling2_model(inkling2_loop_source)
+    loaded = _inkling2_model(vlm)
+
+    def dequantize(path, bits):
+        return mx.dequantize(
+            tensors[f"{path}.weight"],
+            tensors[f"{path}.scales"],
+            tensors[f"{path}.biases"],
+            group_size=32,
+            bits=bits,
+        )
+
+    for layer, (ref, got) in enumerate(
+        zip(reference.model.layers, loaded.model.layers)
+    ):
+        fused = ["in_proj"] if ref.attn.sliding else ["q_proj", "k_proj", "v_proj"]
+        for name in ["o_proj", *fused]:
+            module = getattr(got.attn, name)
+            want = mx.quantize(getattr(ref.attn, name).weight, group_size=64, bits=8)
+            have = (module.weight, module.scales, module.biases)
+            for w, h in zip(want, have):
+                assert mx.array_equal(w, h).item(), f"layer {layer} {name}"
+        base = f"language_model.model.layers.{layer}.mlp.switch_mlp."
+        g, u = dequantize(base + "gate_proj", gate), dequantize(base + "up_proj", up)
+        w13 = mx.stack([g, u], axis=-2).reshape(*g.shape[:-2], -1, g.shape[-1])
+        w2 = dequantize(base + "down_proj", down)
+        experts = got.mlp.experts
+        assert experts.w13.bits == max(gate, up)
+        for proj, want in ((experts.w13, w13), (experts.w2, w2)):
+            have = mx.dequantize(
+                proj.weight, proj.scales, proj.biases, group_size=32, bits=proj.bits
+            )
+            assert mx.array_equal(have, want).item(), f"layer {layer}"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+def test_inkling2_mlx_vlm_quantization_is_rewritten_once(
+    inkling2_loop_source, tmp_path
+):
+    vlm = _mlx_vlm_inkling2(
+        inkling2_loop_source, tmp_path / "mlx_vlm", attention_bits=8
+    )
+    cfg = json.loads((vlm / "config.json").read_text())
+    model_loading.normalize_inkling2_mlx_vlm_quant(cfg)
+    model_loading.expand_per_layer_quant_keys(cfg)
+    once = json.loads(json.dumps(cfg["quantization"]))
+    assert "model.layers.0.attn.in_proj" in once
+    model_loading.normalize_inkling2_mlx_vlm_quant(cfg)
+
+    assert cfg["quantization"] == once
 
 
 class TestGemma4AudioConfigSanitize:

@@ -82,8 +82,6 @@ def _loop_message_queries(queries: dict, core: range, out: dict) -> None:
 def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
     """Returns the mapped weights and the routed-expert format per layer."""
     if is_mlx_vlm_layout(weights):
-        # Expert carriers come from the per-path ``quantization`` that
-        # ``mlx_vlm_quantization`` rewrote, so no per-layer formats here.
         return sanitize_mlx_vlm_weights(model, weights), {}
     if not is_original_layout(weights):
         return weights, {}
@@ -192,21 +190,9 @@ def sanitize_weights(model, weights: dict) -> tuple[dict, dict]:
     return out, formats
 
 
-# mlx-vlm layout -----------------------------------------------------------
-#
-# mlx-vlm's ``inkling2`` model renames the published checkpoint and splits its
-# fused tensors (``Model.sanitize`` in mlx_vlm/models/inkling2/inkling2.py).
-# Quantized builds made with mlx-vlm, such as orcarouter's abliterated MLX
-# release, ship in that layout. The maps below undo mlx-vlm's sanitize so the
-# same files load on this runtime with the same quantized weights: codes are
-# kept, or re-packed at a wider bit width where the runtime fuses rows that
-# were quantized at different widths.
-
 _VLM_TEXT = "language_model."
 _VLM_LAYER = "language_model.model.layers."
 _VLM_VISION = "vision_tower."
-# (mlx-vlm, runtime) substrings of the vision tower names; the runtime keeps
-# the published names under ``backbone``.
 _VLM_VISION_RENAMES = (
     ("pre_layernorm.", "ln_pre."),
     (".layernorm_before.", ".ln_1."),
@@ -248,7 +234,6 @@ def is_mlx_vlm_quantization(quantization: dict) -> bool:
 
 
 def _vlm_vision_name(name: str) -> str:
-    """mlx-vlm ``vision_tower.*`` key or module path -> runtime name."""
     sub = name[len(_VLM_VISION) :] + "."
     for old, new in _VLM_VISION_RENAMES:
         sub = sub.replace(old, new)
@@ -259,7 +244,6 @@ def _vlm_vision_name(name: str) -> str:
 
 
 def _vlm_module_path(path: str, args) -> str | None:
-    """Runtime module that an mlx-vlm module's rows end up in."""
     if path.startswith(_VLM_VISION):
         return _vlm_vision_name(path)
     if path == "language_model.lm_head":
@@ -323,7 +307,6 @@ def _merge_spec(target: str, old: dict | None, new: dict) -> dict:
 
 
 def _pack_codes(codes: mx.array, bits: int) -> mx.array:
-    """Pack unsigned codes the way MLX does: a little-endian bit stream per row."""
     *lead, n = codes.shape
     q = codes.reshape(*lead, n // 32, 32)
     words = [mx.zeros(q.shape[:-1], dtype=mx.uint32) for _ in range(bits)]
@@ -337,11 +320,6 @@ def _pack_codes(codes: mx.array, bits: int) -> mx.array:
 
 
 def _widen(part: dict, spec: dict) -> dict:
-    """Re-encode a narrower affine Linear at ``spec``'s bits, losslessly.
-
-    An affine code ``q`` stands for ``scale * q + bias``. The same scales and
-    biases with ``q`` stored in more bits give the same weights.
-    """
     if "biases" not in part or spec.get("mode", "affine") != "affine":
         return part
     group_size, bits = spec["group_size"], spec["bits"]
@@ -360,7 +338,6 @@ def _widen(part: dict, spec: dict) -> dict:
         bits=have,
     ).astype(mx.uint8)
     weight = _pack_codes(codes, bits)
-    # Bound the transient codes to one projection at a time.
     mx.eval(weight)
     return {**part, "weight": weight}
 
@@ -370,12 +347,6 @@ def _pop_linear(d: dict, name: str) -> dict:
 
 
 def _fuse_rows(parts: list, spec, path: str, out: dict) -> None:
-    """Concatenate Linear weights along their output rows.
-
-    Quantized codes are row-local, so quantized parts keep their codes,
-    widened to the fused module's bits if narrower; any unquantized part is
-    quantized to the fused module's spec first.
-    """
     if not any("scales" in p for p in parts):
         out[path + ".weight"] = mx.concatenate([p["weight"] for p in parts], axis=0)
         return
@@ -395,21 +366,11 @@ def _fuse_rows(parts: list, spec, path: str, out: dict) -> None:
             part = _widen(part, spec)
         for suffix, value in part.items():
             columns.setdefault(suffix, []).append(value)
-    if len({len(v) for v in columns.values()}) != 1:
-        raise ValueError(f"Inkling 2 {path} fuses different quantized carriers")
     for suffix, values in columns.items():
         out[f"{path}.{suffix}"] = mx.concatenate(values, axis=0)
 
 
 def _vlm_experts(d: dict, out: dict, pre: str, spec) -> None:
-    """``switch_mlp.{gate,up,down}_proj`` -> runtime ``w13`` and ``w2``.
-
-    mlx-vlm de-interleaves the published ``w13`` rows into gate (even rows)
-    and up (odd rows), and stores the NVFP4 outer scale as
-    ``amax / denominator``; the runtime keeps ``amax`` in MLX's convention.
-    Builds that quantize gate and up at different affine bits get the
-    narrower one widened to ``spec``, the fused ``w13`` spec.
-    """
     names = ("gate_proj", "up_proj", "down_proj")
     gate, up, down = (_pop_linear(d, "mlp.switch_mlp." + n) for n in names)
     if isinstance(spec, dict):
@@ -500,9 +461,7 @@ def sanitize_mlx_vlm_weights(model, weights: dict) -> dict:
             idx, rest = key[len(_VLM_LAYER) :].split(".", 1)
             per_layer.setdefault(int(idx), {})[rest] = value
             continue
-        if not key.startswith(_VLM_TEXT):
-            raise ValueError(f"Unmapped Inkling 2 tensor: {key}")
-        name = key[len(_VLM_TEXT) :]
+        name = key.removeprefix(_VLM_TEXT)
         if name.startswith("lm_head.") or name in (
             "model.embed_norm.weight",
             "model.norm.weight",
@@ -513,8 +472,6 @@ def sanitize_mlx_vlm_weights(model, weights: dict) -> dict:
         elif name == "model.final_input.query":
             out[name] = value.reshape(-1, hidden).astype(mx.float32)
         elif name == "model.message_queries":
-            # mlx-vlm already stacks each core layer's rows in the runtime's
-            # (attn, k, v, mlp) order.
             core = args.loop_core
             if value.shape[0] != len(core):
                 raise ValueError(
