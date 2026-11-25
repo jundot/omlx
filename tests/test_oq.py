@@ -5494,7 +5494,7 @@ class TestEstimateBpwHeaderOnly:
             "model.layers.0.proj.bias": (bytes(8), [4], "BF16"),
             draft: (bytes(16), [8], "BF16"),
         }
-        self._write_estimate_checkpoint(tmp_path, tensors)
+        _write_safetensors(str(tmp_path / "model.safetensors"), tensors)
         monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: None)
         off = estimate_bpw_and_size(str(tmp_path), 4)
         on = estimate_bpw_and_size(str(tmp_path), 4, preserve_mtp=True)
@@ -5505,18 +5505,25 @@ class TestEstimateBpwHeaderOnly:
         (tmp_path / "config.json").write_text('{"model_type":"qwen3_5"}')
         tensors = {
             "model.layers.0.proj.weight": (bytes(36), [2, 9], "BF16"),
+            "model.layers.0.loop_a.bias": (bytes(4), [2], "BF16"),
+            "model.layers.0.loop_b.bias": (bytes(4), [2], "BF16"),
             "vision_tower.proj.bias": (bytes(16), [8], "BF16"),
             "audio_tower.proj.bias": (bytes(8), [4], "BF16"),
         }
-        self._write_estimate_checkpoint(tmp_path, tensors)
-        monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: None)
+        _write_safetensors(str(tmp_path / "model.safetensors"), tensors)
+
+        def sanitize(weights):
+            loop = [weights.pop(f"model.layers.0.loop_{s}.bias") for s in "ab"]
+            return {**weights, "model.layers.0.loop.bias": mx.concatenate(loop)}
+
+        sanitize._omlx_cast_predicate = lambda name: "loop" not in name
+        monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: sanitize)
         bf16 = estimate_bpw_and_size(str(tmp_path), 4)
         fp16 = estimate_bpw_and_size(str(tmp_path), 4, dtype="float16")
         text = estimate_bpw_and_size(str(tmp_path), 4, dtype="float16", text_only=True)
-        # 9 columns cannot be grouped, so the backbone tensor stays dense.
-        assert bf16["output_size_bytes"] == 36 + 24
-        assert fp16["output_size_bytes"] == 36 + 48
-        assert text["output_size_bytes"] == 36
+        assert bf16["output_size_bytes"] == 36 + 8 + 24
+        assert fp16["output_size_bytes"] == 36 + 8 + 48
+        assert text["output_size_bytes"] == 36 + 8
 
     @pytest.mark.parametrize("family", ["gemma4", "qwen3_5"])
     def test_estimate_adds_only_donated_head(self, tmp_path, monkeypatch, family):
@@ -5526,11 +5533,9 @@ class TestEstimateBpwHeaderOnly:
         donor.mkdir()
         config = {"model_type": family, "num_hidden_layers": 2}
         (source / "config.json").write_text(json.dumps(config))
-        self._write_estimate_checkpoint(
-            source,
-            {
-                "model.layers.0.proj.bias": (bytes(8), [4], "BF16"),
-            },
+        _write_safetensors(
+            str(source / "model.safetensors"),
+            {"model.layers.0.proj.bias": (bytes(8), [4], "BF16")},
         )
         if family == "gemma4":
             donor_config = {
@@ -5547,22 +5552,11 @@ class TestEstimateBpwHeaderOnly:
             for model in (source, donor):
                 (model / "tokenizer.json").write_text("{}")
         (donor / "config.json").write_text(json.dumps(donor_config))
-        self._write_estimate_checkpoint(donor, weights)
+        _write_safetensors(str(donor / "model.safetensors"), weights)
         monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: None)
         off = estimate_bpw_and_size(str(source), 4)
         on = estimate_bpw_and_size(str(source), 4, mtp_assistant_model_path=str(donor))
         assert on["output_size_bytes"] - off["output_size_bytes"] == 16
-
-    @staticmethod
-    def _write_estimate_checkpoint(path, tensors):
-        _write_safetensors(str(path / "model.safetensors"), tensors)
-        (path / "model.safetensors.index.json").write_text(
-            json.dumps(
-                {
-                    "weight_map": dict.fromkeys(tensors, "model.safetensors"),
-                }
-            )
-        )
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

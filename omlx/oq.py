@@ -45,6 +45,7 @@ try:
     from omlx.patches.inkling2 import apply_inkling2_patch
     from omlx.patches.inkling2 import oq_layout as inkling2_layout
     from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
+    from omlx.utils.model_loading import _nextn_weight_prefixes_from_config
 
     HAS_MLX = True
 except ImportError:
@@ -4103,9 +4104,6 @@ def make_predicate(config: dict, oq_level: int = 4) -> Callable:
 
 
 def _estimate_mtp_donor_bytes(source: Path, config: dict, donor: Path) -> int:
-    """Price only the tensors the MTP combine step copies, at their stored size."""
-    from .patches.deepseek_v41.residency import header_with_offset
-
     donor_config = json.loads((donor / "config.json").read_text())
     assistant = donor_config.get("model_type") in GEMMA4_ASSISTANT_TYPES.values()
     if assistant:
@@ -4119,19 +4117,8 @@ def _estimate_mtp_donor_bytes(source: Path, config: dict, donor: Path) -> int:
         }
     if not mapping:
         raise ValueError(f"No MTP tensors found in donor model: {donor}")
-
-    headers = {}
-    total = 0
-    for key, shard in mapping.items():
-        if shard not in headers:
-            file = donor / shard
-            stat = file.stat()
-            headers[shard] = header_with_offset(
-                str(file), stat.st_size, stat.st_mtime_ns
-            )[0]
-        start, end = headers[shard][key]["data_offsets"]
-        total += end - start
-    return total
+    index = _LazyTensorIndex({donor / shard for shard in mapping.values()})._index
+    return sum(index[key][3] - index[key][2] for key in mapping)
 
 
 def estimate_bpw_and_size(
@@ -4291,13 +4278,13 @@ def estimate_bpw_and_size(
             if info.get("transform") == "literal":
                 continue
             shape = tuple(info.get("shape") or ())
-            dtype = info.get("dtype")
+            tensor_dtype = info.get("dtype")
             sources = info.get("sources") or []
-            if dtype is None and len(sources) == 1:
+            if tensor_dtype is None and len(sources) == 1:
                 src_meta = logical.get(sources[0])
                 if src_meta is not None:
-                    dtype = src_meta[1]
-            planned_logical[out_name] = (shape, dtype)
+                    tensor_dtype = src_meta[1]
+            planned_logical[out_name] = (shape, tensor_dtype)
         if planned_logical:
             logical = planned_logical
 
@@ -4305,8 +4292,6 @@ def estimate_bpw_and_size(
         if plan_view is not None:
             return plan_view.source_quant_info(name)
         return idx.source_quant_info(name)
-
-    from omlx.utils.model_loading import _nextn_weight_prefixes_from_config
 
     nextn_prefixes = _nextn_weight_prefixes_from_config(config)
     logical = {
@@ -4412,7 +4397,7 @@ def estimate_bpw_and_size(
             fp32 = (
                 _oq_media_output_is_fp32(name, dtype == "float16")
                 if cast
-                else _dtype in ("F32", mx.float32)
+                else _dtype is not None and _dtype in ("F32", mx.float32)
             )
             tensor_bytes = n_elements * (4 if fp32 else 2)
         total_output_bytes += tensor_bytes
@@ -4439,9 +4424,8 @@ def estimate_bpw_and_size(
             effective_bpw += 0.3 * _down_boost
             total_output_bytes = int(effective_bpw * total_params / 8)
 
-    # A donated head is copied after quantization, outside the oQ bit budget.
     total_output_bytes += donor_bytes
-    source_total = sum(sf.stat().st_size for sf in weight_files)
+    source_total = sum(sf.stat().st_size for sf in _source_weight_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
@@ -4785,7 +4769,6 @@ _SKIP_QUANT_PATTERNS = (
 def _should_skip_tensor(
     name: str, preserve_mtp: bool = False, *, text_only: bool = False
 ) -> bool:
-    """Return whether the export omits this MTP, vision or audio tensor."""
     return (not preserve_mtp and _is_mtp_tensor(name)) or (
         text_only and (_is_vision_tensor(name) or _is_audio_tensor(name))
     )
