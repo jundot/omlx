@@ -11458,26 +11458,9 @@ class Scheduler:
         matched_tokens: int,
         bypass_hot_cache: bool,
     ) -> tuple[Any, list[Any]] | None:
-        """Retry a failed split-GDN restore at the shared system-prefix tail.
-
-        The lookup follows the longest stored chain, and the restore walks back
-        along that chain only. Its recurrent sidecars can be gone while its KV
-        blocks remain: sidecars share the SSD LRU with KV blocks but are
-        touched only when chosen as the restore endpoint, whereas the KV
-        blocks are touched by every hit. The walk-back then finds no
-        checkpoint and the whole prompt is re-prefilled, although the shared
-        system tail (``_store_system_prefix``), which every new context
-        restores and so keeps fresh, still has one. Look up the system prefix
-        alone, once.
-        """
-        system_end = getattr(request, "system_prefix_end", 0) or 0
-        if (
-            not 0 < system_end < matched_tokens
-            or self.block_aware_cache is None
-            or self.paged_cache_manager is None
-        ):
+        system_end = request.system_prefix_end
+        if not 0 < system_end < matched_tokens:
             return None
-        # Release the failed chain before taking the shorter one.
         self.paged_cache_manager.delete_block_table(request.request_id)
         block_table, _ = self.block_aware_cache.fetch_cache(
             request.request_id,
@@ -11487,14 +11470,13 @@ class Scheduler:
             extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             record_stats=False,
         )
-        reconstructed = None
-        if block_table is not None and block_table.num_tokens > 0:
-            reconstructed = self.block_aware_cache.reconstruct_cache(
-                block_table,
-                promote_to_hot_cache=not bypass_hot_cache,
-            )
+        if block_table is None:
+            return None
+        reconstructed = self.block_aware_cache.reconstruct_cache(
+            block_table,
+            promote_to_hot_cache=not bypass_hot_cache,
+        )
         if reconstructed is None:
-            self.paged_cache_manager.delete_block_table(request.request_id)
             return None
         logger.info(
             "Split GDN restore for %s: no recurrent checkpoint on the %d-token "
