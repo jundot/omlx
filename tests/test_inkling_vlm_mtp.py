@@ -2191,6 +2191,30 @@ def _cos(a, b):
     return (mx.sum(a * b) / mx.sqrt(mx.sum(a * a) * mx.sum(b * b))).item()
 
 
+def test_inkling2_fp8_full_attention_prefill_takes_nax_banded(monkeypatch):
+    """On NAX hosts an FP8 full-attention prefill block runs the mask-free
+    NAX kernel over its dequantized codes, as a BF16 cache would."""
+    from omlx.patches.inkling2 import kernels
+
+    nax_attention = _nax_banded_or_skip()
+    calls = []
+    banded = nax_attention.nax_banded_sink_attention
+
+    def counting(*a, **kw):
+        out = banded(*a, **kw)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(nax_attention, "nax_banded_sink_attention", counting)
+    q, k, v, rel, sink = _decode_attention_case(1, 6, 2, 70, 300, 32, mx.bfloat16, 128)
+    kc, vc = kernels.fp8_quantize(k), kernels.fp8_quantize(v)
+    got = kernels.banded_sink_attention(q, kc, vc, rel, sink, scale=128**-0.5, window=0)
+    assert calls == [True]
+    dense_k, dense_v = (kernels.fp8_dequantize(x, mx.bfloat16) for x in (kc, vc))
+    want = kernels._masked_attention(q, dense_k, dense_v, rel, sink, 128**-0.5, 0, None)
+    assert mx.abs(got - want).max().item() < 2e-2
+
+
 def test_inkling2_fp8_codec_is_exact_e4m3_on_gpu_and_cpu():
     from omlx.patches.inkling2 import kernels
 
