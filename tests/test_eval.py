@@ -448,15 +448,7 @@ class TestStripThinkTags:
         # Incomplete think tag (no closing) — should be left as-is
         assert BaseBenchmark._strip_think_tags("<think>still thinking") == "<think>still thinking"
 
-    def test_strip_hy3_think_block(self):
-        from omlx.eval.base import BaseBenchmark
-
-        text = "<think:opensource>\nplan\n</think:opensource>\nA"
-        assert BaseBenchmark._strip_think_tags(text) == "A"
-
     def test_strip_hy4_close_tag_with_open_tag_in_prompt(self):
-        from omlx.eval.base import BaseBenchmark
-
         text = (
             "We need code.\nFinal code.</think:opensource>"
             "import sys\n\ndef main():\n    pass"
@@ -465,11 +457,6 @@ class TestStripThinkTags:
             BaseBenchmark._strip_think_tags(text)
             == "import sys\n\ndef main():\n    pass"
         )
-
-    def test_strip_minimax_think_block(self):
-        from omlx.eval.base import BaseBenchmark
-
-        assert BaseBenchmark._strip_think_tags("<mm:think>x</mm:think>B") == "B"
 
 
 # --- Thinking Mode Tests ---

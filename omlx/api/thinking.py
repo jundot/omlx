@@ -25,8 +25,6 @@ _HY3_CLOSE_TAG = "</think:opensource>"
 
 
 def normalize_think_tags(text: str) -> str:
-    """Map model-specific thinking tags (MiniMax ``<mm:think>``,
-    Hy3/Hy4 ``<think:opensource>``) to ``<think>``/``</think>``."""
     return (
         text.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG)
         .replace(_MINIMAX_CLOSE_TAG, _CLOSE_TAG)
