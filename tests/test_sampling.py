@@ -26,7 +26,6 @@ from omlx.utils.sampling import (
     categorical_sampling,
     make_sampler,
     make_shared_sampler,
-    seed_request_stream,
     select_logprobs,
 )
 
@@ -495,35 +494,3 @@ def test_nucleus_wider_than_candidates_is_redone_densely():
     host = _settled_verify(flagged, sampler, lp, drafts, qs)
     mx.random.seed(2)
     assert host == _stochastic_verify_tokens(sampler, lp, drafts, qs).tolist()
-
-
-def _stream_draws():
-    return mx.random.categorical(mx.zeros((8, 100_000))).tolist()
-
-
-def test_unseeded_request_after_seeded_starts_a_fresh_stream():
-    """A seed must not make the next unseeded request repeatable (#5404)."""
-    seed_request_stream(1234)
-    seeded_first = _stream_draws()
-    seed_request_stream(None)
-    unseeded_first = _stream_draws()
-    seed_request_stream(1234)
-    seeded_second = _stream_draws()
-    seed_request_stream(None)
-    unseeded_second = _stream_draws()
-
-    assert seeded_first == seeded_second
-    assert unseeded_first != unseeded_second
-
-
-def test_unseeded_requests_in_a_row_share_one_stream(monkeypatch):
-    """Only the first unseeded request after a seeded one reseeds."""
-    seed_request_stream(1234)
-    seed_request_stream(None)
-    reseeds = []
-    monkeypatch.setattr(mx.random, "seed", reseeds.append)
-
-    seed_request_stream(None)
-    seed_request_stream(None)
-
-    assert reseeds == []

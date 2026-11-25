@@ -18,32 +18,15 @@ from __future__ import annotations
 
 import functools
 import math
-import os
-import threading
+import secrets
 from typing import Callable, List, Optional, Sequence
 
 import mlx.core as mx
 import numpy as np
 
-# MLX keeps one random stream per thread. This records whether the last
-# request to start that stream on the current thread carried a seed.
-_request_stream = threading.local()
-
 
 def seed_request_stream(seed: int | None) -> None:
-    """Start a request's sampling stream on MLX's global random state.
-
-    A seeded request leaves the stream in a state its seed determines. The
-    samplers draw from that stream without a key, so the next unseeded request
-    would continue it and be repeatable too (#5404). An unseeded request that
-    follows a seeded one starts from fresh entropy instead.
-    """
-    if seed is not None:
-        mx.random.seed(seed)
-        _request_stream.seeded = True
-    elif getattr(_request_stream, "seeded", False):
-        mx.random.seed(int.from_bytes(os.urandom(8), "little"))
-        _request_stream.seeded = False
+    mx.random.seed(secrets.randbits(64) if seed is None else seed)
 
 
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:

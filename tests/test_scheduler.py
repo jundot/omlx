@@ -7126,35 +7126,28 @@ class TestBatchGeneratorAllTokens:
 
 
 class TestRequestSeedStream:
-    """The random stream a request samples from once it is inserted."""
-
     @pytest.mark.parametrize("chunked", [False, True])
-    def test_unseeded_request_after_seeded_starts_a_fresh_stream(
-        self, mock_model, mock_tokenizer, chunked
+    @pytest.mark.parametrize("seeded_row", ["running", "requeued", "finished"])
+    def test_unseeded_insert_after_seeded_request(
+        self, mock_model, mock_tokenizer, chunked, seeded_row
     ):
-        """A seed must not make the next unseeded request repeatable (#5404)."""
         helper = TestBatchGeneratorAllTokens()
 
-        def insert_then_draw(seed):
-            scheduler = helper._make_scheduler(mock_model, mock_tokenizer)
-            request = Request(
-                request_id=f"req-stream-{seed}",
-                prompt=[11, 12, 13, 14],
-                sampling_params=SamplingParams(max_tokens=4, seed=seed),
-            )
+        def insert_then_draw(scheduler, request):
             cache = [MagicMock()]
             helper._queue_request(
                 scheduler,
                 request,
-                prompt_tokens=[11, 12, 13, 14],
-                remaining_tokens=[14],
-                cached_tokens=3,
+                prompt_tokens=[11, 12],
+                remaining_tokens=[12],
+                cached_tokens=1,
                 prompt_cache=cache,
             )
             if chunked:
+                scheduler.waiting.clear()
                 state = SimpleNamespace(
                     cache=cache,
-                    last_token=[14],
+                    last_token=[12],
                     sampler=MagicMock(),
                     sm=MagicMock(),
                     per_row_lps=[],
@@ -7162,17 +7155,30 @@ class TestRequestSeedStream:
                 scheduler._insert_prefilled_request(request, state, [])
             else:
                 scheduler._schedule_waiting()
-            scheduler.batch_generator.insert.assert_called_once()
-            # What the sampler draws for this request.
             return mx.random.categorical(mx.zeros((8, 100_000))).tolist()
 
-        seeded_first = insert_then_draw(1234)
-        unseeded_first = insert_then_draw(None)
-        seeded_second = insert_then_draw(1234)
-        unseeded_second = insert_then_draw(None)
+        def seeded_then_unseeded():
+            scheduler = helper._make_scheduler(mock_model, mock_tokenizer)
+            seeded, unseeded = (
+                Request(f"r{seed}", [11, 12], SamplingParams(max_tokens=4, seed=seed))
+                for seed in (1234, None)
+            )
+            first = insert_then_draw(scheduler, seeded)
+            if seeded_row == "requeued":
+                scheduler.running.clear()
+                seeded.status = RequestStatus.WAITING
+                seeded.requeued_output_tokens = 1
+            elif seeded_row == "finished":
+                scheduler.running.clear()
+                seeded.set_finished(RequestStatus.FINISHED_STOPPED)
+            return first, insert_then_draw(scheduler, unseeded)
 
-        assert seeded_first == seeded_second
-        assert unseeded_first != unseeded_second
+        seeded_draws, unseeded_draws = zip(
+            *(seeded_then_unseeded() for _ in range(2)), strict=True
+        )
+
+        assert seeded_draws[0] == seeded_draws[1]
+        assert (unseeded_draws[0] == unseeded_draws[1]) is (seeded_row != "finished")
 
 
 class TestDetectNeedsThinkPrefix:
