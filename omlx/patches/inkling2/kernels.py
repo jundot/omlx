@@ -1029,12 +1029,8 @@ _FLASH_SOURCE = """
 """
 _flash_kernel = None
 # Shorter query blocks take the decode kernel when batched or left-padded,
-# else the NAX banded kernel (full attention, from two queries) or SDPA.
+# else SDPA.
 _FLASH_MIN_QUERIES = 32
-# The NAX banded kernel takes full-attention blocks from two queries: a short
-# block's mask still spans every cached key, so the masked path pays for the
-# whole context to run a prompt tail or a few-token suffix.
-_NAX_BANDED_MIN_QUERIES = 2
 
 
 # FlashDecoding for batched or left-padded decode-sized query blocks (decode
@@ -1384,41 +1380,17 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
 def _use_flash(length: int, window: int) -> bool:
     """Prefill blocks take the flash kernel on the GPU.
 
-    It does not run on tensor units (NAX). On hosts that have them only
-    sliding layers, whose masked cost is dominated by building the mask,
-    switch to it; full-attention blocks go to the NAX banded kernel
-    (``_use_nax_banded``).
+    On hosts with tensor units (NAX) MLX's masked SDPA runs on them, which
+    this kernel does not; there only sliding layers, whose cost is dominated
+    by building the mask, switch to it.
     """
     if length < _FLASH_MIN_QUERIES or mx.default_device() != mx.gpu:
         return False
     return bool(window) or not is_nax_available()
 
 
-def _use_nax_banded(q, length: int, window: int) -> bool:
-    """Full-attention prefill blocks take the mask-free NAX kernel.
-
-    It reads the bias band, the sinks and the left padding in place, where
-    the masked path builds a [heads, queries, keys] mask per query block.
-    Single queries, row-exact verify and batched decode-sized blocks are
-    routed before this check and keep their kernels.
-    """
-    return (
-        not window
-        and length >= _NAX_BANDED_MIN_QUERIES
-        and q.dtype in (mx.bfloat16, mx.float16)
-        and q.shape[-1] == 128
-        and mx.default_device() == mx.gpu
-        and nax_attention.banded_check_passed(q.dtype)
-    )
-
-
 def prefill_mask_elements() -> int | None:
-    """Mask elements one full-attention prefill call holds, None on flash.
-
-    NAX hosts keep the masked path's bound although their BF16 and FP16
-    blocks build no mask: FP32 blocks still do, and the bound also covers
-    the row state the NAX kernel's queued key-range passes hold.
-    """
+    """Mask elements one full-attention prefill call holds, None on flash."""
     return None if _use_flash(_FLASH_MIN_QUERIES, 0) else _MASK_BUDGET
 
 
@@ -1527,7 +1499,8 @@ def banded_sink_attention(
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )
-    if _use_nax_banded(q, length, window):
+    if not window:
+        # NAX hosts: full attention without building the additive mask.
         out = nax_attention.nax_banded_sink_attention(
             q, k, v, rel, sink, scale=scale, left_padding=left_padding
         )

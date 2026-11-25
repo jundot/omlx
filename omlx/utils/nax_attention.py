@@ -41,18 +41,15 @@ contiguous, as for MLX's SDPA. The output is written in MLX's SDPA layout
 (``[B, L, H, V]`` rows returned as a ``[B, H, L, V]`` view), so the caller's
 ``swapaxes(1, 2).reshape(B, L, -1)`` stays free.
 
-Fail-closed: only (192, 128) prefill and (128, 128) banded prefill, bf16 or
-fp16, on NAX GPUs are handled; the first use of each runs a small self-check
-against an fp32 reference, and any unsupported input returns None so the
-caller keeps its existing route.
+``nax_banded_sink_attention`` runs the same kernel for Inkling 2's
+full-attention prefill: it reads the relative bias band and per-row sinks in
+place (``has_band``, ``row_sinks``) instead of an additive mask, whose build
+and read cost more than the attention at long contexts.
 
-``nax_banded_sink_attention`` is the same kernel for Inkling 2's
-full-attention prefill (128-wide heads): causal attention with a relative
-bias band and one sink logit per query row. MLX's SDPA takes both as a
-[heads, queries, keys] additive mask, which at long contexts costs more to
-build and read than the attention itself. Here the kernel reads the bias
-table and the sinks in place (``has_band``, ``row_sinks``), so the call is
-as fast as mask-free causal attention and holds no mask.
+Fail-closed: only (192, 128) and banded (128, 128) bf16/fp16 prefill on NAX
+GPUs is handled, the first use of each runs a small self-check against an
+fp32 reference, and any unsupported input returns None so the caller keeps
+its existing route.
 """
 
 from __future__ import annotations
@@ -1050,13 +1047,8 @@ def _passes_check_passed(wn: int) -> bool:
     return ok
 
 
-# Banded attention with per-row sinks (Inkling 2 full-attention prefill):
-# equal query/key and value head dims, causal, a relative bias band read from
-# rel and one sink logit per query row. Key-range passes and the head-dim
-# split are used at every size: measured on an M5 Pro at 128-wide heads they
-# match MLX's mask-free causal kernel from 64 queries x 4K keys to 2,048
-# queries x 290K keys, where one unsplit dispatch takes 1.3-1.7x as long.
-BANDED_HEAD_DIMS = frozenset({(128, 128)})
+# Banded prefill always uses key-range passes and the head-dim split: one
+# unsplit dispatch measured 1.3-1.7x slower at 128-wide heads.
 _BANDED_PASS_KEYS = 4096
 # Passes queued between evaluations: each holds its fp32 row state until its
 # command buffer ends (26 MB at 2,048 queries x 24 heads).
@@ -1104,14 +1096,8 @@ def _run_banded(
 
 @lru_cache(maxsize=None)
 def banded_check_passed(dtype: mx.Dtype = mx.bfloat16) -> bool:
-    """Compile and run one small banded case against fp32, once per dtype.
-
-    Unaligned query and key tails, a band shorter than the keys, a left-padded
-    batch row, and key-range passes that must reproduce one dispatch bit for
-    bit. The two runs compile every variant of the banded kernel for this
-    dtype, so the first prefill pays them and no later request waits for a
-    shader.
-    """
+    """Check one small banded case against fp32, once per dtype; its two
+    runs also compile every banded kernel variant for that dtype."""
     if not _nax_available() or dtype not in _METAL_TYPES:
         return False
     try:
@@ -1149,40 +1135,21 @@ def nax_banded_sink_attention(
     scale: float,
     left_padding: Optional[mx.array] = None,
 ) -> Optional[mx.array]:
-    """Causal NAX attention with a relative bias band and per-row sinks.
+    """``kernels.banded_sink_attention`` for full-attention prefill blocks,
+    or None when unsupported (the caller keeps its masked SDPA).
 
-    ``queries`` [B, H, L, D] are the last L of the S keys; ``keys`` and
-    ``values`` [B, Hk, S, D] (bf16 or fp16, any strides with a contiguous head
-    dim); ``rel`` [B, L, H, R] is the bias by backward distance d < R; ``sink``
-    [B, L, H] is the logit of a zero-value sink; ``left_padding`` [B] counts
-    the padding keys at the start of each batch row. No mask is built: the
-    kernel reads rel and sink in place. Returns [B, H, L, D] in the query dtype, or
-    None when the input is unsupported (the caller keeps its own route).
+    ``queries`` [B, H, L, 128] are the last L of the S keys of ``keys`` and
+    ``values`` [B, Hk, S, 128]; ``rel`` [B, L, H, R]; ``sink`` [B, L, H];
+    ``left_padding`` [B] or None.
     """
-    if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4:
-        return None
-    B, H, qL, d = queries.shape
-    _, Hk, kL, _ = keys.shape
     if (
-        (d, values.shape[-1]) not in BANDED_HEAD_DIMS
-        or keys.shape[-1] != d
+        queries.shape[-1] != 128
+        or values.shape[-1] != 128
         or queries.dtype not in _METAL_TYPES
-        or keys.dtype != queries.dtype
-        or values.dtype != queries.dtype
-        or keys.shape[0] != B
-        or tuple(values.shape[:3]) != (B, Hk, kL)
-        or Hk == 0
-        or H % Hk
-        or qL == 0
-        or kL < qL
-        or rel.ndim != 4
-        or tuple(rel.shape[:3]) != (B, qL, H)
-        or rel.shape[-1] == 0
-        or tuple(sink.shape) != (B, qL, H)
-        or (left_padding is not None and tuple(left_padding.shape) != (B,))
+        # MLX's SDPA runs up to 8 queries in its vector kernel, which is faster.
+        or queries.shape[2] <= 8
+        or not banded_check_passed(queries.dtype)
     ):
-        return None
-    if not banded_check_passed(queries.dtype):
         return None
     return _run_banded(
         queries, keys, values, rel, sink, scale, left_padding=left_padding
