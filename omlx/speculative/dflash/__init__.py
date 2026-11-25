@@ -264,7 +264,8 @@ def load_dflash_drafter(
 
 def attach_drafter(language_model: Any, drafter: DFlashDrafter) -> None:
     """Expose the drafter to Lightning MTP through the language model markers."""
-    if getattr(getattr(drafter.model, "config", None), "model_type", None) == (
+    drafter_model = getattr(drafter, "model", None)
+    if getattr(getattr(drafter_model, "config", None), "model_type", None) == (
         "lilicorr"
     ):
         # LiLiCorr capture ids denote layer inputs and the Nemotron-H rollback
