@@ -60,6 +60,9 @@ from .utils.metal_sync import clear_thread_streams
 
 logger = logging.getLogger(__name__)
 
+# mlx: the first head dim 72 or 80 attention call fixes its padding for the process
+mx.config.update("MLX_SDPA_PAD_HEAD_DIM", 1)
+
 # Text that shows a client nothing: whitespace and whole tags such as <think>
 # or <|channel|>. Decided on shape, so no model's tag names live here.
 _BLANK_TEXT = re.compile(r"(?:\s|<[^<>\s]*>)*")

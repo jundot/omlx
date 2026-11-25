@@ -11,7 +11,8 @@ rows too.
 Only (rows, 1, K) inputs with at least ``MIN_ROWS`` rows are routed, and only
 while no speculative verify or one-row exactness mode is armed. Those modes
 own their (rows, 1, K) calls. Prefill chunks and single-request decode keep
-their paths. On GPUs with the NAX tensor unit, mma stops at 16 rows.
+their paths. On GPUs with the NAX tensor unit, stock takes the shapes its own
+few-row kernel serves.
 """
 
 from __future__ import annotations
@@ -39,8 +40,21 @@ _ENGAGED_LOGGED = False
 _CHECKED: dict[tuple, bool] = {}
 
 
+def _stock_qmv_nax(K: int, N: int, bits: int) -> bool:
+    # mlx: use_qmv_mma, the affine shapes qmv_nax reads at 6 to 16 rows
+    return (
+        qwen35_verify_qmm.is_nax_available()
+        and bits != 2
+        and K >= 1024
+        and K % 128 == 0
+        and N % 32 == 0
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def _route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
+    if _stock_qmv_nax(K, N, bits):
+        return None
     route = qwen35_verify_qmm._verify_route(rows, K, N, bits, group_size, dtype)
     # Decode rows keep mma; the skinny kernel is measured on verify rows only.
     if route == "skinny" and qwen35_verify_qmm.mma_eligible(

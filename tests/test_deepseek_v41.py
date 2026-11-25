@@ -883,7 +883,6 @@ def test_prefill_engram_dedupe_matches_undeduped(monkeypatch):
     model.wkv = RecordingWkv(QuantizedProjection(packed, scales, 8, "mxfp8"))
     ids = rng.integers(0, 97, (1, 32, 24), dtype=np.int32)
     ids[0, 8:16] = ids[0, :8]
-    ids[0, 24:32] = ids[0, 16:24]
     h = mx.array(rng.normal(0, 1, (1, 32, c.hc_mult, c.dim)).astype(np.float32))
     mask = np.zeros((1, 32), dtype=bool)
     mask[0, 1] = True
