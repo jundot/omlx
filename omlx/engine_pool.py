@@ -2299,7 +2299,11 @@ class EnginePool:
 
         def estimate(context: int | None) -> int:
             return splash_memory_estimate(
-                entry.model_path, target.draft_path, context, settings.splash_kv_format
+                entry.model_path,
+                target.draft_path,
+                context,
+                settings.splash_kv_format,
+                target.binary.version,
             )
 
         context = self._splash_sizing_context(entry, model_settings, target)
@@ -2453,6 +2457,7 @@ class EnginePool:
             target.draft_path,
             requested_context,
             integrations.splash_kv_format,
+            target.binary.version,
         ):
             # The budget cannot hold the explicit limit (the room under the
             # memory limit shrank, or splash_max_memory_gb is small), and

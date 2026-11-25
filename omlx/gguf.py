@@ -50,6 +50,8 @@ PROJECTOR_PREFERENCE = ("bf16", "f16", "f32")
 _MAX_KEYS = 1 << 20
 _MAX_STRING = 64 << 20
 _MAX_ARRAY = 1 << 26
+_MAX_TENSORS = 1 << 24
+_MAX_DIMS = 8
 
 _SCALARS = {
     0: "<B",
@@ -424,6 +426,54 @@ def read_metadata(
             kind = reader.scalar("<I")
             metadata[key] = reader.value(kind, keep=key in keep_arrays)
     return metadata
+
+
+def tensor_sizes(path: Path) -> dict[str, int]:
+    """Stored bytes of each tensor in a GGUF, by name.
+
+    Each tensor runs from its data offset to the next one, the last to the
+    end of the file, so alignment padding counts toward the tensor before it.
+    An unreadable or inconsistent header gives no sizes.
+    """
+    try:
+        with open(path, "rb") as stream:
+            reader = _Reader(stream)
+            if reader.take(4) != GGUF_MAGIC or reader.scalar("<I") < 2:
+                return {}
+            count = reader.length(_MAX_TENSORS)
+            keys = reader.length(_MAX_KEYS)
+            alignment = 32
+            for _ in range(keys):
+                key = reader.string()
+                value = reader.value(reader.scalar("<I"), keep=False)
+                if key == "general.alignment":
+                    alignment = value
+            records: list[tuple[int, str]] = []
+            for _ in range(count):
+                name = reader.string()
+                dims = reader.scalar("<I")
+                if dims > _MAX_DIMS:
+                    return {}
+                reader.take(8 * dims)
+                reader.scalar("<I")  # ggml type
+                records.append((reader.scalar("<Q"), name))
+            header = stream.tell()
+            size = os.fstat(stream.fileno()).st_size
+    except (OSError, GgufError):
+        return {}
+    if _int(alignment) is None or alignment <= 0:
+        return {}
+    data = size - (header + -header % alignment)
+    records.sort()
+    if data < 0 or any(offset > data for offset, _ in records):
+        return {}
+    ends = [offset for offset, _ in records[1:]] + [data]
+    sizes: dict[str, int] = {}
+    for (offset, name), end in zip(records, ends):
+        if name in sizes:
+            return {}
+        sizes[name] = end - offset
+    return sizes
 
 
 def _int(value) -> int | None:

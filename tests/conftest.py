@@ -1,4 +1,5 @@
 import gc
+import math
 import os
 import struct
 import subprocess
@@ -404,12 +405,26 @@ def _gguf_value(value) -> bytes:
 
 @pytest.fixture
 def write_gguf():
-    """Write a GGUF file of a header with ``metadata`` and ``size`` bytes in all."""
+    """Write a GGUF file of a header with ``metadata`` and ``size`` bytes in all.
 
-    def write(path: Path, metadata: dict, size: int = 0) -> Path:
-        header = b"GGUF" + struct.pack("<IQQ", 3, 0, len(metadata))
+    ``tensors`` lists (name, ggml type, shape) of F32 (0) or F16 (1) tensors,
+    laid out 32-byte aligned after the header.
+    """
+
+    def write(path: Path, metadata: dict, size: int = 0, tensors=()) -> Path:
+        header = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(metadata))
         for key, value in metadata.items():
             header += struct.pack("<Q", len(key)) + key.encode() + _gguf_value(value)
+        data = b""
+        for name, kind, shape in tensors:
+            header += struct.pack("<Q", len(name)) + name.encode()
+            header += struct.pack(f"<I{len(shape)}QI", len(shape), *shape, kind)
+            header += struct.pack("<Q", len(data))
+            data += b"\0" * ({0: 4, 1: 2}[kind] * math.prod(shape))
+            data += b"\0" * (-len(data) % 32)
+        if tensors:
+            header += b"\0" * (-len(header) % 32)
+        header += data
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(header + b"\0" * max(0, size - len(header)))
         return path

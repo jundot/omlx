@@ -2413,6 +2413,52 @@ class TestMemoryEstimate:
 
         assert splash_memory_estimate(model, draft, 1024, "int8") == before + 512
 
+    def test_flash_next_gguf_counts_ple_table_as_row_cache(
+        self, tmp_path, monkeypatch, write_gguf
+    ):
+        vocab = ["a", "b", "c"]
+        metadata = {
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 48,
+            "qwen4exp.context_length": 262144,
+            "qwen4exp.embedding_length": 2560,
+            "qwen4exp.attention.head_count": 24,
+            "qwen4exp.attention.head_count_kv": 2,
+            "qwen4exp.attention.key_length": 256,
+            "qwen4exp.full_attention_interval": 4,
+            "qwen4exp.expert_count": 512,
+            "qwen4exp.expert_used_count": 10,
+            "tokenizer.ggml.tokens": vocab,
+        }
+        source = tmp_path / "models" / "Flash-Next"
+        write_gguf(
+            source / "Flash-Next-00001-of-00002.gguf",
+            metadata,
+            tensors=[("blk.0.ffn_down.weight", 0, (256,))],
+        )
+        write_gguf(
+            source / "Flash-Next-00002-of-00002.gguf",
+            {},
+            tensors=[
+                ("per_layer_token_embd.weight", 0, (1024, 64)),
+                ("output_norm.weight", 0, (8,)),
+            ],
+        )
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        folder = Path(models["Flash-Next"].model_path)
+        monkeypatch.setitem(
+            splash_mod.SPLASH_FAMILIES["Qwen3.8-Flash-Next"], "vocab_size", len(vocab)
+        )
+        monkeypatch.setattr(splash_mod, "PLE_ROW_CACHE_BYTES", 64 * 1024)
+        draft = _write_draft(tmp_path / "draft", FLASH_NEXT_TEXT)
+
+        full = splash_memory_estimate(folder, draft, 1024, "int8")
+        assert splash_memory_estimate(folder, draft, 1024, "int8", "1.6.0") == full
+        assert (
+            splash_memory_estimate(folder, draft, 1024, "int8", "1.6.1")
+            == full - 1024 * 64 * 4 + 64 * 1024
+        )
+
 
 class TestProcessMemory:
     def test_list_process_group_pids(self):

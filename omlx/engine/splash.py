@@ -43,6 +43,7 @@ import httpx
 from transformers import AutoTokenizer
 
 from ..api.utils import _consolidate_system_messages
+from .. import gguf
 from ..exceptions import InvalidRequestError
 from ..gguf import SPLIT_VARIANT
 from ..oqh.format import is_oqh_config
@@ -152,6 +153,11 @@ PRUNED_EXPERTS_VERSION = (1, 4, 1)
 # release on M5+ `auto` quantizes attention queries to int8, so oMLX pins bf16
 # by default and only sends the flag where it is understood.
 ACTIVATIONS_VERSION = (1, 6, 1)
+# From Splash 1.6.1 `--ple-memory auto` keeps a Flash-Next GGUF's per-layer
+# token-embedding table on SSD behind a row cache of at most this size.
+PLE_STREAM_VERSION = (1, 6, 1)
+PLE_ROW_CACHE_BYTES = 237 * 1024 * 1024
+_PLE_TENSOR = "per_layer_token_embd.weight"
 # Older launchers reject --max-concurrent-requests.
 MAX_CONCURRENT_REQUESTS_VERSION = (1, 7, 1)
 _PRUNED_EXPERTS_MULTIPLE = 8
@@ -807,6 +813,7 @@ def splash_memory_estimate(
     draft_path: Path,
     max_context: int | None,
     kv_format: str,
+    splash_version: str | None = None,
 ) -> int:
     """Memory for Splash to hold ``max_context`` tokens of context.
 
@@ -815,13 +822,33 @@ def splash_memory_estimate(
     for image input. Splash's context limit is its whole KV pool, and
     concurrent requests that outgrow the pool wait for pages, so one window
     is enough. Splash spends a larger budget on its prefix cache.
+
+    A Flash-Next GGUF's per-layer embedding table counts as Splash's row
+    cache from ``PLE_STREAM_VERSION`` on, since Splash streams it from SSD.
     """
     path = Path(model_path)
-    text = _text_config(_read_config(path) or {}) or {}
+    config = _read_config(path) or {}
+    text = _text_config(config) or {}
     context = max_context or SPLASH_NATIVE_CONTEXT
     kv = _kv_bytes_per_token(text, kv_format) * context
     draft = int(_safetensors_bytes(draft_path) * _DRAFT_LOAD_RATIO)
-    return _weight_bytes(path) + draft + _RUNTIME_RESERVE_BYTES + kv
+    weights = _weight_bytes(path)
+    version = _version_tuple(splash_version or "")
+    source = _gguf_source(config)
+    if (
+        source is not None
+        and version is not None
+        and version >= PLE_STREAM_VERSION
+        and splash_family(config) == "Qwen3.8-Flash-Next"
+    ):
+        table = sum(
+            size
+            for part in source.get("parts") or []
+            for name, size in gguf.tensor_sizes(path / part).items()
+            if name == _PLE_TENSOR or name.endswith(f".{_PLE_TENSOR}")
+        )
+        weights -= table - min(table, PLE_ROW_CACHE_BYTES)
+    return weights + draft + _RUNTIME_RESERVE_BYTES + kv
 
 
 # -- model staging -------------------------------------------------------------
