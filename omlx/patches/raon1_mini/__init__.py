@@ -7,9 +7,6 @@ only imports under ``trust_remote_code``. oMLX vendors a reviewed copy of that
 module as ``mlx_lm.models.raon1_mini`` and, for the matching file name, drops
 ``model_file`` from the loaded config so mlx-lm resolves the vendored class by
 ``model_type`` instead of executing code from the model directory.
-
-The released checkpoint adds per-layer reasoning-effort vectors. The vendored
-model applies them at the default effort specified by the checkpoint.
 """
 
 from __future__ import annotations

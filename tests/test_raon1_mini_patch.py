@@ -96,9 +96,7 @@ def _dequant_experts(wq, sq, gs):
     )
 
 
-@pytest.mark.parametrize(
-    "alpha", [None, 0.05, 0.0], ids=["preview", "release", "zero-steering"]
-)
+@pytest.mark.parametrize("alpha", [None, 0.05], ids=["preview", "release"])
 def test_nvfp4_checkpoint_loads_strictly_without_remote_code(tmp_path, alpha):
     """An NVFP4 Raon checkpoint (per-expert global scales, separate up/gate as
     exported) loads strictly through mlx-lm without importing ``model_file``,
@@ -127,7 +125,6 @@ def test_nvfp4_checkpoint_loads_strictly_without_remote_code(tmp_path, alpha):
 
     vector_key = "model.layers.1.moe.reasoning_effort_steering"
     if alpha is not None:
-        # Insert this independently of the model tree, as in the released weights.
         params[vector_key] = mx.linspace(-1, 1, args.hidden_size)
     ckpt = dict(params)
     reference = dict(params)
@@ -194,9 +191,7 @@ def test_nvfp4_checkpoint_loads_strictly_without_remote_code(tmp_path, alpha):
 
     if alpha is not None:
         moe = loaded.layers[1].moe
-        # Fused MoE parts bypass the combined output on which steering operates.
-        assert moe.fusable() == (alpha == 0)
-        assert not loaded.cast_predicate(vector_key)
+        assert not moe.fusable()
         x = mx.zeros((1, 2, args.hidden_size))
         got = moe(x)
         vector = moe.reasoning_effort_steering

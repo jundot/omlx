@@ -1688,8 +1688,6 @@ class MoE(nn.Module):
 
 
 class SteeredMoE(MoE):
-    """Apply the release checkpoint's default steering after the expert sum."""
-
     def __init__(self, args):
         super().__init__(args)
         steering = args.reasoning_effort_steering
@@ -1698,14 +1696,11 @@ class SteeredMoE(MoE):
 
     def __call__(self, x):
         out = super().__call__(x)
-        if self._alpha == 0:
-            return out
         steered = out.astype(mx.float32) + self._alpha * self.reasoning_effort_steering
         return steered.astype(out.dtype)
 
     def fusable(self):
-        # parts() hands the expert sum to the next mHC kernel, bypassing __call__.
-        return self._alpha == 0 and super().fusable()
+        return False
 
 
 class GlobalScaledLinear(nn.Module):
