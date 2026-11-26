@@ -50,6 +50,7 @@ PROJECTOR_PREFERENCE = ("bf16", "f16", "f32")
 _MAX_KEYS = 1 << 20
 _MAX_STRING = 64 << 20
 _MAX_ARRAY = 1 << 26
+_MAX_TENSORS = 1 << 24
 
 _SCALARS = {
     0: "<B",
@@ -424,6 +425,33 @@ def read_metadata(
             kind = reader.scalar("<I")
             metadata[key] = reader.value(kind, keep=key in keep_arrays)
     return metadata
+
+
+def tensor_bytes(path: Path, name: str) -> int:
+    """Bytes a GGUF stores for tensor ``name`` with its padding, or 0."""
+    with open(path, "rb") as stream:
+        reader = _Reader(stream)
+        reader.take(8)
+        count = reader.length(_MAX_TENSORS)
+        alignment = 32
+        for _ in range(reader.length(_MAX_KEYS)):
+            key = reader.string()
+            value = reader.value(reader.scalar("<I"), keep=False)
+            if key == "general.alignment":
+                alignment = value
+        start = None
+        offsets = []
+        for _ in range(count):
+            tensor = reader.string()
+            stream.seek(8 * reader.scalar("<I") + 4, os.SEEK_CUR)
+            offsets.append(reader.scalar("<Q"))
+            if tensor == name:
+                start = offsets[-1]
+        header = stream.tell()
+        data = os.fstat(stream.fileno()).st_size - header - -header % alignment
+    if start is None:
+        return 0
+    return min((offset for offset in offsets if offset > start), default=data) - start
 
 
 def _int(value) -> int | None:
