@@ -3,9 +3,11 @@
 
 import json
 import struct
+import sys
 
 import pytest
 
+from omlx import cli
 from omlx.cluster import planner, staging
 from omlx.cluster.planner import (
     LOCAL_NODE,
@@ -352,31 +354,23 @@ def test_the_remote_interpreter_path_still_expands_on_the_peer(monkeypatch):
     assert captured["command"].startswith("~/.omlx/bin/omlx-cluster-python -c ")
 
 
-def _plan_cli(model_root, *extra):
-    import subprocess
-    import sys
-
-    return subprocess.run(
-        [
-            sys.executable, "-m", "omlx.cli", "cluster", "plan",
-            "--model", str(model_root),
-            "--node", "studio=8GiB",
-            "--node", "mbp=4GiB",
-            *extra,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+def _plan_cli(monkeypatch, model_root, *extra):
+    argv = ["omlx", "cluster", "plan", "--model", str(model_root)]
+    argv += ["--node", "studio=8GiB", "--node", "mbp=4GiB", *extra]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    return exc.value.code
 
 
-def test_the_cli_plans_from_a_model_this_mac_holds(tmp_path):
+def test_the_cli_plans_from_a_model_this_mac_holds(tmp_path, monkeypatch, capsys):
     root = _model(tmp_path / "m", present_layers=range(8), declared_layers=8)
 
-    result = _plan_cli(root, "--json")
+    code = _plan_cli(monkeypatch, root, "--json")
 
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["model"]["layer_count"] == 8
+    result = capsys.readouterr()
+    assert code == 0, result.err
+    assert json.loads(result.out)["model"]["layer_count"] == 8
 
 
 def test_the_cli_asks_the_peers_it_was_given(monkeypatch, capsys):
@@ -417,13 +411,14 @@ def test_the_cli_asks_the_peers_it_was_given(monkeypatch, capsys):
     assert "Measured:    studio" in capsys.readouterr().out
 
 
-def test_the_cli_refuses_to_plan_from_one_stage_and_says_who_to_ask(tmp_path):
+def test_the_cli_refuses_to_plan_from_one_stage_and_says_who_to_ask(
+    tmp_path, monkeypatch, capsys
+):
     """The failure that forced planning to be done by hand on the Studio."""
 
     root = _model(tmp_path / "m", present_layers=range(4), declared_layers=8)
 
-    result = _plan_cli(root)
-
-    assert result.returncode == 2
-    assert "4 of 8 layers" in result.stderr
-    assert "--peer" in _plan_cli(root, "--help").stdout
+    assert _plan_cli(monkeypatch, root) == 2
+    assert "4 of 8 layers" in capsys.readouterr().err
+    _plan_cli(monkeypatch, root, "--help")
+    assert "--peer" in capsys.readouterr().out

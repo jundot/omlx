@@ -13,6 +13,7 @@ import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.base import create_causal_mask
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from omlx.engine import batched as batched_engine
 from omlx.patches.mimo_v2 import decode_fast as df
@@ -1273,7 +1274,7 @@ def test_decode_fast_forward_matches_reference(monkeypatch):
     cache = model.make_cache()
     _forward(model, tokens[:, :40], cache, False, monkeypatch)
     pos = 40
-    for L in [1, 2, 3, 1, 7, 1]:
+    for L in [1, 2, 3, 1, 5, 1]:
         step = tokens[:, pos : pos + L]
         ref_cache, fast_cache = _clone(cache), _clone(cache)
         ref = _forward(model, step, ref_cache, False, monkeypatch)
@@ -1321,7 +1322,7 @@ def test_decode_fast_forward_matches_reference_batch_caches(monkeypatch):
     _forward(model, tokens[:, :45], ca, False, monkeypatch)
     _forward(model, tokens[:, 3:40], cb, False, monkeypatch)
     batch = [type(a).merge([a, b]) for a, b in zip(ca, cb)]
-    for L in [1, 3]:
+    for L in [1, 2]:
         step = mx.random.randint(0, 512, (2, L))
         ref_cache, fast_cache = _clone(batch), _clone(batch)
         ref = _forward(model, step, ref_cache, False, monkeypatch)
@@ -1363,7 +1364,7 @@ def test_decode_fast_gqa16_chunked_sdpa_matches_reference(monkeypatch):
     cache = model.make_cache()
     _forward(model, tokens[:, :40], cache, False, monkeypatch)
     pos = 40
-    for L in [1, 3, 7]:
+    for L in [1, 3, 5]:
         step = tokens[:, pos : pos + L]
         ref_cache, fast_cache = _clone(cache), _clone(cache)
         before = chunked["n"]
@@ -1499,8 +1500,8 @@ def test_decode_expert_kernels_match_gather_qmm(layout):
 
 def test_decode_expert_kind_rejects_wrapped_switch_modules():
     """An expert-offload style wrapper is not a stock SwitchGLU."""
-    model = _decode_model(seed=14)
-    sw = model.model.layers[1].mlp.switch_mlp
+    sw = SwitchGLU(128, 64, 2)
+    nn.quantize(sw, group_size=32, bits=4, mode="mxfp4")
 
     class OffloadSwitchGLU(nn.Module):
         def __init__(self, glu):

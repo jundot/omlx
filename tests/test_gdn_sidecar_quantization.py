@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runpy
 import struct
 import subprocess
 import sys
@@ -1357,7 +1358,7 @@ def test_rht_does_not_advance_the_generation_rng():
     assert bool(mx.all(baseline == after))
 
 
-def test_encoded_sidecar_bytes_are_identical_across_processes(tmp_path):
+def test_encoded_sidecar_bytes_are_identical_across_processes(tmp_path, capsys):
     """A separate interpreter must produce byte-identical payload+metadata."""
     script = tmp_path / "encode_once.py"
     script.write_text(
@@ -1392,17 +1393,17 @@ def test_encoded_sidecar_bytes_are_identical_across_processes(tmp_path):
         "sys.stdout.write(h.hexdigest())\n"
     )
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
-    digests = set()
-    for _ in range(2):
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=180,
-        )
-        assert result.returncode == 0, result.stderr
-        digests.add(result.stdout.strip())
+    runpy.run_path(str(script))
+    digests = {capsys.readouterr().out.strip()}
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr
+    digests.add(result.stdout.strip())
     assert len(digests) == 1, f"cross-process encoding diverged: {digests}"
     assert len(next(iter(digests))) == 64
 

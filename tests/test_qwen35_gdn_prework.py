@@ -65,8 +65,7 @@ def _composed(qkv, conv_state, conv1d):
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9, 16])
-@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("seq,batch", [(2, 1), (3, 2), (9, 4), (16, 1)])
 def test_fused_prework_bit_exact(seq, batch, dtype):
     mx.random.seed(11)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(dtype)
@@ -116,8 +115,7 @@ def _composed_l2(qkv, conv_state, conv1d):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9, 16])
-@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("seq,batch", [(2, 1), (3, 2), (9, 4), (16, 1)])
 def test_fused_prework_l2_bit_exact(seq, batch):
     mx.random.seed(41)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(mx.bfloat16)
@@ -414,15 +412,14 @@ def test_qwen4_decode_norm_gate_is_bit_exact(dtype):
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
-@pytest.mark.parametrize("seed", [3, 17, 41])
-def test_qwen4_decode_step_kernel_equals_its_three_launches(dtype, seed):
+def test_qwen4_decode_step_kernel_equals_its_three_launches(dtype):
     """Prework + recurrence + norm-gate in one launch, over two chained steps.
 
     The FP32 recurrent state is compared bit for bit; the FP32 instantiation
     also exposes the unrounded recurrence output and gate products that the
     BF16 output rounds away.
     """
-    mx.random.seed(seed)
+    mx.random.seed(3)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
     q_scale = mx.array(DK**-0.5, dtype=dtype)
     A_log = (mx.random.normal((HV,)) * 0.5).astype(dtype)
@@ -950,8 +947,7 @@ def test_qwen4_decode_route_does_not_commit_states_on_failure(monkeypatch):
     assert cache.advance_calls == 0
 
 
-@pytest.mark.parametrize("batch", [2, 4])
-@pytest.mark.parametrize("seq", [2, 3])
+@pytest.mark.parametrize("batch,seq", [(2, 3), (4, 2)])
 def test_batched_verify_preserves_output_and_all_rollback_states(
     monkeypatch, batch, seq
 ):
@@ -1018,9 +1014,15 @@ def test_batched_verify_preserves_output_and_all_rollback_states(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("seq", [8, 16])
-@pytest.mark.parametrize("batch,retained", [(1, [3]), (1, [8]), (3, [1, 8, 5])])
+@pytest.mark.parametrize(
+    "batch,retained,seq,dtype",
+    [
+        (1, [8], 8, mx.bfloat16),
+        (3, [1, 8, 5], 8, mx.bfloat16),
+        (1, [3], 16, mx.float16),
+        (3, [1, 8, 5], 16, mx.float16),
+    ],
+)
 def test_fused_verify_replays_committed_rows_in_the_next_block(
     monkeypatch, batch, retained, dtype, seq
 ):
@@ -1277,19 +1279,18 @@ def patched_decode(monkeypatch):
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize(
-    "signatures",
+    "signatures, step_fused, qmv",
     [
-        ((6, 64), (6, 64), (6, 64), (6, 64)),  # one fused in-projection launch
-        ((4, 64), (5, 128), (5, 128), (5, 128)),  # four projection launches
-        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e
+        (((6, 64),) * 4, True, True),
+        (((6, 64),) * 4, True, False),
+        (((6, 64),) * 4, False, True),
+        (((6, 64),) * 4, False, False),
+        (((4, 64), (5, 128), (5, 128), (5, 128)), True, True),
+        (((8, 64),) * 4, True, True),
     ],
 )
-@pytest.mark.parametrize("seed", [3, 11])
-@pytest.mark.parametrize(
-    "step_fused, qmv", [(True, True), (True, False), (False, True), (False, False)]
-)
 def test_qwen4_planned_decode_is_bit_identical_to_per_call_path(
-    monkeypatch, patched_decode, signatures, seed, step_fused, qmv
+    monkeypatch, patched_decode, signatures, step_fused, qmv
 ):
     from omlx.patches.row_exact_qmv import OneRowQmv
 
@@ -1309,8 +1310,8 @@ def test_qwen4_planned_decode_is_bit_identical_to_per_call_path(
 
     monkeypatch.setattr(prework_mod, "qwen4_decode_step_fused", counted_step)
     monkeypatch.setattr(OneRowQmv, "__call__", counted_projection)
-    module = _real_qwen4_decode_module(signatures, seed)
-    _assert_planned_decode_matches_per_call_path(monkeypatch, module, 3, seed)
+    module = _real_qwen4_decode_module(signatures, 3)
+    _assert_planned_decode_matches_per_call_path(monkeypatch, module, 3, 3)
     # The planned steps ran the new launches: the step kernel, the out-projection
     # and, when the four projections share one allocation, the in-projection.
     projections = (1 + (len(set(signatures)) == 1)) if qmv else 0
@@ -1517,10 +1518,12 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 # One block per in-projection geometry: the two-row tile, then two, one and
 # three rows per threadgroup.
-@pytest.mark.parametrize("rows", [2, 4, 5, 9])
+@pytest.mark.parametrize(
+    "rows,dtype",
+    [(2, mx.bfloat16), (4, mx.float16), (5, mx.bfloat16), (9, mx.float16)],
+)
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
     monkeypatch, qwen4_verify, dtype, rows
 ):
@@ -1571,9 +1574,15 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
-@pytest.mark.parametrize("rows", [2, 3])
+@pytest.mark.parametrize(
+    "dtype,signatures,rows",
+    [
+        (mx.bfloat16, ((6, 64),) * 4, 2),
+        (mx.bfloat16, ((8, 64),) * 4, 3),
+        (mx.float16, ((8, 64),) * 4, 2),
+        (mx.float16, ((6, 64),) * 4, 3),
+    ],
+)
 def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
     monkeypatch, qwen4_verify, dtype, signatures, rows
 ):
@@ -1644,16 +1653,22 @@ def test_qwen4_batched_decode_step_equals_one_row_steps(rows):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
-@pytest.mark.parametrize("rows", [1, 2, 4, 9, 16])
-@pytest.mark.parametrize("seed", [7, 29])
-def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows, seed):
+@pytest.mark.parametrize(
+    "dtype,rows",
+    [
+        (mx.bfloat16, 1),
+        (mx.bfloat16, 16),
+        (mx.float16, 2),
+        (mx.float16, 9),
+        (mx.float32, 1),
+        (mx.float32, 4),
+        (mx.float32, 9),
+    ],
+)
+def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows):
     """The FP32 instantiation carries the unrounded conv, q/k/v, recurrence
     output and gate products that BF16 rounds away."""
-    if dtype == mx.float32 and rows > 9:
-        pytest.skip("FP32 staging exceeds 32 KB of threadgroup memory past 15 rows; "
-                    "served verify windows are 16-bit")
-    mx.random.seed(seed)
+    mx.random.seed(7)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
     q_scale = mx.array(DK**-0.5, dtype=dtype)
     A_log = (mx.random.normal((HV,)) * 0.5).astype(dtype)

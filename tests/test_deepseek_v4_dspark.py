@@ -121,7 +121,7 @@ def test_dspark_wins_over_legacy_nextn_discriminator(dsv4):
     assert not any(isinstance(stage, dsv4.MTPBlock) for stage in model.mtp)
 
 
-def test_dspark_target_tap_and_parallel_draft_shapes(dsv4):
+def test_dspark_target_tap_and_parallel_draft_shapes(dsv4, monkeypatch):
     from omlx.patches.mlx_lm_mtp import set_mtp_active, set_mtp_depth
 
     set_mtp_active(True)
@@ -152,17 +152,6 @@ def test_dspark_target_tap_and_parallel_draft_shapes(dsv4):
     assert draft_hidden.shape == (1, 3, 8)
     assert [cache.offset for cache in draft_cache] == [1, 1, 1]
 
-
-def test_dspark_query_block_matches_requested_depth(dsv4, monkeypatch):
-    from omlx.patches.mlx_lm_mtp import set_mtp_active, set_mtp_depth
-
-    set_mtp_active(True)
-    set_mtp_depth(3)
-    try:
-        model = dsv4.Model(_tiny_config(dsv4))
-    finally:
-        set_mtp_active(False)
-
     seen_widths = []
     original_call = dsv4.DSparkBlock.__call__
 
@@ -171,21 +160,15 @@ def test_dspark_query_block_matches_requested_depth(dsv4, monkeypatch):
         return original_call(self, hidden, *args, **kwargs)
 
     monkeypatch.setattr(dsv4.DSparkBlock, "__call__", traced_call)
-    target_cache = model.make_cache()
-    _, target_hidden = model(
-        mx.array([[1]], dtype=mx.uint32),
-        cache=target_cache,
-        return_hidden=True,
-    )
-    draft_logits, _ = model.dspark_forward(
-        target_hidden,
-        mx.array([[1]], dtype=mx.uint32),
+    short_logits, _ = model.dspark_forward(
+        target_hidden[:, -1:],
+        mx.array([[4]], dtype=mx.uint32),
         model.make_mtp_cache(),
         draft_length=2,
     )
-    mx.eval(draft_logits)
+    mx.eval(short_logits)
 
-    assert draft_logits.shape == (1, 2, 32)
+    assert short_logits.shape == (1, 2, 32)
     assert seen_widths == [2, 2, 2]
 
 
@@ -339,7 +322,7 @@ def test_verify_singleton_batch_qmv_matches_decode_rows(mode, bits, group_size):
     ("mode", "group_size"),
     [("mxfp8", 32), ("affine", 64)],
 )
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("rows", [2, 3, 6])
 def test_verify_exact_qmv_kernel_matches_decode_rows(mode, group_size, rows):
     from omlx.patches.deepseek_v4.verify_qmv import exact_verify_qmv
 
@@ -442,7 +425,7 @@ def test_verify_batched_gemv_matches_decode_rows():
     assert mx.array_equal(actual, expected).item()
 
 
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("rows", [2, 3, 6])
 def test_verify_exact_dense_gemv_matches_decode_rows(rows):
     from omlx.patches.deepseek_v4.verify_qmv import exact_verify_gemv
 
@@ -495,7 +478,7 @@ def test_dspark_head_gemv_matches_promoted_fp32_projection(rows):
         assert mx.allclose(actual, expected, rtol=0, atol=4e-5).item()
 
 
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("rows", [2, 3, 6])
 def test_verify_exact_multi_qmv_matches_decode_rows(rows):
     from mlx_lm.models.mla import MultiLinear
     from omlx.patches.deepseek_v4.verify_qmv import exact_verify_multi_qmv

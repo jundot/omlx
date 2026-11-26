@@ -208,22 +208,27 @@ class Inkling2MarkovHead(nn.Module):
 
     def fold(self, lm_head: nn.Module) -> None:
         """Fold the target LM head into the latent projection."""
-        if isinstance(lm_head, nn.QuantizedLinear):
-            weight = mx.dequantize(
-                lm_head.weight,
-                lm_head.scales,
-                lm_head.get("biases"),
-                lm_head.group_size,
-                lm_head.bits,
-                mode=getattr(lm_head, "mode", "affine"),
-            )
-        else:
-            weight = lm_head.weight
+        quantized = isinstance(lm_head, nn.QuantizedLinear)
+        mode = getattr(lm_head, "mode", "affine")
         proj = self.hidden_out.weight.astype(mx.float32)
         bias = self.hidden_out.bias.astype(mx.float32)
         rows, biases = [], []
-        for start in range(0, weight.shape[0], 16384):
-            head = weight[start : start + 16384].astype(mx.float32)
+        # A quantized head is dequantized a chunk at a time: the whole float
+        # matrix would be several times the folded result.
+        packed_biases = lm_head.get("biases") if quantized else None
+        for start in range(0, lm_head.weight.shape[0], 16384):
+            chunk = slice(start, start + 16384)
+            head = lm_head.weight[chunk]
+            if quantized:
+                head = mx.dequantize(
+                    head,
+                    lm_head.scales[chunk],
+                    None if packed_biases is None else packed_biases[chunk],
+                    lm_head.group_size,
+                    lm_head.bits,
+                    mode=mode,
+                )
+            head = head.astype(mx.float32)
             rows.append((head @ proj).astype(mx.bfloat16))
             biases.append((head @ bias).astype(mx.bfloat16))
             mx.eval(rows[-1], biases[-1])

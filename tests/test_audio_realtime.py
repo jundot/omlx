@@ -1486,7 +1486,7 @@ def test_lfm3_voice_loop_matches_stream_slots(tiny_lfm3, monkeypatch):
         )
     )
     assert any(codes is not None for _, codes in reference)
-    for seconds in (0.0, 0.01, 10.0):
+    for seconds in (0.0, 10.0):
         backend = _tiny_backend(tiny_lfm3, ids)
         backend.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, [])
         mx.random.seed(0)

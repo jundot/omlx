@@ -14,7 +14,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from omlx.patches import qwen35_verify_qmm, row_exact_qmv
+from omlx.patches import qwen35_verify_qmm, row_exact_gemv, row_exact_qmv
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -50,39 +50,66 @@ def _bit_equal(a, b):
 # other widths, and K = 256 (mod 512) at 6/8 bits, where MLX's qmv_fast block
 # is 256 wide (512 at 4/5 bits).
 SHAPES = [
-    (2560, 10240, 6, 64),
-    (6144, 2560, 5, 128),
-    (2560, 16384, 8, 64),  # 2048 tiles: rows share weight passes, as in the lm_head
-    (640, 2560, 8, 128),
-    (2560, 1, 8, 64),
-    (2560, 12, 6, 64),
-    (320, 1024, 6, 64),
-    (2560, 1024, 4, 64),
-    (2560, 1024, 5, 32),
-    (768, 1024, 8, 64),
-    (1280, 1024, 6, 64),
+    (3, 6144, 2560, 5, 128),
+    (3, 2560, 16384, 8, 64),
+    (8, 2560, 16384, 8, 64),
+    (8, 640, 2560, 8, 128),
+    (16, 2560, 1, 8, 64),
+    (3, 2560, 12, 6, 64),
+    (8, 320, 1024, 6, 64),
+    (16, 2560, 1024, 4, 64),
+    (3, 2560, 1024, 5, 32),
+    (8, 768, 1024, 8, 64),
+    (16, 1280, 1024, 6, 64),
     # oQ2/oQ3 layers: 2-bit qmv_fast reads one pack per thread, 3-bit packs
     # eight values in three bytes; K = 768 takes 3-bit's non-fast arm.
-    (3072, 8192, 2, 64),
-    (640, 2560, 2, 128),
-    (1536, 3072, 3, 64),
-    (768, 520, 3, 32),
+    (3, 3072, 1024, 2, 64),
+    (8, 640, 2560, 2, 128),
+    (16, 1536, 1024, 3, 64),
+    (3, 768, 520, 3, 32),
 ]
 
 
-@pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("rows", [3, 8, 16])
-def test_rows_equal_one_row_quantized_matmul(shape, rows):
-    k, n, bits, group_size = shape
+@pytest.mark.parametrize("rows, k, n, bits, group_size", SHAPES)
+def test_rows_equal_one_row_quantized_matmul(rows, k, n, bits, group_size):
     linear = _linear(k, n, bits, group_size, seed=k + n + rows)
     x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
     assert _bit_equal(row_exact_qmv.quantized_linear(linear, x), _serial(linear, x))
 
 
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("bits", [4, 5, 6])
-@pytest.mark.parametrize("k", [512, 640])
-@pytest.mark.parametrize("n", [8, 12])
+# Inkling 2 dense projections: in_proj (N >= 4096), k_proj, o_proj (K = 3072)
+# and a partial last column tile (N % 4).
+@pytest.mark.parametrize(
+    "n,k,dtype",
+    [
+        (8600, 2304, mx.bfloat16),
+        (1056, 2304, mx.float16),
+        (2304, 3072, mx.bfloat16),
+        (4098, 2304, mx.float16),
+    ],
+)
+def test_dense_rows_equal_one_row_matmul(n, k, dtype):
+    mx.random.seed(n)
+    weight = (mx.random.normal((n, k)) * 0.02).astype(dtype)
+    # A row slice, as the looped in_proj passes project it.
+    for w in (weight, weight[n // 4 : n // 2]):
+        for rows in (2, 4, 5, 9, row_exact_gemv.MAX_ROWS):
+            x = mx.random.normal((1, rows, k)).astype(dtype)
+            serial = mx.concatenate([x[:, r : r + 1] @ w.T for r in range(rows)], axis=1)
+            assert _bit_equal(row_exact_gemv.linear(w, x), serial)
+
+
+@pytest.mark.parametrize(
+    "dtype,bits,k,n",
+    [
+        (mx.float16, 4, 512, 8),
+        (mx.bfloat16, 4, 640, 12),
+        (mx.bfloat16, 5, 512, 12),
+        (mx.float16, 5, 640, 8),
+        (mx.float16, 6, 512, 12),
+        (mx.bfloat16, 6, 640, 8),
+    ],
+)
 def test_bias_sum_widens_inputs_before_accumulation(dtype, bits, k, n):
     linear = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=bits)
     linear.weight = mx.zeros((n, k * bits // 32), dtype=mx.uint32)
@@ -98,15 +125,14 @@ def test_bias_sum_widens_inputs_before_accumulation(dtype, bits, k, n):
 
 
 @pytest.mark.parametrize(
-    "k, sizes, bits, group_size",
+    "k, sizes, bits, group_size, rows",
     [
-        (2560, [10240, 6144, 48, 48], 6, 64),  # DeltaNet in_proj qkv/z/b/a
-        (2560, [12288, 512, 512], 6, 64),  # attention q/k/v
-        (2560, [640, 640], 8, 128),  # shared expert gate/up
-        (640, [2560, 1, 12], 8, 128),  # non-fast K with partial tiles
+        (2560, [10240, 6144, 48, 48], 6, 64, 2),
+        (2560, [12288, 512, 512], 6, 64, 4),
+        (2560, [640, 640], 8, 128, 2),
+        (640, [2560, 1, 12], 8, 128, 4),
     ],
 )
-@pytest.mark.parametrize("rows", [2, 4])
 def test_grouped_rows_equal_one_row_quantized_matmul(k, sizes, bits, group_size, rows):
     linears = [_linear(k, n, bits, group_size, seed=i + k) for i, n in enumerate(sizes)]
     x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
@@ -116,11 +142,19 @@ def test_grouped_rows_equal_one_row_quantized_matmul(k, sizes, bits, group_size,
         assert _bit_equal(output, _serial(linear, x))
 
 
-@pytest.mark.parametrize("rows", [5, 7, 11, 13])
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("grouped", [False, True])
-def test_partial_shared_row_tiles_equal_serial(rows, dtype, grouped):
-    linears = [_linear(2560, n, 8, 64, seed=rows + n) for n in (65536, 16)]
+@pytest.mark.parametrize(
+    "rows,dtype,grouped",
+    [
+        (5, mx.bfloat16, False),
+        (7, mx.float16, False),
+        (5, mx.float16, True),
+        (7, mx.bfloat16, True),
+    ],
+)
+def test_partial_shared_row_tiles_equal_serial(rows, dtype, grouped, monkeypatch):
+    n_shared = 8 * row_exact_qmv._SHARED_ROWS_MIN_TILES
+    monkeypatch.setattr(row_exact_qmv, "_PADDED_ROWS_MIN_WEIGHT_BYTES", n_shared * 2560)
+    linears = [_linear(2560, n, 8, 64, seed=rows + n) for n in (n_shared, 16)]
     for linear in linears:
         linear.scales = linear.scales.astype(dtype)
         linear.biases = linear.biases.astype(dtype)
@@ -129,7 +163,7 @@ def test_partial_shared_row_tiles_equal_serial(rows, dtype, grouped):
         assert row_exact_qmv._group_plan(linears, x, rows) is not None
         outputs = row_exact_qmv.quantized_linears(linears, x)
     else:
-        linears[0]["bias"] = mx.random.normal((65536,)).astype(dtype)
+        linears[0]["bias"] = mx.random.normal((n_shared,)).astype(dtype)
         outputs = [row_exact_qmv.quantized_linear(linears[0], x)]
     for linear, output in zip(linears, outputs):
         expected = _serial(linear, x)
@@ -171,33 +205,31 @@ def _quantized(k, n, bits, group_size, dtype, seed):
 
 # FP32 rows expose the unrounded accumulations that a BF16 output hides.
 @pytest.mark.parametrize(
-    "k, n, bits, group_size",
+    "k, n, bits, group_size, dtype, rps",
     [
-        (2560, 16480, 6, 64),  # DeltaNet stacked qkv/z/b/a in-projection
-        (6144, 2560, 5, 128),  # DeltaNet out-projection
-        (2560, 1024, 4, 64),
-        (1024, 520, 8, 32),
-        (768, 1024, 8, 64),  # 8-bit qmv_fast block is 256 wide
-        (2560, 1024, 2, 64),
-        (3072, 2048, 3, 64),
+        (2560, 16480, 6, 64, mx.bfloat16, 1),
+        (2560, 16480, 6, 64, mx.float32, 4),
+        (6144, 2560, 5, 128, mx.float32, 2),
+        (2560, 1024, 4, 64, mx.bfloat16, 2),
+        (1024, 520, 8, 32, mx.float32, 1),
+        (768, 1024, 8, 64, mx.float32, 4),
+        (2560, 1024, 2, 64, mx.bfloat16, 4),
+        (3072, 2048, 3, 64, mx.float32, 1),
     ],
 )
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rps", [1, 2, 4])
 def test_one_row_qmv_equals_quantized_matmul(k, n, bits, group_size, dtype, rps):
-    for seed in (5, 23):
-        weight, scales, biases = _quantized(k, n, bits, group_size, dtype, seed + rps)
-        x = mx.random.normal((1, 1, k)).astype(dtype)
-        launch = row_exact_qmv.one_row_qmv(
-            weight, scales, biases, bits, group_size, "affine", dtype, rps
-        )
-        expected = mx.quantized_matmul(
-            x, weight, scales, biases, transpose=True, group_size=group_size, bits=bits
-        )
-        observed = launch(x)
-        assert observed.shape == expected.shape and observed.dtype == dtype
-        view = mx.uint32 if dtype == mx.float32 else mx.uint16
-        assert mx.array_equal(observed.view(view), expected.view(view)).item()
+    weight, scales, biases = _quantized(k, n, bits, group_size, dtype, 5 + rps)
+    x = mx.random.normal((1, 1, k)).astype(dtype)
+    launch = row_exact_qmv.one_row_qmv(
+        weight, scales, biases, bits, group_size, "affine", dtype, rps
+    )
+    expected = mx.quantized_matmul(
+        x, weight, scales, biases, transpose=True, group_size=group_size, bits=bits
+    )
+    observed = launch(x)
+    assert observed.shape == expected.shape and observed.dtype == dtype
+    view = mx.uint32 if dtype == mx.float32 else mx.uint16
+    assert mx.array_equal(observed.view(view), expected.view(view)).item()
 
 
 @pytest.mark.parametrize(
@@ -216,8 +248,9 @@ def test_one_row_qmv_declines_unsupported_layouts(k, n, rps):
     )
 
 
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rps", [1, 2])
+@pytest.mark.parametrize(
+    "dtype,rps", [(mx.float16, 1), (mx.bfloat16, 2), (mx.float32, 1)]
+)
 def test_one_row_qmv_partial_outputs_equal_quantized_matmul(dtype, rps):
     weight, scales, biases = _quantized(512, 12, 4, 64, dtype, 5)
     x = mx.random.normal((1, 1, 512)).astype(dtype)
@@ -233,17 +266,15 @@ def test_one_row_qmv_partial_outputs_equal_quantized_matmul(dtype, rps):
 # Every (columns per simdgroup, rows per threadgroup) tile gives each row the
 # one-row bits, so retuning the geometry cannot change a verify row.
 @pytest.mark.parametrize(
-    "k, n, bits, group_size",
+    "k, n, bits, group_size, dtype, rows",
     [
-        (2560, 16480, 6, 64),  # DeltaNet stacked qkv/z/b/a in-projection
-        (6144, 2560, 5, 128),  # DeltaNet out-projection
-        (2560, 1024, 8, 64),
-        (2560, 1024, 2, 64),
-        (3072, 2048, 3, 64),
+        (2560, 16480, 6, 64, mx.bfloat16, 4),
+        (6144, 2560, 5, 128, mx.float32, 9),
+        (2560, 1024, 8, 64, mx.float32, 4),
+        (2560, 1024, 2, 64, mx.bfloat16, 3),
+        (3072, 2048, 3, 64, mx.float32, 3),
     ],
 )
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rows", [3, 4, 9])
 def test_rows_qmv_every_geometry_equals_one_row_quantized_matmul(
     k, n, bits, group_size, dtype, rows
 ):
@@ -278,16 +309,14 @@ def test_rows_qmv_every_geometry_equals_one_row_quantized_matmul(
 # tile inside its register envelope gives each row the one-row bits (at the
 # DeltaNet verify shapes and bit widths, and past the 4-row blocks).
 @pytest.mark.parametrize(
-    "k, n, bits, group_size",
+    "k, n, bits, group_size, dtype, rows",
     [
-        (2560, 16480, 6, 64),  # DeltaNet stacked in-projection (oQ5e)
-        (2560, 16480, 8, 64),  # its 8-bit layer
-        (6144, 2560, 5, 128),  # DeltaNet out-projection
-        (2560, 1024, 4, 64),
+        (2560, 16480, 6, 64, mx.float32, 6),
+        (2560, 1040, 8, 64, mx.bfloat16, 8),
+        (6144, 2560, 5, 128, mx.float32, 4),
+        (2560, 1024, 4, 64, mx.bfloat16, 5),
     ],
 )
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8])
 def test_unrolled_rows_qmv_tiles_equal_one_row_quantized_matmul(
     k, n, bits, group_size, dtype, rows
 ):

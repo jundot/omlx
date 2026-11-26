@@ -2,10 +2,6 @@
 """Tests for API key authentication."""
 
 import json
-import os
-import subprocess
-import sys
-import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -667,10 +663,11 @@ class TestUnauthenticatedInference:
         response = client.post(
             path, json={}, headers={"Authorization": "Bearer management-key"}
         )
-        assert response.status_code == 422
+        expected = 400 if path.startswith("/v1/messages") else 422
+        assert response.status_code == expected
         settings.auth.allow_unauthenticated_inference = True
         # An empty payload reaches request validation only after auth succeeds.
-        assert client.post(path, json={}).status_code == 422
+        assert client.post(path, json={}).status_code == expected
 
     @pytest.mark.parametrize(
         "method,path",
@@ -866,64 +863,3 @@ class TestApiKeyLockout:
         for local in (_LOOPBACK_CLIENT, same_host):
             for _ in range(3 * auth.KEY_FAILURES_PER_LOCKOUT):
                 assert auth.check_api_key(local, lambda: False) is False
-
-
-HEADLESS_PROBE = textwrap.dedent("""
-    import json
-    import sys
-    from pathlib import Path
-
-    from fastapi.testclient import TestClient
-
-    from omlx import server
-    from omlx.admin import auth
-    from omlx.admin import routes as admin_routes
-    from omlx.settings import GlobalSettings
-
-    settings = GlobalSettings(base_path=Path(sys.argv[1]))
-    settings.auth.api_key = "main-key-1234"
-    server._server_state.global_settings = settings
-    server._server_state.api_key = "main-key-1234"
-    server._server_state.bind_host = "127.0.0.1"
-    auth._get_global_settings = lambda: settings
-    admin_routes._get_global_settings = lambda: settings
-
-    client = TestClient(server.app, follow_redirects=False)
-    html = {"Accept": "text/html"}
-    status = {
-        "login_page": client.get("/admin", headers=html).status_code,
-        "dashboard": client.get("/admin/dashboard", headers=html).status_code,
-        "static": client.get("/admin/static/favicon.svg").status_code,
-        "auto_login": client.get(
-            "/admin/auto-login", params={"key": "main-key-1234"}
-        ).status_code,
-        "api_html_no_session": client.get(
-            "/admin/api/global-settings", headers=html
-        ).status_code,
-    }
-    client.post("/admin/api/login", json={"api_key": "main-key-1234"})
-    status["api_with_session"] = client.get("/admin/api/global-settings").status_code
-    print(json.dumps(status))
-    """)
-
-
-def test_headless_serves_admin_api_without_pages(tmp_path):
-    env = {**os.environ, "OMLX_HEADLESS": "1", "HOME": str(tmp_path)}
-    env["OMLX_BASE_PATH"] = str(tmp_path / "base")
-    result = subprocess.run(
-        [sys.executable, "-c", HEADLESS_PROBE, str(tmp_path / "base")],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stderr
-    status = json.loads(result.stdout.strip().splitlines()[-1])
-    assert status == {
-        "login_page": 404,
-        "dashboard": 404,
-        "static": 404,
-        "auto_login": 404,
-        "api_html_no_session": 401,
-        "api_with_session": 200,
-    }

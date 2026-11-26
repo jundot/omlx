@@ -1102,6 +1102,8 @@ def test_autoconfigure_lightning_mtp_plan_is_the_one_activation_recomputes(
     )
     monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
     monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+    monkeypatch.setattr(routes, "peer_import_issues", lambda *_, **__: ())
+    monkeypatch.setattr(routes, "_staging_for", lambda *_: None)
 
     body = (
         _client()

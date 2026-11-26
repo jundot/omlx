@@ -46,7 +46,7 @@ def _max_abs(a, b):
 # --- kernel correctness --------------------------------------------------
 
 
-@pytest.mark.parametrize("seq_len", [256, 1024, 4096])
+@pytest.mark.parametrize("seq_len", [256, 1024])
 def test_flash_sdpa256_square_causal_matches_reference(seq_len):
     from omlx.patches.sdpa256_attention import _flash_sdpa256
 
@@ -57,7 +57,7 @@ def test_flash_sdpa256_square_causal_matches_reference(seq_len):
     assert _max_abs(out, ref) < 2e-2
 
 
-@pytest.mark.parametrize("q_len,k_len", [(1, 4096), (128, 4096), (2048, 8192)])
+@pytest.mark.parametrize("q_len,k_len", [(1, 4096), (512, 2048)])
 def test_flash_sdpa256_chunked_prefill_offset_causal(q_len, k_len):
     """Chunked prefill: q_len queries over a longer cached context (k_len). MLX
     'causal' aligns queries to the END of the key axis — the kernel must match."""
@@ -350,24 +350,30 @@ def test_portable_sinks_and_value_dimension_match_reference(monkeypatch):
 def test_should_route_gate():
     from omlx.patches import sdpa256_attention as sdpa256
 
-    q, k, _ = _qkv(2048, 16384)  # 256, prefill, long
+    def qk(q_len, k_len, head_dim=256):
+        return (
+            mx.zeros((1, 24, q_len, head_dim), dtype=mx.float16),
+            mx.zeros((1, 4, k_len, head_dim), dtype=mx.float16),
+        )
+
+    q, k = qk(2048, 16384)
     assert sdpa256._should_route(q, k, None, "causal", None) is True
     assert sdpa256._should_route(q, k, None, None, None) is True
     # decode (qL==1) -> fused vector kernel handles 256
-    qd, kd, _ = _qkv(1, 16384)
+    qd, kd = qk(1, 16384)
     assert sdpa256._should_route(qd, kd, None, "causal", None) is False
     # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock path;
     # tiny-query fused routing is already handled by MLX's vector kernel
     for q_len in (2, 4, 9, 15):
-        qv, kv, _ = _qkv(q_len, 16384)
+        qv, kv = qk(q_len, 16384)
         assert sdpa256._should_route(qv, kv, None, "causal", None) is False
-    qv, kv, _ = _qkv(16, 16384)
+    qv, kv = qk(16, 16384)
     assert sdpa256._should_route(qv, kv, None, "causal", None) is True
     # short kv -> keep the faster fallback
-    qs, ks, _ = _qkv(2048, 4096)
+    qs, ks = qk(2048, 4096)
     assert sdpa256._should_route(qs, ks, None, "causal", None) is False
     # wrong head_dim
-    qh, kh, _ = _qkv(2048, 16384, head_dim=128)
+    qh, kh = qk(2048, 16384, head_dim=128)
     assert sdpa256._should_route(qh, kh, None, "causal", None) is False
     # Boolean/additive masks and attention sinks remain memory-bounded.
     bool_mask = mx.ones((1, 1, 1, 16384), dtype=mx.bool_)

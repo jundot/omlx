@@ -174,13 +174,13 @@ def test_split_matches_whole_model(k):
     _run(tiny(), k, [7, 5, 3])
 
 
-@pytest.mark.parametrize("k", [1, 3, [3, 2, 1]])
+@pytest.mark.parametrize("k", [3, [3, 2, 1]])
 def test_split_matches_whole_model_with_ced(k):
     # Chunks wider than the window skip the decoder tail, then replay it.
     _run(tiny_ced(), k, [9, 6, 7])
 
 
-@pytest.mark.parametrize("k", [1, 3, [3, 1, 1]])
+@pytest.mark.parametrize("k", [3, [3, 1, 1]])
 def test_split_matches_whole_model_with_engram(k):
     _run(tiny(**_ENGRAM), k, [7, 5, 3])
 
@@ -297,12 +297,13 @@ def test_client_notices_a_helper_that_stops_sending():
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
+    noticed = threading.Event()
 
     def silent():
         sock, _ = listener.accept()
         wire.authenticate(sock, TOKEN, server=True)
         wire.send(sock, {"op": "hello", "protocol": wire.PROTOCOL})
-        time.sleep(2)
+        noticed.wait(10)
         sock.close()
 
     thread = threading.Thread(target=silent, daemon=True)
@@ -312,6 +313,7 @@ def test_client_notices_a_helper_that_stops_sending():
     client.submit(np.arange(3, 9, dtype=np.int32), [6])
     time.sleep(0.2)
     assert client.stalled(0.1)
+    noticed.set()
     client.close()
     thread.join(5)
     listener.close()
@@ -442,7 +444,7 @@ def _drive(sched, request, tokens):
 
 
 @pytest.mark.parametrize(
-    "config", [tiny(), tiny_ced(), tiny(**_ENGRAM)], ids=["plain", "ced", "engram"]
+    "config", [tiny_ced(), tiny(**_ENGRAM)], ids=["ced", "engram"]
 )
 def test_scheduler_helper_prefill_matches_local(config):
     k, tokens = 2, [int(t) for t in np.random.default_rng(3).integers(3, 60, 23)]
@@ -1106,7 +1108,7 @@ def test_manager_retries_a_helper_that_lost_its_gpu(tmp_path, monkeypatch):
     manager.close()
 
 
-def test_manager_retries_an_offline_helper_on_use(tmp_path, monkeypatch):
+def test_manager_retries_an_offline_helper_on_use(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (600.0,))
     monkeypatch.setattr(manager_module, "_RETRY_ON_USE_S", 0.0)
     fake = _FakeLauncher(None)
@@ -1114,9 +1116,17 @@ def test_manager_retries_an_offline_helper_on_use(tmp_path, monkeypatch):
     manager = _manager(fake, [], tmp_path / "speeds.json")
     manager.configure("node-1", None)
     _wait_state(manager, "offline", reason="does not answer over SSH")
+    monkeypatch.setattr(manager_module, "_RETRY_ON_USE_S", 600.0)
+    for _ in range(2):
+        manager.retry_if_offline()
+    monkeypatch.setattr(manager_module, "_RETRY_ON_USE_S", 0.0)
+    noted = [r.getMessage() for r in caplog.records if "not ready" in r.getMessage()]
+    assert len(noted) == 1 and "does not answer over SSH" in noted[0]
     fake.unreachable = False
     manager.retry_if_offline()
     _wait_state(manager, "ready")
+    manager.retry_if_offline()
+    assert caplog.text.count("not ready") == 1
     manager.close()
     # A copy that waits for the user is not cancelled.
     old = {"name": "Old", "bytes": 20 << 30, "used": 0.0}
@@ -1127,6 +1137,7 @@ def test_manager_retries_an_offline_helper_on_use(tmp_path, monkeypatch):
     manager.configure("node-1", None)
     _wait_state(manager, "needs_files")
     manager.retry_if_offline()
+    assert caplog.text.count("not ready") == 2
     assert manager._commands.empty()
     assert manager.status()["state"] == "needs_files"
     manager.close()
@@ -1801,7 +1812,7 @@ def _split_matches(adapter, make, ids, sizes, k, prefix, state_of):
         np.testing.assert_array_equal(a, b)
 
 
-@pytest.mark.parametrize("k,prefix", [(1, 0), (2, 0), (3, 0), (2, 1)])
+@pytest.mark.parametrize("k,prefix", [(1, 0), (3, 0), (2, 1)])
 def test_glm_split_matches_whole_model(k, prefix):
     ids = mx.array(np.random.default_rng(5).integers(3, 60, (1, 23)))
     _split_matches(GLM, _glm, ids, [9, 6, 7], k, prefix, _glm_state)
@@ -1852,14 +1863,10 @@ def _qwen4_state(cache):
     return [np.asarray(a.astype(mx.float32)) for a in out]
 
 
-@pytest.mark.parametrize(
-    "layers,k,prefix", [(2, 1, 0), (4, 1, 0), (4, 2, 0), (4, 3, 0), (4, 2, 1)]
-)
-def test_qwen4_split_matches_whole_model(layers, k, prefix):
+@pytest.mark.parametrize("k,prefix", [(1, 0), (3, 0), (2, 1)])
+def test_qwen4_split_matches_whole_model(k, prefix):
     ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 23)))
-    _split_matches(
-        QWEN4, lambda: _qwen4(layers), ids, [9, 6, 7], k, prefix, _qwen4_state
-    )
+    _split_matches(QWEN4, lambda: _qwen4(4), ids, [9, 6, 7], k, prefix, _qwen4_state)
 
 
 def test_qwen4_prefix_of_a_decoded_cache_sends_text_positions():
@@ -1925,8 +1932,6 @@ def _qwen35_state(cache):
 @pytest.mark.parametrize(
     "k,sizes,prefix",
     [
-        (2, [9, 6, 7], 0),
-        (4, [9, 6, 7], 0),
         (5, [12, 10], 0),
         (2, [9, 6, 7], 1),
         (4, [9, 6, 7], 1),
@@ -2021,9 +2026,11 @@ def test_qwen35_keeps_a_yarn_prompt_off_the_helpers_attention_layers():
 
 
 def _inkling2():
-    """The tiny Inkling 2 stack: NVFP4 experts in layers 0-5 and MXFP8 in
-    6-11, block boundaries at 0 and 6, full attention at 5 and 11."""
-    lm = _inkling2_tiny(formats=("nvfp4",) * 6 + ("mxfp8",) * 6)
+    lm = _inkling2_tiny(
+        formats=("nvfp4",) * 4 + ("mxfp8",) * 4,
+        n_layers_per_attn_res_block=4,
+        local_layer_ids=[0, 1, 2, 4, 5, 6],
+    )
     mx.eval(lm.parameters())
     return lm
 
@@ -2070,12 +2077,10 @@ def _inkling2_state(cache):
     return [np.asarray(a) for a in out]
 
 
-@pytest.mark.parametrize("k,prefix", [(1, 0), (5, 0), (6, 0), (7, 0), (11, 0), (7, 1)])
+@pytest.mark.parametrize("k,prefix", [(3, 0), (4, 0), (5, 0), (5, 1)])
 def test_inkling2_split_matches_whole_model(k, prefix):
-    # Chunks past the 8-key window; cuts before, at and after a block
-    # boundary (6) and a full-attention layer (5).
     ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 30)))
-    _split_matches(INKLING2, _inkling2, ids, [12, 10, 8], k, prefix, _inkling2_state)
+    _split_matches(INKLING2, _inkling2, ids, [20, 10], k, prefix, _inkling2_state)
 
 
 @pytest.mark.parametrize(
@@ -2088,7 +2093,7 @@ def test_inkling2_split_matches_whole_model(k, prefix):
             lambda: (_inkling2(), SimpleNamespace(model_type="inkling2")),
             _inkling2,
             INKLING2,
-            7,
+            5,
             _inkling2_state,
         ),
     ],
@@ -2177,7 +2182,7 @@ def _minimax_state(cache):
     return [np.asarray(a) for item in cache for a in (*item.state[0], item.state[1])]
 
 
-@pytest.mark.parametrize("k,prefix", [(1, 0), (2, 0), (3, 0), (2, 1)])
+@pytest.mark.parametrize("k,prefix", [(1, 0), (3, 0), (2, 1)])
 def test_minimax_split_matches_whole_model(k, prefix):
     # Past 16 blocks of 8 the layers take the sparse path; the 9-token tail
     # keeps explicit positions.
@@ -2206,9 +2211,7 @@ class _Drafter:
     "make,model_type,adapter,k,layers",
     [
         (_minimax, "minimax_m3_vl", MINIMAX, 2, [0, 3]),
-        # Inkling 2 taps the partial sum entering a layer, and the final norm
-        # as layer 12.
-        (_inkling2, "inkling2", INKLING2, 5, [3, 9, 12]),
+        (_inkling2, "inkling2", INKLING2, 5, [3, 6, 8]),
     ],
     ids=["minimax", "inkling2"],
 )

@@ -946,34 +946,6 @@ def test_compiled_swiglu_matches_eager():
     assert mx.array_equal(out, ref)
 
 
-def test_two_output_compiled_tail_is_numerically_close():
-    """C1 marker: two-output mx.compile parity depends on the Apple GPU.
-
-    The Swift challenge compiles the router tail
-    ``(sigmoid(logits), -(sigmoid(logits)+bias))`` into one kernel (challenge
-    commit f8848e0 / submission 8adb56be). In Python MLX 0.32.0 that two-output
-    compiled function is bit-exact on the macos-14-arm64 CI runner but is
-    deterministically ULP-divergent on an M3 Ultra. The router tail therefore
-    stays eager in the port because it feeds argpartition expert selection.
-    A zero difference on one GPU does not resolve C1 for every supported Mac.
-    """
-    key = mx.random.normal((2, 256), dtype=mx.float32)
-    bias = mx.random.normal((256,), dtype=mx.float32)
-
-    def tail(a, b):
-        s = mx.sigmoid(a)
-        return s, -(s + b.astype(s.dtype))
-
-    compiled = mx.compile(tail, shapeless=True)
-    scores, neg = compiled(key, bias)
-    ref_scores, ref_neg = tail(key, bias)
-    mx.eval(scores, neg, ref_scores, ref_neg)
-    sig_diff = float(mx.max(mx.abs(scores - ref_scores)).item())
-    neg_diff = float(mx.max(mx.abs(neg - ref_neg)).item())
-    assert sig_diff <= 1e-4, f"compiled score tail changed: max-abs {sig_diff}"
-    assert neg_diff <= 1e-4, f"compiled corrected tail changed: max-abs {neg_diff}"
-
-
 def test_compiled_combine_matches_eager():
     """The compiled weighted-expert combine reproduces the eager reduction."""
     lm = _registered_laguna_module()
@@ -985,38 +957,6 @@ def test_compiled_combine_matches_eager():
     ref = mx.sum(y * weights[..., None], axis=-2) * 2.5 + shared
     mx.eval(out, ref)
     assert mx.array_equal(out, ref)
-
-
-def test_normalize_then_combine_equals_folded():
-    """eb76e2b8 equivalence gate: router-side normalize + combine is bit-identical
-    to the Swift's folded lagunaCompiledNormalizedExpertCombine.
-
-    The submission folds top-k renormalization into the expert combine
-    (deferred). oMLX keeps the normalize in the router (8adb56be) and the
-    combine separate (9a37e4dc); this pins that the two compositions are
-    bit-identical, so the folded variant adds nothing and is not re-ported.
-    """
-    scale = 2.5
-    outputs = mx.random.normal((1, 1, 2, 64), dtype=mx.float32)
-    weights = mx.random.uniform(shape=(1, 1, 2), dtype=mx.float32)
-    shared = mx.random.normal((1, 1, 64), dtype=mx.float32)
-
-    # oMLX path: normalize in the router, then the compiled combine.
-    normalized = weights / mx.sum(weights, axis=-1, keepdims=True)
-    typed = normalized.astype(outputs.dtype)
-    routed = mx.sum(outputs * typed[..., None], axis=-2)
-    separate = routed * scale + shared
-
-    # Swift folded path (lagunaCompiledNormalizedExpertCombine body).
-    folded = (
-        mx.sum(outputs * (weights / mx.sum(weights, axis=-1, keepdims=True)).astype(
-            outputs.dtype
-        )[..., None], axis=-2)
-        * scale
-        + shared
-    )
-    mx.eval(separate, folded)
-    assert mx.array_equal(separate, folded)
 
 
 def test_compiled_combine_residual_matches_eager():

@@ -93,6 +93,11 @@ def _replay(bounds, layers):
     return out
 
 
+@cache
+def _whole(layers):
+    return _replay((0, 6), layers)
+
+
 def _assert_same(got, expected, tolerance, label):
     assert sorted(got) == sorted(expected), label
     for name, (want, dtype) in expected.items():
@@ -109,8 +114,15 @@ def _assert_same(got, expected, tolerance, label):
             np.testing.assert_array_equal(data, want, err_msg=where)
 
 
-@pytest.mark.parametrize("layers", [6, 4])
-@pytest.mark.parametrize("bounds", [(0, 6), *((0, a, 6) for a in range(1, 6))])
+@pytest.mark.parametrize(
+    "bounds,layers",
+    [
+        ((0, 6), 6),
+        *(((0, a, 6), 6) for a in range(1, 6)),
+        ((0, 6), 4),
+        *(((0, a, 6), 4) for a in range(1, 5)),
+    ],
+)
 def test_stages_reproduce_the_contract_fixture(bounds, layers):
     """One stage and every two-stage split, also for a job that uses fewer
     layers than the stages hold. A second stage may start at an Engram layer
@@ -118,7 +130,6 @@ def test_stages_reproduce_the_contract_fixture(bounds, layers):
     meta, arrays = _case()
     assert meta["contract"] == deepseek_v41.CONTRACT
     tolerance = (meta["rtol"], meta["atol"])
-    whole = _replay((0, meta["layers"]), layers)
     for index, (boundary, state) in enumerate(_replay(bounds, layers)):
         below = {
             n: v
@@ -131,7 +142,7 @@ def test_stages_reproduce_the_contract_fixture(bounds, layers):
         expected = (
             _group(arrays, f"b{index}:")
             if layers == meta["layers"]
-            else whole[index][0]
+            else _whole(layers)[index][0]
         )
         _assert_same(boundary, expected, tolerance, f"chunk {index} boundary")
 

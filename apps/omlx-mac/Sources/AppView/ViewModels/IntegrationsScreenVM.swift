@@ -10,7 +10,7 @@ final class IntegrationsScreenVM {
         case hermesModel, copilotModel, dshModel, vibeModel
         case mcpConfig
         case splashPath, splashLimits, splashKvFormat, splashActivations
-        case splashAnePrefill
+        case splashAnePrefill, splashMaxConcurrentRequests
         case markitdownEnabled, markitdownExposeModel, markitdownMaxFileSize
         case markitdownMaxFiles, markitdownPdfProcessingEngine
     }
@@ -46,6 +46,7 @@ final class IntegrationsScreenVM {
     var splashMaxMemoryGb: String = ""
     var splashSsdCacheGb: String = ""
     private var splashLimitsLoaded = ("", "")
+    var splashMaxConcurrentRequests: String = ""
 
     // MarkItDown
     var markitdownEnabled = true
@@ -108,7 +109,7 @@ final class IntegrationsScreenVM {
     // which can drift after a hot-reload).
     private(set) var serverHost: String = "127.0.0.1"
     private(set) var serverPort: Int = 8000
-    private(set) var serverApiKey: String = ""
+    private(set) var serverApiKeySet: Bool = false
     private(set) var cliPrefix: String = "omlx"
 
     /// Popup options: a leading "Select model…" placeholder + every model id.
@@ -175,15 +176,15 @@ final class IntegrationsScreenVM {
         "\(cliCommandPrefix) launch claude_desktop"
     }
 
-    /// Env-var recipe that runs the real `claude` binary directly. Mirrors
-    /// `claudeCodeCommand` in dashboard.js — cloud form unsets the Anthropic
-    /// vars, local form sets them to point at the oMLX server.
-    var claudeEnvRecipe: String { claudeEnvRecipe(authToken: serverApiKey) }
+    func claudeEnvRecipeForCopy(client: OMLXClient) async throws -> String {
+        guard serverApiKeySet else { return claudeEnvRecipe(authToken: "") }
+        return try await claudeEnvRecipe(authToken: client.revealApiKey())
+    }
 
     /// `claudeEnvRecipe` with the API key masked, for display only. Mirrors
     /// `claudeCodeCommandDisplay` in dashboard.js.
     var claudeEnvRecipeDisplay: String {
-        claudeEnvRecipe(authToken: serverApiKey.isEmpty ? "" : "••••••••")
+        claudeEnvRecipe(authToken: serverApiKeySet ? "••••••••" : "")
     }
 
     private func claudeEnvRecipe(authToken: String) -> String {
@@ -306,6 +307,7 @@ final class IntegrationsScreenVM {
                 self.splashMaxMemoryGb    = Self.gigabytesText(it.splashMaxMemoryGb)
                 self.splashSsdCacheGb     = Self.gigabytesText(it.splashSsdCacheGb)
                 self.splashLimitsLoaded   = (self.splashMaxMemoryGb, self.splashSsdCacheGb)
+                self.splashMaxConcurrentRequests = it.splashMaxConcurrentRequests.map(String.init) ?? ""
             }
             self.markitdownEnabled = settings.integrations?.markitdownEnabled ?? true
             self.markitdownExposeModel = settings.integrations?.markitdownExposeModel ?? false
@@ -337,13 +339,12 @@ final class IntegrationsScreenVM {
             // Available models
             try await refreshModels(client: client)
 
-            // Stats — host/port/api_key/cli_prefix for the command builders.
             // Failure here is non-fatal: the screen still works against the
             // default `omlx` prefix and 127.0.0.1:8000.
             if let stats = try? await client.getStats() {
                 if let host = stats.host, !host.isEmpty { self.serverHost = host }
                 if let port = stats.port               { self.serverPort = port }
-                self.serverApiKey = stats.apiKey ?? ""
+                self.serverApiKeySet = stats.apiKeySet ?? false
                 if let prefix = stats.cliPrefix, !prefix.isEmpty {
                     self.cliPrefix = prefix
                 }
@@ -379,6 +380,8 @@ final class IntegrationsScreenVM {
         case .splashKvFormat:       patch.splashKvFormat = splashKvFormat
         case .splashActivations:    patch.splashActivations = splashActivations
         case .splashAnePrefill:     patch.splashAnePrefill = splashAnePrefill
+        case .splashMaxConcurrentRequests:
+            patch.splashMaxConcurrentRequests = Int(splashMaxConcurrentRequests).map(PatchOptionalInt.value) ?? PatchOptionalInt.null
         case .splashLimits:
             guard let memory = Self.gigabytesPatch(splashMaxMemoryGb, minimum: 1),
                   let ssd = Self.gigabytesPatch(splashSsdCacheGb, minimum: 0) else {

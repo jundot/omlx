@@ -184,6 +184,21 @@ private struct ExternalEnginesSection: View {
                           width: .controlNarrow)
             }
 
+            Row(label: String(localized: "integrations.splash.max_concurrent",
+                              defaultValue: "Concurrent Requests",
+                              comment: "Row label for the Splash concurrent request limit"),
+                sublabel: String(localized: "integrations.splash.max_concurrent.sub",
+                                 defaultValue: "How many requests each Splash model serves at once. Auto uses Splash's default of 4. Applies to Splash 1.7.1 and later.",
+                                 comment: "Sublabel for the Splash concurrent request limit")) {
+                Popup(selection: vm.bind($vm.splashMaxConcurrentRequests, save: {
+                    Task { await vm.save(.splashMaxConcurrentRequests, client: client) }
+                }), width: .controlCompact,
+                      options: [("", String(localized: "integrations.splash.auto",
+                                            defaultValue: "Auto",
+                                            comment: "Placeholder for an automatic Splash size"))]
+                          + (1...8).map { (String($0), String($0)) })
+            }
+
             let running = vm.splash?.models ?? []
             Row(label: String(localized: "integrations.splash.ane_prefill",
                               defaultValue: "Neural Engine Prefill",
@@ -874,7 +889,7 @@ private struct ClaudeApplicationPanel: View {
         FreeRow(isLast: vm.claudeMode != "local") {
             VStack(alignment: .leading, spacing: 6) {
                 CommandBlock(command: vm.claudeEnvRecipeDisplay,
-                             copyValue: vm.claudeEnvRecipe)
+                             copyLoader: { try await vm.claudeEnvRecipeForCopy(client: client) })
                 Text(vm.claudeMode == "cloud" ? envRecipeCloud : envRecipeLocal)
                     .font(.omlxText(11))
                     .foregroundStyle(theme.textTertiary)
@@ -970,11 +985,9 @@ private struct ApplicationPanelHead: View {
     }
 }
 
-/// Monospaced command block with a copy button. `copyValue` lets the block
-/// show a masked command while the button copies the real one.
 private struct CommandBlock: View {
     let command: String
-    var copyValue: String? = nil
+    var copyLoader: (() async throws -> String)? = nil
     var caption: String? = nil
     @Environment(\.omlxTheme) private var theme
 
@@ -996,7 +1009,8 @@ private struct CommandBlock: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             CopyIconButton(
-                value: copyValue ?? command,
+                value: command,
+                valueLoader: copyLoader,
                 helpText: String(localized: "integrations.command.copy",
                                  defaultValue: "Copy command",
                                  comment: "Tooltip for the copy button on a shell command block")

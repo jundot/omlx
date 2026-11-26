@@ -26,22 +26,49 @@ class DSparkAttention(Attention):
         )
         cache.append(kv[:, None], start_offset=start_offset)
 
+    def append_context_rows(self, main_xs, caches):
+        """append_context for several requests' newly committed rows in one projection."""
+        c = self._config
+        positions = [
+            p
+            for x, item in zip(main_xs, caches)
+            for p in range(item.offset, item.offset + x.shape[1])
+        ]
+        kv = quantize_activation(
+            rope(self.kv_norm(self.wkv(mx.concatenate(main_xs, axis=1))), positions, c, False)
+        )
+        at = 0
+        for x, item in zip(main_xs, caches):
+            item.append(kv[:, None, at : at + x.shape[1]])
+            at += x.shape[1]
+
     def __call__(self, x, cache):
         c = self._config
+        caches = cache if isinstance(cache, list) else [cache]
         batch, length, _ = x.shape
-        positions = range(cache.offset, cache.offset + length)
+        positions = [p for item in caches for p in range(item.offset, item.offset + length)]
+
+        def flat(t):
+            return t.reshape(1, batch * length, *t.shape[2:])
+
         q = rope(
-            self.wq_b(self.q_norm(self.wq_a(x))).reshape(
-                batch, length, c.n_heads, c.head_dim
-            ),
+            flat(self.wq_b(self.q_norm(self.wq_a(x))).reshape(batch, length, c.n_heads, c.head_dim)),
             positions,
             c,
             False,
-        )
+        ).reshape(batch, length, c.n_heads, c.head_dim)
         draft_kv = quantize_activation(
-            rope(self.kv_norm(self.wkv(x)), positions, c, False)
+            rope(flat(self.kv_norm(self.wkv(x))), positions, c, False)
+        ).reshape(batch, length, -1)
+        sizes = [item.keys.shape[2] for item in caches]
+        top = max(sizes)
+        rings = mx.concatenate(
+            [mx.pad(item.keys[:, 0], [(0, 0), (top - size, 0), (0, 0)]) for item, size in zip(caches, sizes)]
         )
-        kv = mx.concatenate([cache.keys[:, 0], draft_kv], axis=1)
+        kv = mx.concatenate([rings, draft_kv], axis=1)
+        mask = None
+        if min(sizes) != top:
+            mask = mx.arange(top + length) >= mx.array([top - size for size in sizes])[:, None, None, None]
         # V4.1 does not apply V4's per-head query RMS normalization.
         # The checkpoint's sink and attention accumulation are FP32. SDPA
         # requires a matching sink dtype, so promote this small draft block
@@ -52,12 +79,15 @@ class DSparkAttention(Attention):
                 kv[:, None].astype(mx.float32),
                 kv[:, None].astype(mx.float32),
                 scale=c.head_dim**-0.5,
+                mask=mask,
                 sinks=self.attn_sink.astype(mx.float32),
             )
             .transpose(0, 2, 1, 3)
             .astype(q.dtype)
         )
-        out = rope(out, positions, c, False, inverse=True)
+        out = rope(flat(out), positions, c, False, inverse=True).reshape(
+            batch, length, c.n_heads, c.head_dim
+        )
         # 1017 reference DSparkAttention: act_quant(o) before the wo_a einsum.
         grouped = quantize_activation(out.reshape(batch, length, c.o_groups, -1))
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)

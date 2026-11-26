@@ -297,6 +297,23 @@ class TestSSDCache:
         result = ssd_cache.get("img_hash", "model_a")
         assert result is None
 
+    @pytest.mark.parametrize("value", [float("nan"), float("inf")])
+    def test_put_skips_non_finite_features(self, ssd_cache, value):
+        ssd_cache.put("img_hash", "model_a", mx.array([[1.0, value]]))
+
+        assert ssd_cache.get("img_hash", "model_a") is None
+
+    def test_non_finite_file_is_dropped_on_load(self, ssd_cache):
+        ssd_cache.put("img_hash", "model_a", mx.ones((4, 8)))
+        file_path = ssd_cache._file_path_for_key(_composite_key("model_a", "img_hash"))
+        assert _wait_until(lambda: _write_finished(ssd_cache, "img_hash", "model_a"))
+        mx.save_safetensors(str(file_path), {"feature": mx.full((4, 8), float("nan"))})
+        with ssd_cache._memory_lock:
+            ssd_cache._memory_cache.clear()
+
+        assert ssd_cache.get("img_hash", "model_a") is None
+        assert not file_path.exists()
+
     @pytest.mark.parametrize("operation", ["evict", "load"])
     def test_cleanup_unlink_failure(self, ssd_cache, caplog, operation):
         key = _composite_key("model", "image")

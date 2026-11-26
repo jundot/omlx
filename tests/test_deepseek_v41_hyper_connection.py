@@ -8,8 +8,14 @@ from omlx.patches.deepseek_v41.hyper_connection import fused_hc_projection
 from omlx.patches.deepseek_v41.language import _hc_post_reference, hc_post
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
-@pytest.mark.parametrize("shape", [(1, 1, 64), (2, 17, 128), (1, 3, 513)])
+@pytest.mark.parametrize(
+    "dtype,shape",
+    [
+        (mx.bfloat16, (2, 17, 128)),
+        (mx.float16, (1, 1, 64)),
+        (mx.float32, (1, 3, 513)),
+    ],
+)
 def test_fused_hc_post_matches_reference_and_repeats(dtype, shape):
     mx.random.seed(941)
     x = mx.random.normal(shape).astype(dtype)
@@ -47,9 +53,13 @@ def test_hc_post_noncontiguous_inputs_and_other_stream_counts():
 
 
 @pytest.mark.parametrize(
-    "dtype,tolerance", [(mx.float32, 2e-6), (mx.float16, 0.001), (mx.bfloat16, 0.008)]
+    "dtype,tolerance,width",
+    [
+        (mx.float32, 2e-6, 513),
+        (mx.float16, 0.001, 64),
+        (mx.bfloat16, 0.008, 5120),
+    ],
 )
-@pytest.mark.parametrize("width", [64, 513, 5120])
 def test_pre_norm_fusion_bounds_and_repeat(dtype, tolerance, width):
     from omlx.patches.deepseek_v41.language import hc_pre, hc_pre_norm, norm
 

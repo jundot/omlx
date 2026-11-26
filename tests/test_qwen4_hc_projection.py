@@ -64,9 +64,14 @@ def _production_module(bits: int, group_size: int = 64, dtype=mx.bfloat16):
 
 
 @pytest.mark.parametrize(
-    "group_size,dtype", [(32, mx.bfloat16), (64, mx.bfloat16), (64, mx.float16)]
+    "bits,group_size,dtype",
+    [
+        (4, 32, mx.bfloat16),
+        (5, 64, mx.float16),
+        (6, 64, mx.bfloat16),
+        (8, 32, mx.bfloat16),
+    ],
 )
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(
     bits, group_size, dtype, monkeypatch

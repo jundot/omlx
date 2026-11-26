@@ -96,8 +96,10 @@ struct QuantizationScreen: View {
                 isOpen: $vm.advancedOpen,
                 selectedIsVLM: vm.selectedIsVLM,
                 selectedHasMTP: vm.selectedHasMTP,
+                selectedHasEngram: vm.selectedHasEngram,
                 textOnly: $vm.textOnly,
                 preserveMtp: $vm.preserveMtp,
+                preserveNgram: $vm.preserveNgram,
                 dtype: $vm.dtype
             )
             .padding(.bottom, 12)
@@ -139,6 +141,15 @@ struct QuantizationScreen: View {
             vm.scheduleEstimateRefresh(client: services.client)
         }
         .onChange(of: vm.preserveMtp) { _, _ in
+            vm.scheduleEstimateRefresh(client: services.client)
+        }
+        .onChange(of: vm.preserveNgram) { _, _ in
+            vm.scheduleEstimateRefresh(client: services.client)
+        }
+        .onChange(of: vm.textOnly) { _, _ in
+            vm.scheduleEstimateRefresh(client: services.client)
+        }
+        .onChange(of: vm.dtype) { _, _ in
             vm.scheduleEstimateRefresh(client: services.client)
         }
         .sheet(item: $vm.uploadTarget) { task in
@@ -337,8 +348,10 @@ private struct AdvancedSection: View {
     @Binding var isOpen: Bool
     let selectedIsVLM: Bool
     let selectedHasMTP: Bool
+    let selectedHasEngram: Bool
     @Binding var textOnly: Bool
     @Binding var preserveMtp: Bool
+    @Binding var preserveNgram: Bool
     @Binding var dtype: String
 
     @Environment(\.omlxTheme) private var theme
@@ -397,6 +410,19 @@ private struct AdvancedSection: View {
                     ) {
                         RowSwitch(isOn: $preserveMtp)
                             .disabled(!selectedHasMTP)
+                    }
+
+                    if selectedHasEngram {
+                        Row(
+                            label: String(localized: "quant.advanced.preserve_ngram.label",
+                                          defaultValue: "Keep original Engram tables",
+                                          comment: "Toggle row label: keep DeepSeek V4.1 Engram tables in FP8"),
+                            sublabel: String(localized: "quant.advanced.preserve_ngram.sub",
+                                             defaultValue: "Keep the Engram tables in FP8 instead of 4-bit (larger on disk)",
+                                             comment: "Toggle row sublabel: effect of keeping the original Engram tables")
+                        ) {
+                            RowSwitch(isOn: $preserveNgram)
+                        }
                     }
 
                     Row(

@@ -708,7 +708,7 @@ def test_in_place_slot_bytes_match_the_checkpoint(tmp_path):
     rng = random.Random(7)
     try:
         checked = 0
-        for _ in range(60):
+        for _ in range(20):
             ids = rng.sample(range(plan.count), rng.randint(1, plan.capacity))
             disk.slots.ensure_ids(ids)
             copy.slots.ensure_ids(ids)

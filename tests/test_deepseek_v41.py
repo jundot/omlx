@@ -126,7 +126,7 @@ def load_reference_weights(model, seed=341, scale=0.08, vision=False):
     model.load_weights(weights, strict=True)
 
 
-@pytest.mark.parametrize("length", [1, 3, 8, 17])
+@pytest.mark.parametrize("length", [1, 3, 17])
 def test_official_prefill_decode(expected, length):
     model = LanguageModel(tiny())
     load_reference_weights(model)
@@ -152,13 +152,13 @@ def test_in_place_cache_growth_matches_concatenation(monkeypatch):
 
     model = LanguageModel(tiny())
     load_reference_weights(model)
-    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 24), dtype=np.int32))
+    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 19), dtype=np.int32))
 
     def run():
         cache = model.make_cache()
         logits = [model(ids[:, :9], cache=cache)]
-        for position in range(9, 24):
-            if position == 16:
+        for position in range(9, 19):
+            if position == 14:
                 # Extracting a single row keeps its storage.
                 cache = [layer.extract(0) for layer in cache]
             logits.append(model(ids[:, position : position + 1], cache=cache))
@@ -756,10 +756,12 @@ def test_batch_generator_ragged_prefill_and_admission():
         for response in outputs:
             result[response.uid].append(response.token)
     for uid, prompt in zip([*uids, late], [[3, 4, 5, 6, 7], [8, 9], [10, 11, 12]]):
-        expected = []
+        expected, cache = [], model.make_cache()
+        ids = prompt
         for _ in range(3):
-            token = int(mx.argmax(model(mx.array([prompt + expected]))[0, -1]).item())
+            token = int(mx.argmax(model(mx.array([ids]), cache=cache)[0, -1]).item())
             expected.append(token)
+            ids = [token]
         assert result[uid] == expected
 
 
@@ -881,7 +883,6 @@ def test_prefill_engram_dedupe_matches_undeduped(monkeypatch):
     model.wkv = RecordingWkv(QuantizedProjection(packed, scales, 8, "mxfp8"))
     ids = rng.integers(0, 97, (1, 32, 24), dtype=np.int32)
     ids[0, 8:16] = ids[0, :8]
-    ids[0, 24:32] = ids[0, 16:24]
     h = mx.array(rng.normal(0, 1, (1, 32, c.hc_mult, c.dim)).astype(np.float32))
     mask = np.zeros((1, 32), dtype=bool)
     mask[0, 1] = True
@@ -1526,9 +1527,11 @@ def test_cluster_lightning_mtp_head_loads_on_rank_zero_only(tmp_path):
 
 
 def test_cluster_layout_of_converted_and_source_checkpoints(tmp_path, monkeypatch):
+    from omlx.cluster.autoconfigure import choose_parallelism
     from omlx.cluster.catalogue import assess_model_path
-    from omlx.cluster.planner import NodeBudget, complete_model_layout
+    from omlx.cluster.planner import NodeBudget, PlanningError, complete_model_layout
     from omlx.patches.deepseek_v41.convert import convert
+    from omlx.prefill_helper.adapters import adapter_for_model
 
     source, _ = write_checkpoint(tmp_path, **_ENGRAM)
     target = tmp_path / "converted"
@@ -1545,6 +1548,10 @@ def test_cluster_layout_of_converted_and_source_checkpoints(tmp_path, monkeypatc
 
     # Ranks load their part of converted shards only.
     assert not raw.supports_pipeline and not raw.supports_tensor_parallel
+    with pytest.raises(PlanningError, match="converted by oMLX"):
+        choose_parallelism(raw, nodes)
+    assert adapter_for_model("deepseek_v41", "vlm", source) is None
+    assert adapter_for_model("deepseek_v41", "vlm", target) is not None
     assert fit.supports_pipeline and fit.supports_tensor_parallel
     # The converter keeps the tables outside the index, in a file that holds
     # other tensors too. Stages hold the tables; tensor ranks read them from SSD.

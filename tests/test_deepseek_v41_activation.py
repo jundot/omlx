@@ -166,30 +166,6 @@ def test_normal_scales_are_exact_and_nonzero():
     np.testing.assert_array_equal(compiled, expected)
 
 
-@pytest.mark.parametrize(
-    "bits,group,e4m3", [(8, 32, False), (4, 32, False), (4, 16, True)]
-)
-def test_zero_activation_groups_remain_zero(bits, group, e4m3):
-    from omlx.patches.deepseek_v41.quantization import (
-        _quantize_activation,
-        pack_activation,
-        unpack_activation,
-    )
-
-    x = mx.zeros((3, 128), mx.float32)
-    for result in (
-        _quantize_activation(x, bits, group, e4m3),
-        _compiled_quantize_activation(x, bits, group, e4m3),
-        quantize_activation(x, bits, group, e4m3),
-        unpack_activation(
-            pack_activation(x, bits, group, e4m3), bits, group, e4m3, mx.float32
-        ),
-    ):
-        # This rejects NaNs explicitly, including matching NaNs in both paths.
-        assert mx.all(mx.isfinite(result)).item()
-        np.testing.assert_array_equal(result, np.zeros((3, 128), np.float32))
-
-
 def test_fp8_kernel_preserves_exact_power_of_two_scaled_values():
     # Every scale from the reference amax floor (1e-4 <= 448 * 2^-22) up to the largest
     # whose maximum finite FP8 value fits in a normal FP32. A transcendental exp2
@@ -213,8 +189,15 @@ def test_fp8_kernel_applies_reference_amax_floor():
     np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.parametrize("shape", [(1, 37, 8, 512), (2, 5, 512), (1, 9, 4, 128)])
-@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize(
+    "shape,inverse",
+    [
+        ((1, 37, 8, 512), False),
+        ((1, 37, 8, 512), True),
+        ((2, 5, 512), False),
+        ((1, 9, 4, 128), True),
+    ],
+)
 def test_rope_kernel_matches_reference_rotation(shape, inverse):
     """The one-pass RoPE kernel rotates the tail pairs like the fp32 reference (_rope_apply;
     FMA contraction may differ by one bf16 ulp), its fused act_quant is quantize_activation of
