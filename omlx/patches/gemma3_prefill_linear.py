@@ -26,6 +26,12 @@ _PROJECTIONS = (
 _SHAPES = frozenset(
     (input_dim, output_dim) for _, _, input_dim, output_dim in _PROJECTIONS
 )
+_SCRATCH_GROUPS = (
+    ("self_attn", ("q_proj", "k_proj", "v_proj")),
+    ("self_attn", ("o_proj",)),
+    ("mlp", ("gate_proj", "up_proj")),
+    ("mlp", ("down_proj",)),
+)
 
 
 def _supported_linear(linear, input_dim, output_dim):
@@ -64,6 +70,33 @@ class Gemma3PrefillLinear(nn.QuantizedLinear):
             weight, self.scales, self.biases, group_size=64, bits=4, mode="affine"
         )
         return x @ dense.T
+
+
+def _prefill_scratch_bytes(model) -> int:
+    """Bound simultaneous dense weights once when installing this route.
+
+    Q/K/V and gate/up each share an activation and may materialize together.
+    The dependency in ``Gemma3PrefillLinear`` separates successive groups and
+    layers. The complete 12B route reserves 225 MiB for the gate/up pair,
+    exceeding its 60 MiB Q/K/V group and 112.5 MiB down projection.
+    """
+    layers = getattr(model, "layers", ())
+    if not isinstance(layers, (list, tuple)):
+        return 0
+    peak = 0
+    for layer in layers:
+        for parent_name, names in _SCRATCH_GROUPS:
+            parent = getattr(layer, parent_name, None)
+            group_bytes = 0
+            for name in names:
+                linear = getattr(parent, name, None)
+                if type(linear) is Gemma3PrefillLinear:
+                    output_dim, packed_dim = linear.weight.shape
+                    input_dim = packed_dim * 8
+                    if _supported_linear(linear, input_dim, output_dim):
+                        group_bytes += output_dim * input_dim * 2
+            peak = max(peak, group_bytes)
+    return peak
 
 
 def apply_gemma3_prefill_linear_patch(model) -> int:
@@ -109,4 +142,6 @@ def apply_gemma3_prefill_linear_patch(model) -> int:
                 # QuantizedLinear's storage and parameter paths stay identical.
                 linear.__class__ = Gemma3PrefillLinear
                 count += 1
+    language_model._omlx_prefill_scratch_bytes = _prefill_scratch_bytes(language_model)
+    language_model._omlx_prefill_scratch_min_tokens = _MIN_ROWS
     return count

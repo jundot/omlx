@@ -71,6 +71,8 @@ def test_installation_is_instance_scoped_and_idempotent(m1_max):
     weight = layer.mlp.gate_proj.weight
 
     assert patch.apply_gemma3_prefill_linear_patch(model) == 7
+    assert model.language_model._omlx_prefill_scratch_bytes == 225 * 1024**2
+    assert model.language_model._omlx_prefill_scratch_min_tokens == 512
     assert patch.apply_gemma3_prefill_linear_patch(model) == 0
     assert layer.mlp.gate_proj.weight is weight
     for parent, name, _, _ in patch._PROJECTIONS:
@@ -93,6 +95,18 @@ def test_installation_excludes_linear_subclasses(m1_max):
     attention.k_proj = _linear(cls=CustomLinear)
     assert patch.apply_gemma3_prefill_linear_patch(model) == 6
     assert type(attention.k_proj) is CustomLinear
+
+
+def test_scratch_bound_counts_only_simultaneous_patched_groups(m1_max):
+    model = _model()
+    assert patch.apply_gemma3_prefill_linear_patch(model) == 7
+    language_model = model.language_model
+    assert patch._prefill_scratch_bytes(language_model) == 225 * 1024**2
+    layer = language_model.model.layers[0]
+    layer.mlp = SimpleNamespace()
+    assert patch._prefill_scratch_bytes(language_model) == 60 * 1024**2
+    layer.self_attn = SimpleNamespace()
+    assert patch._prefill_scratch_bytes(language_model) == 0
 
 
 @pytest.mark.parametrize("device", ["Apple M1 Pro", "Apple M2 Max", "Apple M5 Max"])

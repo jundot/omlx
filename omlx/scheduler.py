@@ -16949,7 +16949,14 @@ class Scheduler:
                 # NoPE MLA can use head_dim=0 because the profile provides its dimensions.
                 _pos_int(head_dim) or prefill_memory_profile is not None
             ):
-                from .memory_monitor import _ane_prefill_transient_bytes
+                from .memory_monitor import (
+                    _ane_prefill_transient_bytes,
+                    _prefill_scratch_requirements,
+                )
+
+                scratch_bytes, scratch_min_tokens = _prefill_scratch_requirements(
+                    self.model
+                )
 
                 self.memory_monitor.set_model_info(
                     num_layers=num_layers,
@@ -16980,6 +16987,8 @@ class Scheduler:
                     ane_prefill_transient_bytes=_ane_prefill_transient_bytes(
                         self.model
                     ),
+                    prefill_scratch_bytes=scratch_bytes,
+                    prefill_scratch_min_tokens=scratch_min_tokens,
                 )
                 # Fixed recurrent state (GDN/Mamba) can only be measured from
                 # a live cache after the first forward; arm a one-shot probe.

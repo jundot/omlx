@@ -285,6 +285,8 @@ class MemoryMonitor:
         # ANE program weights the driver wires during prefill (issue #2841);
         # set via set_model_info, 0 unless the Qwen ANE backend is attached.
         self._ane_prefill_transient_bytes: int = 0
+        self._prefill_scratch_bytes: int = 0
+        self._prefill_scratch_min_tokens: int = 1
         # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
         # measured once from a live cache after the first prefill chunk.
         self._fixed_state_bytes: int = 0
@@ -490,6 +492,8 @@ class MemoryMonitor:
         ane_prefill_transient_bytes: int = 0,
         prefill_dtype_size: Optional[float] = None,
         affine_prefill: bool = False,
+        prefill_scratch_bytes: int = 0,
+        prefill_scratch_min_tokens: int = 1,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -527,6 +531,11 @@ class MemoryMonitor:
                 before it shrinks to ``dtype_size``.
             affine_prefill: Reserve one unpacked FP32 layer and bounded
                 attention scores for incremental signed-affine prefill.
+            prefill_scratch_bytes: Additional fixed transient for an installed
+                model-instance prefill route, added to the per-chunk estimate.
+            prefill_scratch_min_tokens: First query length that incurs this
+                reserve. Retain it at larger lengths to keep a monotone bound
+                for adaptive chunk sizing, including routes with an upper cap.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -564,6 +573,8 @@ class MemoryMonitor:
         # The ANE driver wires the program weights outside phys_footprint
         # during prefill, on top of the KV+SDPA peak (issue #2841).
         self._ane_prefill_transient_bytes = max(int(ane_prefill_transient_bytes), 0)
+        self._prefill_scratch_bytes = max(int(prefill_scratch_bytes), 0)
+        self._prefill_scratch_min_tokens = max(int(prefill_scratch_min_tokens), 1)
         # A new model's fixed state must be re-measured; a stale value from
         # the previous model would silently mis-charge admission.
         self._fixed_state_bytes = 0
@@ -954,15 +965,20 @@ class MemoryMonitor:
         ``gathered_core`` prices Qwen4 QSA as a gathered core instead of
         dense Q×kv_len.
         """
+        scratch = (
+            self._prefill_scratch_bytes
+            if n_tokens >= self._prefill_scratch_min_tokens and kv_len > 0
+            else 0
+        )
         if self._prefill_memory_profile is not None:
             profile = self._prefill_memory_profile
             if isinstance(profile, _Qwen4ExpPrefillMemoryProfile):
-                return profile.estimate_prefill_transient_bytes(
+                return scratch + profile.estimate_prefill_transient_bytes(
                     n_tokens,
                     kv_len,
                     gathered_core=gathered_core,
                 )
-            return profile.estimate_prefill_transient_bytes(n_tokens, kv_len)
+            return scratch + profile.estimate_prefill_transient_bytes(n_tokens, kv_len)
         transient = self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
         if self._affine_prefill and n_tokens > 0 and kv_len > 0:
             from .affine4 import _MAX_SCORE_ELEMENTS
@@ -975,7 +991,7 @@ class MemoryMonitor:
             unpacked_kv = 2 * kv_heads * kv_len * dim * 4
             query_and_output = 2 * heads * n_tokens * dim * 4
             transient = max(transient, unpacked_kv + scores + query_and_output)
-        return transient
+        return transient + scratch
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
@@ -2116,6 +2132,22 @@ def _ane_prefill_transient_bytes(model: Any) -> int:
         return 0
 
 
+def _prefill_scratch_requirements(model: Any) -> tuple[int, int]:
+    """Read scalar route metadata from an adapter, VLM, or language model.
+
+    Installation computes the reserve once. This lookup keeps model loading
+    and optional-MLX environments independent of the projection implementation.
+    """
+    language_model = getattr(model, "_language_model", None)
+    if language_model is None:
+        language_model = getattr(model, "language_model", model)
+    reserve = getattr(language_model, "_omlx_prefill_scratch_bytes", 0)
+    min_tokens = getattr(language_model, "_omlx_prefill_scratch_min_tokens", 1)
+    if not _pos_int(reserve) or not _pos_int(min_tokens):
+        return 0, 1
+    return reserve, min_tokens
+
+
 def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
     """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
 
@@ -2223,6 +2255,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         # truthy but fail any later numeric comparison (``> 128`` etc.) deep
         # inside MemoryMonitor. Insist on real positive integers before calling.
         if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+            scratch_bytes, scratch_min_tokens = _prefill_scratch_requirements(model)
             monitor.set_model_info(
                 num_layers=num_layers,
                 num_kv_heads=num_kv_heads,
@@ -2236,6 +2269,8 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 kv_bytes_per_token=kv_bytes_per_token,
                 rotating_layer_specs=rotating_layer_specs,
                 ane_prefill_transient_bytes=_ane_prefill_transient_bytes(model),
+                prefill_scratch_bytes=scratch_bytes,
+                prefill_scratch_min_tokens=scratch_min_tokens,
             )
             logger.debug(
                 f"Model info for memory estimation: "
