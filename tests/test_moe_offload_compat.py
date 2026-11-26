@@ -30,6 +30,8 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     elif kind == "deepseek_v4":
         # text-only flat config, experts under ffn.switch_mlp
         raw.update(text, n_routed_experts=16)
+    elif kind == "bailing_hybrid":
+        raw.update(text, first_k_dense_replace=1)
     elif kind == "glm5_next":
         # VLM text tower with the per-layer sparse selection
         raw["text_config"] = dict(
@@ -43,9 +45,9 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     (path / "config.json").write_text(json.dumps(raw))
     tensors = {}
     for layer in range(2):
-        if kind in ("glm_moe_dsa", "glm5_next") and layer == 0:
+        if kind in ("glm_moe_dsa", "glm5_next", "bailing_hybrid") and layer == 0:
             continue  # dense layer: no experts to cover
-        if kind in ("olmoe", "glm_moe_dsa"):
+        if kind in ("olmoe", "glm_moe_dsa", "bailing_hybrid"):
             prefix = f"model.layers.{layer}.mlp.switch_mlp"
         elif kind == "gemma4":
             prefix = f"language_model.model.layers.{layer}.experts.switch_glu"
@@ -81,6 +83,7 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
         ("glm_moe_dsa", False),
         ("deepseek_v4", False),
         ("glm5_next", False),
+        ("bailing_hybrid", False),
     ],
 )
 def test_supported_layouts_use_headers_only(tmp_path, monkeypatch, kind, per_expert):
@@ -117,6 +120,13 @@ def test_inkling2_nvfp4_and_affine_experts(tmp_path):
     del tensors["model.layers.0.mlp.experts.w2.global_scale"]
     mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
     assert moe_offload_compatibility(tmp_path)[0] is False
+
+
+def test_bailing_hybrid_rejects_per_expert_layout(tmp_path):
+    _checkpoint(tmp_path, "bailing_hybrid", per_expert=True)
+    ok, reason = moe_offload_compatibility(tmp_path)
+    assert ok is False
+    assert "gate_proj.weight" in reason
 
 
 @pytest.mark.parametrize(

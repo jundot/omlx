@@ -21,6 +21,7 @@ _SUPPORTED_TYPES = frozenset(
         "glm5_next",
         "minicpmv4_7",
         "inkling2_loop",
+        "bailing_hybrid",
     }
 )
 
@@ -61,7 +62,11 @@ def _inspect(path, signature):
     from .moe_expert_offload import CheckpointExpertStore, _qwen35_checkpoint_prefix
 
     text = raw.get("text_config", raw)
-    if kind in ("glm_moe_dsa", "deepseek_v4", "glm5_next", "inkling2_loop"):
+    if kind == "bailing_hybrid":
+        count = int(text.get("num_experts") or 0)
+        first_moe = int(text.get("first_k_dense_replace") or 0)
+        moe_freq = int(text.get("moe_layer_freq") or 1)
+    elif kind in ("glm_moe_dsa", "deepseek_v4", "glm5_next", "inkling2_loop"):
         count = int(text.get("n_routed_experts") or 0)
         first_moe = int(text.get("first_k_dense_replace") or 0)
         moe_freq = int(text.get("moe_layer_freq") or 1)
@@ -102,7 +107,7 @@ def _inspect(path, signature):
             continue  # dense layer (GLM's first_k_dense_replace)
         if sparse_layers is not None and layer not in sparse_layers:
             continue  # dense layer (glm5_next's mlp_layer_types)
-        if kind in ("olmoe", "glm_moe_dsa"):
+        if kind in ("olmoe", "glm_moe_dsa", "bailing_hybrid"):
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         elif kind in ("qwen4_exp", "qwen3_5_moe", "minicpmv4_7"):
@@ -138,6 +143,7 @@ def _inspect(path, signature):
             "qwen3_5_moe",
             "minicpmv4_7",
             "inkling2_loop",
+            "bailing_hybrid",
         ) and not store.has(first):
             # These adapters read the stacked slabs positionally; a
             # per-expert layout wraps nothing.
