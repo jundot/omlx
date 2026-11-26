@@ -82,9 +82,7 @@ Clearing Session or All Time in the dashboard does not erase history.
 
 Usage history is on by default. Turn it off with the **Record usage history**
 switch (web dashboard: Settings → Usage History; macOS app: Server → Usage
-History), or set `usage.usage_history` to `false` in `settings.json`. The
-`OMLX_USAGE_HISTORY` environment variable (`0`/`false`/`off` or `1`/`true`/`on`)
-overrides the saved value at startup.
+History), or set `usage.usage_history` to `false` in `settings.json`.
 
 The switch applies immediately, without a restart. Turning it off flushes any
 pending aggregates and then stops recording; `usage.sqlite3` stays in place, so

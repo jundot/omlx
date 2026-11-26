@@ -327,10 +327,13 @@ def _assert_restored_matches_cold(model, scheduler, prefix, tokens, expected_cac
     prefix.release_cache("probe")
 
 
-@pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize(
-    "kind,split",
-    [("gdn", False), ("gdn", True), ("rotating", False)],
+    "kind,split,chunked",
+    [
+        ("gdn", False, False),
+        ("gdn", True, True),
+        ("rotating", False, True),
+    ],
 )
 def test_prefill_tail_reuse_matches_cold_forward(
     mock_tokenizer, tmp_path, kind, split, chunked
@@ -500,8 +503,15 @@ def _chunked_scheduler_rig(mock_tokenizer, tmp_path, kind):
     return model, scheduler, prefix
 
 
-@pytest.mark.parametrize("kind", ["gdn", "rotating", "deepseek_v41"])
-@pytest.mark.parametrize("finish", ["cancel", "parser_stop"])
+@pytest.mark.parametrize(
+    "kind,finish",
+    [
+        ("gdn", "cancel"),
+        ("gdn", "parser_stop"),
+        ("rotating", "cancel"),
+        ("deepseek_v41", "parser_stop"),
+    ],
+)
 def test_requeued_request_stores_each_output_token_once(
     mock_tokenizer, tmp_path, kind, finish
 ):

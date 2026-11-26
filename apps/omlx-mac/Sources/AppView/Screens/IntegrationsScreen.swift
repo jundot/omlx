@@ -889,7 +889,7 @@ private struct ClaudeApplicationPanel: View {
         FreeRow(isLast: vm.claudeMode != "local") {
             VStack(alignment: .leading, spacing: 6) {
                 CommandBlock(command: vm.claudeEnvRecipeDisplay,
-                             copyValue: vm.claudeEnvRecipe)
+                             copyLoader: { try await vm.claudeEnvRecipeForCopy(client: client) })
                 Text(vm.claudeMode == "cloud" ? envRecipeCloud : envRecipeLocal)
                     .font(.omlxText(11))
                     .foregroundStyle(theme.textTertiary)
@@ -985,11 +985,9 @@ private struct ApplicationPanelHead: View {
     }
 }
 
-/// Monospaced command block with a copy button. `copyValue` lets the block
-/// show a masked command while the button copies the real one.
 private struct CommandBlock: View {
     let command: String
-    var copyValue: String? = nil
+    var copyLoader: (() async throws -> String)? = nil
     var caption: String? = nil
     @Environment(\.omlxTheme) private var theme
 
@@ -1011,7 +1009,8 @@ private struct CommandBlock: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             CopyIconButton(
-                value: copyValue ?? command,
+                value: command,
+                valueLoader: copyLoader,
                 helpText: String(localized: "integrations.command.copy",
                                  defaultValue: "Copy command",
                                  comment: "Tooltip for the copy button on a shell command block")

@@ -538,6 +538,16 @@ class RuntimeTelemetry:
             self._uid_to_request[uid] = request_id
             self._request_to_uid[request_id] = uid
 
+    def keep_waiting_alive(self, waiting: dict[Any, int]) -> None:
+        with self._lock:
+            queues = [
+                (self._request_queues.get(self._uid_to_request.get(uid)), total)
+                for uid, total in waiting.items()
+            ]
+        for queue, total in queues:
+            if queue is not None:
+                queue.put((0, total))
+
     def cancel_uids(self, uids: Any) -> None:
         """Close requests removed by MLX-LM without a terminal queue item."""
 
@@ -1334,15 +1344,12 @@ def install_server_telemetry(
                     )
                 if execution.max_kv_size is not None:
                     kwargs.setdefault("max_kv_size", execution.max_kv_size)
-            model = args[0] if args else kwargs.get("model")
-            if getattr(model, "_omlx_one_prompt_prefill", False):
-                # Prompts prefill one at a time, as on a single Mac.
-                kwargs["prefill_batch_size"] = 1
             super().__init__(*args, **kwargs)
             # Full token sequence per in-flight uid, so a boundary snapshot can
             # be keyed while the batched prefill is still running.
             self._omlx_tokens: dict[Any, list[int]] = {}
             self._omlx_prepared_cancel_vote: tuple[int, tuple[int, ...]] | None = None
+            self._omlx_waiting_keepalive_at = -math.inf
             telemetry.register_batch_generator(self)
 
         def _omlx_drain_cancel_boundary(self, epoch: int, uids: Any) -> None:
@@ -1497,6 +1504,15 @@ def install_server_telemetry(
                 generation_responses=len(generation_responses),
                 elapsed_seconds=elapsed,
             )
+            waiting = getattr(self, "_unprocessed_sequences", ())
+            now = time.monotonic()
+            if waiting and (
+                now - self._omlx_waiting_keepalive_at >= _DEFAULT_HEARTBEAT_INTERVAL
+            ):
+                self._omlx_waiting_keepalive_at = now
+                telemetry.keep_waiting_alive(
+                    {sequence[0]: sum(map(len, sequence[1])) for sequence in waiting}
+                )
             return prompt_responses, generation_responses
 
     class TelemetryPromptCache(original_prompt_cache):

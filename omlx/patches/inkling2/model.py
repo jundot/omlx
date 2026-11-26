@@ -34,7 +34,7 @@ from .. import row_exact_gemv
 from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
-from . import kernels, verify_experts
+from . import expert_mma, fused, kernels, loopcd, verify_experts
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -42,6 +42,7 @@ _NVFP4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 _MXFP8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 # ModelOpt NVFP4 tensor scale: amax / (FP8 E4M3 max * FP4 E2M1 max).
 _NVFP4_DENOMINATOR = 448.0 * 6.0
+_LONG_ATTENTION_MIN_KEYS = 32768
 
 
 @dataclass
@@ -398,26 +399,58 @@ class Inkling2Experts(nn.Module):
     def unreduced(self, x: mx.array, inds: mx.array, weights: mx.array):
         """The routed expert outputs [N, K, H] and their FP32 weights [N, K]
         (NVFP4 tensor scale included), before ``moe_sum``."""
+        z = self.routes(x, inds)
+        s2 = self.w2.post_scale(inds, z.dtype)
+        if s2 is not None:
+            weights = weights * s2
+        return z, weights
+
+    def routes(
+        self, x: mx.array, inds: mx.array, call: tuple[int, int, int] | None = None
+    ) -> mx.array:
+        """Unweighted per-route outputs ``[..., k, H]`` (before the w2 post-scale).
+
+        The kernel is picked for ``call`` = (routes, rows, experts), by default
+        ``inds`` and this stack's expert count. Expert offload passes its whole
+        routing's, as its ``inds`` are slots or a part of that routing.
+        """
         xe = mx.expand_dims(x, (-2, -3))
+        armed = is_row_exact_armed()
+        # The expert-order kernel repeats gather_qmm's one-pair arithmetic, so
+        # it takes every block gather_qmm runs pair by pair: a decode row, a
+        # row-exact verify block, and any block below gather_qmm's batched
+        # sorted kernel (four pairs per expert). Shared experts are read once.
+        call = call or (inds.size, inds.shape[0], self.w13.weight.shape[0])
+        size, rows, experts = call
+        per_pair = size < verify_experts.PAIRS_PER_EXPERT * experts
+        fused = (
+            (per_pair or (armed and rows <= verify_experts.MAX_ROWS))
+            and verify_experts.supported(self.w13, x.dtype)
+            and verify_experts.supported(self.w2, x.dtype)
+        )
         # Sorting regroups the pairs by expert and changes their arithmetic;
         # row-exact verify rows keep the per-pair gather of a decode step.
-        do_sort = inds.size >= 64 and not is_row_exact_armed()
+        do_sort = not fused and size >= 64 and not armed
+        if (
+            do_sort
+            and not per_pair
+            and size <= expert_mma.MAX_PAIRS
+            and expert_mma.supported(self.w13, x.dtype)
+            and expert_mma.supported(self.w2, x.dtype)
+        ):
+            pairs = inds.reshape(-1)
+            routing = expert_mma.plan(pairs, self.w13.weight.shape[0])
+            y = expert_mma.gather(self.w13, x, inds.shape[-1], routing)
+            act = _softcapped_swiglu(y[:, 0::2], y[:, 1::2], self._gcap, self._ucap)
+            z = expert_mma.gather(self.w2, act, 1, routing)
+            return z.reshape(*inds.shape, -1)
         idx = inds
         inv = None
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
-        # A row-exact verify block runs its pairs in expert order, so rows
-        # that share an expert read its weights once (same bits per pair).
-        order = None
-        if (
-            not do_sort
-            and 1 < inds.shape[0] <= verify_experts.MAX_ROWS
-            and is_row_exact_armed()
-            and verify_experts.supported(self.w13, x.dtype)
-            and verify_experts.supported(self.w2, x.dtype)
-        ):
+        if fused:
             pairs = inds.reshape(-1)
-            order = pair_order(pairs)
+            order = pair_order(pairs) if inds.shape[0] > 1 else None
             y = verify_experts.gather(
                 self.w13, x, pairs, inds.shape[-1], order
             ).reshape(*inds.shape, 1, -1)
@@ -429,7 +462,7 @@ class Inkling2Experts(nn.Module):
         act = _softcapped_swiglu(
             y[..., 0::2], y[..., 1::2], self._gcap, self._ucap, s13
         )
-        if order is not None:
+        if fused:
             z = verify_experts.gather(
                 self.w2, act.reshape(pairs.shape[0], -1), pairs, 1, order
             ).reshape(*inds.shape, 1, -1)
@@ -437,11 +470,7 @@ class Inkling2Experts(nn.Module):
             z = self.w2(act, idx, do_sort)
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
-        z = z.squeeze(-2)
-        s2 = self.w2.post_scale(inds, act.dtype)
-        if s2 is not None:
-            weights = weights * s2
-        return z, weights
+        return z.squeeze(-2)
 
 
 def moe_sum(z: mx.array, weights: mx.array) -> mx.array:
@@ -603,12 +632,9 @@ def _row_matmul(x: mx.array, w: mx.array) -> mx.array:
     does: a multi-row matmul switches kernels with the row count."""
     rows = x.shape[-2]
     if rows > 1 and is_row_exact_armed():
-        # One single-row product per row in a batch: with a stride-0 weight
-        # batch MLX keeps the one-row kernel instead of folding the rows into
-        # a multi-row matmul.
-        batch = mx.broadcast_shapes(x.shape[:-2], w.shape[:-2])
-        wb = mx.broadcast_to(w[..., None, :, :], (*batch, rows, *w.shape[-2:]))
-        return (x[..., :, None, :] @ wb).squeeze(-2)
+        return mx.concatenate(
+            [x[..., row : row + 1, :] @ w for row in range(rows)], axis=-2
+        )
     return x @ w
 
 
@@ -832,6 +858,9 @@ class Inkling2Attention(nn.Module):
             left_padding = getattr(kv, "left_padding", None)
         elif state is not None:
             k, v, left_padding = windows.append(state, k, v)
+        out = self._long_attention(q, k, v, rel, sink, left_padding)
+        if out is not None:
+            return out
         return kernels.banded_sink_attention(
             q,
             k,
@@ -843,6 +872,46 @@ class Inkling2Attention(nn.Module):
             left_padding=left_padding,
         )
 
+    def _long_attention(self, q, k, v, rel, sink, left_padding):
+        length, s = q.shape[2], k.shape[2]
+        if (
+            self.window
+            or length > _COMPILED_MAX_TOKENS
+            or s < _LONG_ATTENTION_MIN_KEYS
+            or not fused.long_attention_supported(q, k, v)
+        ):
+            return None
+        first = s - length + 1
+        below = _LONG_ATTENTION_MIN_KEYS - first
+        if below <= 0 or not is_row_exact_armed():
+            return fused.long_decode_attention(
+                q, k, v, rel, sink, scale=self.scale, left_padding=left_padding
+            )
+        outs = [
+            kernels.banded_sink_attention(
+                q[:, :, r : r + 1],
+                k[:, :, : first + r],
+                v[:, :, : first + r],
+                rel[:, r : r + 1],
+                sink[:, r : r + 1],
+                scale=self.scale,
+                left_padding=left_padding,
+            )
+            for r in range(below)
+        ]
+        outs.append(
+            fused.long_decode_attention(
+                q[:, :, below:],
+                k,
+                v,
+                rel[:, below:],
+                sink[:, below:],
+                scale=self.scale,
+                left_padding=left_padding,
+            )
+        )
+        return mx.concatenate(outs, axis=2)
+
     def output(self, out, gate):
         b, _, length, _ = out.shape
         out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
@@ -850,6 +919,19 @@ class Inkling2Attention(nn.Module):
             gate.dtype
         )
         return _linear(self.o_proj, out)
+
+
+def _row_picks(starts: list[int], width: int) -> mx.array | int:
+    if len(set(starts)) == 1:
+        return starts[0]
+    return mx.array(starts, dtype=mx.int32)[:, None] + mx.arange(width)
+
+
+def _rows_from(x: mx.array, picks: mx.array | int, width: int) -> mx.array:
+    if isinstance(picks, int):
+        return x[:, picks : picks + width]
+    index = picks.reshape(*picks.shape, *([1] * (x.ndim - 2)))
+    return mx.take_along_axis(x, index, axis=1)
 
 
 def _cumsum(xs):
@@ -982,6 +1064,12 @@ class Inkling2Layer(nn.Module):
         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
+        residual, x, x32, s2 = self._post_attn(out, gate, h, mlp_blocks, s2, messages)
+        z, zw = self.mlp.unreduced(x, x32)
+        h, s3 = self._post_mlp(residual, z, zw, s3, h)
+        return h, s2, s3
+
+    def _post_attn(self, out, gate, h, mlp_blocks, s2, messages=None):
         a = self.attn.output(out, gate)
         # The conv kernels also do the FP32 residual adds: the attention
         # output joins h (off a block boundary), the MLP output the residual.
@@ -1040,7 +1128,9 @@ class Inkling2Layer(nn.Module):
                         self.loop_gain_forget[3:],
                     ).squeeze(0)
                 x, x32 = _norm(self.mlp_norm, y).astype(h.dtype), None
-        z, zw = self.mlp.unreduced(x, x32)
+        return residual, x, x32, s2
+
+    def _post_mlp(self, residual, z, zw, s3, h):
         conv = kernels.moe_short_conv(
             z, zw, self.mlp_conv, s3, self._conv_scale, residual, h.dtype
         )
@@ -1053,8 +1143,7 @@ class Inkling2Layer(nn.Module):
                 residual=residual,
                 dtype=h.dtype,
             )
-        h, s3 = conv
-        return h, s2, s3
+        return conv
 
     def __call__(self, h, blocks, cache=None, bank=None, tau=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
@@ -1135,6 +1224,8 @@ class Inkling2TextModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self._schedule = tuple(args.layer_schedule())
         self._core_start = args.loop_core.start if args.loop_config else None
+        self._reference_visits: tuple = ()
+        self._caches_thinking_flags = False
 
     @property
     def num_visits(self) -> int:
@@ -1143,13 +1234,16 @@ class Inkling2TextModel(nn.Module):
             return len(self.layers)
         return len(self._schedule)
 
+    def _visit_order(self) -> tuple:
+        return self._schedule[: self.num_visits] + self._reference_visits
+
     def cache_layout(self) -> list[tuple[int | None, int]]:
         """Where each layer visit's ``(KVCache, state)`` sit in a cache list.
 
         A sliding visit has no ``KVCache``; its one entry holds everything.
         """
         layout, entry = [], 0
-        for idx, _ in self._schedule[: self.num_visits]:
+        for idx, _ in self._visit_order():
             if self.layers[idx].sliding:
                 layout.append((None, entry))
                 entry += 1
@@ -1162,6 +1256,7 @@ class Inkling2TextModel(nn.Module):
         """``(KVCache or None, state)`` of every layer visit in ``cache``."""
         layout = self.cache_layout()
         entries = layout[-1][1] + 1 if layout else 0
+        entries += self._caches_thinking_flags
         if len(cache) != entries:
             # A per-layer cache would silently skip the later loop passes.
             raise ValueError(
@@ -1176,7 +1271,7 @@ class Inkling2TextModel(nn.Module):
             for kv, state in layout
         ]
 
-    def __call__(self, inputs, cache=None, input_embeddings=None, capture=None):
+    def __call__(self, inputs, cache, input_embeddings, capture):
         """``capture`` maps draft feature ids to fill: ``i`` < num visits is
         the partial block sum entering layer visit ``i``; ``num visits`` is
         the final-norm output."""
@@ -1184,16 +1279,22 @@ class Inkling2TextModel(nn.Module):
             h = input_embeddings
         else:
             h = self.embed_norm(self.embed(inputs))
-        visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
+        order = self._visit_order()
+        visits = [None] * len(order) if cache is None else self.visit_caches(cache)
         eval_every = _EVAL_EVERY if h.shape[1] <= _COMPILED_MAX_TOKENS else 0
         last = len(visits) - 1
         blocks: list = []
-        prelude = bank = tau = None
-        for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
+        prelude = bank = tau = first_pass = None
+        for visit, ((idx, loop_pass), c) in enumerate(zip(order, visits)):
             layer = self.layers[idx]
-            if idx == self._core_start and prelude is None:
+            if visit == self.num_visits:
+                out = self._readout(h, blocks)
+                h, blocks = first_pass
+            elif idx == self._core_start and prelude is None:
                 prelude = (h, list(blocks))
             elif idx == self._core_start:
+                if loop_pass == 1:
+                    first_pass = (h, blocks)
                 # The next pass restarts from the prelude output; the blocks
                 # the last pass wrote become its message bank.
                 bank = (
@@ -1201,7 +1302,7 @@ class Inkling2TextModel(nn.Module):
                     _unit_rms(h.astype(mx.float32)),
                 )
                 h, blocks = prelude[0], list(prelude[1])
-            if capture is not None and visit in capture:
+            if visit in capture:
                 capture[visit] = h
             if not layer.sliding and tau is None:
                 # The full-attention visits hold the same positions, so they
@@ -1216,6 +1317,15 @@ class Inkling2TextModel(nn.Module):
             )
             if eval_every and visit < last and (visit + 1) % eval_every == 0:
                 mx.async_eval(h)
+        if self._reference_visits:
+            capture[loopcd.REFERENCE] = self._readout(h, blocks)
+        else:
+            out = self._readout(h, blocks)
+        if self.num_visits in capture:
+            capture[self.num_visits] = out
+        return out
+
+    def _readout(self, h, blocks):
         _keep_fp32_weight(self.norm)
         norm_w = _fp32_norm_stack(self, (self.norm,), "final")
         fused = None
@@ -1235,8 +1345,6 @@ class Inkling2TextModel(nn.Module):
         else:
             x = self.final_input(blocks, _unit_rms(h.astype(mx.float32)))[:, :, 0]
             out = _norm(self.norm, x).astype(h.dtype)
-        if capture is not None and self.num_visits in capture:
-            capture[self.num_visits] = out
         return out
 
 
@@ -1279,6 +1387,34 @@ class Model(nn.Module):
             names = ("in_proj",) if attn.sliding else ("q_proj", "k_proj", "v_proj")
             linears += [getattr(attn, name) for name in names] + [attn.o_proj]
         return all(type(m) in (nn.Linear, nn.QuantizedLinear) for m in linears)
+
+    def enable_loopcd(self, skip_thinking: bool) -> bool:
+        args = self.args.text
+        coda = range(args.loop_core.stop, args.num_hidden_layers)
+        passes = int((args.loop_config or {}).get("num_passes", 1))
+        if passes < 2 or not coda:
+            return False
+        self.model._reference_visits = tuple((idx, 0) for idx in coda)
+        self.model._caches_thinking_flags = skip_thinking
+        return True
+
+    def _loopcd_logits(self, h, reference, inputs, cache):
+        thinking = None
+        if self.model._caches_thinking_flags:
+            before = cache[-1][0] if cache is not None else None
+            thinking = loopcd.thinking_flags(inputs, False if before is None else before)
+            if cache is not None:
+                cache[-1][0] = thinking[:, -1:]
+                cache[-1]._omlx_verify_xp = thinking
+        compiled = h.shape[-2] <= _COMPILED_MAX_TOKENS
+        guide = loopcd.guide_compiled if compiled else loopcd.guide
+        return guide(
+            _linear(self.lm_head, h),
+            _linear(self.lm_head, reference),
+            self._softcap,
+            self._vocab_bias,
+            thinking,
+        )
 
     def logits_from_hidden(self, h):
         # Decode and verify rows run the cast, softcap and vocab bias as one
@@ -1360,31 +1496,41 @@ class Model(nn.Module):
         )
         if observe:
             capture_layer_ids = list(drafter.target_layer_ids)
-        if not capture_layer_ids and not return_hidden:
-            return self.logits_from_hidden(self.model(inputs, cache, input_embeddings))
         capture = {int(i): None for i in capture_layer_ids or ()}
         h = self.model(inputs, cache, input_embeddings, capture=capture)
-        logits = self.logits_from_hidden(h)
+        if self.model._reference_visits:
+            reference = capture[loopcd.REFERENCE]
+            logits = self._loopcd_logits(h, reference, inputs, cache)
+        else:
+            logits = self.logits_from_hidden(h)
+        if not capture_layer_ids and not return_hidden:
+            return logits
         captures = [capture[int(i)] for i in capture_layer_ids or ()]
         if observe:
             drafter.observe(scope, captures)
             return logits
         if return_hidden:
             return SimpleNamespace(
-                logits=logits, hidden_states=captures + [h], gdn_states=None
+                logits=logits,
+                hidden_states=captures + [h],
+                gdn_states=[] if h.shape[0] > 1 else None,
             )
         return SimpleNamespace(logits=logits, hidden_states=captures)
 
-    # Rows that accept different counts would need a ragged conv rollback.
-    _omlx_drafter_single_row = True
+    def mtp_partial_rollback(self, cache, accepted, num_drafts: int) -> bool:
+        """Drop the rejected drafts of a ``num_drafts + 1``-token verify.
 
-    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
-        """Drop the rejected drafts of a ``num_drafts + 1``-token verify."""
-        rejected = int(num_drafts) - int(accepted)
-        if rejected <= 0:
+        ``accepted`` is one count for every row, or a list with one per row.
+        """
+        counts = accepted if isinstance(accepted, (list, tuple)) else [accepted]
+        rejected = [int(num_drafts) - int(count) for count in counts]
+        if max(rejected) <= 0:
             return True
-        keep = int(accepted) + 1
+        keep = [int(count) + 1 for count in counts]
+        common = min(rejected)
+        extra = [count - common for count in rejected]
         width = self.args.text.sconv_kernel_size - 1
+        picks = _row_picks(keep, width)
         for kv, conv in self.model.visit_caches(cache):
             padded = getattr(conv, "_omlx_verify_xp", None)
             if padded is None:
@@ -1392,17 +1538,22 @@ class Model(nn.Module):
             if kv is None:
                 if not windows.trim(conv, rejected):
                     return False
-            elif kv.trim(rejected) != rejected:
+            elif kv.trim(common) != common:
                 return False
+            elif any(extra):
+                kv.prepare(right_padding=extra)
+                kv.finalize()
             base = windows.CONV if kv is None else 0
             for slot, xp in padded.items():
-                # A verify window is a few rows, so the state may stay a view.
-                conv[base + slot] = xp[:, keep : keep + width]
+                conv[base + slot] = _rows_from(xp, picks, width)
             conv._omlx_verify_xp = None
+        if self.model._caches_thinking_flags:
+            flags = cache[-1]._omlx_verify_xp
+            last = _row_picks([start - 1 for start in keep], 1)
+            cache[-1][0] = _rows_from(flags, last, 1)
         return True
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
-        accepted = int(accepted)
         if not self.mtp_partial_rollback(caches, accepted, int(block_size) - 1):
             raise RuntimeError("Inkling 2 verify rollback found no conv windows")
         return accepted
@@ -1422,6 +1573,8 @@ class Model(nn.Module):
                 cache.append(windows.ArraysCache(window=window))
             else:
                 cache += [KVCache(), ArraysCache(4)]
+        if self.model._caches_thinking_flags:
+            cache.append(ArraysCache(1))
         return cache
 
     def restore_cache(self, cache: list) -> list:

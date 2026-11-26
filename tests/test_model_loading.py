@@ -7,7 +7,9 @@ import sys
 import types
 from unittest.mock import MagicMock
 
+import mlx.core as mx
 import mlx_lm.utils as mlx_lm_utils
+import mlx_vlm.utils as mlx_vlm_utils
 import pytest
 
 from omlx.utils import model_loading
@@ -62,6 +64,23 @@ class TestRemoteCodePreflight:
                 model_path=tmp_path,
                 trust_remote_code=False,
             )
+
+    @pytest.mark.parametrize(
+        "trusted, error", [(False, ValueError), (True, AttributeError)]
+    )
+    def test_vlm_load_runs_the_model_file_only_when_trusted(
+        self, tmp_path, trusted, error
+    ):
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "custom_vlm", "model_file": "arch.py", "vision_config": {}}'
+        )
+        (tmp_path / "arch.py").write_text(
+            "import pathlib\npathlib.Path(__file__).with_name('ran').touch()\n"
+        )
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), {"w": mx.zeros(1)})
+        with pytest.raises(error):
+            mlx_vlm_utils.load_model(tmp_path, trust_remote_code=trusted)
+        assert (tmp_path / "ran").exists() is trusted
 
     def test_tokenizer_trust_failure_happens_before_mlx_lm_load(
         self, tmp_path, monkeypatch

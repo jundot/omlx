@@ -28,6 +28,15 @@ from omlx.admin.accuracy_benchmark import (
 from omlx.model_settings import ModelSettings
 
 
+@pytest.fixture(autouse=True)
+def _skip_hardware_probe(monkeypatch):
+    monkeypatch.setattr(
+        accuracy_benchmark,
+        "build_upload_context",
+        MagicMock(side_effect=RuntimeError("no upload")),
+    )
+
+
 class TestAccuracyBenchmarkRequest:
     def test_valid_request(self):
         req = AccuracyBenchmarkRequest(

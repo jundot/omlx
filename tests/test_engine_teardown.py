@@ -174,14 +174,24 @@ def test_force_ownership_does_not_replace_closing_engine(mock_model, mock_tokeni
         engine.close()
 
 
-@pytest.mark.parametrize("progressing", [False, True])
-def test_watchdog_terminates_stalled_or_over_budget_process(progressing):
-    code = f"""
+def test_watchdog_stops_a_stalled_teardown():
+    guard = budget()
+    with (
+        patch("omlx.engine_core.time.monotonic", return_value=160.0),
+        patch("omlx.engine_core.fatal_exit", side_effect=SystemExit) as fatal_exit,
+        pytest.raises(SystemExit),
+    ):
+        guard._watch()
+    assert "no recent SSD persistence progress" in fatal_exit.call_args.args[0]
+    assert not guard.extended
+
+
+def test_watchdog_terminates_over_budget_process():
+    code = """
 import time
 from omlx.engine_core import _EngineTeardown
 with _EngineTeardown("subprocess", 0.2) as guard:
-    if {progressing!r}:
-        guard.set_phase("primary_ssd", time.monotonic)
+    guard.set_phase("primary_ssd", time.monotonic)
     time.sleep(10)
 """
     # Cold engine imports can exceed five seconds before the watchdog starts.
@@ -189,12 +199,8 @@ with _EngineTeardown("subprocess", 0.2) as guard:
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=30
     )
     assert result.returncode == 70
-    if progressing:
-        assert "extending teardown to 0.4s" in result.stderr
-        assert "exceeded 0.4s" in result.stderr
-    else:
-        assert "no recent SSD persistence progress" in result.stderr
-        assert "extending teardown" not in result.stderr
+    assert "extending teardown to 0.4s" in result.stderr
+    assert "exceeded 0.4s" in result.stderr
 
 
 def test_completed_close_removes_watchdog_thread():

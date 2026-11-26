@@ -12,7 +12,11 @@ from urllib.error import HTTPError, URLError
 import pytest
 
 from omlx.cluster.pairing import PairingRequestError
-from tests.test_cluster_pairing import _loopback_pair, _manager
+from tests.test_cluster_pairing import (  # noqa: F401
+    _loopback_pair,
+    _manager,
+    cheap_pbkdf2,
+)
 
 
 def _restart(tmp_path, old):

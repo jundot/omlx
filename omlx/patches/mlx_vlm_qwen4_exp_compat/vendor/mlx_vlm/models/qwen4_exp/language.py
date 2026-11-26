@@ -29,7 +29,8 @@ from omlx.memory_monitor import (
 )
 
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
-from omlx.patches.vlm_batch_kv_capacity import _ladder_capacity, _roll_logical_prefix
+from omlx.patches.kv_roll import _roll_logical_prefix
+from omlx.patches.vlm_batch_kv_capacity import _ladder_capacity
 from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 

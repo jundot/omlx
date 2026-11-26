@@ -26,9 +26,9 @@ _PASS1 = r"""
     constexpr int VP = V / BD;
     const int kv_head = int(threadgroup_position_in_grid.x);
     const int batch = int(threadgroup_position_in_grid.y);
-    const int block = int(threadgroup_position_in_grid.z);
+    const int block = int(threadgroup_position_in_grid.z) / L;
     const int g = int(thread_position_in_threadgroup.y);
-    const int row = int(thread_position_in_threadgroup.z);
+    const int row = int(threadgroup_position_in_grid.z) % L;
     const uint lane = thread_index_in_simdgroup;
     const int qh = GQA * kv_head + g;
 
@@ -146,11 +146,12 @@ _PASS1_SHARED = r"""
     constexpr int VP = V / BD;
     const int kv_head = int(threadgroup_position_in_grid.x);
     const int batch = int(threadgroup_position_in_grid.y);
-    const int block = int(threadgroup_position_in_grid.z);
+    constexpr int GROUPS = (L + RPS - 1) / RPS;
+    const int block = int(threadgroup_position_in_grid.z) / GROUPS;
     const int g = int(thread_position_in_threadgroup.y);
     const uint lane = thread_index_in_simdgroup;
     const int qh = GQA * kv_head + g;
-    const int base = int(thread_position_in_threadgroup.z) * RPS;
+    const int base = int(threadgroup_position_in_grid.z) % GROUPS * RPS;
     const int count = min(RPS, L - base);
 
     const device T* keys = k + batch * k_strides[0] + kv_head * k_strides[1] +
@@ -250,30 +251,31 @@ _PASS2 = r"""
     constexpr int EPT = D / BD;
     const uint simd_gid = simdgroup_index_in_threadgroup;
     const uint simd_lid = thread_index_in_simdgroup;
+    const int blocks = n_blocks[0];
     float o[EPT] = {0};
     threadgroup float outputs[BN * BD];
 
     const int head_idx = int(threadgroup_position_in_grid.x);
     const int q_seq_idx = int(threadgroup_position_in_grid.y);
     const int q_offset = head_idx * L + q_seq_idx;
-    const device T* pp = partials + q_offset * BLOCKS * D + simd_gid * D +
+    const device T* pp = partials + q_offset * blocks * D + simd_gid * D +
         simd_lid * EPT;
-    const device float* sp = sums + q_offset * BLOCKS;
-    const device float* mp = maxs + q_offset * BLOCKS;
+    const device float* sp = sums + q_offset * blocks;
+    const device float* mp = maxs + q_offset * blocks;
     device T* op = out + (q_seq_idx * HQ + head_idx) * D + simd_gid * EPT;
 
     float sum_exp_score = 0.0;
     float max_score = Limits<float>::finite_min;
-    for (int b = 0; b < BLOCKS / BN; ++b) {
+    for (int b = 0; b < blocks / BN; ++b) {
       max_score = max(max_score, mp[simd_lid + BN * b]);
     }
     max_score = simd_max(max_score);
-    for (int b = 0; b < BLOCKS / BN; ++b) {
+    for (int b = 0; b < blocks / BN; ++b) {
       float factor = fast::exp(mp[simd_lid + BN * b] - max_score);
       sum_exp_score += factor * sp[simd_lid + BN * b];
     }
     sum_exp_score = simd_sum(sum_exp_score);
-    for (int b = 0; b < BLOCKS / BN; ++b) {
+    for (int b = 0; b < blocks / BN; ++b) {
       float factor = fast::exp(mp[simd_gid] - max_score);
       for (int i = 0; i < EPT; i++) {
         o[i] += factor * static_cast<float>(pp[i]);
@@ -323,7 +325,7 @@ def _pass1_shared():
 def _pass2():
     return mx.fast.metal_kernel(
         name="omlx_inkling2_verify_sdpa_pass2",
-        input_names=["partials", "sums", "maxs"],
+        input_names=["partials", "sums", "maxs", "n_blocks"],
         output_names=["out"],
         source=_PASS2,
     )
@@ -407,9 +409,6 @@ def rows_attention(q, k, v, rel, sink, *, scale: float, window: int):
         return None
     blocks = blocks.pop()
     windowed = any(lo_rows)
-    if windowed and 32 * gqa * length > 1024:
-        # One simdgroup per (head, row) would not fit a threadgroup.
-        return None
     dt = q.dtype
     out_shapes = [
         (b * hq * length * blocks * d,),
@@ -442,7 +441,7 @@ def rows_attention(q, k, v, rel, sink, *, scale: float, window: int):
             ],
             template=common + [("RPS", rps)],
             grid=(32 * hkv, gqa * b, groups * blocks),
-            threadgroup=(32, gqa, groups),
+            threadgroup=(32, gqa, 1),
             output_shapes=out_shapes,
             output_dtypes=[dt, mx.float32, mx.float32],
         )
@@ -460,13 +459,13 @@ def rows_attention(q, k, v, rel, sink, *, scale: float, window: int):
             ],
             template=common + [("TK", _TK)],
             grid=(32 * hkv, gqa * b, length * blocks),
-            threadgroup=(32, gqa, length),
+            threadgroup=(32, gqa, 1),
             output_shapes=out_shapes,
             output_dtypes=[dt, mx.float32, mx.float32],
         )
     out = _pass2()(
-        inputs=[partials, sums, maxs],
-        template=[("T", dt), ("D", d), ("L", length), ("HQ", hq), ("BLOCKS", blocks)],
+        inputs=[partials, sums, maxs, mx.array([blocks], dtype=mx.int32)],
+        template=[("T", dt), ("D", d), ("L", length), ("HQ", hq)],
         grid=(1024 * b * hq, length, 1),
         threadgroup=(1024, 1, 1),
         output_shapes=[(b, length, hq, d)],

@@ -22,11 +22,13 @@ from ...custom_kernels.nax import is_nax_available
 from ...oqh.modules import exact_rows as oqh_exact_rows
 from ..deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
 from ..glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
-from . import exact, indexing
+from . import exact, indexing, verify_dispatch
 from . import kernels as hc_kernels
 from .config import TextConfig
 from .flash import CompressedIndexer
 from .rope import TrailingRoPE, rotate
+from .verify_moe import routed_experts
+from .verify_sparse import attend as attend_sparse_verify
 
 _ROW_CHUNK = 256
 # Up to this many query rows, attention gathers each row's own keys instead of
@@ -74,6 +76,25 @@ def masked_min(dtype) -> mx.array:
     return mx.array(mx.finfo(dtype).min, dtype)
 
 
+def _sliding_shared_values(q, kv, mask, sinks, scale):
+    """Apply the stock masked D512 softmax, then multiply the shared V once.
+
+    MLX's D512 fallback treats the value product as one matmul per query
+    head. Here every head uses the same single KV bank, so the value product
+    can use the flattened head and query rows of one matmul.
+    """
+    _, heads, rows, channels = q.shape
+    width = kv.shape[2]
+    logits = (q * scale) @ kv.swapaxes(-1, -2) + mask
+    sink_column = mx.broadcast_to(sinks[None, :, None, None], (1, heads, rows, 1))
+    weights = mx.softmax(
+        mx.concatenate((sink_column, logits), axis=-1), axis=-1, precise=True
+    )[..., 1:]
+    return (weights.reshape(1, heads * rows, width) @ kv[0]).reshape(
+        1, heads, rows, channels
+    )
+
+
 def rope_offset(cache) -> Any:
     if cache is None:
         return 0
@@ -115,9 +136,12 @@ class HyperConnectionPre(nn.Module):
     def __call__(self, streams: mx.array) -> tuple[mx.array, mx.array]:
         if not hc_kernels.available():
             return self.reference(streams)
+        return self._mix(streams, self._fused.get(self.hc_fn))
+
+    def _mix(self, streams, transposed):
         return hc_kernels.hc_pre(
             streams,
-            self._fused.get(self.hc_fn),
+            transposed,
             self.hc_base.astype(mx.float32),
             self.hc_scale.astype(mx.float32),
             self._norm_eps,
@@ -320,7 +344,15 @@ class MoE(nn.Module):
         if exact.block(x):
             y = self._exact_experts(routed, inds, weights)
         else:
-            y = self.switch_mlp(routed, inds, scores=weights, weighted_sum=True)
+            y = None
+            if verify_dispatch.eligible(routed.shape[0]):
+                activation = getattr(self.switch_mlp, "activation", None)
+                if type(activation) is ClampedSwiGLU and activation.limit is not None:
+                    y = routed_experts(
+                        self.switch_mlp, routed, inds, weights, activation.limit
+                    )
+            if y is None:
+                y = self.switch_mlp(routed, inds, scores=weights, weighted_sum=True)
             if y.ndim == routed.ndim + 1:
                 y = (y * weights[..., None].astype(y.dtype)).sum(axis=-2)
         if "routed_expert_up_proj" in self:
@@ -569,9 +601,8 @@ class Attention(nn.Module):
             return cache, None
         return cache[0], (cache[1] if len(cache.caches) > 1 else None)
 
-    def __call__(self, x, mask, cache=None, prev_topk=None, positions=None):
+    def _project_inputs(self, x):
         b, length, _ = x.shape
-        kv_cache, index_cache = self._caches(cache)
         gate = mx.sigmoid(exact.linear(self.linear_gate, x)).reshape(
             b, length, self.num_heads, self.v_head_dim
         )
@@ -584,6 +615,11 @@ class Attention(nn.Module):
         )
         latent = self.kv_a_layernorm(latent)[:, None]
         k_pe = k_pe.reshape(b, 1, length, self.rope_dim)
+        return gate, qr, q_nope, q_pe, latent, k_pe
+
+    def _prepare_cache(self, x, projected, mask, cache, prev_topk, positions):
+        kv_cache, index_cache = self._caches(cache)
+        gate, qr, q_nope, q_pe, latent, k_pe = projected
         offset = rope_offset(kv_cache)
         q_pe = rotate(self.rope, q_pe, offset, positions)
         k_pe = rotate(self.rope, k_pe, offset, positions)
@@ -599,10 +635,28 @@ class Attention(nn.Module):
             # DFly reuses this layer's selection for the last committed row.
             self._captured_topk = topk
         sinks = self.learnable_sink_param.astype(x.dtype)
+        return kv_cache, topk, gate, q_nope, q_pe, latent, k_pe, sinks
+
+    def __call__(
+        self,
+        x,
+        mask,
+        cache=None,
+        prev_topk=None,
+        positions=None,
+        *,
+        return_values=False,
+    ):
+        b, length = x.shape[:2]
+        kv_cache, topk, gate, q_nope, q_pe, latent, k_pe, sinks = self._prepare_cache(
+            x, self._project_inputs(x), mask, cache, prev_topk, positions
+        )
         if exact.block(x):
             out = self._exact_rows(
                 q_nope, q_pe, latent, k_pe, topk, mask, kv_cache, sinks
             )
+            if return_values:
+                return (out, gate), topk
             out = out.swapaxes(1, 2) * gate
             out = exact.linear(self.o_proj, out.reshape(b, length, -1))
             if "post_proj_norm" in self:
@@ -617,11 +671,17 @@ class Attention(nn.Module):
             out = self._verify(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
         else:
             out = self._prefill(q_nope, q_pe, latent, k_pe, topk, mask, sinks)
-        out = out.swapaxes(1, 2) * gate
+        if return_values:
+            return (out, gate), topk
+        return self._project_output(out, gate), topk
+
+    def _project_output(self, values, gate):
+        b, length = gate.shape[:2]
+        out = values.swapaxes(1, 2) * gate
         out = self.o_proj(out.reshape(b, length, -1))
         if "post_proj_norm" in self:
             out = self.post_proj_norm(out)
-        return out, topk
+        return out
 
     def _exact_rows(self, q_nope, q_pe, latent, k_pe, topk, mask, kv_cache, sinks):
         """One-token decode steps for the rows of an exact verify block.
@@ -712,12 +772,47 @@ class Attention(nn.Module):
         q_latent = self.embed_q(q_nope)
         rows = mx.arange(total - length, total)
         mask = as_4d_mask(mask)
+        if (
+            self.kind == "sparse"
+            and verify_dispatch.eligible(length)
+            and topk is not None
+            and b == 1
+            and heads == 32
+            and topk.shape[-1] == 2048
+            and q_pe.shape[-1] == k_pe.shape[-1] == 64
+            and q_latent.shape[-1] == latent.shape[-1] == 512
+            and q_latent.dtype
+            == q_pe.dtype
+            == latent.dtype
+            == k_pe.dtype
+            == sinks.dtype
+            and latent.dtype in (mx.bfloat16, mx.float16)
+        ):
+            return self.unembed_out(
+                attend_sparse_verify(
+                    q_latent, q_pe, latent, k_pe, topk, mask, sinks, self.scale
+                )
+            )
         if topk is None:
             keep = rows[:, None] >= mx.arange(total)
             if mask is not None:
                 keep = keep & mask
             scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
             scores = mx.where(keep, scores, masked_min(scores.dtype))
+            if (
+                self.kind == "sliding"
+                and b == 1
+                and heads == 64
+                and 512 <= total < 512 + length
+                and q_latent.shape[-1] == 512
+                and latent.shape == (1, 1, total, 512)
+                and q_latent.dtype == latent.dtype == scores.dtype == sinks.dtype
+                and latent.dtype == mx.bfloat16
+                and verify_dispatch.eligible(length)
+            ):
+                return self.unembed_out(
+                    _sliding_shared_values(q_latent, latent, scores, sinks, self.scale)
+                )
             out = mx.fast.scaled_dot_product_attention(
                 q_latent, latent, latent, scale=self.scale, mask=scores, sinks=sinks
             )

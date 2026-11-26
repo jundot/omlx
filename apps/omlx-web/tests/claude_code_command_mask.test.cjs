@@ -9,24 +9,22 @@ const source = fs.readFileSync(path.join(__dirname, '../omlx_web/static/js/dashb
 function setup() {
     return vm.runInNewContext(source + '\n dashboard;', {
         localStorage: { getItem: () => null }, window: { t: key => key },
-        console: { error() {} }, URL, fetch: async () => ({ ok: true }), alert() {},
+        console: { error() {} }, URL, fetch: async () => ({ ok: true, json: async () => ({ api_key: 'sk-live-secret-token' }) }), alert() {},
     })();
 }
 
-test('displayed Claude Code command masks the API key; copy keeps the real one', () => {
+test('displayed Claude Code command masks the API key; copy fetches the real one', async () => {
     const app = setup();
     app.globalSettings.claude_code.mode = 'local';
-    app.stats.api_key = 'sk-live-secret-token';
+    app.stats.api_key_set = true;
     const display = app.claudeCodeCommandDisplay;
-    assert.equal(display.includes('sk-live-secret-token'), false);
     assert.equal(display.includes("ANTHROPIC_AUTH_TOKEN='••••••••'"), true);
-    assert.equal(app.claudeCodeCommand.includes("ANTHROPIC_AUTH_TOKEN='sk-live-secret-token'"), true);
+    assert.equal((await app.claudeCodeCommand()).includes("ANTHROPIC_AUTH_TOKEN='sk-live-secret-token'"), true);
 });
 
-test('without an API key the display matches the real command', () => {
+test('without an API key the display matches the real command', async () => {
     const app = setup();
     app.globalSettings.claude_code.mode = 'local';
-    app.stats.api_key = '';
-    assert.equal(app.claudeCodeCommandDisplay, app.claudeCodeCommand);
+    assert.equal(app.claudeCodeCommandDisplay, await app.claudeCodeCommand());
     assert.equal(app.claudeCodeCommandDisplay.includes('ANTHROPIC_AUTH_TOKEN='), false);
 });

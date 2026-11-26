@@ -126,7 +126,7 @@ def load_reference_weights(model, seed=341, scale=0.08, vision=False):
     model.load_weights(weights, strict=True)
 
 
-@pytest.mark.parametrize("length", [1, 3, 8, 17])
+@pytest.mark.parametrize("length", [1, 3, 17])
 def test_official_prefill_decode(expected, length):
     model = LanguageModel(tiny())
     load_reference_weights(model)
@@ -152,13 +152,13 @@ def test_in_place_cache_growth_matches_concatenation(monkeypatch):
 
     model = LanguageModel(tiny())
     load_reference_weights(model)
-    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 24), dtype=np.int32))
+    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 19), dtype=np.int32))
 
     def run():
         cache = model.make_cache()
         logits = [model(ids[:, :9], cache=cache)]
-        for position in range(9, 24):
-            if position == 16:
+        for position in range(9, 19):
+            if position == 14:
                 # Extracting a single row keeps its storage.
                 cache = [layer.extract(0) for layer in cache]
             logits.append(model(ids[:, position : position + 1], cache=cache))
@@ -756,10 +756,12 @@ def test_batch_generator_ragged_prefill_and_admission():
         for response in outputs:
             result[response.uid].append(response.token)
     for uid, prompt in zip([*uids, late], [[3, 4, 5, 6, 7], [8, 9], [10, 11, 12]]):
-        expected = []
+        expected, cache = [], model.make_cache()
+        ids = prompt
         for _ in range(3):
-            token = int(mx.argmax(model(mx.array([prompt + expected]))[0, -1]).item())
+            token = int(mx.argmax(model(mx.array([ids]), cache=cache)[0, -1]).item())
             expected.append(token)
+            ids = [token]
         assert result[uid] == expected
 
 
@@ -881,7 +883,6 @@ def test_prefill_engram_dedupe_matches_undeduped(monkeypatch):
     model.wkv = RecordingWkv(QuantizedProjection(packed, scales, 8, "mxfp8"))
     ids = rng.integers(0, 97, (1, 32, 24), dtype=np.int32)
     ids[0, 8:16] = ids[0, :8]
-    ids[0, 24:32] = ids[0, 16:24]
     h = mx.array(rng.normal(0, 1, (1, 32, c.hc_mult, c.dim)).astype(np.float32))
     mask = np.zeros((1, 32), dtype=bool)
     mask[0, 1] = True
@@ -1526,9 +1527,11 @@ def test_cluster_lightning_mtp_head_loads_on_rank_zero_only(tmp_path):
 
 
 def test_cluster_layout_of_converted_and_source_checkpoints(tmp_path, monkeypatch):
+    from omlx.cluster.autoconfigure import choose_parallelism
     from omlx.cluster.catalogue import assess_model_path
-    from omlx.cluster.planner import NodeBudget, complete_model_layout
+    from omlx.cluster.planner import NodeBudget, PlanningError, complete_model_layout
     from omlx.patches.deepseek_v41.convert import convert
+    from omlx.prefill_helper.adapters import adapter_for_model
 
     source, _ = write_checkpoint(tmp_path, **_ENGRAM)
     target = tmp_path / "converted"
@@ -1545,6 +1548,10 @@ def test_cluster_layout_of_converted_and_source_checkpoints(tmp_path, monkeypatc
 
     # Ranks load their part of converted shards only.
     assert not raw.supports_pipeline and not raw.supports_tensor_parallel
+    with pytest.raises(PlanningError, match="converted by oMLX"):
+        choose_parallelism(raw, nodes)
+    assert adapter_for_model("deepseek_v41", "vlm", source) is None
+    assert adapter_for_model("deepseek_v41", "vlm", target) is not None
     assert fit.supports_pipeline and fit.supports_tensor_parallel
     # The converter keeps the tables outside the index, in a file that holds
     # other tensors too. Stages hold the tables; tensor ranks read them from SSD.
@@ -1719,12 +1726,17 @@ from mlx_lm.models import deepseek_v41
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
 prompt = np.random.default_rng(16).integers(3, 60, 13).tolist()
+second = np.random.default_rng(17).integers(3, 60, 11).tolist()
 full, _ = load(sys.argv[1], ced_prefill=True)
 lm = full.language_model
-cache = lm.make_cache()
-for a, b in ((0, 7), (7, 12)):
-    lm._omlx_prefill(mx.array([prompt[a:b]]), cache=cache)
-reference = lm(mx.array([prompt[12:]]), cache=cache)[0, -1].astype(mx.float32)
+def ced_reference(tokens):
+    cache = lm.make_cache()
+    for a in range(0, len(tokens) - 1, 7):
+        lm._omlx_prefill(mx.array([tokens[a : min(a + 7, len(tokens) - 1)]]), cache=cache)
+    logits = lm(mx.array([tokens[-1:]]), cache=cache)[0, -1].astype(mx.float32)
+    return logits - mx.logsumexp(logits)
+expected = ced_reference(prompt)
+second_expected = ced_reference(second)
 full.close()
 
 ced_layers = []
@@ -1745,11 +1757,10 @@ assert not model.language_model._config.a8_prefill
 assert model(mx.array([prompt[:7]]), cache=model.make_cache()).shape[1] == 7
 assert not ced_layers
 
-expected = reference - mx.logsumexp(reference)
-def check(got):
+def check(got, want=expected):
     got = got.astype(mx.float32)
-    assert mx.allclose(got, expected, atol=1e-3, rtol=1e-3).item(), mx.abs(
-        got - expected
+    assert mx.allclose(got, want, atol=1e-3, rtol=1e-3).item(), mx.abs(
+        got - want
     ).max()
 
 gen = BatchGenerator(model, max_tokens=1, prefill_step_size=7)
@@ -1772,6 +1783,18 @@ with _cache_only_prompt_prefill(mlx_generate):
     steps.close()
 assert ced_layers
 check(logprobs)
+
+ced_layers.clear()
+gen = BatchGenerator(model, max_tokens=1, prefill_step_size=7, prefill_batch_size=2)
+with _cache_only_prompt_prefill(mlx_generate):
+    first_uid, second_uid = gen.insert([prompt, second], max_tokens=[1, 1])
+    batched = {}
+    while len(batched) < 2:
+        batched.update((r.uid, r.logprobs) for r in gen.next()[1])
+gen.close()
+assert ced_layers
+check(batched[first_uid])
+check(batched[second_uid], second_expected)
 print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
 """
 

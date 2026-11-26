@@ -39,7 +39,6 @@ from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.splash import (
     EXTERNAL_ENGINES,
-    SPLASH_NATIVE_CONTEXT,
     SplashEngine,
     SplashOptions,
     SplashTarget,
@@ -484,7 +483,7 @@ class EnginePool:
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
-        self._unloading_models: set[str] = set()
+        self._unloading_models: dict[str, asyncio.Task[None]] = {}
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
@@ -1509,6 +1508,11 @@ class EnginePool:
 
         add("lora_adapter", data.get("lora_adapter") or None)
 
+        loopcd_active = bool(data.get("loopcd_enabled", False))
+        add("loopcd_enabled", loopcd_active)
+        if loopcd_active:
+            add("loopcd_skip_thinking", data.get("loopcd_skip_thinking", False))
+
         return tuple(signature)
 
     def _wanted_specprefill_draft(
@@ -2276,8 +2280,8 @@ class EnginePool:
             return min(int(configured), target.max_context)
         native = entry.model_context_length
         policy = get_global_settings().sampling.max_context_window_policy
-        if native and policy:
-            return min(native, policy)
+        if native:
+            return min(native, policy or native, target.max_context)
         return native
 
     def _splash_wanted_bytes(
@@ -2295,14 +2299,18 @@ class EnginePool:
 
         def estimate(context: int | None) -> int:
             return splash_memory_estimate(
-                entry.model_path, target.draft_path, context, settings.splash_kv_format
+                entry.model_path,
+                target.draft_path,
+                context,
+                settings.splash_kv_format,
+                target.binary.version,
             )
 
         context = self._splash_sizing_context(entry, model_settings, target)
         wanted = estimate(context)
-        if context and context > SPLASH_NATIVE_CONTEXT and 0 < room < wanted:
+        if context and context > target.native_context and 0 < room < wanted:
             # Splash keeps the native window then and must not reserve more.
-            wanted = estimate(SPLASH_NATIVE_CONTEXT)
+            wanted = estimate(target.native_context)
         return wanted
 
     def _splash_admission_target(self) -> int:
@@ -2449,6 +2457,7 @@ class EnginePool:
             target.draft_path,
             requested_context,
             integrations.splash_kv_format,
+            target.binary.version,
         ):
             # The budget cannot hold the explicit limit (the room under the
             # memory limit shrank, or splash_max_memory_gb is small), and
@@ -2463,13 +2472,13 @@ class EnginePool:
                 entry.model_id,
             )
             requested_context = None
-        if requested_context and requested_context > SPLASH_NATIVE_CONTEXT:
+        if requested_context and requested_context > target.native_context:
             logger.warning(
                 "Splash: the %d-token context of %s is past the native %d; "
                 "YaRN is on and changes answers at every length",
                 requested_context,
                 entry.model_id,
-                SPLASH_NATIVE_CONTEXT,
+                target.native_context,
             )
         return SplashEngine(
             model_name=entry.model_path,
@@ -2859,6 +2868,8 @@ class EnginePool:
         if ready is not None:
             return ready
         async with self._lock:
+            if model_id in self._unloading_models:
+                await self._unload_engine(model_id)
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
@@ -3835,24 +3846,22 @@ class EnginePool:
         return False
 
     async def _unload_engine(self, model_id: str, *, local_only: bool = False) -> None:
-        if model_id in self._unloading_models:
-            raise ModelBusyError(model_id, "unload while teardown is in progress")
-        self._unloading_models.add(model_id)
-        task = asyncio.create_task(
-            self._stop_and_unload_engine(
-                model_id, **({"local_only": True} if local_only else {})
+        task = self._unloading_models.get(model_id)
+        if task is None:
+            task = asyncio.create_task(
+                self._stop_and_unload_engine(
+                    model_id, **({"local_only": True} if local_only else {})
+                )
             )
-        )
+            self._unloading_models[model_id] = task
+            task.add_done_callback(lambda _: self._unloading_models.pop(model_id))
         cancelled = False
-        try:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    cancelled = True
-            task.result()
-        finally:
-            self._unloading_models.discard(model_id)
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
         if cancelled:
             raise asyncio.CancelledError
 

@@ -24,6 +24,8 @@ from __future__ import annotations
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache as _ArraysCache
 
+from ..kv_roll import _roll_logical_prefix
+
 KEYS, VALUES, CONV, PADDING = 0, 1, 2, 6
 SLOTS = 7
 
@@ -39,6 +41,8 @@ class ArraysCache(_ArraysCache):
     because oMLX selects its cache handlers by class name; a restored state
     arrives as the plain class and ``adopt`` turns it into this one.
     """
+
+    _omlx_mtp_batch_rollback_cache = True
 
     def __init__(self, size: int = SLOTS, left_padding=None, window: int = 0):
         super().__init__(size, left_padding)
@@ -230,14 +234,23 @@ def append(state, keys: mx.array, values: mx.array):
     )
 
 
-def trim(state, count: int) -> bool:
-    """Drop the ``count`` newest keys: the rejected drafts of the verify
-    block just appended, which the buffer still holds the window for."""
+def trim(state, counts: list[int]) -> bool:
+    """Drop the ``counts[b]`` newest keys of row ``b``: the rejected drafts of
+    the verify block just appended, which the buffer still holds the window
+    for. Rows that drop more than the fewest move right, behind more padding."""
     buffer = _buffer(state)
-    if buffer.keys is None or not 0 <= count <= buffer.n:
+    if buffer.keys is None or min(counts) < 0 or max(counts) > buffer.n:
         return False
     state.cache[KEYS] = state.cache[VALUES] = buffer.view = None
-    buffer.n -= count
+    common = min(counts)
+    buffer.n -= common
+    extra = [count - common for count in counts]
+    most = max(extra)
+    if most:
+        shift = mx.array(extra, dtype=mx.int32)[:, None]
+        buffer.keys = _roll_logical_prefix(buffer.keys, shift, buffer.n, 2, most)
+        buffer.values = _roll_logical_prefix(buffer.values, shift, buffer.n, 2, most)
+        buffer.pads = [pad + more for pad, more in zip(buffer.pads, extra)]
     _publish(state, buffer)
     return True
 

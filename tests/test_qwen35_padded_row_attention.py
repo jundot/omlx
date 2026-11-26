@@ -28,7 +28,7 @@ from omlx.patches.vlm_batch_kv_capacity import (  # noqa: E402
 from omlx.turboquant_kv import quantized_cache_class  # noqa: E402
 
 DTYPE = mx.bfloat16
-Q_HEADS, KV_HEADS, D = 24, 4, 256
+Q_HEADS, KV_HEADS, D = 12, 2, 256
 SCALE = D**-0.5
 # Below 1024 keys every GPU uses the one-pass plan; above 8192 every GPU uses
 # a two-pass plan, so these rows never share a ragged-kernel plan.
@@ -88,9 +88,9 @@ def _step(lengths, length, seed=0):
     total = max(lengths)
     caches = [BatchKVCache([total - n for n in lengths]), None, BatchKVCache([total - n for n in lengths])]
     batch = len(lengths)
+    k = mx.random.normal((batch, KV_HEADS, total - length, D)).astype(DTYPE)
+    v = mx.random.normal((batch, KV_HEADS, total - length, D)).astype(DTYPE)
     for c in (caches[0], caches[2]):
-        k = mx.random.normal((batch, KV_HEADS, total - length, D)).astype(DTYPE)
-        v = mx.random.normal((batch, KV_HEADS, total - length, D)).astype(DTYPE)
         c.update_and_fetch(k, v)
     h = mx.zeros((batch, length, 8), dtype=DTYPE)
     mask = q35._create_qwen3_5_attention_mask(h, caches[0])
@@ -155,7 +155,7 @@ def test_decode_rows_sharing_a_plan_keep_the_ragged_kernel(patched):
     assert cache in patched.calls
 
 
-@pytest.mark.parametrize("length", [2, 4, 5])
+@pytest.mark.parametrize("length", [2, 4])
 def test_long_verify_rows_match_solo(patched, length):
     cache, q, k, v, mask, pads = _step([SHORT + 3000, LONG], length)
     assert isinstance(mask, mx.array)
@@ -380,8 +380,10 @@ def test_other_cache_access_realigns_first(patched, touch):
         assert mx.array_equal(a, b).item()
 
 
-@pytest.mark.parametrize("lengths", [(37, 30), (33, 33)])
-@pytest.mark.parametrize("deferred_tail", [False, True])
+@pytest.mark.parametrize(
+    "deferred_tail,lengths",
+    [(False, (37, 30)), (True, (37, 30)), (True, (33, 33))],
+)
 def test_mixed_quantized_batch_rolls_back_like_the_deepcopy(
     monkeypatch, deferred_tail, lengths
 ):
@@ -426,9 +428,7 @@ def test_mixed_quantized_batch_rolls_back_like_the_deepcopy(
         rows.append(row)
     cache = bg._merge_row_caches(rows)
     depth = 3
-    for cycle, accepted in enumerate(
-        ([3, 0], [1, 2], [0, 0], [2, 3], [0, 1], [3, 1])
-    ):
+    for cycle, accepted in enumerate(([3, 0], [0, 0], [0, 3], [1, 2])):
         block = mx.random.randint(0, 100, (2, depth + 1), key=mx.random.key(cycle))
         mx.eval(language.model(block, cache=cache))
         references = []

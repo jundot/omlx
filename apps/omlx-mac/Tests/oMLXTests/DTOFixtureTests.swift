@@ -84,6 +84,7 @@ final class DTOFixtureTests: XCTestCase {
             textOnly: false,
             dtype: "bfloat16",
             preserveMtp: false,
+            preserveNgramTable: true,
             enhanced: true,
             hadamard: false,
             imatrixCachePath: "/Users/test/cache/imatrix.npz",
@@ -94,6 +95,7 @@ final class DTOFixtureTests: XCTestCase {
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let body = try JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
 
+        XCTAssertEqual(body?["preserve_ngram_table"] as? Bool, true)
         XCTAssertEqual(body?["enhanced"] as? Bool, true)
         XCTAssertEqual(body?["imatrix_cache_path"] as? String, "/Users/test/cache/imatrix.npz")
         XCTAssertEqual(body?["imatrix_reuse_cache"] as? Bool, true)
@@ -111,8 +113,8 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(stats.port)
         XCTAssertNotNil(stats.cliPrefix,
                         "Stats must carry cli_prefix so Integrations can render `omlx launch …` commands.")
-        XCTAssertNotNil(stats.apiKey,
-                        "Stats must surface api_key (empty string allowed) so the Welcome-skip path can recover it.")
+        XCTAssertNotNil(stats.apiKeySet,
+                        "Stats must surface api_key_set so Integrations can mask the Claude env recipe.")
 
         // active_models is the structure Status renders; nested fields can
         // be nil but the wrapper must always decode.

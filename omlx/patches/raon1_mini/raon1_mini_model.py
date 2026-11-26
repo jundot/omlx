@@ -1,6 +1,8 @@
 # ruff: noqa
-# Vendored verbatim from KRAFTON/Raon-1-mini-preview-mlx (raon_mlx_model.py,
+# Vendored from KRAFTON/Raon-1-mini-preview-mlx (raon_mlx_model.py,
 # revision c558ec0f8050925e44a80e7ee357f41fbcf8cfe5, sha256 82a5c6bc...5296).
+# Default-effort MoE steering adapted from KRAFTON/Raon-1-mini-mlx,
+# revision 78b7555b89023baa76da051b9b7c190545691038.
 # Apache-2.0 (KRAFTON) with MIT portions from Apple mlx-lm; see the notice below.
 # Portions Copyright © 2025-2026 Apple Inc., MIT License:
 #
@@ -856,6 +858,7 @@ class ModelArgs(BaseModelArgs):
     raon_fused_mhc_decode: bool = True
     raon_global_scaled_linears: Optional[list] = None
     raon_merged_gate_up: bool = True
+    reasoning_effort_steering: Optional[dict] = None
 
     def __post_init__(self):
         if self.hidden_act != "situ" or self.moe_router_activation_func != "sigmoid":
@@ -1684,6 +1687,22 @@ class MoE(nn.Module):
         return self.switch_mlp(x, indices), weights, self.shared_experts(x)
 
 
+class SteeredMoE(MoE):
+    def __init__(self, args):
+        super().__init__(args)
+        steering = args.reasoning_effort_steering
+        self._alpha = steering["alpha"][steering.get("default", "high")]
+        self.reasoning_effort_steering = mx.zeros((args.hidden_size,), dtype=mx.float32)
+
+    def __call__(self, x):
+        out = super().__call__(x)
+        steered = out.astype(mx.float32) + self._alpha * self.reasoning_effort_steering
+        return steered.astype(out.dtype)
+
+    def fusable(self):
+        return False
+
+
 class GlobalScaledLinear(nn.Module):
     """NVFP4 weight-only linear from the converted checkpoint: quantized_matmul(x, codes, E4M3 block scales) * FP32 global.
     quantized_matmul has no global_scale argument, so the per-tensor scale is applied to the output (exact).
@@ -1727,7 +1746,11 @@ class DecoderLayer(nn.Module):
         self.self_attn_raon_mhc = MHC(args)
         self.mlp_raon_mhc = MHC(args)
         if self.is_moe:
-            self.moe = MoE(args)
+            steering = args.reasoning_effort_steering
+            if steering and index in steering["layers"]:
+                self.moe = SteeredMoE(args)
+            else:
+                self.moe = MoE(args)
         else:
             self.mlp = MLP(args, args.intermediate_size)
 
@@ -2017,6 +2040,7 @@ class Model(nn.Module):
                     "e_score_correction_bias",
                     "res.eta",
                     "global_scale",
+                    "reasoning_effort_steering",
                 )
             )
             or (self.args.raon_fp32_export_head and path == "lm_head.weight")
