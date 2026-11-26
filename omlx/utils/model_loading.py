@@ -919,6 +919,12 @@ def maybe_apply_pre_load_patches(
         if apply_glm5_next_mlx_lm_patch():
             logger.info("GLM-5.3 mlx-lm registration applied for %s", model_name)
 
+    if model_type == "kimi_k31":
+        from ..patches.kimi_k31 import apply_kimi_k31_patch
+
+        if apply_kimi_k31_patch():
+            logger.info("Kimi K3.1 mlx-lm registration applied for %s", model_name)
+
     if for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
     ):

@@ -660,6 +660,21 @@ def test_nemotron_h_quant_group_divisors_cap_tp_degree():
     assert not all(v % 4 == 0 for v in divisors)  # TP=4 rejected (58 % 4 != 0)
 
 
+def test_kimi_k31_tensor_degree_divides_the_kda_heads():
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "kimi_k31",
+        "text_config": {
+            "num_attention_heads": 96,
+            "num_key_value_heads": 96,
+            "linear_attn_config": {"num_heads": 64},
+        },
+    }
+
+    assert set(_tensor_parallel_divisors(config)) == {96, 64}
+
+
 def test_nemotron_h_divisors_omit_quant_groups_when_unquantized():
     """Without a quantization block there are no group-count constraints."""
 

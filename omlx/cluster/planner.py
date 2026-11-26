@@ -806,7 +806,7 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
         )
         if not tied:
             values.append(_config_int(config, "vocab_size", 1, maximum=10_000_000))
-    if model_type == "glm5_next":
+    if model_type in {"glm5_next", "kimi_k31"}:
         # KDA heads, read the way the model's TextConfig reads them.
         linear_heads = _config_int(config, "linear_num_heads", 64)
         text = config.get("text_config")
@@ -1292,7 +1292,13 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
                 )
                 denominator = num_layers * index_pool
                 return (numerator + denominator - 1) // denominator
-        return _hybrid_kv_average((kv_lora_rank + rope_dim) * dtype_size, config)
+        attention_bytes = (kv_lora_rank + rope_dim) * dtype_size
+        dsa = layer_config.get("dsa_config")
+        if config.get("model_type") == "kimi_k31" and isinstance(dsa, dict):
+            # Every attention layer also caches an indexer key and a zero
+            # value of the same size.
+            attention_bytes += 2 * _config_int(dsa, "index_head_dim", 0) * dtype_size
+        return _hybrid_kv_average(attention_bytes, config)
 
     heads = _config_int(config, "num_attention_heads", 0)
     kv_heads = _config_int(config, "num_key_value_heads", heads)

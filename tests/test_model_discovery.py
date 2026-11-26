@@ -165,6 +165,13 @@ class TestDetectModelType:
 
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_kimi_k31_with_a_vision_tower_as_llm(self, tmp_path):
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "kimi_k31", "vision_config": {"depth": 28}})
+        )
+
+        assert detect_model_type(tmp_path) == "llm"
+
     def test_detect_embedding_model_by_type(self, tmp_path):
         """Test detection of embedding model by model_type."""
         config = {
