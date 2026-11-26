@@ -60,6 +60,31 @@ def test_inspect_safetensors_layout_reads_headers_without_loading_tensors(tmp_pa
     assert layout.tensor_count == 5
 
 
+def test_inspect_safetensors_layout_reads_an_index_with_an_entry_per_expert_tensor(
+    tmp_path,
+):
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [("model.layers.0.mlp.down_proj.weight", 300)],
+    )
+    weight_map = {
+        f"language_model.model.layers.{layer}.block_sparse_moe.experts.{expert}"
+        f".{projection}.{part}": "model.safetensors"
+        for layer in range(1, 93)
+        for expert in range(896)
+        for projection in ("w1", "w2", "w3")
+        for part in ("weight_packed", "weight_scale")
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}, indent=2)
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    assert layout.layer_weight_bytes == (300,)
+    assert layout.tensor_count == 1
+
+
 def test_inspect_safetensors_layout_rejects_offset_past_file(tmp_path):
     header = {
         "model.layers.0.weight": {
