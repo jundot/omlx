@@ -22,7 +22,7 @@ def armed() -> bool:
 
 @cache
 def _supported_gpu() -> bool:
-    return mx.device_info().get("architecture") == "applegpu_g17s"
+    return mx.device_info().get("architecture") in ("applegpu_g17s", "applegpu_g17d")
 
 
 def short_gpu_verify(rows: int) -> bool:
