@@ -1076,6 +1076,34 @@ def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
     assert current + old_peak > limit
 
 
+@pytest.mark.parametrize("cached", [0, 32768])
+def test_prefill_scratch_prices_first_chunk_and_limits_adaptive_size(cached):
+    scheduler = _make_scheduler()
+    scheduler._prefill_min_chunk_tokens = 32
+    scheduler.model = SimpleNamespace(config=_ModelConfig(), layers=[])
+    scheduler._set_model_info_for_monitor()
+    scheduler._prefill_transient_tracker = None
+    baseline = scheduler._predicted_chunk_transient(512, cached)
+    reserve = 225 * 1024**2
+    scheduler.model._omlx_prefill_scratch_bytes = reserve
+    scheduler.model._omlx_prefill_scratch_min_tokens = 512
+    scheduler._set_model_info_for_monitor()
+
+    assert scheduler._predicted_chunk_transient(512, cached) == pytest.approx(
+        baseline + reserve * Scheduler._PREFILL_TRANSIENT_SAFETY
+    )
+    rows = (511, 512, 2048, 2049, 4096)
+    predictions = [scheduler._predicted_chunk_transient(n, cached) for n in rows]
+    assert predictions == sorted(predictions)
+    headroom = baseline + reserve / 2
+    fitting = scheduler._largest_fitting_prefill_chunk(
+        4096, 32, headroom, cached, gathered_core=False
+    )
+    assert fitting == 480
+    assert scheduler._predicted_chunk_transient(fitting, cached) <= headroom
+    assert scheduler._predicted_chunk_transient(fitting + 32, cached) > headroom
+
+
 def test_preflight_charges_observed_max_transient():
     """A session's observed max chunk transient converts a would-be
     mid-prefill abort into an upfront 400."""

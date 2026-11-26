@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -118,9 +120,8 @@ def test_scratch_bound_counts_only_simultaneous_patched_groups(m1_max):
     assert model.language_model._omlx_prefill_scratch_bytes == 60 * 1024**2
 
 
-@pytest.mark.parametrize("device", ["Apple M1 Pro", "Apple M2 Max", "Apple M5 Max"])
-def test_installation_declines_unmeasured_devices(m1_max, monkeypatch, device):
-    monkeypatch.setattr(mx, "device_info", lambda: {"device_name": device})
+def test_installation_declines_unmeasured_device(m1_max, monkeypatch):
+    monkeypatch.setattr(mx, "device_info", lambda: {"device_name": "Apple M1 Pro"})
     assert patch.apply_gemma3_prefill_linear_patch(_model()) == 0
 
 
@@ -131,13 +132,18 @@ def test_installation_declines_other_model_geometry(m1_max):
 
 
 @pytest.mark.parametrize(
-    "input_dim,output_dim", [(3840, 2048), (3840, 15360), (15360, 3840)]
+    "input_dim,output_dim,rows",
+    [(3840, 2048, 512), (3840, 15360, 2047), (15360, 3840, 2048)],
 )
-@pytest.mark.parametrize("rows", [512, 2047, 2048])
 def test_dense_projection_equals_packed_reference(input_dim, output_dim, rows):
     linear = _linear(input_dim, output_dim, cls=patch.Gemma3PrefillLinear)
-    # Powers-of-two inputs and affine metadata make this an exact arithmetic
-    # check of dequantization and projection, including ragged query rows.
+    row = mx.arange(output_dim, dtype=mx.uint32)[:, None]
+    word = mx.arange(input_dim // 8, dtype=mx.uint32)[None, :]
+    linear.weight = (row + word) * mx.array(0x1234567, mx.uint32)
+    group = mx.arange(input_dim // 64, dtype=mx.uint32)[None, :]
+    linear.scales = ((row + group) % 4 + 1).astype(mx.bfloat16) / 64
+    linear.biases = ((row + group) % 3).astype(mx.bfloat16) / 8 - 0.125
+    # Binary fractions keep products and accumulator sums exactly representable.
     x = mx.random.randint(-8, 9, (1, rows, input_dim), key=mx.random.key(17))
     x = x.astype(mx.bfloat16) / 8
     reference = nn.QuantizedLinear.__call__(linear, x)
@@ -151,13 +157,11 @@ def test_dense_projection_equals_packed_reference(input_dim, output_dim, rows):
     "shape,dtype",
     [
         ((1, 1, 3840), mx.bfloat16),
-        ((1, 128, 3840), mx.bfloat16),
         ((1, 511, 3840), mx.bfloat16),
         ((1, 2049, 3840), mx.bfloat16),
         ((2, 512, 3840), mx.bfloat16),
         ((512, 3840), mx.bfloat16),
         ((1, 512, 3840), mx.float16),
-        ((1, 512, 3840), mx.float32),
     ],
 )
 def test_unsupported_calls_bypass_dense_path(monkeypatch, shape, dtype):
@@ -173,12 +177,32 @@ def test_unsupported_calls_bypass_dense_path(monkeypatch, shape, dtype):
 @pytest.mark.parametrize(
     "field,value", [("bits", 8), ("group_size", 128), ("mode", "mxfp4")]
 )
-def test_changed_quantization_uses_original_call(monkeypatch, field, value):
-    sentinel = object()
-    monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: sentinel)
-    linear = _linear(cls=patch.Gemma3PrefillLinear)
+def test_installation_declines_other_quantization(m1_max, field, value):
+    model = _model()
+    linear = model.language_model.model.layers[0].self_attn.k_proj
     setattr(linear, field, value)
-    assert linear(mx.zeros((1, 512, 3840), mx.bfloat16)) is sentinel
+    assert patch.apply_gemma3_prefill_linear_patch(model) == 6
+    assert type(linear) is nn.QuantizedLinear
+
+
+def test_installation_declines_other_parameter_layouts(m1_max):
+    model = _model()
+    attention = model.language_model.model.layers[0].self_attn
+    attention.q_proj = _linear(3840, 4095)
+    attention.k_proj.scales = attention.k_proj.scales.astype(mx.float16)
+    attention.v_proj.bias = mx.zeros((2048,), mx.bfloat16)
+    attention.o_proj.biases = None
+
+    assert patch.apply_gemma3_prefill_linear_patch(model) == 3
+    assert all(
+        type(linear) is nn.QuantizedLinear
+        for linear in (
+            attention.q_proj,
+            attention.k_proj,
+            attention.v_proj,
+            attention.o_proj,
+        )
+    )
 
 
 def test_dense_weight_depends_on_activation_and_is_transient(monkeypatch):

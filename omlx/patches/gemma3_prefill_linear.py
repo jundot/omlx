@@ -26,29 +26,22 @@ _PROJECTION_GROUPS = (
     ("mlp", (("gate_proj", 3840, 15360), ("up_proj", 3840, 15360))),
     ("mlp", (("down_proj", 15360, 3840),)),
 )
-_SHAPES = frozenset(
-    (input_dim, output_dim)
-    for _, projections in _PROJECTION_GROUPS
-    for _, input_dim, output_dim in projections
-)
 
 
 def _supported_linear(linear, input_dim, output_dim):
+    biases = linear.get("biases")
     return (
-        (input_dim, output_dim) in _SHAPES
-        and getattr(linear, "mode", None) == "affine"
-        and getattr(linear, "bits", None) == 4
-        and getattr(linear, "group_size", None) == 64
+        linear.mode == "affine"
+        and linear.bits == 4
+        and linear.group_size == 64
         and "bias" not in linear
-        and isinstance(linear.get("weight"), mx.array)
         and linear.weight.dtype == mx.uint32
         and linear.weight.shape == (output_dim, input_dim // 8)
-        and isinstance(linear.get("scales"), mx.array)
         and linear.scales.dtype == mx.bfloat16
         and linear.scales.shape == (output_dim, input_dim // 64)
-        and isinstance(linear.get("biases"), mx.array)
-        and linear.biases.dtype == mx.bfloat16
-        and linear.biases.shape == linear.scales.shape
+        and biases is not None
+        and biases.dtype == mx.bfloat16
+        and biases.shape == linear.scales.shape
     )
 
 
@@ -61,12 +54,16 @@ class Gemma3PrefillLinear(nn.QuantizedLinear):
             or x.shape[0] != 1
             or not _MIN_ROWS <= x.shape[1] <= _MAX_ROWS
             or x.dtype != mx.bfloat16
-            or not _supported_linear(self, x.shape[-1], self.weight.shape[0])
         ):
             return super().__call__(x)
         weight = mx.depends(self.weight, x)
         dense = mx.dequantize(
-            weight, self.scales, self.biases, group_size=64, bits=4, mode="affine"
+            weight,
+            self.scales,
+            self.biases,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
         )
         return x @ dense.T
 
