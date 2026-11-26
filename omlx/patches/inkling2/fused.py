@@ -188,12 +188,14 @@ def _rows_per_pass(group: int) -> int:
 
 def long_attention_supported(q: mx.array, k: mx.array, v: mx.array) -> bool:
     """Shapes and dtypes ``long_decode_attention`` covers: one sequence,
-    128-wide heads with contiguous rows, BF16 activations on the GPU."""
+    128-wide heads with contiguous rows, BF16 activations and KV on the GPU."""
     return (
         mx.default_device() == mx.gpu
         and q.shape[0] == 1
         and q.shape[-1] == HEAD_DIM
         and q.dtype == mx.bfloat16
+        and k.dtype == mx.bfloat16
+        and v.dtype == mx.bfloat16
     )
 
 

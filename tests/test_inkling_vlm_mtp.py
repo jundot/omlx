@@ -2582,3 +2582,26 @@ async def test_inkling2_fp8_kv_ssd_blocks_survive_a_reload_in_the_same_mode(
         assert manager.has_block(block) is kept, mode
         assert (manager.load_block(block) is not None) is kept, mode
         await engine.stop()
+
+
+def test_inkling2_long_attention_skips_fp8_uint8_kv(monkeypatch):
+    if mx.default_device() != mx.gpu:
+        pytest.skip("long-context attention guard runs on the GPU")
+    q, k, v, rel, sink, scale = _attention_inputs(4, 128, hq=8)
+    k_fp8 = kernels.fp8_quantize(k)
+    v_fp8 = kernels.fp8_quantize(v)
+    assert k_fp8.dtype == mx.uint8 and v_fp8.dtype == mx.uint8
+    assert fused.long_attention_supported(q, k, v) is True
+    assert fused.long_attention_supported(q, k_fp8, v_fp8) is False
+
+    # End-to-end full-attention layer above _LONG_ATTENTION_MIN_KEYS with FP8 KV must not crash Metal compilation.
+    monkeypatch.setattr(inkling2_model, "_LONG_ATTENTION_MIN_KEYS", 64)
+    model = _bf16(_inkling2_tiny(head_dim=128, swa_head_dim=128, **_TINY_LOOP))
+    model.set_fp8_kv("full")
+    cache = model.make_cache()
+    ids = mx.random.randint(0, 300, (1, 96))
+    logits = model(ids, cache=cache)
+    mx.eval(logits)
+    nxt = model(mx.random.randint(0, 300, (1, 1)), cache=cache)
+    mx.eval(nxt)
+    assert nxt.shape[:2] == (1, 1) and mx.all(mx.isfinite(nxt[:, :, :300])).item()
