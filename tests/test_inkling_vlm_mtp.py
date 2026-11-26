@@ -1506,8 +1506,6 @@ def test_nax_banded_attention_rows_do_not_depend_on_the_block():
 
 
 def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
-    """Full-attention blocks of more than 8 queries, lone or left-padded,
-    build no mask on NAX hosts; shorter blocks and sliding layers keep SDPA."""
     from omlx.patches.inkling2 import kernels
 
     nax_attention = _nax_banded_or_skip()
@@ -1527,7 +1525,7 @@ def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
         (2, 70, lp, 0, True),
         (1, 9, None, 0, True),
         (1, 8, None, 0, False),
-        (1, 70, None, 32, False),
+        (1, 70, None, 32, True),
     ):
         args = _decode_attention_case(batch, 6, 2, length, 300, 32, mx.bfloat16, 128)
         calls.clear()
@@ -1536,7 +1534,7 @@ def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
         )
         assert any(calls) == taken
         if taken:
-            ref = kernels._masked_attention(*args, scale, 0, padding)
+            ref = kernels._masked_attention(*args, scale, window, padding)
             diff = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max()
             assert diff.item() < 1e-2
 
