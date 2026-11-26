@@ -9459,3 +9459,87 @@ def test_token_bytes_follow_the_detokenizer_vocab():
     ):
         assert scheduler_module._token_bytes(detokenizer, None, 0) == b" hi"
         assert scheduler_module._token_bytes(detokenizer, None, 1) == b"\xec"
+
+
+def _cache_arrays(layers):
+    return [x for c in layers for x in c.state if isinstance(x, mx.array)]
+
+
+class _FilterBatch:
+    def __init__(self, layers, rows):
+        self.prompt_cache = layers
+        self.uids = list(range(rows))
+
+    def filter(self, keep):
+        self.uids = [self.uids[i] for i in keep]
+        for c in self.prompt_cache:
+            c.filter(keep)
+
+
+def _filter_peak(monkeypatch, patched):
+    layers = []
+    for _ in range(8):
+        c = BatchKVCache([0] * 3)
+        k = mx.random.normal((3, 8, 4096, 128)).astype(mx.bfloat16)
+        c.update_and_fetch(k, k)
+        layers.append(c)
+    mx.eval(_cache_arrays(layers))
+    batch = _FilterBatch(layers, 3)
+    monkeypatch.setattr(
+        scheduler_module, "_original_generation_batch_filter", _FilterBatch.filter
+    )
+    filter_fn = (
+        scheduler_module._patched_generation_batch_filter
+        if patched
+        else _FilterBatch.filter
+    )
+    mx.synchronize()
+    start = mx.get_active_memory()
+    mx.reset_peak_memory()
+    filter_fn(batch, [1, 2])
+    mx.eval(_cache_arrays(batch.prompt_cache))
+    mx.synchronize()
+    layer = sum(x.nbytes for x in _cache_arrays(batch.prompt_cache[:1]))
+    return mx.get_peak_memory() - start, layer, batch
+
+
+@pytest.mark.skipif(mx.default_device() != mx.gpu, reason="Metal memory accounting")
+def test_batch_filter_rebuilds_one_layer_at_a_time(monkeypatch):
+    lazy, layer, _ = _filter_peak(monkeypatch, patched=False)
+    layered, _, batch = _filter_peak(monkeypatch, patched=True)
+    # Lazily all 8 filtered layers are built while the old batch lives.
+    assert lazy > 6 * layer
+    assert layered < 2 * layer
+    assert batch.uids == [1, 2]
+
+
+def test_finished_row_copy_lets_the_old_batch_free():
+    """A finished row copied out of its batch keeps its contents, and the old
+    batch frees while the row waits for its cache store."""
+    import gc
+
+    batch = []
+    for _ in range(4):
+        c = BatchKVCache([0] * 3)
+        k = mx.random.normal((3, 8, 2048, 128)).astype(mx.bfloat16)
+        c.update_and_fetch(k, k)
+        batch.append(c)
+    mx.eval(_cache_arrays(batch))
+    # No automatic collection: the batch must be freed by refcount alone.
+    gc.collect()
+    gc.disable()
+    try:
+        row = [c.extract(1) for c in batch]
+        want = [mx.array(x) for x in _cache_arrays(row)]
+        mx.eval(want)
+        detached = scheduler_module._detach_finished_row(row)
+        assert all(
+            mx.array_equal(a, b) for a, b in zip(_cache_arrays(detached), want)
+        )
+        mx.synchronize()
+        before = mx.get_active_memory()
+        del batch
+        mx.synchronize()
+        assert before - mx.get_active_memory() >= 2 * sum(x.nbytes for x in want)
+    finally:
+        gc.enable()
