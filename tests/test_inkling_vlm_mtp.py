@@ -2411,6 +2411,8 @@ def test_inkling2_fp8_kv_row_exact_verify_rows_match_serial_decode():
     def prefilled():
         cache = model.make_cache()
         model(ids[:, :40], cache=cache)
+        # As the server does after each prefill chunk.
+        mx.eval([c.state for c in cache])
         return cache
 
     cache = prefilled()
