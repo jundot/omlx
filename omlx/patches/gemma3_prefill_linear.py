@@ -7,30 +7,29 @@ materialization until the preceding layer has produced its input. Each module
 continues to store its original packed weights, scales, and biases.
 """
 
+from importlib import import_module
+
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..utils.hardware import get_mlx_device_name
 
-# Measured long-prefill range on the M1 Max.
 _MIN_ROWS = 512
 _MAX_ROWS = 2048
-_PROJECTIONS = (
-    ("self_attn", "q_proj", 3840, 4096),
-    ("self_attn", "k_proj", 3840, 2048),
-    ("self_attn", "v_proj", 3840, 2048),
-    ("self_attn", "o_proj", 4096, 3840),
-    ("mlp", "gate_proj", 3840, 15360),
-    ("mlp", "up_proj", 3840, 15360),
-    ("mlp", "down_proj", 15360, 3840),
+# Projections sharing an input may materialize their BF16 weights together.
+_PROJECTION_GROUPS = (
+    (
+        "self_attn",
+        (("q_proj", 3840, 4096), ("k_proj", 3840, 2048), ("v_proj", 3840, 2048)),
+    ),
+    ("self_attn", (("o_proj", 4096, 3840),)),
+    ("mlp", (("gate_proj", 3840, 15360), ("up_proj", 3840, 15360))),
+    ("mlp", (("down_proj", 15360, 3840),)),
 )
 _SHAPES = frozenset(
-    (input_dim, output_dim) for _, _, input_dim, output_dim in _PROJECTIONS
-)
-_SCRATCH_GROUPS = (
-    ("self_attn", ("q_proj", "k_proj", "v_proj")),
-    ("self_attn", ("o_proj",)),
-    ("mlp", ("gate_proj", "up_proj")),
-    ("mlp", ("down_proj",)),
+    (input_dim, output_dim)
+    for _, projections in _PROJECTION_GROUPS
+    for _, input_dim, output_dim in projections
 )
 
 
@@ -72,41 +71,12 @@ class Gemma3PrefillLinear(nn.QuantizedLinear):
         return x @ dense.T
 
 
-def _prefill_scratch_bytes(model) -> int:
-    """Bound simultaneous dense weights once when installing this route.
-
-    Q/K/V and gate/up each share an activation and may materialize together.
-    The dependency in ``Gemma3PrefillLinear`` separates successive groups and
-    layers. The complete 12B route reserves 225 MiB for the gate/up pair,
-    exceeding its 60 MiB Q/K/V group and 112.5 MiB down projection.
-    """
-    layers = getattr(model, "layers", ())
-    if not isinstance(layers, (list, tuple)):
-        return 0
-    peak = 0
-    for layer in layers:
-        for parent_name, names in _SCRATCH_GROUPS:
-            parent = getattr(layer, parent_name, None)
-            group_bytes = 0
-            for name in names:
-                linear = getattr(parent, name, None)
-                if type(linear) is Gemma3PrefillLinear:
-                    output_dim, packed_dim = linear.weight.shape
-                    input_dim = packed_dim * 8
-                    if _supported_linear(linear, input_dim, output_dim):
-                        group_bytes += output_dim * input_dim * 2
-            peak = max(peak, group_bytes)
-    return peak
-
-
 def apply_gemma3_prefill_linear_patch(model) -> int:
     """Rebind eligible projections on this loaded Gemma 3 12B instance."""
-    if not mx.metal.is_available():
-        return 0
-    if mx.device_info().get("device_name") != "Apple M1 Max":
+    if get_mlx_device_name() != "Apple M1 Max":
         return 0
 
-    from mlx_vlm.models.gemma3 import language
+    language = import_module("mlx_vlm.models.gemma3.language")
 
     language_model = getattr(model, "language_model", None)
     if type(language_model) is not language.LanguageModel:
@@ -127,6 +97,7 @@ def apply_gemma3_prefill_linear_patch(model) -> int:
         return 0
 
     count = 0
+    peak_bytes = 0
     for layer in text_model.layers:
         if (
             type(layer) is not language.TransformerBlock
@@ -134,14 +105,20 @@ def apply_gemma3_prefill_linear_patch(model) -> int:
             or type(layer.mlp) is not language.MLP
         ):
             continue
-        for parent_name, name, input_dim, output_dim in _PROJECTIONS:
-            linear = getattr(getattr(layer, parent_name), name)
-            if type(linear) is nn.QuantizedLinear and _supported_linear(
-                linear, input_dim, output_dim
-            ):
-                # QuantizedLinear's storage and parameter paths stay identical.
-                linear.__class__ = Gemma3PrefillLinear
-                count += 1
-    language_model._omlx_prefill_scratch_bytes = _prefill_scratch_bytes(language_model)
+        for parent_name, projections in _PROJECTION_GROUPS:
+            parent = getattr(layer, parent_name)
+            group_bytes = 0
+            for name, input_dim, output_dim in projections:
+                linear = getattr(parent, name)
+                if type(linear) not in (nn.QuantizedLinear, Gemma3PrefillLinear):
+                    continue
+                if not _supported_linear(linear, input_dim, output_dim):
+                    continue
+                if type(linear) is nn.QuantizedLinear:
+                    linear.__class__ = Gemma3PrefillLinear
+                    count += 1
+                group_bytes += input_dim * output_dim * mx.bfloat16.size
+            peak_bytes = max(peak_bytes, group_bytes)
+    language_model._omlx_prefill_scratch_bytes = peak_bytes
     language_model._omlx_prefill_scratch_min_tokens = _MIN_ROWS
     return count

@@ -30,11 +30,22 @@ def _linear(input_dim=3840, output_dim=2048, cls=nn.QuantizedLinear):
     )
 
 
+_PROJECTIONS = (
+    ("self_attn", "q_proj", 3840, 4096),
+    ("self_attn", "k_proj", 3840, 2048),
+    ("self_attn", "v_proj", 3840, 2048),
+    ("self_attn", "o_proj", 4096, 3840),
+    ("mlp", "gate_proj", 3840, 15360),
+    ("mlp", "up_proj", 3840, 15360),
+    ("mlp", "down_proj", 15360, 3840),
+)
+
+
 def _model():
     attention = _module(language.Attention)
     mlp = _module(language.MLP)
     layer = _module(language.TransformerBlock, self_attn=attention, mlp=mlp)
-    for parent, name, input_dim, output_dim in patch._PROJECTIONS:
+    for parent, name, input_dim, output_dim in _PROJECTIONS:
         setattr(getattr(layer, parent), name, _linear(input_dim, output_dim))
     config = SimpleNamespace(
         hidden_size=3840,
@@ -74,8 +85,9 @@ def test_installation_is_instance_scoped_and_idempotent(m1_max):
     assert model.language_model._omlx_prefill_scratch_bytes == 225 * 1024**2
     assert model.language_model._omlx_prefill_scratch_min_tokens == 512
     assert patch.apply_gemma3_prefill_linear_patch(model) == 0
+    assert model.language_model._omlx_prefill_scratch_bytes == 225 * 1024**2
     assert layer.mlp.gate_proj.weight is weight
-    for parent, name, _, _ in patch._PROJECTIONS:
+    for parent, name, _, _ in _PROJECTIONS:
         assert type(getattr(getattr(layer, parent), name)) is patch.Gemma3PrefillLinear
     assert (
         type(other.language_model.model.layers[0].mlp.gate_proj) is nn.QuantizedLinear
@@ -99,14 +111,11 @@ def test_installation_excludes_linear_subclasses(m1_max):
 
 def test_scratch_bound_counts_only_simultaneous_patched_groups(m1_max):
     model = _model()
-    assert patch.apply_gemma3_prefill_linear_patch(model) == 7
-    language_model = model.language_model
-    assert patch._prefill_scratch_bytes(language_model) == 225 * 1024**2
-    layer = language_model.model.layers[0]
-    layer.mlp = SimpleNamespace()
-    assert patch._prefill_scratch_bytes(language_model) == 60 * 1024**2
-    layer.self_attn = SimpleNamespace()
-    assert patch._prefill_scratch_bytes(language_model) == 0
+    layer = model.language_model.model.layers[0]
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(layer.mlp, name, nn.Identity())
+    assert patch.apply_gemma3_prefill_linear_patch(model) == 4
+    assert model.language_model._omlx_prefill_scratch_bytes == 60 * 1024**2
 
 
 @pytest.mark.parametrize("device", ["Apple M1 Pro", "Apple M2 Max", "Apple M5 Max"])

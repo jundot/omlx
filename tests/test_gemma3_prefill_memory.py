@@ -9,14 +9,17 @@ from omlx import memory_monitor as mm
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.scheduler import Scheduler
 
-
 _RESERVE = 2 * 3840 * 15360 * 2
 
 
 def _model(*, optimized=True, shape="direct"):
     config = SimpleNamespace(
-        model_type="gemma3_text", hidden_size=3840, intermediate_size=15360,
-        num_hidden_layers=48, num_attention_heads=16, num_key_value_heads=8,
+        model_type="gemma3_text",
+        hidden_size=3840,
+        intermediate_size=15360,
+        num_hidden_layers=48,
+        num_attention_heads=16,
+        num_key_value_heads=8,
         head_dim=256,
     )
     model = SimpleNamespace(
@@ -35,7 +38,9 @@ def _model(*, optimized=True, shape="direct"):
         layers=model.layers,
         make_cache=model.make_cache,
     )
-    setattr(wrapper, "_language_model" if shape == "adapter" else "language_model", model)
+    setattr(
+        wrapper, "_language_model" if shape == "adapter" else "language_model", model
+    )
     return wrapper
 
 
@@ -143,9 +148,9 @@ def test_first_chunk_prediction_and_bisection_include_scratch(cached):
     scheduler = _scheduler(_model())
     base = _scheduler(_model(optimized=False))
     assert scheduler._prefill_transient_tracker is None
-    delta = scheduler._predicted_chunk_transient(512, cached) - base._predicted_chunk_transient(
+    delta = scheduler._predicted_chunk_transient(
         512, cached
-    )
+    ) - base._predicted_chunk_transient(512, cached)
     assert delta == pytest.approx(_RESERVE * Scheduler._PREFILL_TRANSIENT_SAFETY)
 
     rows = [511, 512, 1024, 2047, 2048, 2049, 4096]

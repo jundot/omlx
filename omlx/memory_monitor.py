@@ -2132,12 +2132,7 @@ def _ane_prefill_transient_bytes(model: Any) -> int:
         return 0
 
 
-def _prefill_scratch_requirements(model: Any) -> tuple[int, int]:
-    """Read scalar route metadata from an adapter, VLM, or language model.
-
-    Installation computes the reserve once. This lookup keeps model loading
-    and optional-MLX environments independent of the projection implementation.
-    """
+def _prefill_scratch_requirements(model: object) -> tuple[int, int]:
     language_model = getattr(model, "_language_model", None)
     if language_model is None:
         language_model = getattr(model, "language_model", model)
