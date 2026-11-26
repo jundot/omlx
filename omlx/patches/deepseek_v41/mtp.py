@@ -232,7 +232,7 @@ class DSparkMixin:
         # A verify-only rank may not hold the target layers the taps come from.
         capture = (return_hidden or bool(capture_dspark)) and not verify_only
         if kwargs.get("_ced_prefill", False) and self._config.ced_prefill:
-            if input_ids.shape[0] != 1:
+            if input_ids.shape[0] != 1 and self._stage()[0][1]._tensor_group is None:
                 raise ValueError("CED scheduler prefill requires one request row")
             if capture or verify:
                 raise ValueError("CED prefill cannot supply full hidden/verify states")
