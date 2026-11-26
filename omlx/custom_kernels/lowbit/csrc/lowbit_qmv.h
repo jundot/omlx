@@ -35,12 +35,6 @@ array t5_qmv_wide(
     const array& scales,
     StreamOrDevice s = {});
 
-array t5_qmv_wide_batch4(
-    const array& x,
-    const array& w,
-    const array& scales,
-    StreamOrDevice s = {});
-
 // ---------------------------------------------------------------------------
 // t5 MMA GEMM (Identity I-M): fused dequant + simdgroup matmul for prefill
 // ---------------------------------------------------------------------------
