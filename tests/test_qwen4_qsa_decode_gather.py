@@ -1707,31 +1707,3 @@ def test_batch_gather_rows_below_the_crossover_keep_the_dense_path(monkeypatch):
         pair.attention._gathered_batch_paddings(x, mask, pair.fast, None, None, False)
         is None
     )
-
-
-def test_batch_gather_below_the_crossover_does_not_read_left_padding(monkeypatch):
-    pair = _GatherPair(monkeypatch, prefixes=(5, 3))
-    monkeypatch.setattr(pair.language, "_GATHERED_BATCH_DISABLED", False)
-    hidden = pair.config.hidden_size
-    # Width 5, ratio 2, top-k 4: 4 verify rows reach 4 blocks, 5 rows reach 5.
-    below, above = mx.zeros((2, 4, hidden)), mx.zeros((2, 5, hidden))
-    masks = {
-        x.shape[1]: pair.language._create_qwen3_5_attention_mask(x, pair.fast)
-        for x in (below, above)
-    }
-
-    def paddings(x):
-        return pair.attention._gathered_batch_paddings(
-            x, masks[x.shape[1]], pair.fast, None, None, True
-        )
-
-    reads = []
-    tolist = mx.array.tolist
-
-    def counted(array):
-        reads.append(array)
-        return tolist(array)
-
-    monkeypatch.setattr(mx.array, "tolist", counted)
-    assert paddings(below) is None and not reads
-    assert paddings(above) == [0, 2] and len(reads) == 1

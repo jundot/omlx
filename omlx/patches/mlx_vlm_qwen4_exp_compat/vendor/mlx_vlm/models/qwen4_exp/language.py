@@ -2500,15 +2500,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             or index_positions.shape[-1] != width
         ):
             return None
-        # Below the crossover every row is plain causal attention, which the
-        # dense path already runs without a sparse mask.
-        ratio, topk = self.indexer.compress_ratio, self.indexer.block_topk
-        # No row attends more than width + length keys.
-        if (width + length) // ratio <= topk:
-            return None
         paddings = cache.left_padding.tolist()
         if len(paddings) != batch or not all(0 <= pad <= width for pad in paddings):
             return None
+        # Below the crossover every row is plain causal attention, which the
+        # dense path already runs without a sparse mask.
+        ratio, topk = self.indexer.compress_ratio, self.indexer.block_topk
         if not any((width - pad + length) // ratio > topk for pad in paddings):
             return None
         return paddings
