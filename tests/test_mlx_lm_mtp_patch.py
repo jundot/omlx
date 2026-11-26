@@ -6466,6 +6466,8 @@ def test_batched_decode_leaves_exact_modes_on_stock(monkeypatch, mode):
 @pytest.mark.parametrize(
     "bits,rows,dtype",
     [
+        (2, 2, mx.float16),
+        (2, 3, mx.float16),
         (2, 8, mx.bfloat16),
         (3, 4, mx.float16),
         (4, 4, mx.bfloat16),
@@ -6501,10 +6503,10 @@ def test_sg8_kernels_match_quantized_matmul(bits, rows, dtype):
         swiglu = vq.vk_swiglu_sg8(x, gate, up, sums)
         assert _close(swiglu, nn.silu(g) * u, tol=2e-2)
 
-        if bits not in (4, 5):
+        if bits not in (2, 4, 5):
             continue
-        # Mixed 4/5-bit projections of one input share a launch.
-        group = [layer, _quantized_linear(512, 1024, 9 - bits, 14, dtype), gate]
+        partner_bits = 2 if bits == 2 else 9 - bits
+        group = [layer, _quantized_linear(512, 1024, partner_bits, 14, dtype), gate]
         for got, linear in zip(vq.vk_group_sg8(x, group, sums), group):
             assert _close(got, _reference(linear, x))
 
@@ -6787,3 +6789,81 @@ def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
     actual, _ = generate(model, prompts, limits)
     assert fired
     assert actual == expected
+
+
+def test_verify_qmm_routes_2bit_short_blocks_and_dense_linears(monkeypatch):
+    from mlx_vlm.speculative.ops import linear as ops
+
+    from omlx.patches import qwen35_verify_qmm as vq
+
+    qwen35_verify_linear.apply()
+    monkeypatch.setattr(vq, "_m1_route", lambda *args: None)
+    monkeypatch.setattr(vq, "is_nax_available", lambda: True)
+
+    for rows in (2, 3, 4, 5):
+        assert vq._verify_route(rows, 5120, 5120, 2, 128, mx.float16) == "sg8"
+    assert vq._verify_route(2, 5120, 248320, 2, 128, mx.float16) == "sg8"
+    assert vq._verify_route(3, 3584, 16384, 2, 128, mx.float16) == "vk"
+    assert vq._verify_route(2, 5120, 5120, 4, 64, mx.float16) is None
+    assert vq._verify_route(4, 5120, 5120, 4, 64, mx.float16) is None
+
+    monkeypatch.setattr(vq, "_is_armed", lambda: True)
+    qkv = nn.QuantizedLinear(5120, 10240, bias=False, group_size=128, bits=2)
+    z = nn.QuantizedLinear(5120, 6144, bias=False, group_size=128, bits=2)
+    for proj in (qkv, z):
+        proj.scales = proj.scales.astype(mx.float16)
+        proj.biases = proj.biases.astype(mx.float16)
+    x = mx.zeros((1, 2, 5120), dtype=mx.float16)
+    assert vq.sg8_group_eligible((qkv, z), x)
+    assert vq.sg8_swiglu_eligible(qkv, qkv, x)
+
+    monkeypatch.setattr(ops, "exact_speculative_verify_dense_available", lambda: True)
+    dense = nn.Linear(5120, 48, bias=False)
+    dense.weight = dense.weight.astype(mx.float16)
+    router = nn.Linear(2560, 256, bias=False)
+    router.weight = router.weight.astype(mx.float16)
+    assert ops._use_target_verify_dense(dense, mx.zeros((1, 3, 5120), dtype=mx.float16)) is False
+    assert ops._use_target_verify_dense(router, mx.zeros((1, 3, 2560), dtype=mx.float16)) is True
+
+    dense_calls: list[tuple[int, ...]] = []
+    orig_linear_call = nn.Linear.__call__
+
+    def spy_dense(self, inp):
+        dense_calls.append(tuple(inp.shape))
+        return orig_linear_call(self, inp)
+
+    monkeypatch.setattr(nn.Linear, "__call__", spy_dense)
+    out = ops._target_verify_linear(dense, mx.zeros((1, 3, 5120), dtype=mx.float16))
+    assert out.shape == (1, 3, 48)
+    assert dense_calls == [(1, 3, 5120)]
+
+    dense_calls.clear()
+    monkeypatch.setattr(vq, "_is_armed", lambda: False)
+    monkeypatch.setattr(vq, "is_row_exact_armed", lambda: True)
+    ops._target_verify_linear(dense, mx.zeros((1, 3, 5120), dtype=mx.float16))
+    assert dense_calls == [(1, 1, 5120)] * 3
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows,cols", [(2, 4096), (3, 4096), (2, 100032)])
+def test_vk_qmm_2bit_ksplit_and_msg_match_quantized_matmul(rows, cols):
+    from omlx.patches import qwen35_verify_qmm as vq
+
+    mx.random.seed(19)
+    k = 512
+    x = (mx.random.normal((rows, k)) * 0.5).astype(mx.float16)
+    w_fp = (mx.random.normal((cols, k)) * 0.02).astype(mx.float16)
+    wq, scales, biases = mx.quantize(w_fp, group_size=128, bits=2)
+    got = vq.vk_qmm(x, wq, scales, biases, bits=2, group_size=128)
+    expected = mx.quantized_matmul(
+        x.astype(mx.float32),
+        wq,
+        scales.astype(mx.float32),
+        biases.astype(mx.float32),
+        transpose=True,
+        group_size=128,
+        bits=2,
+    )
+    mx.eval(got, expected)
+    assert _close(got, expected)
+

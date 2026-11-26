@@ -1,17 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.utils.model_loading.maybe_load_custom_quantization."""
 
+import copy
+import gc
 import json
 import logging
 import sys
 import types
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import mlx.core as mx
+import mlx.nn as nn
 import mlx_lm.utils as mlx_lm_utils
 import mlx_vlm.utils as mlx_vlm_utils
+import numpy as np
 import pytest
+from mlx.utils import tree_flatten
+from safetensors.numpy import save_file
 
+from omlx.cache.paged_ssd_cache import numerics_revision_for_model
+from omlx.oqh import modules as oqh_modules
+from omlx.patches import prism_hadamard_verify, qwen35_verify_qmm
 from omlx.utils import model_loading
 from omlx.utils.model_loading import (
     dflash_draft_for,
@@ -20,6 +30,19 @@ from omlx.utils.model_loading import (
     maybe_load_custom_quantization,
     preflight_text_remote_code,
 )
+
+try:
+    from mlx_vlm.models.prism_hadamard_qwen35 import Model as PrismModel
+    from mlx_vlm.models.prism_hadamard_qwen35 import ModelConfig as PrismModelConfig
+    from mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35 import (
+        hadamard_transform as ref_hadamard_transform,
+    )
+    from mlx_vlm.models.qwen3_5.config import TextConfig as Qwen35TextConfig
+    from mlx_vlm.models.qwen3_5.config import VisionConfig as Qwen35VisionConfig
+
+    HAS_PRISM_HADAMARD = True
+except ImportError:
+    HAS_PRISM_HADAMARD = False
 
 
 def _write_config(tmp_path, body: str) -> str:
@@ -1495,3 +1518,244 @@ def test_dflash_draft_for_expands_a_home_relative_path(tmp_path, monkeypatch):
     assert dflash_draft_for(settings, None) == str(tmp_path / "d")
     settings.dflash_draft_model = "z-lab/d"
     assert dflash_draft_for(settings, None) == "z-lab/d"
+
+
+def _build_prism_hadamard_checkpoint(root: Path) -> None:
+    rng = np.random.default_rng(7)
+    text_cfg = {
+        "model_type": "qwen3_5_text",
+        "vocab_size": 512,
+        "hidden_size": 512,
+        "intermediate_size": 1024,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "full_attention_interval": 2,
+        "layer_types": ["linear_attention", "full_attention"],
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 64,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 8,
+        "linear_value_head_dim": 64,
+        "rms_norm_eps": 1e-6,
+        "attn_output_gate": True,
+        "output_gate_type": "swish",
+        "partial_rotary_factor": 0.25,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [6, 5, 5],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000,
+            "rope_type": "default",
+        },
+        "tie_word_embeddings": False,
+        "max_position_embeddings": 8192,
+        "mtp_num_hidden_layers": 0,
+        "dtype": "bfloat16",
+    }
+    vision_cfg = {
+        "model_type": "qwen3_5_vision",
+        "depth": 1,
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_heads": 4,
+        "in_channels": 3,
+        "patch_size": 14,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+        "out_hidden_size": 512,
+    }
+    base_cfg = {
+        "schema_version": 2,
+        "model_type": prism_hadamard_verify.PRISM_HADAMARD_MODEL_TYPE,
+        "base_model_type": "qwen3_5",
+        "tensor_namespace": "mlx-vlm-qwen3_5",
+        "gdn_activation_layout": "grouped",
+        "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+        "text_config": text_cfg,
+        "vision_config": vision_cfg,
+        "modules": [
+            {"path": "lm_head", "block": 512, "embedding": False, "dtype": "float16"},
+            {
+                "path": "model.embed_tokens",
+                "block": 512,
+                "embedding": True,
+                "dtype": "float16",
+            },
+        ],
+    }
+
+    def _make_cfg(cfg_dict):
+        copied = copy.deepcopy(cfg_dict)
+        copied["text_config"] = Qwen35TextConfig.from_dict(copied["text_config"])
+        copied["vision_config"] = Qwen35VisionConfig.from_dict(copied["vision_config"])
+        return PrismModelConfig.from_dict(copied)
+
+    probe = PrismModel(_make_cfg(base_cfg))
+    modules = []
+    for name, mod in probe.language_model.named_modules():
+        if name.endswith(("in_proj_a", "in_proj_b")):
+            continue
+        if name in ("lm_head", "model.embed_tokens"):
+            modules.append(
+                {
+                    "path": name,
+                    "block": 512,
+                    "embedding": name == "model.embed_tokens",
+                    "dtype": "float16",
+                }
+            )
+        elif isinstance(mod, nn.Linear) and mod.weight.shape[1] % 512 == 0:
+            modules.append(
+                {"path": name, "block": 512, "embedding": False, "dtype": "float16"}
+            )
+    base_cfg["modules"] = modules
+    (root / "config.json").write_text(json.dumps(base_cfg))
+
+    fresh = PrismModel(_make_cfg(base_cfg))
+    mx.eval(fresh.parameters())
+    signs_by_width: dict[int, np.ndarray] = {}
+    tensors = {}
+    for key, arr in tree_flatten(fresh.parameters()):
+        np_arr = np.array(arr)
+        if np_arr.dtype == np.uint32:
+            tensors[key] = rng.integers(0, 2**32, size=np_arr.shape, dtype=np.uint32)
+        elif key.endswith(".signs"):
+            width = int(np_arr.shape[0])
+            if width not in signs_by_width:
+                signs_by_width[width] = rng.choice(
+                    np.array([-1.0, 1.0], dtype=np.float32), size=(width,)
+                )
+            tensors[key] = signs_by_width[width]
+        elif key.endswith((".scales", ".biases")):
+            tensors[key] = (rng.standard_normal(np_arr.shape) * 0.05).astype(np.float16)
+        elif key.startswith("language_model.") and (
+            np_arr.ndim == 1 or key.endswith(("conv1d.weight", "in_proj_a.weight", "in_proj_b.weight"))
+        ):
+            val = 1.15 if np_arr.ndim == 1 else rng.standard_normal(np_arr.shape) * 0.02
+            tensors[key] = np.broadcast_to(np.asarray(val, dtype=np.float32), np_arr.shape).copy()
+        else:
+            tensors[key] = (rng.standard_normal(np_arr.shape) * 0.02).astype(np.float16)
+    save_file(tensors, str(root / "model.safetensors"), metadata={"format": "mlx"})
+
+
+@pytest.mark.skipif(not HAS_PRISM_HADAMARD, reason="requires prism_hadamard_qwen35")
+@pytest.mark.parametrize("block", [512, 1024, 2048, 4096])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_signed_fwht_matches_reference_transform(block, inverse):
+    rng = np.random.default_rng(block + int(inverse))
+    width = block * 2 if block < 4096 else 4096
+    x = mx.array(rng.standard_normal((2, 3, width)).astype(np.float16) * 0.5)
+    signs = mx.array(
+        rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=(width,))
+    )
+    got = prism_hadamard_verify.signed_fwht(x, signs, block, inverse=inverse)
+    expected = ref_hadamard_transform(x, block, signs, inverse=inverse)
+    mx.eval(got, expected)
+    assert got.dtype == mx.float16
+    assert float(mx.max(mx.abs(got - expected)).item()) <= 1e-3
+
+    with pytest.raises(ValueError, match="signed_fwht expects signs"):
+        prism_hadamard_verify.signed_fwht(x, signs[: block // 2], block)
+
+
+@pytest.mark.skipif(not HAS_PRISM_HADAMARD, reason="requires prism_hadamard_qwen35")
+def test_prism_hadamard_verify_recasts_trunk_memoizes_siblings_and_routes_verify(
+    tmp_path, monkeypatch
+):
+    _build_prism_hadamard_checkpoint(tmp_path)
+    unpatched_load_weights = getattr(
+        PrismModel.load_weights, "__wrapped__", PrismModel.load_weights
+    )
+    monkeypatch.setattr(PrismModel, "load_weights", unpatched_load_weights)
+    monkeypatch.setattr(
+        PrismModel, "_omlx_prism_load_weights_patched", False, raising=False
+    )
+
+    stock = mlx_vlm_utils.load_model(tmp_path, lazy=False)
+    tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
+    stock_cache = stock.language_model.make_cache()
+    stock_logits = stock.language_model(
+        tokens, cache=stock_cache, speculative_verify=True
+    ).logits
+    mx.eval(stock_logits, stock_cache[1].keys)
+    assert stock_logits.dtype == mx.float32
+
+    maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+    patched = mlx_vlm_utils.load_model(tmp_path, lazy=False)
+    gdn = patched.language_model.model.layers[0].linear_attn
+    attn = patched.language_model.model.layers[1].self_attn
+    assert patched.language_model.model.layers[0].input_layernorm.weight.dtype == mx.float16
+    assert gdn.conv1d.weight.dtype == mx.float16
+    assert gdn.in_proj_a.weight.dtype == mx.float16
+    assert gdn.dt_bias.dtype == mx.float16
+    assert gdn.A_log.dtype == mx.float32
+    assert attn.rotary_emb._inv_freq.dtype == mx.float32
+    assert gdn.in_proj_qkv.signs.dtype == mx.float32
+    assert gdn.in_proj_qkv._hadamard_key == gdn.in_proj_z._hadamard_key
+    assert attn.q_proj._hadamard_key == attn.k_proj._hadamard_key == attn.v_proj._hadamard_key
+    rev = numerics_revision_for_model(patched)
+    assert rev is not None and "fp16-recast" in rev
+
+    packed_linears = [
+        mod
+        for _, mod in patched.language_model.named_modules()
+        if isinstance(mod, prism_hadamard_verify._FastHadamardLinear)
+        and not isinstance(mod, prism_hadamard_verify._FastHadamardEmbedding)
+    ]
+    assert len(packed_linears) == 14
+
+    fwd_rotations = 0
+    orig_fwht = prism_hadamard_verify.signed_fwht
+
+    def count_fwht(x, signs, block, *, inverse=False):
+        nonlocal fwd_rotations
+        if not inverse:
+            fwd_rotations += 1
+        return orig_fwht(x, signs, block, inverse=inverse)
+
+    monkeypatch.setattr(prism_hadamard_verify, "signed_fwht", count_fwht)
+    oqh_modules._MEMO.entries.clear()
+
+    plain_cache = patched.language_model.make_cache()
+    plain_out = patched.language_model(tokens, cache=plain_cache).logits
+    mx.eval(plain_out)
+    assert plain_out.dtype == mx.float16
+    assert fwd_rotations == 9
+    del plain_out, plain_cache
+    gc.collect()
+    assert oqh_modules._MEMO.entries == []
+
+    fwd_rotations = 0
+    patched_cache = patched.language_model.make_cache()
+    qwen35_verify_qmm.set_verify_qmm_armed(True)
+    try:
+        out = patched.language_model(
+            tokens, cache=patched_cache, speculative_verify=True
+        ).logits
+        mx.eval(out, patched_cache[1].keys)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+
+    assert out.dtype == mx.float16
+    assert patched_cache[1].keys.dtype == mx.float16
+    assert fwd_rotations == 9
+    assert bool(
+        mx.array_equal(
+            mx.argmax(out, axis=-1), mx.argmax(stock_logits, axis=-1)
+        ).item()
+    )
+    del out, patched_cache
+    gc.collect()
+    assert oqh_modules._MEMO.entries == []
+
+    flipped = -gdn.in_proj_z.signs
+    patched.load_weights(
+        [("language_model.model.layers.0.linear_attn.in_proj_z.signs", flipped)],
+        strict=False,
+    )
+    assert gdn.in_proj_qkv._hadamard_key is None
+    assert gdn.in_proj_z._hadamard_key is None
+
+

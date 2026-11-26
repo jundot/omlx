@@ -136,9 +136,9 @@ def is_row_exact_armed() -> bool:
 
 
 def _fma_block(m: int, bits: int) -> str:
-    per = 8 if bits == 4 else 4
-    mask = "0xFu" if bits == 4 else "0xFFu"
-    shift = 4 if bits == 4 else 8
+    per = 8 if bits in (2, 4) else 4
+    mask = "0x3u" if bits == 2 else ("0xFu" if bits == 4 else "0xFFu")
+    shift = 2 if bits == 2 else (4 if bits == 4 else 8)
     lines = [f"for (int ki = 0; ki < {per}; ++ki) {{"]
     for j in range(4):
         lines.append(
@@ -148,7 +148,7 @@ def _fma_block(m: int, bits: int) -> str:
         for r in range(m):
             lines.append(
                 f"    acc[{j} * {m} + {r}] += "
-                f"float(v{r}[ki{'' if bits == 4 else ' + koff'}]) * w{j};"
+                f"float(v{r}[ki{'' if bits in (2, 4) else ' + koff'}]) * w{j};"
             )
     lines.append("}")
     return "\n            ".join(lines)
@@ -164,14 +164,19 @@ def _build_msg_kernel(m: int, bits: int, group_size: int, dtype, nsg: int):
     xloads = "\n            ".join(
         f"Vec8 v{r} = xv[({r} * K + k_base) / 8];" for r in range(m)
     )
-    if bits == 4:
-        pack_setup = """
+    if bits in (2, 4):
+        word_expr = (
+            "uint32_t(((const device ushort*)w_q)[(n0 + {j}) * K_by_p + pack])"
+            if bits == 2
+            else "w_q[(n0 + {j}) * K_by_p + pack]"
+        )
+        loads = "\n            ".join(
+            f"uint32_t p{j} = {word_expr.format(j=j)};" for j in range(4)
+        )
+        pack_setup = f"""
             int k_base = pack * 8;
             int gi = k_base / GS;
-            uint32_t p0 = w_q[(n0 + 0) * K_by_p + pack];
-            uint32_t p1 = w_q[(n0 + 1) * K_by_p + pack];
-            uint32_t p2 = w_q[(n0 + 2) * K_by_p + pack];
-            uint32_t p3 = w_q[(n0 + 3) * K_by_p + pack];
+            {loads}
         """
         body = f"""
         for (int pack = int(lane); pack < K_by_p; pack += 32) {{
@@ -186,7 +191,7 @@ def _build_msg_kernel(m: int, bits: int, group_size: int, dtype, nsg: int):
             float b2 = float(biases[(n0 + 2) * K_by_gs + gi]);
             float b3 = float(biases[(n0 + 3) * K_by_gs + gi]);
             _Pragma("unroll")
-            {_fma_block(m, 4)}
+            {_fma_block(m, bits)}
         }}
         """
     else:
@@ -229,7 +234,7 @@ def _build_msg_kernel(m: int, bits: int, group_size: int, dtype, nsg: int):
 
         int K = int(K_size);
         int N = int(N_size);
-        int K_by_p = {"K / 8" if bits == 4 else "K / 8"};
+        int K_by_p = K / 8;
         int K_by_gs = K / GS;
         int n0 = (int(tg_n) * NSG + int(sg)) * 4;
         if (n0 + 3 >= N) {{ return; }}
@@ -278,9 +283,16 @@ def _pack_block(m: int, bits: int, sfx: str) -> str:
     lines = [f"int k_base{sfx} = {p} * 8;", f"int gi{sfx} = k_base{sfx} / GS;"]
     for r in range(m):
         lines.append(f"Vec8 v{sfx}_{r} = xv[({r} * K + k_base{sfx}) / 8];")
-    if bits == 4:
+    if bits in (2, 4):
+        mask = "0x3u" if bits == 2 else "0xFu"
+        shift = 2 if bits == 2 else 4
         for j in range(4):
-            lines.append(f"uint32_t p{sfx}_{j} = w_q[(n0 + {j}) * K_by_p + {p}];")
+            if bits == 2:
+                lines.append(
+                    f"uint32_t p{sfx}_{j} = uint32_t(((const device ushort*)w_q)[(n0 + {j}) * K_by_p + {p}]);"
+                )
+            else:
+                lines.append(f"uint32_t p{sfx}_{j} = w_q[(n0 + {j}) * K_by_p + {p}];")
         for j in range(4):
             lines.append(
                 f"float s{sfx}_{j} = float(scales[(n0 + {j}) * K_by_gs + gi{sfx}]);"
@@ -293,7 +305,7 @@ def _pack_block(m: int, bits: int, sfx: str) -> str:
                 f"    float s = s{sfx}_{j};",
                 f"    float b = b{sfx}_{j};",
                 "    for (int ki = 0; ki < 8; ++ki) {",
-                "        float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;",
+                f"        float wv = float((packed >> (ki * {shift})) & {mask}) * s + b;",
             ]
             for r in range(m):
                 block.append(
@@ -813,13 +825,13 @@ def sg8_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> b
     if _m1_route(M, K, N, bits, group_size, dtype):
         return False
     nsg, ct = _sg8_geometry(int(K), int(N))
+    min_rows = 2 if int(bits) == 2 else _SG8_MIN_ROWS
     return (
         # The operand holds 128 + q exactly only up to 7-bit codes.
         int(bits) in (2, 3, 4, 5, 6)
         and int(group_size) in (32, 64, 128)
         and dtype in (mx.bfloat16, mx.float16)
-        # Two or three rows stay on split-K, which is faster there in context.
-        and _SG8_MIN_ROWS <= int(M) <= 8
+        and min_rows <= int(M) <= 8
         and int(K) % (int(group_size) * nsg) == 0
         and int(N) % (8 * ct) == 0
         and int(N) >= _MIN_SG8_ROUTE_N
@@ -1054,14 +1066,12 @@ def vk_qmm(x2, w_q, scales, biases, *, bits: int, group_size: int):
 def vk_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
     import mlx.core as mx
 
-    # M >= 3: at M=2 (depth-1 verify) the dispatch overhead eats the GPU win
-    # AND skipping it keeps depth-1 greedy output bit-identical to the
-    # unrouted path. Depth >= 2 verifies at M >= 3 where the kernels pay.
+    min_rows = 2 if int(bits) == 2 else 3
     return (
-        int(bits) in (4, 8)
+        int(bits) in (2, 4, 8)
         and int(group_size) in (32, 64, 128)
         and dtype in (mx.bfloat16, mx.float16)
-        and 3 <= int(M) <= 6
+        and min_rows <= int(M) <= 6
         and int(K) % 64 == 0
         and int(N) % 4 == 0
         and int(N) >= _MIN_ROUTE_N
@@ -1078,9 +1088,12 @@ _QL_PATCHED = False
 def _sg8_group_source(ns: tuple, bits: tuple, half: bool = False) -> str:
     """One launch for projections sharing x; matrix i owns tiles [E_{i-1}, E_i).
 
-    Matrices may mix 4- and 5-bit storage; the branch is uniform per
+    Matrices may mix 2-, 4- and 5-bit storage; the branch is uniform per
     threadgroup.
     """
+    pair2 = _operand_bits(
+        "((w0 >> (2 * j)) & 0x3u) | (((w1 >> (2 * j)) & 0x3u) << 16)", half
+    )
     pair4 = _operand_bits("((w0 >> (4 * j)) & 0x000F000Fu)", half)
     pair5 = _operand_bits(
         "((w0 >> (5 * j)) & 0x1Fu) | (((w1 >> (5 * j)) & 0x1Fu) << 16)", half
@@ -1139,6 +1152,10 @@ def _sg8_group_source(ns: tuple, bits: tuple, half: bool = False) -> str:
             uint w0, w1 = 0;
             if (wbits == 4) {{
                 w0 = ((const device uint*)(wg + qd * 16))[fn >> 1];
+            }} else if (wbits == 2) {{
+                uint packed16 = uint(((const device ushort*)(wg + qd * 8))[fn >> 1]);
+                w0 = packed16;
+                w1 = packed16 >> 8;
             }} else {{
                 const device uint* wp = (const device uint*)(wg + qd * 20);
                 uint at = (fn >> 1) * 5;
@@ -1155,7 +1172,7 @@ def _sg8_group_source(ns: tuple, bits: tuple, half: bool = False) -> str:
                 xsum += float2(float(xa), float(xb));
                 uint pair = wbits == 4
                     ? {pair4}
-                    : {pair5};
+                    : (wbits == 2 ? {pair2} : {pair5});
                 simdgroup_matrix<T, 8, 8> a, b;
                 a.thread_elements()[0] = as_type<T>(ushort(pair));
                 a.thread_elements()[1] = as_type<T>(ushort(pair >> 16));
@@ -1216,7 +1233,7 @@ def sg8_group_eligible(linears, x) -> bool:
             isinstance(linear, nn.QuantizedLinear)
             and getattr(linear, "mode", "affine") == "affine"
             and "bias" not in linear
-            and int(linear.bits) in (4, 5)
+            and int(linear.bits) in (2, 4, 5)
             and linear.group_size == first.group_size
             and linear.weight.shape[1] * 32 // linear.bits == K
             and linear.scales.shape[0] % 8 == 0
@@ -1225,8 +1242,11 @@ def sg8_group_eligible(linears, x) -> bool:
             and linear.biases.dtype == x.dtype
         ):
             return False
+    min_rows = (
+        2 if all(int(linear.bits) == 2 for linear in linears) else _SG8_MIN_ROWS
+    )
     return (
-        _SG8_MIN_ROWS <= rows <= 8
+        min_rows <= rows <= 8
         and int(first.group_size) in (32, 64, 128)
         and K % (int(first.group_size) * _SG8_GROUP_NSG) == 0
         and max(linear.scales.shape[0] for linear in linears) >= _MIN_MMA_ROUTE_N
@@ -1583,7 +1603,7 @@ def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
     if m1:
         return m1
     if sg8_eligible(rows, K, N, bits, group_size, dtype):
-        if rows < _SG8_SINGLE_MIN_ROWS_NAX and is_nax_available():
+        if int(bits) != 2 and rows < _SG8_SINGLE_MIN_ROWS_NAX and is_nax_available():
             return None
         return "sg8"
     if skinny_eligible(rows, K, N, bits, group_size, dtype):

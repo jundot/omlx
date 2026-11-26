@@ -19,6 +19,10 @@ from ..patches.inkling2.loader import is_mlx_vlm_quantization, mlx_vlm_quantizat
 from ..patches.inkling2.loopcd import apply_loopcd
 from ..patches.inkling2.model import TextArgs
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
+from ..patches.prism_hadamard_verify import (
+    PRISM_HADAMARD_MODEL_TYPE,
+    apply_prism_hadamard_patch,
+)
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
 
@@ -783,10 +787,19 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
-    if for_vlm and model_type in {"qwen3_5", "qwen3_5_moe", "qwen4_exp"}:
+    if for_vlm and model_type in {
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen4_exp",
+        PRISM_HADAMARD_MODEL_TYPE,
+    }:
         from ..patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
 
         apply_qwen35_ssm_mask_patch()
+
+    if for_vlm and model_type == PRISM_HADAMARD_MODEL_TYPE:
+        if apply_prism_hadamard_patch():
+            logger.info("Prism Hadamard verify patch applied for %s", model_name)
 
     if for_vlm and model_type == "qwen3_5":
         from ..patches.mlx_vlm_qwen35_base_compat import (
@@ -1274,6 +1287,7 @@ def maybe_apply_pre_load_patches(
     if for_vlm and (
         str(model_type or "").startswith("qwen3_5")
         or str(text_model_type or "").startswith("qwen3_5")
+        or model_type == PRISM_HADAMARD_MODEL_TYPE
     ):
         try:
             from ..patches.qwen35_gdn_prework import apply_qwen35_vlm_qk_norm_patch
