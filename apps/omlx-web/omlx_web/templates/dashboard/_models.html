@@ -1440,11 +1440,12 @@
                                 </div>
                                 <!-- Estimated Memory + BPW + Output Size (below the form row) -->
                                 <div x-show="oqSelectedModelPath" x-cloak class="mt-3 pt-3 border-t border-neutral-100">
-                                    <div class="text-xs text-neutral-400 flex items-center flex-wrap gap-y-1">
+                                    <div x-show="!oqEstimateError" class="text-xs text-neutral-400 flex items-center flex-wrap gap-y-1">
                                         <span class="inline-flex items-center gap-1.5"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg><span x-text="window.t('models.oq.estimated_memory').replace('{value}', oqEstimatedMemory())"></span></span>
                                         <span class="inline-flex items-center gap-1.5 ml-5"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg><span x-text="oqEstimatedBpw() ? window.t('models.oq.effective_bpw').replace('{value}', oqEstimatedBpw()) : window.t('models.oq.calculating')"></span></span>
                                         <span class="inline-flex items-center gap-1.5 ml-5"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg><span x-text="oqEstimatedOutputSize() ? window.t('models.oq.estimated_output_size').replace('{value}', oqEstimatedOutputSize()) : window.t('models.oq.calculating')"></span></span>
                                     </div>
+                                    <p x-show="oqEstimateError" x-text="oqEstimateError" role="status" class="text-xs text-amber-700"></p>
                                 </div>
                                 <!-- Enhanced quantization (oQe) -->
                                 <div class="mt-4 border-t border-neutral-100 pt-3 space-y-3">

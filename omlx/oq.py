@@ -45,6 +45,7 @@ try:
     from omlx.patches.inkling2 import apply_inkling2_patch
     from omlx.patches.inkling2 import oq_layout as inkling2_layout
     from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
+    from omlx.utils.model_loading import _nextn_weight_prefixes_from_config
 
     HAS_MLX = True
 except ImportError:
@@ -372,8 +373,8 @@ def _validate_v41_oq_settings(oq_level, dtype="bfloat16", group_size=64):
         raise ValueError(
             f"DeepSeek V4.1 does not support oQ{oq_level:g}/oQ{oq_level:g}e. "
             "Choose oQ2, oQ2.5, oQ2.7, oQ3 or oQ4, with or without e. oQ4 "
-            "preserves the original FP4/FP8 projection precision, and every "
-            "level quantizes Engram tables to 4 bits."
+            "preserves the original FP4/FP8 projection precision, and Auto "
+            "quantizes Engram tables to 4 bits at every level."
         )
     if dtype != "bfloat16" or group_size != 64:
         raise ValueError(
@@ -1164,17 +1165,94 @@ def _qwen_ple_scale_key(weight_key):
     return weight_key.split(".ngram_embedding.", 1)[0] + ".ngram_embedding.weight_scale"
 
 
+def _declared_engram_layers(config):
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        text = config
+    if _is_qwen4_exp_config(config):
+        layers = text.get("ple_layer_ids", ())
+        first_layer = 1
+    elif _is_v41_engram_config(config):
+        layers = config.get("engram_layer_ids", text.get("engram_layer_ids", ()))
+        first_layer = 0
+    elif config.get("model_type") == "hy_v4_flash":
+        layers = text.get("engram_layer_ids", ())
+        first_layer = 1
+    else:
+        return ()
+    if layers is None:
+        return ()
+    if not isinstance(layers, (tuple, list)) or any(
+        type(layer) is not int or layer < first_layer for layer in layers
+    ):
+        raise ValueError("Invalid Engram layer IDs in the model configuration")
+    return layers
+
+
+def _check_engram_table_coverage(weights, config):
+    """Check declared layer/shard slots independently of the checkpoint index."""
+    layers = _declared_engram_layers(config)
+    if not layers:
+        return
+    if _is_qwen4_exp_config(config):
+        text = config.get("text_config") or config
+        parts = text.get("split_ngram_parts", 128)
+        if type(parts) is not int or parts < 1:
+            raise ValueError("Qwen PLE split_ngram_parts must be a positive integer")
+        pattern = (
+            r"\.layers\.(\d+)\.ple\.ple_embedding\.ngram_embedding"
+            r"\.shard(?:_|s\.)(\d+)\.weight$"
+        )
+        expected = {(layer - 1, part) for layer in layers for part in range(parts)}
+    elif _is_v41_engram_config(config):
+        pattern = r"\.layers\.(\d+)\.engram\.embed\.weight$"
+        expected = {(layer,) for layer in layers}
+    else:
+        pattern = (
+            r"\.layers\.(\d+)\.engram_layer\.multi_head_embedding\.embedding\.weight$"
+        )
+        expected = {(layer - 1,) for layer in layers}
+
+    found = set()
+    for key in weights:
+        match = re.search(pattern, "." + key)
+        if match is None:
+            raise ValueError(f"Unexpected Engram table key: {key}")
+        slot = tuple(map(int, match.groups()))
+        if slot not in expected:
+            raise ValueError(f"Engram table is not declared in the model config: {key}")
+        if slot in found:
+            raise ValueError(f"Duplicate Engram table for {key}")
+        found.add(slot)
+    if missing := expected - found:
+        first = min(missing)
+        raise ValueError(
+            f"Missing {len(missing)} Engram table(s) from the index; "
+            f"first missing layer/shard (zero-based): {first}"
+        )
+
+
 def _engram_source_tensors(source, config):
     from .patches.deepseek_v41.residency import header_with_offset
 
     def header(path):
-        stat = path.stat()
-        entries, offset = header_with_offset(str(path), stat.st_size, stat.st_mtime_ns)
-        return entries, offset, stat.st_size
+        try:
+            stat = path.stat()
+            entries, offset = header_with_offset(
+                str(path), stat.st_size, stat.st_mtime_ns
+            )
+            return entries, offset, stat.st_size
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Cannot read Engram shard {path.name}: {exc}") from exc
 
     index = source / "model.safetensors.index.json"
     if index.is_file():
-        mapping = json.loads(index.read_text())["weight_map"]
+        try:
+            mapping = json.loads(index.read_text())["weight_map"]
+            if not isinstance(mapping, dict):
+                raise ValueError("weight_map must be an object")
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid Engram checkpoint index: {exc}") from exc
     else:
         mapping = {
             key: file.name
@@ -1187,6 +1265,7 @@ def _engram_source_tensors(source, config):
         for key in mapping
         if key.endswith(".weight") and _is_offload_table_tensor(key, config)
     ]
+    _check_engram_table_coverage(weights, config)
     companions = set()
     for key in weights:
         base = key.removesuffix(".weight")
@@ -1199,22 +1278,52 @@ def _engram_source_tensors(source, config):
     tensors = {}
     headers = {}
     for key in sorted(set(weights) | (companions & mapping.keys())):
-        file = source / mapping[key]
-        if file not in headers:
-            headers[file] = header(file)
-        entries, offset, file_size = headers[file]
-        entry = entries[key]
-        start, end = entry["data_offsets"]
-        if not 0 <= start < end <= file_size - offset:
-            raise ValueError(f"Invalid Engram tensor offsets: {key}")
+        try:
+            file = source / mapping[key]
+            if file not in headers:
+                headers[file] = header(file)
+            entries, offset, file_size = headers[file]
+            entry = entries[key]
+            start, end = entry["data_offsets"]
+            shape, dtype = tuple(entry["shape"]), entry["dtype"]
+            if not isinstance(dtype, str):
+                raise ValueError("invalid dtype")
+            if not all(type(dim) is int and dim > 0 for dim in shape):
+                raise ValueError("invalid shape")
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or not 0 <= start < end <= file_size - offset
+            ):
+                raise ValueError("invalid data offsets")
+            item_sizes = {
+                "BF16": 2,
+                "F16": 2,
+                "F32": 4,
+                "U32": 4,
+                "I8": 1,
+                "U8": 1,
+            }
+            item_size = item_sizes.get(dtype)
+            if dtype.startswith(("F8_E4M3", "F8_E8M0")):
+                item_size = 1
+            if item_size and math.prod(shape) * item_size != end - start:
+                raise ValueError("shape and stored byte count disagree")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid Engram tensor {key}: {exc}") from exc
         tensors[key] = _StoredEngramTensor(
-            file, entry["dtype"], tuple(entry["shape"]), offset + start, end - start
+            file, dtype, shape, offset + start, end - start
         )
     return weights, tensors
 
 
 def detect_engram_table_precision(model_path, config=None) -> dict:
     """Inspect the indexed tables and their scale layouts without loading weights."""
+    from .patches.deepseek_v41.storage import (
+        ENGRAM_FP8_SCALE_DTYPES,
+        ENGRAM_FP8_WEIGHT_DTYPES,
+    )
+
     source = Path(model_path)
     if config is None:
         config = json.loads((source / "config.json").read_text())
@@ -1231,6 +1340,7 @@ def detect_engram_table_precision(model_path, config=None) -> dict:
         return result
     precisions = set()
     modes = {"8": set(), "16": set()}
+    auto_affine = True
     float_types = {"BF16": "bf16", "F16": "fp16", "F32": "fp32"}
     for key in weights:
         tensor = tensors[key]
@@ -1273,9 +1383,10 @@ def detect_engram_table_precision(model_path, config=None) -> dict:
                     mode8 = "preserve_fp8"
                 if (
                     v41
+                    and dtype in ENGRAM_FP8_WEIGHT_DTYPES
                     and not (bias or inv_scale)
                     and scale
-                    and scale.dtype.startswith("F8_E8M0")
+                    and scale.dtype in ENGRAM_FP8_SCALE_DTYPES
                     and width % 32 == 0
                     and scale.shape == (rows, width // 32)
                 ):
@@ -1292,6 +1403,7 @@ def detect_engram_table_precision(model_path, config=None) -> dict:
             ):
                 precision = "mxfp4"
         precisions.add(precision)
+        auto_affine &= mode8 is not None and shape[-1] % 32 == 0
         modes["8"].add(mode8)
         modes["16"].add(mode16)
     result["source_precision"] = precisions.pop() if len(precisions) == 1 else "mixed"
@@ -1301,6 +1413,7 @@ def detect_engram_table_precision(model_path, config=None) -> dict:
         if len(options) == 1 and None not in options
     }
     result["available"].extend(result["modes"])
+    result["auto_affine"] = auto_affine
     result["tensors"] = tensors
     return result
 
@@ -1314,17 +1427,37 @@ def resolve_engram_precision(
             f"Invalid Engram precision {requested!r}. "
             f"Must be one of {_ENGRAM_PRECISION_CHOICES}"
         )
-    if preserve_ngram_table and _is_v41_engram_config(config):
-        return {"mode": "preserve", "tensors": {}}
-    if requested == "auto":
-        mode = (
-            "preserve"
-            if preserve_ngram_table and _is_qwen4_exp_config(config)
-            else "auto"
-        )
-        return {"mode": mode, "tensors": {}}
+    v41 = _is_v41_engram_config(config)
+    qwen = _is_qwen4_exp_config(config)
+    if (
+        requested == "auto"
+        and not preserve_ngram_table
+        and not _declared_engram_layers(config)
+    ):
+        return {"mode": "auto", "tensors": {}}
 
     detected = detect_engram_table_precision(model_path, config)
+    if preserve_ngram_table and (v41 or qwen):
+        modes = detected.get("modes", {})
+        mode = next(
+            (
+                candidate
+                for candidate in ("preserve_fp8", "preserve")
+                if candidate in modes.values()
+            ),
+            None,
+        )
+        if mode is None:
+            raise ValueError(
+                "Cannot retain Engram tables in this checkpoint's stored format"
+            )
+        return {"mode": mode, "tensors": detected["tensors"]}
+
+    if requested == "auto":
+        if v41 and not detected.get("auto_affine"):
+            raise ValueError("Auto cannot quantize this DeepSeek V4.1 Engram layout")
+        return {"mode": "auto", "tensors": {}}
+
     mode = detected.get("modes", {}).get(requested)
     if mode is None:
         raise ValueError(
@@ -4374,12 +4507,34 @@ def make_predicate(config: dict, oq_level: int = 4) -> Callable:
     return predicate
 
 
+def _estimate_mtp_donor_bytes(source: Path, config: dict, donor: Path) -> int:
+    donor_config = json.loads((donor / "config.json").read_text())
+    assistant = donor_config.get("model_type") in GEMMA4_ASSISTANT_TYPES.values()
+    if assistant:
+        validate_gemma4_assistant_pair(config, donor_config)
+    else:
+        validate_mtp_donor_pair(source, donor)
+    mapping = _shard_key_map(donor)
+    if not assistant:
+        mapping = {
+            key: shard for key, shard in mapping.items() if _strip_mtp_key_prefix(key)
+        }
+    if not mapping:
+        raise ValueError(f"No MTP tensors found in donor model: {donor}")
+    index = _LazyTensorIndex({donor / shard for shard in mapping.values()})._index
+    return sum(index[key][3] - index[key][2] for key in mapping)
+
+
 def estimate_bpw_and_size(
     model_path: str,
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
+    *,
+    text_only: bool = False,
+    dtype: str = "bfloat16",
+    mtp_assistant_model_path: str = "",
     engram_precision: str = "auto",
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
@@ -4396,6 +4551,10 @@ def estimate_bpw_and_size(
             source bytes, as ``quantize_oq_streaming`` stores them.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
+        text_only: Omit vision and audio tensors from the output.
+        dtype: Output dtype used by the streaming exporter.
+        mtp_assistant_model_path: Add the donor head's stored bytes to the
+            output size. Effective bpw describes the weights priced by oQ.
 
     Returns:
         Dict with effective_bpw, output_size_bytes, output_size_formatted.
@@ -4404,6 +4563,21 @@ def estimate_bpw_and_size(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+
+    if not isinstance(config, dict):
+        raise ValueError("Model config.json must be an object")
+    if dtype not in OQ_DTYPES:
+        raise ValueError(f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}")
+    _validate_oq_dtype_for_model(config, dtype)
+    if preserve_ngram_table and not _is_v41_engram_config(config):
+        raise ValueError(
+            "Keeping the original Engram tables is only available for DeepSeek V4.1"
+        )
+    engram_plan = resolve_engram_precision(
+        source, config, engram_precision, preserve_ngram_table
+    )
+    if text_only and decision_kind(source, config) == "d3":
+        raise ValueError("Decision 3.0 requires its vision encoder")
 
     weight_files = _source_weight_files(source)
     if not weight_files:
@@ -4419,19 +4593,28 @@ def estimate_bpw_and_size(
         if not _checkpoint_has_mtp_weights(source):
             preserve_mtp = False
 
+    donor_bytes = 0
+    if mtp_assistant_model_path:
+        if preserve_mtp:
+            raise ValueError(
+                "Preserving MTP and combining an MTP head are mutually exclusive"
+            )
+        donor_bytes = _estimate_mtp_donor_bytes(
+            source, config, Path(mtp_assistant_model_path)
+        )
+
     if config.get("model_type") == "deepseek_v41":
         from .patches.deepseek_v41.oq import source_budget
 
-        _validate_v41_oq_settings(oq_level, group_size=group_size)
+        _validate_v41_oq_settings(oq_level, dtype, group_size)
+        if text_only:
+            raise ValueError("V4.1 oQ export currently preserves the vision encoder")
         if "omlx_deepseek_v41" in config:
             raise ValueError("V4.1 quantization requires the original checkpoint")
         mapping = json.loads((source / "model.safetensors.index.json").read_text())[
             "weight_map"
         ]
-        plan = resolve_engram_precision(
-            source, config, engram_precision, preserve_ngram_table
-        )
-        engram_bits = _engram_output_bits(plan["mode"], oq_level)
+        engram_bits = _engram_output_bits(engram_plan["mode"], oq_level)
         budget = source_budget(
             source,
             config,
@@ -4488,13 +4671,16 @@ def estimate_bpw_and_size(
     # model as fp16 passthrough (15.8 bpw for a 4-bit run). Falls back to
     # the raw header names when discovery is unavailable.
     plan_view = None
+    cast_predicate = None
     try:
         _sanitize_fn = _build_model_sanitizer(
             config,
+            text_only=text_only,
             model_path=source,
             preserve_mtp=preserve_mtp,
         )
         if _sanitize_fn is not None:
+            cast_predicate = getattr(_sanitize_fn, "_omlx_cast_predicate", None)
             _plan = _discover_sanitize_plan(_sanitize_fn, idx)
             if _plan:
                 plan_view = _DiscoveredPlan(_plan, idx)
@@ -4507,13 +4693,13 @@ def estimate_bpw_and_size(
             if info.get("transform") == "literal":
                 continue
             shape = tuple(info.get("shape") or ())
-            dtype = info.get("dtype")
+            tensor_dtype = info.get("dtype")
             sources = info.get("sources") or []
-            if dtype is None and len(sources) == 1:
+            if tensor_dtype is None and len(sources) == 1:
                 src_meta = logical.get(sources[0])
                 if src_meta is not None:
-                    dtype = src_meta[1]
-            planned_logical[out_name] = (shape, dtype)
+                    tensor_dtype = src_meta[1]
+            planned_logical[out_name] = (shape, tensor_dtype)
         if planned_logical:
             logical = planned_logical
 
@@ -4521,6 +4707,14 @@ def estimate_bpw_and_size(
         if plan_view is not None:
             return plan_view.source_quant_info(name)
         return idx.source_quant_info(name)
+
+    nextn_prefixes = _nextn_weight_prefixes_from_config(config)
+    logical = {
+        name: meta
+        for name, meta in logical.items()
+        if not _should_skip_tensor(name, preserve_mtp, text_only=text_only)
+        and (preserve_mtp or not name.startswith(nextn_prefixes))
+    }
 
     named_shapes = {}
     for name, (shape, _dtype) in logical.items():
@@ -4533,9 +4727,6 @@ def estimate_bpw_and_size(
     # the per-tensor pricing loop below (the flag changes which predicate
     # branch answers).
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
-    engram_plan = resolve_engram_precision(
-        source, config, engram_precision, preserve_ngram_table
-    )
     engram_mode = engram_plan["mode"]
     engram_copies = _engram_copy_targets(
         engram_plan["tensors"], plan_view._plan if plan_view is not None else None
@@ -4595,9 +4786,6 @@ def estimate_bpw_and_size(
         for d in shape:
             n_elements *= d
 
-        if _should_skip_tensor(name, preserve_mtp=preserve_mtp):
-            continue
-
         if name in engram_copies:
             tensor_bytes = engram_copies[name].size
             total_params += n_elements
@@ -4605,23 +4793,14 @@ def estimate_bpw_and_size(
             total_output_bytes += tensor_bytes
             continue
 
-        if not _should_quantize_tensor(name, shape):
-            total_params += n_elements
-            total_weighted_bits += n_elements * 16
-            total_output_bytes += n_elements * 2
-            continue
-
-        bits, gs, _mode = _get_predicate_bits(
-            name, config, oq_level, group_size, engram_mode
-        )
-        if bits is None:
-            total_params += n_elements
-            total_weighted_bits += n_elements * 16
-            total_output_bytes += n_elements * 2
-            continue
-
         total_params += n_elements
-        src_info = _source_quant_info(name)
+        bits, gs, mode = (None, None, None)
+        if _should_quantize_tensor(name, shape):
+            bits, gs, mode = _get_predicate_bits(
+                name, config, oq_level, group_size, engram_mode
+            )
+
+        src_info = _source_quant_info(name) if bits is not None else None
         if src_info is not None and bits >= src_info["bits"]:
             # Passthrough: packed weight at source bits plus one e8m0
             # uint8 scale byte per group.
@@ -4629,25 +4808,28 @@ def estimate_bpw_and_size(
             n_groups = shape[-1] // src_info["group_size"]
             tensor_bytes = (n_elements * src_info["bits"] + 7) // 8
             tensor_bytes += rows * n_groups
-            total_output_bytes += tensor_bytes
-            total_weighted_bits += tensor_bytes * 8
-        elif len(shape) >= 2:
-            n_groups = (shape[-1] + gs - 1) // gs
+        elif bits is not None and shape[-1] % gs == 0:
+            n_groups = shape[-1] // gs
             rows = n_elements // max(shape[-1], 1)
             weight_bytes = (n_elements * bits + 7) // 8
-            if _mode == "mxfp4":
+            if mode == "mxfp4":
                 bytes_per_group = 1
-            elif _mode == "mxfp8":
+            elif mode == "mxfp8":
                 bytes_per_group = 2
             else:
                 bytes_per_group = 4
             overhead_bytes = rows * n_groups * bytes_per_group
             tensor_bytes = weight_bytes + overhead_bytes
-            total_output_bytes += tensor_bytes
-            total_weighted_bits += tensor_bytes * 8
         else:
-            total_output_bytes += n_elements * 2
-            total_weighted_bits += n_elements * 16
+            cast = cast_predicate is None or cast_predicate(name)
+            fp32 = (
+                _oq_media_output_is_fp32(name, dtype == "float16")
+                if cast
+                else _dtype is not None and _dtype in ("F32", mx.float32)
+            )
+            tensor_bytes = n_elements * (4 if fp32 else 2)
+        total_output_bytes += tensor_bytes
+        total_weighted_bits += tensor_bytes * 8
 
     for k in ("_oq_use_budget_plan", "_oq_boost_map", "_oq_sensitivity_map"):
         config.pop(k, None)
@@ -4670,6 +4852,7 @@ def estimate_bpw_and_size(
             effective_bpw += 0.3 * _down_boost
             total_output_bytes = int(effective_bpw * total_params / 8)
 
+    total_output_bytes += donor_bytes
     source_total = sum(sf.stat().st_size for sf in _source_weight_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
@@ -5011,17 +5194,12 @@ _SKIP_QUANT_PATTERNS = (
 )
 
 
-def _should_skip_tensor(name: str, preserve_mtp: bool = False) -> bool:
-    """Check if a tensor should be completely excluded from output.
-
-    By default mtp.* tensors are stripped because mlx-lm's stock sanitize()
-    removes them when the model has no MTP head. When ``preserve_mtp`` is
-    True the caller has stashed mtp.* tensors around the sanitize call and
-    re-merged them, so we must keep them in the output shards.
-    """
-    if ".mtp." in name or name.startswith("mtp."):
-        return not preserve_mtp
-    return False
+def _should_skip_tensor(
+    name: str, preserve_mtp: bool = False, *, text_only: bool = False
+) -> bool:
+    return (not preserve_mtp and _is_mtp_tensor(name)) or (
+        text_only and (_is_vision_tensor(name) or _is_audio_tensor(name))
+    )
 
 
 def _is_mtp_tensor(name: str) -> bool:
@@ -5137,14 +5315,16 @@ def _should_quantize_tensor(name: str, shape: tuple) -> bool:
     return True
 
 
+def _oq_media_output_is_fp32(name: str, fp16: bool) -> bool:
+    return fp16 and (_is_vision_tensor(name) or _is_audio_tensor(name))
+
+
 def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
     """Cast an unquantized output tensor to its storage dtype."""
     if not mx.issubdtype(w_mx.dtype, mx.floating):
         return w_mx
 
-    if target_dtype == mx.float16 and (
-        _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
-    ):
+    if _oq_media_output_is_fp32(tensor_name, target_dtype == mx.float16):
         if w_mx.dtype != mx.float32:
             return w_mx.astype(mx.float32)
         return w_mx
@@ -8477,6 +8657,12 @@ def quantize_oq_streaming(
                 processed_bytes += tensor_bytes
                 continue
 
+            # Hy4 SSD storage uses BF16 for dense Engram and affine metadata.
+            storage_dtype = (
+                mx.bfloat16
+                if _is_hy_v4_engram_table(tensor_name, config)
+                else target_dtype
+            )
             if _should_quantize_tensor(tensor_name, shape) and not (
                 engram_mode in ("preserve", "preserve_fp8")
                 and _is_offload_table_tensor(tensor_name, config)
@@ -8494,10 +8680,6 @@ def quantize_oq_streaming(
                     # Cast to target dtype before quantize: scales/biases inherit
                     # the input dtype, which drives inference speed on Apple
                     # Silicon (M1/M2 prefer float16, M3/M4 handle both).
-                    storage_dtype = target_dtype
-                    if _is_hy_v4_engram_table(tensor_name, config):
-                        # Hy4's SSD loader requires BF16 scales and biases.
-                        storage_dtype = mx.bfloat16
                     if (
                         mx.issubdtype(w_mx.dtype, mx.floating)
                         and w_mx.dtype != storage_dtype
@@ -8538,11 +8720,13 @@ def quantize_oq_streaming(
                         per_layer_config[base] = layer_cfg
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
-                        w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
+                        w_mx = _cast_passthrough_tensor(
+                            tensor_name, w_mx, storage_dtype
+                        )
                     out_shard_data[tensor_name] = w_mx
             else:
                 if cast_predicate is None or cast_predicate(tensor_name):
-                    w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
+                    w_mx = _cast_passthrough_tensor(tensor_name, w_mx, storage_dtype)
                 out_shard_data[tensor_name] = w_mx
 
             del w_mx

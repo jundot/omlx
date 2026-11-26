@@ -164,6 +164,8 @@ def source_engram_tables(mapping, config):
                 raise ValueError(
                     f"Packed Engram table without a declared quantization: {prefix}"
                 )
+            if scale_key not in mapping:
+                raise ValueError(f"Missing Engram scales for affine table: {prefix}")
             if mapping[bias_key] != mapping[scale_key]:
                 raise ValueError(f"Engram metadata must share one shard: {prefix}")
         tables[mapped(prefix)] = {

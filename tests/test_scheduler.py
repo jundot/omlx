@@ -7125,6 +7125,62 @@ class TestBatchGeneratorAllTokens:
         assert scheduled == [request]
 
 
+class TestRequestSeedStream:
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("seeded_row", ["running", "requeued", "finished"])
+    def test_unseeded_insert_after_seeded_request(
+        self, mock_model, mock_tokenizer, chunked, seeded_row
+    ):
+        helper = TestBatchGeneratorAllTokens()
+
+        def insert_then_draw(scheduler, request):
+            cache = [MagicMock()]
+            helper._queue_request(
+                scheduler,
+                request,
+                prompt_tokens=[11, 12],
+                remaining_tokens=[12],
+                cached_tokens=1,
+                prompt_cache=cache,
+            )
+            if chunked:
+                scheduler.waiting.clear()
+                state = SimpleNamespace(
+                    cache=cache,
+                    last_token=[12],
+                    sampler=MagicMock(),
+                    sm=MagicMock(),
+                    per_row_lps=[],
+                )
+                scheduler._insert_prefilled_request(request, state, [])
+            else:
+                scheduler._schedule_waiting()
+            return mx.random.categorical(mx.zeros((8, 100_000))).tolist()
+
+        def seeded_then_unseeded():
+            scheduler = helper._make_scheduler(mock_model, mock_tokenizer)
+            seeded, unseeded = (
+                Request(f"r{seed}", [11, 12], SamplingParams(max_tokens=4, seed=seed))
+                for seed in (1234, None)
+            )
+            first = insert_then_draw(scheduler, seeded)
+            if seeded_row == "requeued":
+                scheduler.running.clear()
+                seeded.status = RequestStatus.WAITING
+                seeded.requeued_output_tokens = 1
+            elif seeded_row == "finished":
+                scheduler.running.clear()
+                seeded.set_finished(RequestStatus.FINISHED_STOPPED)
+            return first, insert_then_draw(scheduler, unseeded)
+
+        seeded_draws, unseeded_draws = zip(
+            *(seeded_then_unseeded() for _ in range(2)), strict=True
+        )
+
+        assert seeded_draws[0] == seeded_draws[1]
+        assert (unseeded_draws[0] == unseeded_draws[1]) is (seeded_row != "finished")
+
+
 class TestDetectNeedsThinkPrefix:
     """Tests for _detect_needs_think_prefix() method.
 

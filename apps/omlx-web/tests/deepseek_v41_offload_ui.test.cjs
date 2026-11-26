@@ -103,6 +103,7 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
         assert.ok(catalog['models.oq.engramPrecisionHelp']);
     }
     let catalog = loadCatalog('en.json');
+    let lastEstimateOptions, lastStartOptions;
     const oqContext = {
         localStorage: {getItem: () => null},
         window: {t: key => catalog[key] ?? key},
@@ -112,10 +113,12 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
         clearTimeout: () => {},
         fetch: async (url, init) => {
             if (init) {
-                requests.push(JSON.parse(init.body).engram_precision);
+                lastStartOptions = JSON.parse(init.body);
+                requests.push(lastStartOptions.engram_precision);
                 return {ok: false, json: async () => ({detail: 'stop'})};
             }
-            const precision = new URLSearchParams(url.split('?')[1]).get('engram_precision');
+            lastEstimateOptions = Object.fromEntries(new URLSearchParams(url.split('?')[1]));
+            const precision = lastEstimateOptions.engram_precision;
             if (precision === 'auto') {
                 return new Promise(resolve => { firstEstimate = resolve; });
             }
@@ -160,12 +163,19 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
     app.oqRefreshEstimate();
     const stale = estimateCallback();
     app.oqEngramPrecision = '16';
+    app.oqDtype = 'float16';
     vm.runInNewContext('with (app) { ' + effect + ' }', {app});
     await estimateCallback();
     firstEstimate({ok: true, json: async () => ({output_size_bytes: 4})});
     await stale;
     assert.equal(app.oqEstimate.output_size_bytes, 16);
     await app.startOQQuantization();
+    for (const [key, value] of Object.entries(lastEstimateOptions)) {
+        assert.equal(String(lastStartOptions[key]), value, key);
+    }
+    assert.equal(lastEstimateOptions.engram_precision, '16');
+    assert.equal(lastEstimateOptions.dtype, 'float16');
+    assert.ok(!('preserve_ngram_table' in lastEstimateOptions));
 
     app.oqSelectedModelPath = 'v41';
     app.oqApplyModelPolicy();
@@ -183,4 +193,69 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
         await app.startOQQuantization();
     }
     assert.deepEqual(requests, ['16', '8', 'auto', 'auto', 'auto']);
+})().catch(error => {console.error(error); process.exitCode = 1});
+
+(async () => {
+    let pending;
+    const queries = [];
+    const alpineContext = vm.createContext({
+        window: {t: k => k, Element: class {}},
+        document: {createElement: () => ({})},
+        MutationObserver: class {},
+        queueMicrotask: () => {},
+        localStorage: {getItem: () => null},
+        URLSearchParams,
+        console,
+        setTimeout: callback => { pending = callback; return 1; },
+        clearTimeout: () => { pending = null; },
+        fetch: async url => {
+            const query = Object.fromEntries(new URLSearchParams(url.split('?')[1]));
+            queries.push(query);
+            if (query.mtp_assistant_model_path === 'incompatible') {
+                return {ok: false, json: async () => ({detail: 'Donor mismatch'})};
+            }
+            return {ok: true, json: async () => ({output_size_bytes: queries.length})};
+        },
+    });
+    const js = path.join(root, 'omlx_web/static/js');
+    vm.runInContext(fs.readFileSync(path.join(js, 'alpine.min.js'), 'utf8'), alpineContext);
+    alpineContext.queueMicrotask = queueMicrotask;
+    vm.runInContext(fs.readFileSync(path.join(js, 'dashboard.js'), 'utf8'), alpineContext);
+    const app = alpineContext.window.Alpine.reactive(alpineContext.dashboard());
+    app.oqModels = [{path: 'source', model_type: 'qwen3_5', has_mtp_heads: true}];
+    app.oqAllModels = ['donor', 'incompatible'].map(path => ({
+        path, model_type: 'qwen3_5', has_mtp_heads: true,
+    }));
+    app.oqSelectedModelPath = 'source';
+    const html = fs.readFileSync(path.join(root,
+        'omlx_web/templates/dashboard/_models.html'), 'utf8');
+    const effect = html.match(/x-effect="([^"\n]*oqRefreshEstimate[^"\n]*)"/)[1];
+    const runEffect = vm.runInNewContext(`(app) => { with (app) { ${effect} } }`);
+    alpineContext.window.Alpine.effect(() => runEffect(app));
+    async function refreshed() {
+        await new Promise(setImmediate);
+        assert.equal(typeof pending, 'function', 'Option change must refresh the estimate');
+        const run = pending;
+        pending = null;
+        await run();
+        return queries.at(-1);
+    }
+
+    await refreshed();
+    const mtpClick = html.match(/@click="([^"\n]*oqPreserveMtp = !oqPreserveMtp)"/)[1];
+    vm.runInNewContext(`with (app) { ${mtpClick} }`, {app});
+    assert.equal((await refreshed()).preserve_mtp, 'true');
+    app.oqPreserveMtp = false;
+    app.oqDtype = 'float16';
+    assert.equal((await refreshed()).dtype, 'float16');
+    app.oqTextOnly = true;
+    assert.equal((await refreshed()).text_only, 'true');
+    app.oqMtpAssistantPath = 'incompatible';
+    await refreshed();
+    assert.equal(app.oqEstimate, null);
+    assert.equal(app.oqEstimateError, 'Donor mismatch');
+    app.oqMtpAssistantPath = 'donor';
+    assert.equal((await refreshed()).mtp_assistant_model_path, 'donor');
+    assert.equal(app.oqEstimateError, '');
+    console.log('PASS: every oQ output option refreshes the size estimate');
 })().catch(error => {console.error(error); process.exitCode = 1});

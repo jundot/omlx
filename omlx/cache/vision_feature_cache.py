@@ -196,6 +196,14 @@ class VisionFeatureSSDCache:
             features: Evaluated mx.array (or list of mx.array for multi-image).
             grid: Optional per-image patch grid ``[t, h, w]``.
         """
+        if not self._features_finite(features):
+            logger.warning(
+                "Refusing to cache non-finite vision features for %s (%s)",
+                model_name,
+                image_hash[:16],
+            )
+            return
+
         model_name = self._model_key(model_name)
         key = _composite_key(model_name, image_hash)
 
@@ -288,6 +296,11 @@ class VisionFeatureSSDCache:
         if isinstance(features, (list, tuple)):
             return sum(int(f.nbytes) for f in features)
         return int(features.nbytes)
+
+    @staticmethod
+    def _features_finite(features: mx.array | list[mx.array]) -> bool:
+        tensors = features if isinstance(features, (list, tuple)) else [features]
+        return mx.stack([mx.isfinite(t).all() for t in tensors]).all().item()
 
     # ── SSD persistence ─────────────────────────────────────────────
 
@@ -443,6 +456,9 @@ class VisionFeatureSSDCache:
                             "Missing tensor %s in %s", tensor_key, file_path
                         )
                         return None
+
+            if not self._features_finite(features):
+                raise ValueError("cached vision features contain NaN or Inf")
 
             # Update access time
             with self._ssd_lock:

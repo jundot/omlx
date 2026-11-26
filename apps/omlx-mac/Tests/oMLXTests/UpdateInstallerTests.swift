@@ -106,6 +106,24 @@ final class UpdateInstallerTests: XCTestCase {
         )
     }
 
+    func testRunProcessDrainsBothPipesBeforeExit() throws {
+        let byteCount = 262_144
+        let script = #"""
+        alarm 5;
+        print STDERR "e" x $ARGV[0];
+        print "o" x $ARGV[0];
+        exit 23;
+        """#
+        let result = try UpdateInstaller.runProcess(
+            "/usr/bin/perl",
+            arguments: ["-e", script, String(byteCount)]
+        )
+
+        XCTAssertEqual(result.status, 23)
+        XCTAssertTrue(result.stdout == String(repeating: "o", count: byteCount))
+        XCTAssertTrue(result.stderr == String(repeating: "e", count: byteCount))
+    }
+
     private func makeBundle(name: String, marker: String) throws -> URL {
         let bundle = temporaryDirectory.appendingPathComponent(name)
         try FileManager.default.createDirectory(

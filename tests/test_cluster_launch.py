@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import io
+import itertools
 import json
 import platform
 import signal
@@ -1825,7 +1826,7 @@ def test_supervisor_reaps_remote_ranks_escalates_to_sigkill(monkeypatch, tmp_pat
         script = command.split("python3 -c ", 1)[1]
         import shlex as _shlex
 
-        script = _shlex.split(script)[0]
+        script = _shlex.split(script)[0].replace("monotonic()+3.0", "monotonic()+0.2")
         result = subprocess.run(
             [sys.executable, "-c", script],
             capture_output=True,
@@ -2064,6 +2065,9 @@ def test_supervisor_stop_raises_and_keeps_state_when_group_survives(
         lambda pgid, sig: signals.append((pgid, sig)),
     )
     monkeypatch.setattr(supervisor, "_sweep_rank_leftovers", lambda **_kw: [])
+    monkeypatch.setattr(
+        launch, "read_remote_marker", lambda *_a, **_k: (None, None, None, "")
+    )
 
     with pytest.raises(launch.DistributedTeardownError) as excinfo:
         supervisor.stop()
@@ -2232,6 +2236,13 @@ def test_teardown_sweep_reports_an_unkillable_rank(tmp_path, monkeypatch):
         launch,
         "read_remote_marker",
         lambda *_a, **_k: (None, None, None, ""),
+    )
+
+    clock = itertools.count()
+    monkeypatch.setattr(
+        launch,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda _seconds: None),
     )
 
     failures = supervisor._sweep_rank_leftovers(kill_grace=0.01)

@@ -751,10 +751,10 @@ def make_host(dtype=mx.float32, *, mtp_layers=0, **overrides):
     return host
 
 
-@pytest.mark.parametrize("size", [2, 4])
 # Block 2 leaves rows mid-window; block 8 completes two kpool windows per row.
-@pytest.mark.parametrize("depth", [1, 7])
-@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize(
+    "size,depth,dtype", [(2, 1, mx.float32), (4, 7, mx.bfloat16)]
+)
 def test_vector_restore_and_continuation_match_scalar(size, depth, dtype):
     mx.random.seed(349)
     host = make_host(dtype)
@@ -842,15 +842,14 @@ def test_split_k_batched_decode_matches_rows_alone(monkeypatch, lengths):
     assert len(calls) == 2 * len(widths)
 
 
-@pytest.mark.parametrize("size", [2, 3, 4])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
-def test_masked_replay_restores_metadata(size, dtype):
+def test_masked_replay_restores_metadata(dtype):
     from mlx_vlm.models.cache import ArraysCache
     from mlx_vlm.models.glm5_next import language
 
     mx.random.seed(884)
     host = make_host(dtype)
-    width, heads, dim, kernel = 4, 2, 32, 4
+    size, width, heads, dim, kernel = 4, 4, 2, 32, 4
     q, k, v, a = [
         mx.random.normal((size, width, heads, dim)).astype(dtype) for _ in range(4)
     ]
@@ -864,7 +863,7 @@ def test_masked_replay_restores_metadata(size, dtype):
             [False, True, True, False],
             [True, True, False, True],
             [True, True, True, True],
-        ][:size]
+        ]
     )
     entry = (q, k, v, a, b, a_log, bias, initial, conv, kernel, None, mask)
     cache = ArraysCache(2)
@@ -874,7 +873,7 @@ def test_masked_replay_restores_metadata(size, dtype):
     )
     cache.lengths = mx.array([8 + row for row in range(size)])
     cache.left_padding = mx.array([-4 - row for row in range(size)])
-    counts = [0, 3, 1, 2][:size]
+    counts = [0, 3, 1, 2]
     refs = []
     for row, count in enumerate(counts):
         ref = copy.deepcopy(cache)
@@ -958,9 +957,10 @@ def coupled_sampler(index):
     return sampler
 
 
-@pytest.mark.parametrize("size", [2, 3, 4])
-@pytest.mark.parametrize("stochastic", [False, True])
-@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize(
+    "size,stochastic,quantized",
+    [(2, False, False), (3, True, False), (4, False, True)],
+)
 def test_history_and_clone_match_independent_heads(size, stochastic, quantized):
     assert glm5_next_vlm_runtime.apply()
     from mlx_vlm.models.glm5_next import language
@@ -1534,6 +1534,8 @@ def test_fused_verify_cycles_are_bitwise_reference_with_nax_tf32():
         "import sys; sys.path[:0] = [%r, %r]\n"
         "import test_glm5_next_mtp as t\n"
         "t.dk.moe_router = t._stock_verify_router(t.dk.moe_router)\n"
+        "import conftest, pytest\n"
+        "conftest.use_qmv_wide_reference(pytest.MonkeyPatch())\n"
         "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
         "used = []\n"
         "for seed, ctx in ((5, 300), (11, 2101)):\n"

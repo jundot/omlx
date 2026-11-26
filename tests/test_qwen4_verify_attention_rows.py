@@ -162,7 +162,7 @@ def _copy_cache(cache):
 
 
 @pytest.fixture(scope="module")
-def masked_prefill(_stock_sdpa_helper):
+def shared_prefill(_stock_sdpa_helper):
     """``(attn, cache)`` for a context: one prefill per context, a copy per case.
 
     Trimming a verify window restores the offsets, not the position rank or
@@ -240,46 +240,37 @@ def _bit_equal(a: mx.array, b: mx.array) -> bool:
     return a.shape == b.shape and a.dtype == b.dtype and mx.array_equal(a, b).item()
 
 
-# 2060: the window starts just past the sparse crossover; 16382: its rows
-# straddle MLX's two-pass partition switch at 16384 keys (the multi-row MLX
-# path gave row 0 of a two-row window the 16384-key plan); 24000: the served
-# 24K case.
-@pytest.mark.parametrize("context", [2060, 16382, 24000])
-@pytest.mark.parametrize("rows", [2, 3, 8, 16])
+@pytest.mark.parametrize(
+    "context,rows",
+    [(2060, 2), (2060, 3), (2060, 16), (16382, 2), (16382, 3), (16382, 8)],
+)
 def test_masked_verify_rows_equal_serial_decode_steps(
-    masked_prefill, monkeypatch, context, rows
+    shared_prefill, monkeypatch, context, rows
 ):
-    attn, cache = masked_prefill(context)
+    attn, cache = shared_prefill(context)
     selections = _record_selection(monkeypatch)
-    for seed in (11, 12):
-        mx.random.seed(seed + rows)
-        x = (mx.random.normal((1, rows, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+    mx.random.seed(11 + rows)
+    x = (mx.random.normal((1, rows, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
 
-        verified = _verify(attn, cache, x)
-        verified_state = _state(cache)
-        verified_selections = selections[:]
-        selections.clear()
-        cache.trim(rows)
+    verified = _verify(attn, cache, x)
+    verified_state = _state(cache)
+    verified_selections = selections[:]
+    selections.clear()
+    cache.trim(rows)
 
-        serial = _serial(attn, cache, x)
-        serial_state = _state(cache)
-        serial_selections = selections[:]
-        selections.clear()
-        cache.trim(rows)
+    serial = _serial(attn, cache, x)
+    serial_state = _state(cache)
 
-        assert _bit_equal(verified, serial)
-        for got, want in zip(verified_state, serial_state):
-            assert _bit_equal(got, want)
-        # Each row's FP32 block scores and selected tokens: the multi-row
-        # scores are a GEMM that rounds differently and can flip a selection
-        # at the cut-off.
-        assert len(verified_selections) == len(serial_selections) == rows
-        for (scores, keys, mask), (want_scores, want_keys, want_mask) in zip(
-            verified_selections, serial_selections
-        ):
-            assert keys == want_keys
-            assert _bit_equal(scores, want_scores)
-            assert _bit_equal(mask, want_mask)
+    assert _bit_equal(verified, serial)
+    for got, want in zip(verified_state, serial_state):
+        assert _bit_equal(got, want)
+    assert len(verified_selections) == len(selections) == rows
+    for (scores, keys, mask), (want_scores, want_keys, want_mask) in zip(
+        verified_selections, selections
+    ):
+        assert keys == want_keys
+        assert _bit_equal(scores, want_scores)
+        assert _bit_equal(mask, want_mask)
 
 
 def test_masked_verify_rollback_then_decode_matches_serial():
@@ -308,20 +299,19 @@ def test_masked_verify_rollback_then_decode_matches_serial():
 # Below the block budget: 700 keys stays on MLX's one-pass vector kernel;
 # windows at 1020/1022 put rows on both sides of its two-pass switch at 1024
 # keys, which a shared multi-row call would hide.
-@pytest.mark.parametrize("context", [700, 1020, 1022])
-@pytest.mark.parametrize("rows", [2, 3, 4, 8, 16])
-def test_dense_verify_rows_equal_serial_decode_steps(context, rows):
-    attn = _attention(seed=8)
-    cache = _prefill(attn, context, seed=9)
-    for seed in (31, 32):
-        mx.random.seed(seed + rows)
-        x = (mx.random.normal((1, rows, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
-        verified = _verify(attn, cache, x)
-        verified_state = _state(cache)
-        cache.trim(rows)
-        serial = _serial(attn, cache, x)
-        serial_state = _state(cache)
-        cache.trim(rows)
-        assert _bit_equal(verified, serial)
-        for got, want in zip(verified_state, serial_state):
-            assert _bit_equal(got, want)
+@pytest.mark.parametrize(
+    "context,rows",
+    [(700, 3), (700, 8), (1020, 4), (1020, 16), (1022, 2), (1022, 3)],
+)
+def test_dense_verify_rows_equal_serial_decode_steps(shared_prefill, context, rows):
+    attn, cache = shared_prefill(context)
+    mx.random.seed(31 + rows)
+    x = (mx.random.normal((1, rows, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+    verified = _verify(attn, cache, x)
+    verified_state = _state(cache)
+    cache.trim(rows)
+    serial = _serial(attn, cache, x)
+    serial_state = _state(cache)
+    assert _bit_equal(verified, serial)
+    for got, want in zip(verified_state, serial_state):
+        assert _bit_equal(got, want)

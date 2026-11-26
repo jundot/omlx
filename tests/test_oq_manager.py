@@ -873,7 +873,23 @@ async def test_v41_preserve_ngram_table_names_output_and_reaches_export(
     source = tmp_path / "DeepSeek-V4.1"
     source.mkdir()
     (source / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
-    (source / "model.safetensors").write_bytes(bytes(64))
+    key = "layers.1.engram.embed"
+    header = {
+        f"{key}.weight": {
+            "dtype": "F8_E4M3",
+            "shape": [2, 32],
+            "data_offsets": [0, 64],
+        },
+        f"{key}.scale": {
+            "dtype": "F8_E8M0",
+            "shape": [2, 1],
+            "data_offsets": [64, 66],
+        },
+    }
+    encoded = json.dumps(header).encode()
+    (source / "model.safetensors").write_bytes(
+        len(encoded).to_bytes(8, "little") + encoded + bytes(66)
+    )
     calls = []
 
     def _fake_quantize(model_path, output_path, *args, **kwargs):
@@ -891,6 +907,10 @@ async def test_v41_preserve_ngram_table_names_output_and_reaches_export(
     assert task.output_name == "DeepSeek-V4.1-oQ4e-ngram"
     assert [call["preserve_ngram_table"] for call in calls] == [True]
     assert [call["engram_precision"] for call in calls] == ["auto"]
+    with pytest.raises(ValueError, match="Output directory already exists"):
+        await manager.start_quantization(
+            str(source), 4, enhanced=True, engram_precision="8"
+        )
 
 
 @pytest.mark.asyncio
@@ -1011,3 +1031,85 @@ class TestOQManagerUnreadableEntries:
         source_models, _ = await manager.list_quantizable_models()
 
         assert sorted(m["name"] for m in source_models) == ["Llama-3B", "Qwen-7B"]
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing shard", "missing tensor", "short tensor", "invalid config"]
+)
+def test_engram_source_errors_match_estimate_and_start(tmp_path, monkeypatch, damage):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from omlx.admin import routes
+
+    source = tmp_path / "Hy4"
+    source.mkdir()
+    config = {"model_type": "hy_v4_flash", "text_config": {"engram_layer_ids": [1]}}
+    (source / "config.json").write_text(
+        json.dumps([] if damage == "invalid config" else config)
+    )
+    key = "model.layers.0.engram_layer.multi_head_embedding.embedding.weight"
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "engram.safetensors"}})
+    )
+    if damage != "missing shard":
+        name = "other.weight" if damage == "missing tensor" else key
+        header = json.dumps(
+            {
+                name: {"dtype": "BF16", "shape": [2, 64], "data_offsets": [0, 128]},
+            }
+        ).encode()
+        (source / "engram.safetensors").write_bytes(
+            len(header).to_bytes(8, "little") + header + bytes(128)
+        )
+
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[routes.require_admin] = lambda: True
+    manager = OQManager([str(tmp_path)])
+    monkeypatch.setattr(routes, "_oq_manager", manager)
+    options = {"model_path": str(source), "oq_level": 4, "engram_precision": "16"}
+    with TestClient(app) as client:
+        preview = client.get("/admin/api/oq/estimate", params=options)
+        start = client.post("/admin/api/oq/start", json=options)
+    assert preview.status_code == start.status_code == 400
+    assert preview.json()["detail"] == start.json()["detail"]
+    if damage != "invalid config":
+        assert key in start.json()["detail"]
+    else:
+        assert "config.json must be an object" in start.json()["detail"]
+    assert not manager._tasks
+
+
+@pytest.mark.parametrize(
+    ("model_type", "option", "expected"),
+    [
+        ("qwen4_exp", {"preserve_ngram_table": True}, "only available for DeepSeek"),
+        ("deepseek_v41", {"text_only": True}, "preserves the vision encoder"),
+        ("deepseek_v41", {"group_size": 32}, "group_size=64"),
+    ],
+)
+def test_engram_api_routes_reject_the_same_incompatible_options(
+    tmp_path, monkeypatch, model_type, option, expected
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from omlx.admin import routes
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    (tmp_path / "model.safetensors").write_bytes(bytes(64))
+
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[routes.require_admin] = lambda: True
+    manager = OQManager([str(tmp_path)])
+    monkeypatch.setattr(routes, "_oq_manager", manager)
+    options = {"model_path": str(tmp_path), "oq_level": 4, **option}
+    with TestClient(app) as client:
+        preview = client.get("/admin/api/oq/estimate", params=options)
+        start = client.post("/admin/api/oq/start", json=options)
+    assert preview.status_code == start.status_code == 400
+    assert preview.json()["detail"] == start.json()["detail"]
+    assert expected in start.json()["detail"]
+    assert not manager._tasks

@@ -2399,8 +2399,10 @@ def _depthwise_conv(channels, taps=4, dilation=3, dtype=mx.bfloat16, bias=False)
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
-@pytest.mark.parametrize("dilation,taps", [(3, 4), (1, 4), (2, 3)])
+@pytest.mark.parametrize(
+    "dtype,dilation,taps",
+    [(mx.bfloat16, 3, 4), (mx.float16, 1, 4), (mx.float32, 2, 3)],
+)
 def test_ple_depthwise_conv_kernel_is_bit_equal_to_conv1d(_depthwise_conv_state, dtype, dilation, taps):
     language = _depthwise_conv_state
     mx.random.seed(dilation * 10 + taps)

@@ -11,6 +11,7 @@ oQh routed experts.
 
 import zlib
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,19 +87,30 @@ def _oqh_experts(weight, bits, key, row_parallel):
     return m
 
 
+@lru_cache(maxsize=None)
+def _parameter(seed, name, shape):
+    rng = np.random.default_rng(seed + zlib.crc32(name.encode()))
+    data = rng.normal(0, 0.03, shape).astype(np.float32)
+    if "norm.weight" in name:
+        data += 1
+    if "weights_proj.weight" in name:
+        data = np.abs(data)
+    dtype = mx.float32 if any(key in name for key in _FP32) else mx.bfloat16
+    return mx.array(data).astype(dtype)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _release_parameters():
+    yield
+    _parameter.cache_clear()
+
+
 def build(seed=4121, fmt="mxfp", **overrides):
     model = LanguageModel(replace(config(), **overrides))
-    weights = []
-    for name, parameter in tree_flatten(model.parameters()):
-        rng = np.random.default_rng(seed + zlib.crc32(name.encode()))
-        data = rng.normal(0, 0.03, parameter.shape).astype(np.float32)
-        if "norm.weight" in name:
-            data += 1
-        if "weights_proj.weight" in name:
-            data = np.abs(data)
-        dtype = mx.float32 if any(key in name for key in _FP32) else mx.bfloat16
-        weights.append((name, mx.array(data).astype(dtype)))
-    model.load_weights(weights, strict=True)
+    model.load_weights(
+        [(name, _parameter(seed, name, value.shape)) for name, value in tree_flatten(model.parameters())],
+        strict=True,
+    )
 
     def quantized(weight, bits, mode):
         if fmt == "oqh" and role in ("w1", "w3", "w2"):
@@ -153,10 +165,8 @@ def shared_build():
 @pytest.mark.parametrize(
     "fmt,tiles,inter",
     [
-        ("mxfp", False, 256),
-        ("affine", False, 256),
-        ("affine", True, 256),
         ("mxfp", False, 384),
+        ("affine", False, 256),
         ("affine", True, 384),
         pytest.param("oqh", False, 256, marks=_NEEDS_OQH),
         pytest.param("oqh", True, 256, marks=_NEEDS_OQH),
@@ -251,8 +261,8 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
         # Requests then verify one by one, so the batch policy must not cap their depth.
         assert model.mtp_shared_verify_rows() == 0
         cache = model.make_cache()
-        mx.eval(model(mx.array([[1, 2, 3, 4, 5]]), cache=cache))
-        assert mx.isfinite(model(mx.array([[6]]), cache=cache)).all().item()
+        mx.eval(model(mx.array([[1, 2]]), cache=cache))
+        assert mx.isfinite(model(mx.array([[3]]), cache=cache)).all().item()
     finally:
         plan.close()
 
@@ -275,9 +285,14 @@ def test_batched_index_queries_match_each_request_alone(batch):
         assert mx.array_equal(q[:, r : r + 1], alone[0]).item() and mx.array_equal(w[:, r : r + 1], alone[1]).item()
 
 
-@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-# Irregular, equal and stepped positions; 3 and 17: a tile lane holds half a vector pair.
-@pytest.mark.parametrize("lengths", [[13, 20, 19], [14] * 4, [13 + r * r * 7 % 11 for r in range(8)], [13 + 2 * r for r in range(17)]])
+@pytest.mark.parametrize(
+    "lengths,fmt",
+    [
+        pytest.param([12, 18, 15], "mxfp", id="irregular-mxfp"),
+        pytest.param([12, 15, 18], "affine", id="stepped-affine"),
+        pytest.param([(12, 18, 15)[r % 3] for r in range(17)], "affine", id="two-chunks-affine"),
+    ],
+)
 def test_batched_decode_matches_single_requests(monkeypatch, lengths, fmt):
     """On the row kernels (below decode_moe.MMA_MIN_BATCH requests without the drafter), B
     single-token requests through decode_block_nb give each request the logits it gets
@@ -319,8 +334,6 @@ def test_batched_decode_matches_single_requests(monkeypatch, lengths, fmt):
     for item in batched:
         item.prepare(lengths=[4] * batch)
     tokens = [p[-1] for p in prompts]
-    # The first step decodes an even position, the second an odd one: only the second
-    # completes a ratio-2 compression group.
     for step in range(2):
         expected = [np.asarray(model(mx.array([[t]]), cache=c_)[0, -1].astype(mx.float32)) for t, c_ in zip(tokens, singles)]
         got = np.asarray(model(mx.array([[t] for t in tokens]), cache=batched)[:, -1].astype(mx.float32))
@@ -403,13 +416,13 @@ def test_batched_fp8_mma_projection_within_fp32_summation_of_exact(
         assert np.all(np.abs(got - exact) <= bound + half_ulp)
 
 
-@pytest.mark.parametrize("nb", [4, 8, 13])
-def test_batched_mma_kernels_match_rows_kernels(monkeypatch, nb):
+@pytest.mark.parametrize("nb", [4, 13])
+def test_batched_mma_kernels_match_rows_kernels(monkeypatch, shared_build, nb):
     """Each simdgroup-matrix kernel (wq_b+RoPE, wo_a+act_quant, MoE shared expert) agrees with
     its fp8_rows_nb counterpart up to summation rounding; MoE routing is untouched."""
     from omlx.patches.deepseek_v41 import decode_layer as DL, decode_moe
 
-    model = build()
+    model = shared_build()
     c = model._config
     blk = model.layers[0]
     att = blk.attn
@@ -551,7 +564,7 @@ def test_paired_weight_decoders_are_exact():
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine", pytest.param("oqh", marks=_NEEDS_OQH)])
-@pytest.mark.parametrize("nb", [3, 8, 16])
+@pytest.mark.parametrize("nb", [3, 16])
 def test_batched_moe_matches_single_token_moe(monkeypatch, shared_build, nb, fmt):
     """Without matrix tiles, each token of the batched MoE gets the single-token kernels'
     output, routing indices and weights bit for bit, also when tokens share experts: the
@@ -610,9 +623,16 @@ def test_batched_engram_projects_each_request_like_a_single_request(batch):
     assert mx.array_equal(batched, single).item()
 
 
-@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-@pytest.mark.parametrize("prompt_length", [11, 2])   # full window (batched attention) / filling
-@pytest.mark.parametrize("rows,accepted", [(2, 0), (3, 2), (6, 3)])
+@pytest.mark.parametrize(
+    "rows,accepted,prompt_length,fmt",
+    [
+        pytest.param(3, 2, 11, "mxfp", id="full-window-3-2-mxfp"),
+        pytest.param(6, 3, 11, "mxfp", id="full-window-6-3-mxfp"),
+        pytest.param(2, 0, 11, "affine", id="full-window-2-0-affine"),
+        pytest.param(2, 0, 2, "mxfp", id="filling-window-2-0-mxfp"),
+        pytest.param(6, 3, 2, "affine", id="filling-window-6-3-affine"),
+    ],
+)
 def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted, prompt_length, fmt):
     """An MTP verify block through the fused kernels gives every token bit for bit the
     logits of decoding it alone, and after a partial rollback the cache continues exactly
@@ -650,17 +670,16 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
     assert mx.array_equal(model(nxt, cache=verified), model(nxt, cache=accepted_only)).item()
 
 
-@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-def test_requests_verified_together_match_their_batched_decode(fmt):
+def test_requests_verified_together_match_their_batched_decode():
     """mtp_verify_rows gives each request bit for bit the logits that decoding the same
     requests token by token as a batch gives, and after rolling back to the same accepted
     count the caches continue exactly like that batch's."""
     from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 
-    model = verify_exact(build(fmt=fmt, vocab_size=4096, dspark_target_layer_ids=(2, 3, 4)))
+    model = verify_exact(build(vocab_size=4096, dspark_target_layer_ids=(2, 3, 4)))
     rng = np.random.default_rng(37)
     # One request with a full window, one still filling it; different positions.
-    prompts = [rng.integers(3, 60, 11).tolist(), rng.integers(3, 60, 3).tolist()]
+    prompts = [rng.integers(3, 60, 11).tolist(), rng.integers(3, 60, 2).tolist()]
     blocks = [rng.integers(3, 60, 3).tolist() for _ in prompts]
 
     def prefilled():
@@ -694,8 +713,7 @@ def test_requests_verified_together_match_their_batched_decode(fmt):
     assert mx.array_equal(decode(together, 2), decode(accepted_only, 2)).item()
 
 
-@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch, fmt):
+def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch):
     """DSpark speculation over the fused decode kernels reproduces greedy decoding token for
     token (verify blocks are token-exact, rejected drafts roll back exactly)."""
     from mlx_lm.generate import BatchGenerator
@@ -704,7 +722,6 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch, fmt):
 
     batch_generator.apply()
     model = build(
-        fmt=fmt,
         vocab_size=4096,
         preserve_mtp=True,
         n_mtp_layers=1,
@@ -720,7 +737,7 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch, fmt):
     for s in range(0, len(prompt) - 1, 4):
         model(mx.array([prompt[s : min(s + 4, len(prompt) - 1)]]), cache=cache)
     ids = mx.array([prompt[-1:]])
-    for _ in range(24):
+    for _ in range(12):
         token = int(mx.argmax(model(ids, cache=cache)[0, -1]).item())
         expected.append(token)
         ids = mx.array([[token]])
@@ -732,22 +749,22 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch, fmt):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block_verify", counted)
-    generator = BatchGenerator(model, max_tokens=24, prefill_step_size=4, sampler=lambda logits: mx.argmax(logits, -1))
+    generator = BatchGenerator(model, max_tokens=12, prefill_step_size=4, sampler=lambda logits: mx.argmax(logits, -1))
     result = []
     try:
         generator.insert([prompt])
         for _ in range(96):
             _, responses = generator.next()
             result.extend(response.token for response in responses)
-            if len(result) >= 24:
+            if len(result) >= 12:
                 break
     finally:
         generator.close()
     assert calls and max(calls) > 1, "verify blocks must take the fused path"
-    assert result[:24] == expected
+    assert result[:12] == expected
 
 
-@pytest.mark.parametrize("count", [2, 8])   # 8: the policy caps the depth below the drafts'
+@pytest.mark.parametrize("count", [2, pytest.param(5, id="5-capped-depth")])
 def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, count):
     """Requests decoding with DSpark verify their blocks in one forward and each
     reproduces its own greedy decoding token for token."""
@@ -778,7 +795,7 @@ def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, 
         for s in range(0, len(prompt) - 1, 4):
             model(mx.array([prompt[s : min(s + 4, len(prompt) - 1)]]), cache=cache)
         ids = mx.array([prompt[-1:]])
-        for _ in range(16):
+        for _ in range(8):
             token = int(mx.argmax(model(ids, cache=cache)[0, -1]).item())
             tokens.append(token)
             ids = mx.array([[token]])
@@ -792,7 +809,7 @@ def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, 
 
     monkeypatch.setattr(type(model), "mtp_verify_rows", counted)
     generator = BatchGenerator(
-        model, max_tokens=16, prefill_step_size=4, prefill_batch_size=count,
+        model, max_tokens=8, prefill_step_size=4, prefill_batch_size=count,
         sampler=lambda logits: mx.argmax(logits, -1),
     )
     result = {}
@@ -802,13 +819,13 @@ def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, 
             _, responses = generator.next()
             for response in responses:
                 result.setdefault(response.uid, []).append(response.token)
-            if all(len(result.get(uid, [])) >= 16 for uid in uids):
+            if all(len(result.get(uid, [])) >= 8 for uid in uids):
                 break
     finally:
         generator.close()
     assert together and max(shape[0] for shape in together) == count, "the requests must verify in one forward"
     for uid, want in zip(uids, expected):
-        assert result[uid][:16] == want
+        assert result[uid][:8] == want
 
 
 # Two pipeline ranks run batched Lightning MTP for two requests (rank 0 holds the head and

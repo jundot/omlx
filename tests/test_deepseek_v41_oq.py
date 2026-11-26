@@ -2,6 +2,7 @@
 
 import json
 import math
+import shutil
 import struct
 
 import mlx.core as mx
@@ -83,23 +84,39 @@ def _tensor_bytes(path, key):
     return data[8 + length + start : 8 + length + end]
 
 
-def test_copied_fp8_engram_keeps_source_bytes_and_rows(tmp_path):
+@pytest.mark.parametrize("scale_suffix", ["scale", "scales"])
+def test_copied_fp8_engram_keeps_source_bytes_and_rows(tmp_path, scale_suffix):
     rng = np.random.default_rng(3)
     rows, width = 40, 64
     values = rng.integers(0, 256, (rows, width), dtype=np.uint8)
     values[(values & 0x7F) == 0x7F] = 0  # E4M3 NaN encodings
     scales = rng.integers(118, 136, (rows, width // 32), dtype=np.uint8)
+    scale_key = f"layers.1.engram.embed.{scale_suffix}"
     source = {
         "layers.1.engram.embed.weight": ("F8_E4M3", values.shape, values.tobytes()),
-        "layers.1.engram.embed.scale": ("F8_E8M0", scales.shape, scales.tobytes()),
+        scale_key: ("F8_E8M0", scales.shape, scales.tobytes()),
         "layers.1.attn_norm.weight": ("BF16", (width,), bytes(2 * width)),
     }
     _write_raw_safetensors(tmp_path / "source.safetensors", source)
     table = {
         "weight_file": "source.safetensors",
         "weight_key": "layers.1.engram.embed.weight",
-        "scale_key": "layers.1.engram.embed.scale",
+        "scale_key": scale_key,
     }
+    mapping = dict.fromkeys(source, "source.safetensors")
+    for bits, expected in (
+        (4, values.size // 2 + scales.size * 4),
+        (None, values.nbytes + scales.nbytes),
+    ):
+        budget = source_budget(
+            tmp_path,
+            {"model_type": "deepseek_v41"},
+            mapping,
+            preserve_mtp=False,
+            engram_bits=bits,
+        )
+        assert budget["engram"]["tensor_bytes"] == expected
+
     module = "language_model.layers.1.engram.embed"
     spec = copy_engram(
         tmp_path,
@@ -776,28 +793,33 @@ def test_official_oq3_refines_routed_expert_codes_in_place(tmp_path, monkeypatch
     tokens = mx.array([[3, 4, 5, 6, 7, 8, 9, 10], [9, 8, 7, 6, 5, 4, 3, 11]])
     monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
 
-    def export(name):
-        output = tmp_path / name
-        oq.quantize_oq_streaming(
-            str(source),
-            str(output),
-            3,
-            enhanced=True,
-            target_bpw=32,
-            hard_cap_bpw=32,
-            imatrix_num_samples=2,
-            imatrix_seq_length=8,
-            sensitivity_map_override={i: 1.0 for i in range(5)},
-        )
-        tensors = {}
+    real_refine = converter.refine_experts
+
+    def keep_unrefined_copy(source, destination, *args, **kwargs):
+        shutil.copytree(destination, tmp_path / "plain")
+        return real_refine(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(converter, "refine_experts", keep_unrefined_copy)
+    refined = tmp_path / "refined"
+    oq.quantize_oq_streaming(
+        str(source),
+        str(refined),
+        3,
+        enhanced=True,
+        target_bpw=32,
+        hard_cap_bpw=32,
+        imatrix_num_samples=2,
+        imatrix_seq_length=8,
+        sensitivity_map_override={i: 1.0 for i in range(5)},
+    )
+
+    def tensors(output):
+        loaded = {}
         for shard in output.glob("*.safetensors"):
-            tensors.update(mx.load(str(shard)))
-        return output, tensors
+            loaded.update(mx.load(str(shard)))
+        return loaded
 
-    refined, after = export("refined")
-    monkeypatch.setattr(converter, "refine_experts", lambda *a, **kw: None)
-    _, before = export("plain")
-
+    after, before = tensors(refined), tensors(tmp_path / "plain")
     report = json.loads((refined / "quantization_report.json").read_text())["refine"]
     assert report["status"] == "done" and report["tensors"] > 0
     assert report["after"] < report["before"]

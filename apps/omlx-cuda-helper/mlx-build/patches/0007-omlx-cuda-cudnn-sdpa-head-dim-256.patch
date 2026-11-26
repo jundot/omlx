@@ -5,11 +5,11 @@ of 637 ms on the float32 sheets the helper used before). Allow 256 for more than
 a single decode row keeps the path it had.
 
 diff --git a/mlx/backend/cuda/scaled_dot_product_attention.cpp b/mlx/backend/cuda/scaled_dot_product_attention.cpp
-index 2257609fb..8b8ed7a15 100644
+index 5dd2f9189..0ead290c6 100644
 --- a/mlx/backend/cuda/scaled_dot_product_attention.cpp
 +++ b/mlx/backend/cuda/scaled_dot_product_attention.cpp
-@@ -343,9 +343,11 @@ bool supports_sdpa_cudnn(
-     return false;
+@@ -406,9 +406,11 @@ bool supports_sdpa_cudnn(
+     }
    }
  
 -  // D_qk and D_v must be a multiple of 8 with maximum value 128.

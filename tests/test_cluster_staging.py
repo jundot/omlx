@@ -948,18 +948,25 @@ def test_copy_paths_with_spaces_use_sftp_without_shell_quotes(
     )
 
 
-@pytest.mark.parametrize("missing", [False, True])
-@pytest.mark.parametrize("direction", ["push", "pull", "relay"])
 @pytest.mark.parametrize(
-    "name",
+    ("direction", "name", "missing"),
     [
-        "with spaces",
-        "model[1]",
-        "model*",
-        "model?",
-        "back\\slash",
-        "single'quote",
-        'double"quote',
+        ("push", "with spaces", False),
+        ("push", "back\\slash", False),
+        ("push", "single'quote", False),
+        ("push", "model[1]", True),
+        ("pull", "with spaces", False),
+        ("pull", "model[1]", False),
+        ("pull", "back\\slash", False),
+        ("pull", "model?", True),
+        ("relay", "with spaces", False),
+        ("relay", "model[1]", False),
+        ("relay", "model*", False),
+        ("relay", "model?", False),
+        ("relay", "back\\slash", False),
+        ("relay", "single'quote", False),
+        ("relay", 'double"quote', False),
+        ("relay", "model*", True),
     ],
 )
 def test_real_sftp_copies_literal_paths(

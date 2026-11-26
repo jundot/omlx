@@ -44,7 +44,12 @@ from .oqh import (
     write_experts,
 )
 from .sharding import ShardWriter
-from .storage import TensorFile, decode_array
+from .storage import (
+    ENGRAM_FP8_SCALE_DTYPES,
+    ENGRAM_FP8_WEIGHT_DTYPES,
+    TensorFile,
+    decode_array,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +143,31 @@ def source_budget(
         with (source / filename).open("rb") as f:
             size = struct.unpack("<Q", f.read(8))[0]
             headers[filename] = json.loads(f.read(size))
-    params = output_bytes = draft_tensors = 0
+    tables = source_engram_tables(mapping, config)
     engram_params = engram_bytes = 0
+    engram_keys = set()
+    for table in tables.values():
+        weight_key = table["weight_key"]
+        info = headers[mapping[weight_key]][weight_key]
+        shape, dtype = info["shape"], info["dtype"]
+        count = math.prod(shape) * (2 if dtype in ("I8", "U8") else 1)
+        engram_params += count
+        if engram_bits is None:
+            for field in ("weight_key", "scale_key", "bias_key"):
+                key = table[field]
+                if key is not None:
+                    start, end = headers[mapping[key]][key]["data_offsets"]
+                    engram_bytes += end - start
+        else:
+            if len(shape) != 2 or shape[-1] % 32:
+                raise ValueError("Engram rows must divide into 32-channel groups")
+            engram_bytes += count * engram_bits // 8 + count // 32 * 4
+        engram_keys.update(
+            weight_key.removesuffix(".weight") + suffix
+            for suffix in (".weight", ".scale", ".scales", ".biases")
+        )
+
+    params = output_bytes = draft_tensors = 0
     for name, filename in mapping.items():
         if name.startswith("mtp."):
             if not preserve_mtp:
@@ -148,21 +176,10 @@ def source_budget(
         if text_only and name.startswith(("vision.", "aligner.", "image_")):
             continue
         info = headers[filename][name]
-        if ".engram.embed." in name and engram_bits is None:
-            engram_bytes += info["data_offsets"][1] - info["data_offsets"][0]
-            if name.endswith(".weight"):
-                engram_params += math.prod(info["shape"])
-            continue
-        if name.endswith(".scale"):
+        if name in engram_keys or name.endswith(".scale"):
             continue
         shape, dtype = info["shape"], info["dtype"]
         count = math.prod(shape) * (2 if dtype in ("I8", "U8") else 1)
-        if ".engram.embed." in name:
-            if len(shape) != 2 or shape[-1] % 32:
-                raise ValueError("Engram rows must divide into 32-channel groups")
-            engram_params += count
-            engram_bytes += count * engram_bits // 8 + count // 32 * 4
-            continue
         params += count
         if dtype.startswith("F8_E4M3"):
             output_bytes += (
@@ -336,12 +353,14 @@ def copy_engram(
         scales = located[1][2]
         rows, width = weight["shape"]
         if (
-            not weight["dtype"].startswith("F8_E4M3")
-            or not scales["dtype"].startswith("F8_E8M0")
+            weight["dtype"] not in ENGRAM_FP8_WEIGHT_DTYPES
+            or scales["dtype"] not in ENGRAM_FP8_SCALE_DTYPES
             or scales["shape"] != [rows, width // 32]
         ):
             raise ValueError("Only FP8 Engram tables with E8M0 block scales copy")
         mode = "mxfp8"
+    elif weight["dtype"] not in {"BF16", "F16", "F32"}:
+        raise ValueError("Only dense floating-point Engram tables copy without a scale")
     header, offset = {}, 0
     for name, _, entry, _, length in located:
         header[f"{module_name}.{name}"] = {

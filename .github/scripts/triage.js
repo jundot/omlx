@@ -37,6 +37,19 @@ const PR_CLOSE_TAIL =
   "This isn't a judgment on the change. If you'd like to continue, rebase on current `main` and open a new PR. " +
   `See ${POLICY} for the policy.`;
 
+const TEMPLATE_URL = 'https://github.com/jundot/omlx/blob/main/.github/pull_request_template.md';
+const TLDR_SINCE = Date.parse('2026-11-25T08:08:53Z');
+const TLDR_GRACE_MS = 5 * 60 * 1000;
+const TLDR_LABEL = 'needs-tldr';
+const TLDR_BOX = 'I wrote the TL;DR myself. No AI wrote or edited it.';
+const TLDR_CLOSE_TAIL =
+  `Fix the description with the [PR template](${TEMPLATE_URL}) and this PR reopens automatically. ` +
+  'The TL;DR and the tick must come from the author, not from an AI. See #5646.';
+const CHECKLIST_BOXES = [
+  ['CONTRIBUTING.md', '"I read CONTRIBUTING.md"'],
+  ['I understand every change', '"I understand every change in this PR and can explain it in review"'],
+];
+
 const OPEN_PRS_QUERY = `
 query($owner: String!, $repo: String!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
@@ -72,8 +85,37 @@ query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) { pullRequest(number: $number) { mergeable } }
 }`;
 
+const PR_QUERY = `
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      id number state isDraft body createdAt authorAssociation
+      author { __typename }
+      labels(first: 20) { nodes { name } }
+    }
+  }
+}`;
+
+const DRAFT_MUTATION =
+  'mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { pullRequest { isDraft } } }';
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const labelNames = (node) => node.labels.nodes.map((l) => l.name);
+
+const ticked = (body, phrase) =>
+  body.split('\n').some((line) => /^\s*[-*]\s*\[x\]/i.test(line) && line.includes(phrase));
+
+function tldrText(body) {
+  const match = /^##[ \t]+TL;DR[ \t]*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/im.exec(body.replace(/<!--[\s\S]*?-->/g, ''));
+  return match ? match[1].trim() : '';
+}
+
+function tldrProblem(body) {
+  const box = ticked(body, TLDR_BOX) ? null : `the box "${TLDR_BOX}" is not ticked`;
+  if (tldrText(body)) return box;
+  if (!box) return 'the TL;DR section at the top of the description is missing or empty';
+  return `the TL;DR section is missing or empty and ${box}`;
+}
 
 module.exports = async ({ github, context, core }) => {
   const { owner, repo } = context.repo;
@@ -132,10 +174,7 @@ module.exports = async ({ github, context, core }) => {
     if (comments.some((c) => c.body?.includes(LARGE_PR_MARKER))) return;
     const lines = pr.additions + pr.deletions;
     await scheduledWrite('draft large PR', `move PR #${pr.number} to draft (${lines} lines, ${pr.authorAssociation})`, async () => {
-      await github.graphql(
-        'mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { pullRequest { isDraft } } }',
-        { id: pr.id },
-      );
+      await github.graphql(DRAFT_MUTATION, { id: pr.id });
       await comment(pr.number, LARGE_PR_MESSAGE);
     });
   }
@@ -150,6 +189,53 @@ module.exports = async ({ github, context, core }) => {
     pr.author?.__typename === 'Bot' ||
     pr.authorAssociation === 'OWNER' ||
     labelNames(pr).some((l) => PR_EXEMPT_LABELS.includes(l));
+
+  async function onPullRequest() {
+    const { number } = context.payload.pull_request;
+    const fetchPr = async () => (await github.graphql(PR_QUERY, { owner, repo, number })).repository.pullRequest;
+    const skipped = (pr) => pr.state === 'MERGED' || prExempt(pr) || Date.parse(pr.createdAt) < TLDR_SINCE;
+
+    let pr = await fetchPr();
+    const wait = Date.parse(pr.createdAt) + TLDR_GRACE_MS - Date.now();
+    if (wait > 0 && !skipped(pr)) {
+      core.info(`PR #${number} was just opened, checking it in ${Math.ceil(wait / 1000)} s`);
+      await sleep(wait);
+      pr = await fetchPr();
+    }
+    if (skipped(pr)) return;
+    const body = pr.body.replace(/\r\n/g, '\n');
+
+    const problem = tldrProblem(body);
+    if (problem) {
+      if (pr.state !== 'OPEN') return;
+      await scheduledWrite('close PR (TL;DR)', `close PR #${pr.number}: ${problem}`, async () => {
+        await comment(pr.number, `Closing this PR because ${problem}. ${TLDR_CLOSE_TAIL}`);
+        await addLabel(pr.number, TLDR_LABEL);
+        await github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'closed' });
+      });
+      return;
+    }
+
+    if (labelNames(pr).includes(TLDR_LABEL)) {
+      await scheduledWrite('reopen PR (TL;DR)', `reopen PR #${pr.number}`, async () => {
+        if (pr.state === 'CLOSED') await github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'open' });
+        await removeLabel(pr.number, TLDR_LABEL);
+      });
+    } else if (pr.state === 'CLOSED') {
+      return;
+    }
+
+    const boxes = CHECKLIST_BOXES.filter(([phrase]) => !ticked(body, phrase)).map(([, name]) => name);
+    if (pr.isDraft || boxes.length === 0) return;
+    await scheduledWrite('draft PR (checklist)', `move PR #${pr.number} to draft (checklist)`, async () => {
+      await github.graphql(DRAFT_MUTATION, { id: pr.id });
+      await comment(
+        pr.number,
+        `This PR has been moved to draft because ${boxes.join(' and ')} ${boxes.length > 1 ? 'are' : 'is'} ` +
+          'not ticked in the checklist. Tick the missing boxes yourself, then mark the PR ready for review.',
+      );
+    });
+  }
 
   function prIdleDays(pr, now) {
     const last = pr.commits.nodes[0]?.commit.committedDate;
@@ -283,5 +369,6 @@ module.exports = async ({ github, context, core }) => {
   }
 
   if (context.eventName === 'issue_comment') return onIssueComment();
+  if (context.eventName === 'pull_request_target') return onPullRequest();
   return daily();
 };

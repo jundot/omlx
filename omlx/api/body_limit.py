@@ -69,6 +69,7 @@ class RequestBodySizeLimitMiddleware:
             response = JSONResponse(
                 status_code=413,
                 content={
+                    "type": "error",
                     "error": {
                         "message": (
                             "Request body exceeds the maximum allowed size "

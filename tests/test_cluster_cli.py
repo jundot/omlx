@@ -7,6 +7,15 @@ import sys
 
 import pytest
 
+from omlx import cli
+
+
+def _run_in_process(monkeypatch, *args):
+    monkeypatch.setattr(sys, "argv", ["omlx", "cluster", *args])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    return exc.value.code
+
 
 def test_cluster_help_is_exposed():
     result = subprocess.run(
@@ -23,15 +32,11 @@ def test_cluster_help_is_exposed():
     assert "plan" in result.stdout
 
 
-def test_cluster_status_json_is_runnable():
-    result = subprocess.run(
-        [sys.executable, "-m", "omlx.cli", "cluster", "status", "--json"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
+def test_cluster_status_json_is_runnable(monkeypatch, capsys):
+    code = _run_in_process(monkeypatch, "status", "--json")
+    result = capsys.readouterr()
+    assert code == 0, result.err
+    payload = json.loads(result.out)
     assert payload["protocol_version"] == "1.0"
     assert "recommended_working_set_bytes" in payload["node"]
     assert payload["transport"]["state"]
@@ -101,30 +106,23 @@ def test_cluster_status_rejects_hostname_route_target():
     assert "IPv4 or IPv6" in result.stderr
 
 
-def test_cluster_unequal_plan_json_is_runnable():
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "omlx.cli",
-            "cluster",
-            "plan",
-            "--model-size",
-            "300GiB",
-            "--layers",
-            "80",
-            "--node",
-            "studio=256GiB",
-            "--node",
-            "mobile=128GiB",
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
+def test_cluster_unequal_plan_json_is_runnable(monkeypatch, capsys):
+    code = _run_in_process(
+        monkeypatch,
+        "plan",
+        "--model-size",
+        "300GiB",
+        "--layers",
+        "80",
+        "--node",
+        "studio=256GiB",
+        "--node",
+        "mobile=128GiB",
+        "--json",
     )
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
+    result = capsys.readouterr()
+    assert code == 0, result.err
+    payload = json.loads(result.out)
     assert payload["strategy"] == "unequal_contiguous_pipeline"
     assert payload["model"]["total_weight_bytes"] == 300 * 1024**3
     assert payload["assignments"][0]["node_id"] == "studio"

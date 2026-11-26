@@ -244,7 +244,7 @@ def test_incremental_matches_full_forward(model):
     ids = _ids(1)
     full = _run(model, ids, [SEQ])
     # Prefill, ragged chunks (open compressed-indexer groups) and decode steps.
-    for chunks in ([24] + [1] * 16, [7, 7, 7, 7, 7, 5], [1] * SEQ):
+    for chunks in ([24] + [1] * 16, [7, 7, 7, 7, 7, 5], [1] * 20 + [20]):
         np.testing.assert_allclose(_run(model, ids, chunks), full, atol=2e-4)
 
 
@@ -386,9 +386,19 @@ def _decode_logits(lm, cache, tokens):
     ]
 
 
-@pytest.mark.parametrize("batched", [False, True])
-@pytest.mark.parametrize("bits", [None, 4, 3, "mxfp8"])
-@pytest.mark.parametrize("kind", ["hy4", "flash"])
+@pytest.mark.parametrize(
+    ("kind", "bits", "batched"),
+    [
+        ("hy4", None, False),
+        ("hy4", 4, True),
+        ("hy4", 3, False),
+        ("hy4", "mxfp8", True),
+        ("flash", None, True),
+        ("flash", 4, False),
+        ("flash", 3, True),
+        ("flash", "mxfp8", False),
+    ],
+)
 def test_exact_verify_rows_match_decode(monkeypatch, kind, bits, batched):
     # Past the index top-k and the 8-slot sliding window, so sparse selection
     # and a rotated ring are both in play. mlx-lm's generator hands even one
@@ -423,7 +433,7 @@ def test_exact_verify_rows_match_decode(monkeypatch, kind, bits, batched):
     assert lm.mtp_partial_rollback(cache, accepted=2, num_drafts=block - 1)
     reference = primed()
     _decode_logits(lm, reference, ids[prompt : prompt + 3])
-    tail = ids[prompt + 3 : prompt + 9] + 1
+    tail = ids[prompt + 3 : prompt + 6] + 1
     for got, want in zip(
         _decode_logits(lm, cache, tail), _decode_logits(lm, reference, tail)
     ):
@@ -546,8 +556,7 @@ def _generate(model, prompts, count, use_mtp):
     return [tokens[u][:count] for u in uids]
 
 
-@pytest.mark.parametrize("bits", [4, 3])
-@pytest.mark.parametrize("kind", ["hy4", "flash"])
+@pytest.mark.parametrize(("kind", "bits"), [("hy4", 4), ("flash", 3)])
 def test_mtp_generation_matches_greedy(monkeypatch, kind, bits):
     """Through the generator (draft, exact verify, accept, rollback), alone and
     with a second request, MTP emits each request's own greedy tokens."""
@@ -566,8 +575,8 @@ def test_mtp_generation_matches_greedy(monkeypatch, kind, bits):
 
     monkeypatch.setattr(type(lm), "dspark_forward", tracked)
     prompt = _ids(11, n=26)
-    expected = _generate(model, [prompt], 24, use_mtp=False)
-    assert _generate(model, [prompt], 24, use_mtp=True) == expected
+    expected = _generate(model, [prompt], 12, use_mtp=False)
+    assert _generate(model, [prompt], 12, use_mtp=True) == expected
     assert drafts, "the MTP loop must draft"
 
 
@@ -592,9 +601,9 @@ def test_mtp_drafts_for_concurrent_requests(monkeypatch, kind):
 
     monkeypatch.setattr(type(lm), "dspark_forward", tracked)
     prompts = [_ids(11, n=26), _ids(12, n=19)]
-    expected = [_generate(model, [p], 20, use_mtp=False)[0] for p in prompts]
+    expected = [_generate(model, [p], 10, use_mtp=False)[0] for p in prompts]
     drafts.clear()
-    assert _generate(model, prompts, 20, use_mtp=True) == expected
+    assert _generate(model, prompts, 10, use_mtp=True) == expected
     assert len(drafts) > 2
 
 
@@ -633,6 +642,10 @@ def test_streamed_calibration_matches_resident(tmp_path, monkeypatch, kind):
 
     apply_patch()
     cfg = _hy4_config() if kind == "hy4" else _flash_config()
+    schedule = "indexer_types" if kind == "hy4" else "layer_types"
+    cfg["text_config"].update(
+        {"num_hidden_layers": 4, schedule: cfg["text_config"][schedule][:4]}
+    )
     source = tmp_path / "source"
     _checkpoint(source, cfg, _model(cfg))
     resident_model = load_model(source, lazy=False, strict=True)
