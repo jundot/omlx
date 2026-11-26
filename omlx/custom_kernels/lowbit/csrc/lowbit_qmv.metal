@@ -102,6 +102,9 @@ bonsai_qmv_wide_t5_types(128)
 instantiate_kernel(
     "affine_qmv_wide_t5_float16_t_gs_128_nv_4_kl_8_batch4_lut",
     affine_qmv_wide_t5, float16_t, 128, 4, 8, true)
+instantiate_kernel(
+    "affine_qmv_wide_t5_float16_t_gs_128_nv_4_kl_4_batch4_lut",
+    affine_qmv_wide_t5, float16_t, 128, 4, 4, true)
 
 // ---- t5 MMA GEMM (Identity I-M): fused dequant + simdgroup matmul for prefill ----
 // w(0)=uint8 t5 bytes, scales(1), x(2), out(3), M(4), N(5), K(6)

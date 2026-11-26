@@ -152,7 +152,7 @@ void dispatch_qmv_wide_t5(
 
     int n_tiles = (M + 4) / 5;
     int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
-    int k_lanes = 8;
+    int k_lanes = (batch4_lut && N >= 4096) ? 4 : 8;
     int num_simdgroups = 4;
     int rows_per_tg = (32 / k_lanes) * num_simdgroups;
 
