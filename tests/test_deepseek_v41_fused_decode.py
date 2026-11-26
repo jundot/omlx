@@ -749,6 +749,8 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block_verify", counted)
+    # Random weights draft with low confidence; keep whole blocks so verify runs wide.
+    monkeypatch.setattr(type(model), "dspark_draft_keep", lambda self, top: mx.array(top.shape[0]))
     generator = BatchGenerator(model, max_tokens=12, prefill_step_size=4, sampler=lambda logits: mx.argmax(logits, -1))
     result = []
     try:

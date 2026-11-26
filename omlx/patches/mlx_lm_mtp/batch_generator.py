@@ -870,6 +870,9 @@ class _MtpState:
     # acceptance. Lazy arrays; only evaluated if a consumer touches them.
     draft_lps: List[Any] = field(default_factory=list)
     draft_accept_lps: List[Any] = field(default_factory=list)
+    # Lazy count of leading drafts worth a verify row, from a host's
+    # ``dspark_draft_keep``; None when the whole block is verified.
+    draft_keep: Optional[Any] = None
     # MTP-head cache offset at cycle start. Chain entries beyond this offset
     # are speculative and trimmed at commit; committed history is re-appended
     # from verify-forward hidden rows so the head sees a dense, committed-only
@@ -3106,9 +3109,15 @@ def _dspark_host(model: Any) -> Optional[Any]:
 
 
 def _dspark_draft_depth(host, state, depth=None):
+    block = int(getattr(host.args, "dspark_block_size", 0))
     if depth is None:
-        depth = state.controller.cur if state.controller is not None else state.depth
-    return min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+        controller = state.controller
+        depth = controller.cur if controller is not None else state.depth
+        if depth > 0 and getattr(host, "dspark_draft_keep", None) is not None:
+            # A single request drafts its whole block; the host's keep rule
+            # then picks the verify width from the drafts themselves.
+            depth = controller.max_depth if controller is not None else state.depth
+    return min(int(depth), block) if block else int(depth)
 
 
 def _queue_dspark_block(host, prepare, gen_batch, state, hidden, packet, k, *, greedy):
@@ -3161,8 +3170,12 @@ def _dspark_next_drafts(
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
+    keep_rule = None
+    if depth is None and logits is None:
+        keep_rule = getattr(host, "dspark_draft_keep", None)
     depth = _dspark_draft_depth(host, state, depth)
     n = int(committed.shape[0])
+    state.draft_keep = None
     if depth <= 0:
         host.dspark_append_context(hidden_rows, state.mtp_cache)
         state.hist_offset += n
@@ -3226,6 +3239,10 @@ def _dspark_next_drafts(
     state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
     state.draft_accept_lps = draft_accept_lps
+    if keep_rule is not None:
+        state.draft_keep = keep_rule(mx.stack([mx.max(lp) for lp in draft_lps]))
+        mx.async_eval(state.drafts, state.draft_keep)
+        return
     mx.async_eval(state.drafts)
 
 
@@ -4628,6 +4645,11 @@ def _run_verify_cycle_chain(
             state,
             state.controller.cur if state.controller is not None else state.depth,
         )
+    keep = state.draft_keep
+    state.draft_keep = None
+    if keep is not None and not state.copy_drafts and verify_result is None:
+        # The drafts are already awaited on the host, so this adds no sync.
+        _clip_block_drafts(state, int(keep.item()))
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])

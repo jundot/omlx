@@ -6,6 +6,14 @@ import mlx.core as mx
 from . import decode_fused, growth
 from .head import project_logits
 
+# P(draft accepted | earlier drafts accepted) = sigmoid(b0 + b1*lp + b2*log(1 - e^lp)),
+# lp being the draft's top log-probability. Fitted on 40k verified drafts of
+# DeepSeek-V4.1-Flash oQ2e (single request, greedy, thinking on).
+_DRAFT_KEEP_FIT = (0.5819, 1.1944, -0.6339)
+# A verify row costs about a tenth of a cycle that yields about three tokens,
+# so a draft pays for its row when it survives with probability near 0.25.
+_DRAFT_KEEP_MIN = 0.25
+
 
 class AcceptanceDepthController:
     """Choose verification shapes from token acceptance, never wall-clock time.
@@ -108,6 +116,20 @@ class DSparkMixin:
         for stage, items in zip(self.mtp, by_stage):
             stage.attn.append_context_rows(parts, items)
         return proposal_hidden(self, mx.concatenate(anchor_ids, axis=0), by_stage, draft_length)
+
+    def dspark_draft_keep(self, top_logprobs):
+        """How many leading drafts of one request's block are worth a verify row.
+
+        ``top_logprobs`` holds each draft position's highest log-probability.
+        A logistic fit maps it to the chance that the draft is accepted given
+        the ones before it were; a position is kept while the chance that the
+        block survives up to it stays above the cost of its verify row relative
+        to a cycle. The count depends only on the drafts, never on timing.
+        """
+        b0, b1, b2 = _DRAFT_KEEP_FIT
+        lp = mx.minimum(top_logprobs, -1e-6)
+        accept = mx.sigmoid(b0 + b1 * lp + b2 * mx.log1p(-mx.exp(lp)))
+        return (mx.cumprod(accept) >= _DRAFT_KEEP_MIN).sum()
 
     def dspark_logits(self, hidden):
         """The DSpark vocabulary head of dspark_hidden_rows outputs (any number of rows)."""
