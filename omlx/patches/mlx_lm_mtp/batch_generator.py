@@ -3105,6 +3105,39 @@ def _dspark_host(model: Any) -> Optional[Any]:
     return None
 
 
+def _dspark_draft_depth(host, state, depth=None):
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
+    return min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+
+
+def _queue_dspark_block(host, prepare, gen_batch, state, hidden, packet, k, *, greedy):
+    """Queue only the deterministic block. Sampling follows the actual commit."""
+    import mlx.core as mx
+
+    depth = _dspark_draft_depth(host, state)
+    if depth <= 0:
+        return None
+    m = packet[:1]
+    if greedy:
+        anchor = mx.take(packet[1 : k + 2], m)
+    else:
+        residual = packet[k + 1 : 2 * k + 1]
+        anchor = mx.where(
+            m < k,
+            mx.take(residual, mx.minimum(m, k - 1)),
+            packet[2 * k + 1 : 2 * k + 2],
+        )
+    build = prepare(gen_batch.prompt_cache, hidden, m, anchor, k, depth)
+    if build is None:
+        return None
+    # The host reads the acceptance packet without waiting for the new block.
+    mx.async_eval(packet)
+    block = build()
+    mx.async_eval(block)
+    return depth, block
+
+
 def _dspark_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -3112,6 +3145,9 @@ def _dspark_next_drafts(
     committed: Any,
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
+    logits: Optional[Any] = None,
+    *,
+    prepared_block=None,
 ) -> None:
     """Append committed target taps and sample one DSpark block.
 
@@ -3125,9 +3161,7 @@ def _dspark_next_drafts(
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
-    if depth is None:
-        depth = state.controller.cur if state.controller is not None else state.depth
-    depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+    depth = _dspark_draft_depth(host, state, depth)
     n = int(committed.shape[0])
     if depth <= 0:
         host.dspark_append_context(hidden_rows, state.mtp_cache)
@@ -3138,13 +3172,17 @@ def _dspark_next_drafts(
         return
 
     anchor = committed[-1:].reshape(1, 1)
-    logits, _ = host.dspark_forward(
-        hidden_rows,
-        anchor,
-        state.mtp_cache,
-        draft_length=depth,
-    )
-    state.hist_offset += n
+    if logits is None:
+        if prepared_block is not None and prepared_block[0] == depth:
+            logits = prepared_block[1]
+        else:
+            logits, _ = host.dspark_forward(
+                hidden_rows,
+                anchor,
+                state.mtp_cache,
+                draft_length=depth,
+            )
+        state.hist_offset += n
 
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
@@ -3194,13 +3232,10 @@ def _dspark_next_drafts(
 def _dspark_draft_jobs(jobs: List[tuple]) -> None:
     """``draft_next`` for several requests' chain jobs (``_run_verify_cycle_chain`` with
     ``draft_jobs``) on an embedded DSpark host.
-
-    The requests are greedy without logits processors. Each keeps its own context-copy
-    proposal and DSpark stages; requests at one depth share the vocabulary head and the
-    Markov steps, whose per-row arithmetic does not depend on the other rows.
     """
     import mlx.core as mx
 
+    host = _dspark_host(jobs[0][0].model)
     shared: List[tuple] = []
     for gen_batch, state, hidden_rows, committed, prev_buf in jobs:
         if not state.head_clone:
@@ -3213,13 +3248,14 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
             if copied:
                 state.drafts = mx.array(copied, dtype=mx.uint32)
                 state.draft_lps = []
-                state.draft_accept_lps = []
+                state.draft_accept_lps = (
+                    [] if _is_greedy(gen_batch) else _copy_draft_q(copied, int(host.args.vocab_size))
+                )
                 state.copy_drafts = True
             continue
-        shared.append((gen_batch, state, hidden_rows, committed))
+        shared.append((gen_batch, state, hidden_rows, committed, prev_buf))
     if not shared:
         return
-    host = _dspark_host(shared[0][0].model)
     depths = {}
     for job in shared:
         state = job[1]
@@ -3227,14 +3263,23 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
         depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
         depths.setdefault(depth, []).append(job)
     for depth, group in depths.items():
-        hidden, anchors = [], []
-        for gen_batch, state, hidden_rows, committed in group:
-            anchor = committed[-1:].reshape(1, 1)
-            hidden.append(host.dspark_hidden(hidden_rows, anchor, state.mtp_cache, draft_length=depth))
+        anchors = [committed[-1:].reshape(1, 1) for _, _, _, committed, _ in group]
+        hidden = host.dspark_hidden_rows(
+            [hidden_rows for _, _, hidden_rows, _, _ in group],
+            anchors,
+            [state.mtp_cache for _, state, _, _, _ in group],
+            draft_length=depth,
+        )
+        for _, state, _, committed, _ in group:
             state.hist_offset += int(committed.shape[0])
-            anchors.append(anchor.reshape(1))
-        logits = host.dspark_logits(mx.concatenate(hidden, 0))
-        previous = mx.concatenate(anchors)
+        logits = host.dspark_logits(hidden)
+        if not all(_is_greedy(job[0]) and _proc_list(job[0]) is None for job in group):
+            for r, (gen_batch, state, _, committed, prev_buf) in enumerate(group):
+                _dspark_next_drafts(
+                    gen_batch, state, None, committed, prev_buf, depth=depth, logits=logits[r : r + 1]
+                )
+            continue
+        previous = mx.concatenate([anchor.reshape(1) for anchor in anchors])
         tokens, lps = [], []
         for idx in range(depth):
             bias, _ = host.dspark_markov(previous)
@@ -3244,7 +3289,7 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
             lps.append(lp)
             previous = token
         drafts = mx.stack(tokens, axis=1)
-        for r, (gen_batch, state, _, _) in enumerate(group):
+        for r, (gen_batch, state, _, _, _) in enumerate(group):
             sampler = _resolve_sampler(gen_batch)
             state.drafts = drafts[r]
             state.draft_lps = [lp[r] for lp in lps]
@@ -3259,6 +3304,8 @@ def _chain_next_drafts(
     committed: Any,
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
+    *,
+    prepared_block=None,
 ) -> None:
     """Rebuild committed MTP-head history and draft the next chain.
 
@@ -3290,6 +3337,7 @@ def _chain_next_drafts(
             committed,
             prev_buf,
             depth,
+            prepared_block=prepared_block,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
@@ -4644,6 +4692,20 @@ def _run_verify_cycle_chain(
         and not defer_commit
     )
     predrafted = False
+    prepared_block = None
+    dspark = None
+    prepare_block = None
+    if (
+        k > 0
+        and drafter is None
+        and sync is None
+        and not defer_commit
+        and draft_jobs is None
+        and commit_cache is None
+        and gdn_states is None
+    ):
+        dspark = _dspark_host(gen_batch.model)
+        prepare_block = getattr(dspark, "dspark_prepare_block", None)
 
     if k == 0:
         # Depth-0 cycle (controller escape hatch): the forward above was a
@@ -4675,6 +4737,17 @@ def _run_verify_cycle_chain(
                     host_arr,
                     m_arr,
                     mx.take(targets, m_arr),
+                )
+            elif prepare_block is not None:
+                prepared_block = _queue_dspark_block(
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    host_arr,
+                    k,
+                    greedy=True,
                 )
             host = host_arr.tolist()
         else:
@@ -4714,8 +4787,23 @@ def _run_verify_cycle_chain(
                 predrafted = _predraft(
                     gen_batch, state, drafter, captured, result, m_arr, anchor
                 )
+            elif prepare_block is not None:
+                prepared_block = _queue_dspark_block(
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    result,
+                    k,
+                    greedy=False,
+                )
+            verify_packet = result.tolist()
+            if not verify_packet[-1]:
+                # The dense redraw can choose a different row or correction.
+                prepared_block = None
             host = _settled_verify(
-                result.tolist(),
+                verify_packet,
                 sampler,
                 combined_lp,
                 state.drafts,
@@ -4803,6 +4891,8 @@ def _run_verify_cycle_chain(
     # backbone cache yet, so materialize it before the queue reaches it.
     materialize_boundary_emit = align > 0 and to_boundary > 0 and to_boundary == m + 1
     state.boundary_emit_pending = materialize_boundary_emit
+    if materialize_boundary_emit:
+        draft_jobs = None
 
     # --- stats ---
     state.stats.cycles += 1
@@ -4881,6 +4971,7 @@ def _run_verify_cycle_chain(
                 committed,
                 prev_buf,
                 depth=0 if copied else None,
+                prepared_block=prepared_block if m == m_gpu and not copied else None,
             )
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))

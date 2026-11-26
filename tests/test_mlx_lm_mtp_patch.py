@@ -94,14 +94,26 @@ class TestCacheRollback:
 class TestMtpBoundaryCommit:
     @staticmethod
     def _run_full_accept_cycle(
-        monkeypatch, *, emitted, drafts, clamp=None, context_copy=None
+        monkeypatch,
+        *,
+        emitted,
+        drafts,
+        clamp=None,
+        context_copy=None,
+        prepare=None,
+        draft_calls=None,
+        commit_align=4,
     ):
         import mlx.core as mx
 
         from omlx.patches.mlx_lm_mtp import batch_generator as bg
 
         cache = SimpleNamespace(offset=emitted - 1)
-        model = SimpleNamespace(_omlx_mtp_commit_align=4)
+        model = SimpleNamespace(_omlx_mtp_commit_align=commit_align)
+        if prepare is not None:
+            model._omlx_dspark_decode_enabled = True
+            model.args = SimpleNamespace(dspark_block_size=5)
+            model.dspark_prepare_block = prepare
         if clamp is not None:
             model.mtp_clamp_accept = lambda _cache, accepted, _drafts: min(
                 accepted, clamp
@@ -160,11 +172,72 @@ class TestMtpBoundaryCommit:
 
         monkeypatch.setattr(bg, "_call_backbone", fake_backbone)
         monkeypatch.setattr(bg, "_chain_rollback", fake_rollback)
-        monkeypatch.setattr(bg, "_chain_next_drafts", lambda *args, **kwargs: None)
+        def draft(*args, **kwargs):
+            if draft_calls is not None:
+                draft_calls.append(kwargs.get("prepared_block"))
+
+        monkeypatch.setattr(bg, "_chain_next_drafts", draft)
         monkeypatch.setattr(bg, "_clear_rollback", lambda _cache: None)
 
         bg._run_verify_cycle_chain(batch, state)
         return batch, state, cache
+
+    @pytest.mark.parametrize("emitted,adopted", [(0, True), (3, False)])
+    def test_dspark_predraft_uses_the_final_accepted_row(
+        self, monkeypatch, emitted, adopted
+    ):
+        queued = []
+        draft_calls = []
+        block = mx.array([99])
+
+        def prepare(_cache, _hidden, row, anchor, count, depth):
+            queued.append((int(row.item()), int(anchor.item()), count, depth))
+            return lambda: block
+
+        self._run_full_accept_cycle(
+            monkeypatch,
+            emitted=emitted,
+            drafts=3,
+            prepare=prepare,
+            draft_calls=draft_calls,
+        )
+        assert queued == [(3, 20, 3, 3)]
+        if adopted:
+            assert draft_calls[0][0] == 3
+            assert draft_calls[0][1] is block
+        else:
+            assert draft_calls[0] is None
+
+    def test_dspark_predraft_discarded_after_dense_redraw(self, monkeypatch):
+        queued = []
+        draft_calls = []
+
+        def prepare(_cache, _hidden, row, anchor, _count, _depth):
+            queued.append((int(row.item()), int(anchor.item())))
+            return lambda: mx.array([99])
+
+        monkeypatch.setattr(bg, "_is_greedy", lambda _batch: False)
+        monkeypatch.setattr(
+            bg,
+            "_verify_stochastic",
+            lambda *args, **kwargs: mx.array([3, 1, 2, 3, 10, 11, 12, 20, 0]),
+        )
+        monkeypatch.setattr(
+            bg,
+            "_stochastic_verify_tokens",
+            lambda *args, **kwargs: mx.array([3, 1, 2, 3, 10, 11, 12, 23]),
+        )
+        _, state, _ = self._run_full_accept_cycle(
+            monkeypatch,
+            emitted=0,
+            drafts=3,
+            prepare=prepare,
+            draft_calls=draft_calls,
+            commit_align=8,
+        )
+        assert queued == [(3, 20)]
+        assert draft_calls == [None]
+        assert state.queue[-1][0] == 23
 
     @pytest.mark.parametrize(
         ("drafts", "clamp", "boundary_source"),

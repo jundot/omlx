@@ -44,7 +44,7 @@ from transformers import AutoTokenizer
 
 from ..api.utils import _consolidate_system_messages
 from ..exceptions import InvalidRequestError
-from ..gguf import SPLIT_VARIANT
+from ..gguf import SPLIT_VARIANT, tensor_bytes
 from ..oqh.format import is_oqh_config
 from ..request import DecodeMarks, add_decode_mark, live_decode_rate
 from ..utils.hardware import get_chip_name, parse_chip_info
@@ -152,6 +152,9 @@ PRUNED_EXPERTS_VERSION = (1, 4, 1)
 # release on M5+ `auto` quantizes attention queries to int8, so oMLX pins bf16
 # by default and only sends the flag where it is understood.
 ACTIVATIONS_VERSION = (1, 6, 1)
+PLE_STREAM_VERSION = (1, 6, 1)
+PLE_ROW_CACHE_BYTES = 237 * 1024 * 1024
+_PLE_TENSOR = "per_layer_token_embd.weight"
 # Older launchers reject --max-concurrent-requests.
 MAX_CONCURRENT_REQUESTS_VERSION = (1, 7, 1)
 _PRUNED_EXPERTS_MULTIPLE = 8
@@ -775,7 +778,7 @@ def _splash_projector_rank(name: str) -> int:
     return len(_SPLASH_PROJECTOR_ORDER)
 
 
-def _weight_bytes(path: Path) -> int:
+def _weight_bytes(path: Path, splash_version: str | None = None) -> int:
     """Bytes of the weights Splash loads: the safetensors, or for a GGUF its
     file and the projector Splash pairs it with."""
     config = _read_config(path) or {}
@@ -786,8 +789,17 @@ def _weight_bytes(path: Path) -> int:
     projectors = sorted(source.get("projectors") or [], key=_splash_projector_rank)
     # A family without a vision tower never loads the projector.
     loaded = projectors[:1] if splash_has_vision(config) else []
-    names = [*(source.get("parts") or []), *loaded]
-    return sum((path / name).stat().st_size for name in names)
+    parts = source.get("parts") or []
+    size = sum((path / name).stat().st_size for name in [*parts, *loaded])
+    version = _version_tuple(splash_version or "")
+    if (
+        version is not None
+        and version >= PLE_STREAM_VERSION
+        and splash_family(config) == "Qwen3.8-Flash-Next"
+    ):
+        table = sum(tensor_bytes(path / part, _PLE_TENSOR) for part in parts)
+        size -= table - min(table, PLE_ROW_CACHE_BYTES)
+    return size
 
 
 def _kv_bytes_per_token(text: dict, kv_format: str) -> int:
@@ -807,6 +819,7 @@ def splash_memory_estimate(
     draft_path: Path,
     max_context: int | None,
     kv_format: str,
+    splash_version: str | None = None,
 ) -> int:
     """Memory for Splash to hold ``max_context`` tokens of context.
 
@@ -821,7 +834,7 @@ def splash_memory_estimate(
     context = max_context or SPLASH_NATIVE_CONTEXT
     kv = _kv_bytes_per_token(text, kv_format) * context
     draft = int(_safetensors_bytes(draft_path) * _DRAFT_LOAD_RATIO)
-    return _weight_bytes(path) + draft + _RUNTIME_RESERVE_BYTES + kv
+    return _weight_bytes(path, splash_version) + draft + _RUNTIME_RESERVE_BYTES + kv
 
 
 # -- model staging -------------------------------------------------------------
@@ -1921,7 +1934,9 @@ class SplashEngine(BaseEngine):
     def _weights_bytes(self) -> int:
         if self._weights_size is None:
             if _gguf_source(_read_config(self._path) or {}) is not None:
-                self._weights_size = _weight_bytes(self._path)
+                self._weights_size = _weight_bytes(
+                    self._path, self._target.binary.version
+                )
             else:
                 self._weights_size = sum(
                     f.stat().st_size for f in _model_files(self._path)

@@ -764,8 +764,11 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch):
     assert result[:12] == expected
 
 
-@pytest.mark.parametrize("count", [2, pytest.param(5, id="5-capped-depth")])
-def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, count):
+@pytest.mark.parametrize(
+    ("count", "align"),
+    [(2, 0), pytest.param(2, 8, id="2-boundary-aligned"), pytest.param(5, 0, id="5-capped-depth")],
+)
+def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, count, align):
     """Requests decoding with DSpark verify their blocks in one forward and each
     reproduces its own greedy decoding token for token."""
     from mlx_lm.generate import BatchGenerator
@@ -808,6 +811,15 @@ def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, 
         return real(self, inputs, row_caches)
 
     monkeypatch.setattr(type(model), "mtp_verify_rows", counted)
+    model._omlx_mtp_commit_align = align
+    anchored = []
+    real_jobs = batch_generator._dspark_draft_jobs
+
+    def drafted(jobs):
+        anchored.extend(int(state.next_main[0]) == int(committed[-1]) for _, state, _, committed, _ in jobs)
+        return real_jobs(jobs)
+
+    monkeypatch.setattr(batch_generator, "_dspark_draft_jobs", drafted)
     generator = BatchGenerator(
         model, max_tokens=8, prefill_step_size=4, prefill_batch_size=count,
         sampler=lambda logits: mx.argmax(logits, -1),
@@ -824,6 +836,7 @@ def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, 
     finally:
         generator.close()
     assert together and max(shape[0] for shape in together) == count, "the requests must verify in one forward"
+    assert anchored and all(anchored)
     for uid, want in zip(uids, expected):
         assert result[uid][:8] == want
 

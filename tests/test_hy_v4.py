@@ -35,6 +35,7 @@ from omlx.patches.hy_v4 import (  # noqa: E402
     indexing,
     language,  # noqa: E402
     layers,
+    verify_dispatch,
 )
 from omlx.patches.hy_v4.config import VisionConfig  # noqa: E402
 from omlx.patches.hy_v4.flash import CompressedIndexer, Engram  # noqa: E402
@@ -246,6 +247,59 @@ def test_incremental_matches_full_forward(model):
     # Prefill, ragged chunks (open compressed-indexer groups) and decode steps.
     for chunks in ([24] + [1] * 16, [7, 7, 7, 7, 7, 5], [1] * 20 + [20]):
         np.testing.assert_allclose(_run(model, ids, chunks), full, atol=2e-4)
+
+
+def test_flash_engram_submits_ids_before_prefix_only_for_ssd(tmp_path, monkeypatch):
+    from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
+
+    config = _flash_config()
+    config["text_config"].update(hidden_size=8, hc_mult=1)
+    engram = Engram(ModelConfig.from_dict(config).text_config, layer_id=2)
+    engram.set_dtype(mx.bfloat16)
+    weight = engram.multi_head_embedding.embedding.weight
+    streams = mx.ones((1, 2, 1, 8), dtype=mx.bfloat16)
+    ngrams = mx.zeros((1, 2, engram.max_order), dtype=mx.int32)
+    keep = mx.ones((1, 2), dtype=mx.bool_)
+    table_path = tmp_path / "engram.safetensors"
+    mx.save_safetensors(str(table_path), {"weight": weight})
+    submitted = []
+    by_lookup = []
+    async_eval = mx.async_eval
+    lookup = Engram.lookup
+    verifying = True
+
+    def record(array):
+        submitted.append(array)
+        async_eval(array)
+
+    def record_lookup(self, rows):
+        by_lookup.append(len(submitted))
+        return lookup(self, rows)
+
+    monkeypatch.setattr(mx, "async_eval", record)
+    monkeypatch.setattr(Engram, "lookup", record_lookup)
+    monkeypatch.setattr(
+        verify_dispatch, "short_gpu_verify", lambda rows: verifying and rows == 2
+    )
+
+    engram(streams, ngrams, keep)
+    assert submitted == []
+    reader = DiskEngramEmbedding(table_path, "weight", None)
+    engram.multi_head_embedding.embedding = reader
+    try:
+        verifying = False
+        expected = engram(streams, ngrams, keep)
+        assert submitted == []
+        verifying = True
+        actual = engram(streams, ngrams, keep)
+        assert len(submitted) == 2 and submitted[1] is streams
+        assert by_lookup == [0, 0, 2]
+        np.testing.assert_array_equal(submitted[0], engram.hash_rows(ngrams))
+        np.testing.assert_array_equal(
+            actual.astype(mx.float32), expected.astype(mx.float32)
+        )
+    finally:
+        reader.close()
 
 
 def _batch_cache(model, left):

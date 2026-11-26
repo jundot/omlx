@@ -11,18 +11,23 @@ from mlx.utils import tree_flatten
 
 try:
     import mlx.core as mx
+    import mlx.nn as nn
 
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
 
-from omlx.patches.inkling2 import loopcd
+from omlx.patches.inkling2 import fused, kernels, loopcd
+from omlx.patches.inkling2 import model as inkling2_model
 from omlx.patches.moe_expert_offload import (
     apply_moe_expert_offload,
     materialize_offload_state,
     moe_offload_stats,
 )
-from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+from omlx.patches.qwen35_verify_qmm import (
+    apply_verify_qmm_patch,
+    set_verify_qmm_armed,
+)
 
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
@@ -2054,3 +2059,86 @@ def test_inkling2_dspark_fold_dequantizes_the_head_in_chunks():
         assert mx.array_equal(head._fold_weight[start:end], expected)
         expected = (rows @ bias).astype(mx.bfloat16)
         assert mx.array_equal(head._fold_bias[start:end], expected)
+
+
+def _attention_inputs(length, keys, hq=8, hkv=2, d=128, r=16):
+    mx.random.seed(length)
+    q = (mx.random.normal((1, hq, length, d)) * 3).astype(mx.bfloat16)
+    k = mx.random.normal((1, hkv, keys, d)).astype(mx.bfloat16)
+    v = mx.random.normal((1, hkv, keys, d)).astype(mx.bfloat16)
+    rel = (mx.random.normal((1, length, hq, r)) * 4).astype(mx.bfloat16)
+    sink = (mx.random.normal((1, length, hq)) * 4 + 6).astype(mx.bfloat16)
+    return q, k, v, rel, sink, d**-0.5
+
+
+@pytest.mark.parametrize("hq", [8, 12])
+@pytest.mark.parametrize("padding", [0, 700])
+@pytest.mark.parametrize("length", [1, 5, 16])
+def test_inkling2_long_attention_matches_reference(length, padding, hq):
+    if mx.default_device() != mx.gpu:
+        pytest.skip("the long-context attention kernel runs on the GPU")
+    q, k, v, rel, sink, scale = _attention_inputs(length, 2600, hq=hq)
+    lp = mx.array([padding]) if padding else None
+    got = fused.long_decode_attention(q, k, v, rel, sink, scale=scale, left_padding=lp)
+    expected = kernels._masked_attention(q, k, v, rel, sink, scale, 0, lp)
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+    assert diff.max().item() < 2e-2
+    s = k.shape[2]
+    for t in range(length):
+        end = s - length + t + 1
+        alone = fused.long_decode_attention(
+            q[:, :, t : t + 1],
+            k[:, :, :end],
+            v[:, :, :end],
+            rel[:, t : t + 1],
+            sink[:, t : t + 1],
+            scale=scale,
+            left_padding=lp,
+        )
+        assert mx.array_equal(got[:, :, t : t + 1], alone)
+
+
+def test_inkling2_long_context_verify_rows_match_serial_decode(monkeypatch):
+    if mx.default_device() != mx.gpu:
+        pytest.skip("row-exact projections run on the GPU")
+    monkeypatch.setattr(inkling2_model, "_LONG_ATTENTION_MIN_KEYS", 4096)
+    calls = []
+    kernel = fused.long_decode_attention
+    monkeypatch.setattr(
+        fused,
+        "long_decode_attention",
+        lambda *a, **kw: calls.append(a[0].shape[2]) or kernel(*a, **kw),
+    )
+    apply_verify_qmm_patch()
+    model = _bf16(_inkling2_tiny(head_dim=128, swa_head_dim=128, **_TINY_LOOP))
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=8,
+        class_predicate=lambda _, m: isinstance(m, nn.Linear),
+    )
+    prefix, width = 4092, 16
+    ids = mx.random.randint(0, 300, (1, prefix + width))
+
+    def prefilled():
+        cache = model.make_cache()
+        for s in range(0, prefix, 2048):
+            model(ids[:, s : min(prefix, s + 2048)], cache=cache)
+            mx.eval([c.state for c in cache])
+        return cache
+
+    cache = prefilled()
+    serial = [
+        model(ids[:, t : t + 1], cache=cache)[0, -1]
+        for t in range(prefix, prefix + width)
+    ]
+    cache = prefilled()
+    calls.clear()
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        block = model(ids[:, prefix : prefix + width], cache=cache)[0]
+    finally:
+        set_verify_qmm_armed(False)
+    assert calls
+    for row, expected in enumerate(serial):
+        assert mx.array_equal(block[row], expected)
