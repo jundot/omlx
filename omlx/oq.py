@@ -62,6 +62,7 @@ except ImportError:
 
 from omlx.model_discovery import (
     D3_DECISION_CONFIG,
+    DECISION_SIDECAR_DIRS,
     DECISION_SIDECAR_FILES,
     DECISION_SIDECAR_WEIGHTS,
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
@@ -7528,14 +7529,14 @@ def quantize_oq_streaming(
         )
         text_only = True
     _validate_oq_dtype_for_model(config, dtype)
-    if decision_kind(source, config) == "d3":
+    if decision_kind(source, config) in ("d3", "pplx_decider"):
         if text_only:
             raise ValueError(
-                "Decision 3.0 reads images with its vision tower; text-only "
+                "Decision models read images with their vision tower; text-only "
                 "output is not supported"
             )
-        d3_config = json.loads((source / D3_DECISION_CONFIG).read_text())
-        if d3_config.get("attention_mode") == "noncausal_full_attention":
+        decision_config = json.loads((source / D3_DECISION_CONFIG).read_text())
+        if decision_config.get("attention_mode") == "noncausal_full_attention":
             config["_oq_noncausal_attention"] = True
     static_sensitivity_map = _normalize_sensitivity_map_override(
         config, sensitivity_map_override
@@ -8514,7 +8515,10 @@ def quantize_oq_streaming(
     )
     for name in DECISION_SIDECAR_FILES:
         if (source / name).is_file():
-            shutil.copy(source / name, output / name)
+            shutil.copy2(source / name, output / name)
+    for name in DECISION_SIDECAR_DIRS:
+        if (source / name).is_dir():
+            shutil.copytree(source / name, output / name, dirs_exist_ok=True)
     if not text_only:
         _copy_bundled_drafts(source, output)
     if inkling2_layout.is_inkling2(config):

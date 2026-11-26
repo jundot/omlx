@@ -36,7 +36,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev", "d3", "d1"]
+DecisionKind = Literal["clef", "openjev", "d3", "pplx_decider", "d1", "d1_lfm2"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -130,12 +130,24 @@ _OPENJEV_HELPER = Path("helper/shim.py")
 D3_READOUT_WEIGHTS = "readout.safetensors"
 D3_DECISION_CONFIG = "decision_config.json"
 D3_FORMAT_ID = "d3-code-readout-v1"
+# Perplexity Decider (pplx-decider) checkpoints: the same readout layout
+# under the chunked joint protocol of the release runtime.
+PPLX_READOUT_WEIGHTS = "readout.safetensors"
+PPLX_JOINT_CONFIG = "joint_config.json"
+PPLX_DECISION_CONFIG = "decision_config.json"
+PPLX_TEMPLATE = "joint-chunked-readout-v1"
+PPLX_LOCATE_DIR = "locate-span"
 # Files of a decision head, not of the backbone. Quantizers copy them as is.
 DECISION_SIDECAR_WEIGHTS = (CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS)
+# Directories of a decision head: the Perplexity Decider locate adapter is a
+# directory of its own (unmerged LoRA, span head, config), copied as a tree.
+DECISION_SIDECAR_DIRS = (PPLX_LOCATE_DIR,)
 DECISION_SIDECAR_FILES = (
     *DECISION_SIDECAR_WEIGHTS,
     CLEF_HEAD_CONFIG,
     D3_DECISION_CONFIG,
+    PPLX_JOINT_CONFIG,
+    PPLX_DECISION_CONFIG,
 )
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
@@ -512,15 +524,36 @@ def _is_d3_decision_config(path: Path) -> bool:
         return False
 
 
-def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
+def _is_d1_config(config: dict) -> bool:
+    """True for a LiquidAI d1 config: the ``D1Model`` marker on a VL backbone.
+
+    d1 declares the marker either as its architecture or as the checkpoint's
+    remote-code ``AutoModel`` entry.
+    """
+    return "D1Model" in (config.get("architectures") or ()) or str(
+        (config.get("auto_map") or {}).get("AutoModel", "")
+    ).endswith("D1Model")
+
+
+def _is_pplx_joint_config(path: Path) -> bool:
+    try:
+        with open(path) as f:
+            return json.load(f).get("template") == PPLX_TEMPLATE
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def decision_kind(model_path: Path | str, config: dict | None = None) -> DecisionKind | None:
     """Return the decision-model family of a checkpoint, or None.
 
     Clef is identified by its joint head files and Decision 3.0 by its
-    readout and decision config. LiquidAI d1 declares ``D1Model`` on an
-    LFM3-VL or LFM3-Omni config. OpenJev is a plain Qwen3.5 checkpoint, so it
-    is identified by its helper directory or, for MLX conversions without the
-    helper, by the directory name.
+    readout and decision config. LiquidAI d1 declares ``D1Model`` on a VL
+    config: on an LFM3-VL or LFM3-Omni backbone it is ``d1``, on the older
+    LFM2-VL backbone (mlx-vlm's ``models.d1``) it is ``d1_lfm2``. OpenJev is a
+    plain Qwen3.5 checkpoint, so it is identified by its helper directory or,
+    for MLX conversions without the helper, by the directory name.
     """
+    model_path = Path(model_path)
     if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
         model_path / CLEF_HEAD_CONFIG
     ).is_file():
@@ -529,6 +562,10 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
         model_path / D3_DECISION_CONFIG
     ):
         return "d3"
+    if (model_path / PPLX_READOUT_WEIGHTS).is_file() and _is_pplx_joint_config(
+        model_path / PPLX_JOINT_CONFIG
+    ):
+        return "pplx_decider"
     if config is None:
         try:
             with open(model_path / "config.json") as f:
@@ -536,11 +573,11 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
         except (OSError, ValueError):
             return None
     model_type = config.get("model_type")
-    if model_type in {"lfm3_vl", "lfm3_omni"} and (
-        "D1Model" in (config.get("architectures") or ())
-        or str((config.get("auto_map") or {}).get("AutoModel", "")).endswith("D1Model")
-    ):
-        return "d1"
+    if _is_d1_config(config):
+        if model_type in {"lfm3_vl", "lfm3_omni"}:
+            return "d1"
+        if model_type == "lfm2_vl":
+            return "d1_lfm2"
     if model_type != "qwen3_5":
         return None
     if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
