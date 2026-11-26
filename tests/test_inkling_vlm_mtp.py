@@ -943,6 +943,8 @@ def test_inkling2_batch_verify_rolls_each_row_back_to_its_own_count():
         assert out.gdn_states == []
         model.rollback_speculative_cache(joined, out.gdn_states, accepted, block)
         starts = [s + a + 1 for s, a in zip(starts, accepted)]
+    full = next(c for c in joined if hasattr(c, "offset"))
+    assert full.offset.tolist() == ends
     nxt = mx.stack([ids[row, end : end + 1] for row, end in enumerate(ends)])
     short = [c.extract(1) for c in joined]
     got = mx.concatenate([model(nxt, cache=joined), model(nxt[1:], cache=short)])
@@ -2179,3 +2181,109 @@ def test_inkling2_long_context_verify_rows_match_serial_decode(monkeypatch):
     assert calls
     for row, expected in enumerate(serial):
         assert mx.array_equal(block[row], expected)
+
+
+def _inkling2_batch(model, prompts):
+    # Rows prefilled alone, merged as the generator merges them.
+    rows = []
+    for ids in prompts:
+        cache = model.make_cache()
+        model(ids[None], cache=cache)
+        rows.append(cache)
+    return [type(entries[0]).merge(list(entries)) for entries in zip(*rows)]
+
+
+def _inkling2_realign(model, cache):
+    from omlx.patches import qwen35_deferred_realign as deferred
+    from omlx.patches.inkling2 import cache as windows
+
+    for kv, conv in model.model.visit_caches(cache):
+        if kv is None:
+            windows.realign(conv)
+        else:
+            deferred.realign(kv)
+
+
+def _inkling2_ragged(model, cache) -> bool:
+    from omlx.patches.inkling2 import cache as windows
+    from omlx.patches.inkling2.model import _kv_tails
+
+    return any(
+        (windows.tails(conv) if kv is None else _kv_tails(kv)) is not None
+        for kv, conv in model.model.visit_caches(cache)
+    )
+
+
+# Row 0 accepts every draft and row 1 none at first, so row 1's full-attention
+# tail passes the realign limit; then mixed counts. Sliding windows of 8 keys
+# re-cut every few cycles, with ragged rows in them.
+_RAGGED_PLAN = [(2, 0)] * 6 + [(1, 0), (0, 2), (2, 1), (0, 0), (1, 2), (2, 2), (0, 1)]
+
+
+@pytest.mark.parametrize("bf16", [False, True], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOPCD], ids=["plain", "loopcd"])
+def test_inkling2_ragged_batch_rollback_matches_realigned_rows(dims, bf16):
+    """Verify and decode steps over ragged rows have the bits of the same rows
+    realigned, also when a row joins and for a prefill-sized block."""
+    model = _inkling2_tiny(**dims)
+    if bf16:
+        model = _bf16(model)
+    mx.random.seed(3)
+    prompts = [mx.random.randint(0, 300, (n,)) for n in (13, 21, 9)]
+    ragged, aligned = _inkling2_batch(model, prompts), _inkling2_batch(model, prompts)
+    saw_ragged = False
+    rows = 3
+    for step, accepted in enumerate(_RAGGED_PLAN):
+        if step == 7:
+            # A request joins while the rows are ragged.
+            joiner = mx.random.randint(0, 300, (17,))
+            for batch in (ragged, aligned):
+                for entry, new in zip(batch, _inkling2_batch(model, [joiner])):
+                    entry.extend(new)
+            rows = 4
+        accepted = (list(accepted) * 2)[:rows]
+        accepted[-1] = (accepted[0] + step) % 3
+        inputs = mx.random.randint(0, 300, (rows, 3))
+        got = model(inputs, cache=ragged, return_hidden=True)
+        want = model(inputs, cache=aligned, return_hidden=True)
+        assert mx.array_equal(got.logits, want.logits), step
+        model.rollback_speculative_cache(ragged, got.gdn_states, accepted, 3)
+        model.rollback_speculative_cache(aligned, want.gdn_states, accepted, 3)
+        _inkling2_realign(model, aligned)
+        saw_ragged |= _inkling2_ragged(model, ragged)
+        if step % 3 == 2:
+            # A plain batched decode step reads the ragged rows too.
+            token = mx.random.randint(0, 300, (rows, 1))
+            got_step = model(token, cache=ragged)
+            assert mx.array_equal(got_step, model(token, cache=aligned)), step
+    assert saw_ragged and _inkling2_ragged(model, ragged)
+    # A block too long for the ragged-row kernel realigns the rows first. The
+    # ragged copy ends a column shorter (trims reclaim columns every row left
+    # behind), and the bf16 prefill kernels round differently on that layout.
+    block = mx.random.randint(0, 300, (rows, 40))
+    got, want = model(block, cache=ragged), model(block, cache=aligned)
+    assert not _inkling2_ragged(model, ragged)
+    if bf16:
+        assert mx.allclose(got[..., :300], want[..., :300], atol=5e-2).item()
+    else:
+        assert mx.array_equal(got, want)
+
+
+def test_inkling2_rollback_realigns_when_the_kv_write_is_not_tail_aware(monkeypatch):
+    from mlx_lm.models.cache import BatchKVCache
+
+    model = _bf16(_inkling2_tiny())
+    mx.random.seed(6)
+    prompts = [mx.random.randint(0, 300, (13,)), mx.random.randint(0, 300, (21,))]
+    ragged, aligned = _inkling2_batch(model, prompts), _inkling2_batch(model, prompts)
+    aware = BatchKVCache.update_and_fetch
+    monkeypatch.setattr(
+        BatchKVCache, "update_and_fetch", lambda self, k, v: aware(self, k, v)
+    )
+    inputs = mx.random.randint(0, 300, (2, 3))
+    for batch in (ragged, aligned):
+        out = model(inputs, cache=batch, return_hidden=True)
+        model.rollback_speculative_cache(batch, out.gdn_states, [2, 0], 3)
+    _inkling2_realign(model, aligned)
+    token = mx.random.randint(0, 300, (2, 1))
+    assert mx.array_equal(model(token, cache=ragged), model(token, cache=aligned))

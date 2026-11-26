@@ -5,8 +5,8 @@ When batch rows accept different draft counts, the stock rollback rolls every
 lagging row over the whole logical width so all rows end at ``_idx`` again.
 Here a rollback on a marked cache records a per-row *tail* instead: row ``r``
 keeps its keys in ``[left_padding[r], _idx - tail[r])`` and writes its next
-block at ``_idx - tail[r]``. Only the padded-row attention reads tails, so it
-marks the full-attention caches it serves.
+block at ``_idx - tail[r]``. The padded-row attention (which marks the caches
+it serves) and Inkling 2's flash decode read tails.
 
 The bank is realigned (the stock roll, all tails at once) when a tail exceeds
 ``_MAX_TAIL`` or before anything else touches the cache: ``filter``,
@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 TAIL = "_omlx_tail"  # list[int] per live row
 MARK = "_omlx_tail_ok"
 REALIGN_ALL = "_omlx_realign_all"
+# Class attribute: the tail-aware update_and_fetch this patch installed.
+TAIL_UPDATE = "_omlx_tail_update"
 _PENDING = "_omlx_pending_tail"
 # Realign once a tail exceeds this, so the realignment shift stays within the
 # native in-place roll (16 columns) after one more verify block.
@@ -202,6 +204,7 @@ def _wrap_class(cls) -> None:
     cls.prepare = prepare
     cls.finalize = finalize
     cls.update_and_fetch = update_and_fetch
+    setattr(cls, TAIL_UPDATE, update_and_fetch)
 
     for name in ("filter", "extend", "extract"):
         orig = getattr(cls, name)

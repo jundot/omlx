@@ -17,14 +17,15 @@ Appending writes into a buffer with room to grow, so a decode step copies
 nothing; the buffer is re-cut once per ``window`` tokens. Keys are only ever
 dropped in whole attention tiles, so a single row's prefill tiles sit where a
 cache of every key would have them and its output is bit-identical to it.
+
+A batched rollback whose rows accept different counts leaves row ``r`` ending
+``tails[r]`` keys early; a re-cut, extract, filter, extend or merge realigns it.
 """
 
 from __future__ import annotations
 
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache as _ArraysCache
-
-from ..kv_roll import _roll_logical_prefix
 
 KEYS, VALUES, CONV, PADDING = 0, 1, 2, 6
 SLOTS = 7
@@ -62,6 +63,7 @@ class ArraysCache(_ArraysCache):
         return state
 
     def extract(self, idx):
+        realign(self)
         row = ArraysCache(len(self.cache), window=self.window)
         row.cache = [None if c is None else c[idx : idx + 1] for c in self.cache]
         pad = _padding(self)[idx]
@@ -73,6 +75,7 @@ class ArraysCache(_ArraysCache):
         return row
 
     def filter(self, batch_indices):
+        realign(self)
         super().filter(batch_indices)
         pads = _padding(self)
         drop = min(pads, default=0)
@@ -83,6 +86,8 @@ class ArraysCache(_ArraysCache):
             self.cache[PADDING] = mx.array([p - drop for p in pads], dtype=mx.int32)
 
     def extend(self, other):
+        realign(self)
+        realign(other)
         joined = _join([self, other])
         self.cache = joined.cache
         self.left_padding = None
@@ -90,6 +95,8 @@ class ArraysCache(_ArraysCache):
 
     @classmethod
     def merge(cls, caches):
+        for state in caches:
+            realign(state)
         return _join(caches)
 
 
@@ -141,7 +148,7 @@ def _join(states) -> ArraysCache:
 class _Buffer:
     """Growth buffers of one state; rows ``[0, n)`` hold keys."""
 
-    __slots__ = ("keys", "values", "n", "view", "pads", "shown")
+    __slots__ = ("keys", "values", "n", "view", "pads", "shown", "tails")
 
     def __init__(self):
         self.keys = self.values = self.view = None
@@ -149,6 +156,8 @@ class _Buffer:
         # Left padding of each row, in buffer rows and as last published.
         self.pads: list[int] = []
         self.shown: list[int] | None = None
+        # Keys each row ends before ``n`` (a ragged rollback); [] when none.
+        self.tails: list[int] = []
 
     @property
     def capacity(self) -> int:
@@ -176,9 +185,13 @@ def _floor_tile(n: int) -> int:
     return max(0, n) // _TILE * _TILE
 
 
+def _reach(state, buffer: _Buffer) -> int:
+    return _floor_tile(buffer.n - max(buffer.tails, default=0) - (state.window - 1))
+
+
 def _publish(state, buffer: _Buffer) -> None:
     """Set the state slots to the keys a later step can still reach."""
-    start = _floor_tile(buffer.n - (state.window - 1))
+    start = _reach(state, buffer)
     state.cache[KEYS] = buffer.keys[:, :, start : buffer.n]
     state.cache[VALUES] = buffer.values[:, :, start : buffer.n]
     buffer.view = state.cache[KEYS]
@@ -199,7 +212,7 @@ def append(state, keys: mx.array, values: mx.array):
     if window <= 0:
         raise ValueError("A sliding state needs its layer's window size")
     length = keys.shape[2]
-    first = _floor_tile(buffer.n - (window - 1))
+    first = _reach(state, buffer)
     if buffer.n + length > buffer.capacity:
         # Re-cut: the reachable keys move to the front of a buffer with room
         # for this chunk, or for the next ``window`` decode steps.
@@ -208,19 +221,35 @@ def append(state, keys: mx.array, values: mx.array):
         shape = (b, heads, kept + max(length, window), dim)
         new_keys = mx.zeros(shape, dtype=keys.dtype)
         new_values = mx.zeros(shape, dtype=values.dtype)
-        if kept:
+        tails = buffer.tails
+        if kept and not tails:
             new_keys[:, :, :kept] = buffer.keys[:, :, first : buffer.n]
             new_values[:, :, :kept] = buffer.values[:, :, first : buffer.n]
+        elif kept:
+            for row, tail in enumerate(tails):
+                end = buffer.n - tail
+                new_keys[row, :, tail:kept] = buffer.keys[row, :, first:end]
+                new_values[row, :, tail:kept] = buffer.values[row, :, first:end]
         buffer.keys, buffer.values, buffer.n = new_keys, new_values, kept
-        buffer.pads = [max(0, p - first) for p in buffer.pads]
+        buffer.pads = [
+            max(0, p - first) + (tails[i] if tails else 0)
+            for i, p in enumerate(buffer.pads)
+        ]
+        buffer.tails = []
         first = 0
     if not buffer.pads:
         buffer.pads = [0] * keys.shape[0]
     # The state slots are views of the buffers; dropping them first lets the
     # write below happen in place.
     state.cache[KEYS] = state.cache[VALUES] = buffer.view = None
-    buffer.keys[:, :, buffer.n : buffer.n + length] = keys
-    buffer.values[:, :, buffer.n : buffer.n + length] = values
+    if buffer.tails:
+        for row, tail in enumerate(buffer.tails):
+            start = buffer.n - tail
+            buffer.keys[row, :, start : start + length] = keys[row]
+            buffer.values[row, :, start : start + length] = values[row]
+    else:
+        buffer.keys[:, :, buffer.n : buffer.n + length] = keys
+        buffer.values[:, :, buffer.n : buffer.n + length] = values
     buffer.n += length
     _publish(state, buffer)
     left_padding = None
@@ -234,25 +263,65 @@ def append(state, keys: mx.array, values: mx.array):
     )
 
 
-def trim(state, counts: list[int]) -> bool:
-    """Drop the ``counts[b]`` newest keys of row ``b``: the rejected drafts of
-    the verify block just appended, which the buffer still holds the window
-    for. Rows that drop more than the fewest move right, behind more padding."""
+def trim(state, count: int) -> bool:
+    """Drop the ``count`` newest keys: the rejected drafts of the verify
+    block just appended, which the buffer still holds the window for."""
     buffer = _buffer(state)
-    if buffer.keys is None or min(counts) < 0 or max(counts) > buffer.n:
+    if buffer.keys is None or not 0 <= count <= buffer.n:
         return False
     state.cache[KEYS] = state.cache[VALUES] = buffer.view = None
-    common = min(counts)
-    buffer.n -= common
-    extra = [count - common for count in counts]
-    most = max(extra)
-    if most:
-        shift = mx.array(extra, dtype=mx.int32)[:, None]
-        buffer.keys = _roll_logical_prefix(buffer.keys, shift, buffer.n, 2, most)
-        buffer.values = _roll_logical_prefix(buffer.values, shift, buffer.n, 2, most)
-        buffer.pads = [pad + more for pad, more in zip(buffer.pads, extra)]
+    buffer.n -= count
     _publish(state, buffer)
     return True
+
+
+def trim_rows(state, drops) -> bool:
+    """Drop ``drops[r]`` newest keys of row ``r`` without moving keys: rows
+    that drop more than the fewest end early (``tails``)."""
+    buffer = _buffer(state)
+    if buffer.keys is None:
+        return False
+    ends = [t + d for t, d in zip(buffer.tails or [0] * len(drops), drops)]
+    if max(ends) > buffer.n:
+        return False
+    common = min(ends)
+    state.cache[KEYS] = state.cache[VALUES] = buffer.view = None
+    buffer.n -= common
+    rest = [e - common for e in ends]
+    buffer.tails = rest if any(rest) else []
+    _publish(state, buffer)
+    return True
+
+
+def tails(state) -> list[int] | None:
+    """Keys each row ends before the newest (ragged rows), or None."""
+    buffer = state.__dict__.get("_omlx_window")
+    if buffer is None or buffer.view is not state.cache[KEYS]:
+        return None
+    return buffer.tails or None
+
+
+def realign(state) -> None:
+    """End every row at the newest key again; ragged rows move right."""
+    if tails(state) is None:
+        return
+    buffer = _buffer(state)
+    state.cache[KEYS] = state.cache[VALUES] = buffer.view = None
+    rows_k, rows_v = [], []
+    for row, tail in enumerate(buffer.tails):
+        k, v = buffer.keys[row : row + 1], buffer.values[row : row + 1]
+        if tail:
+            pad = mx.zeros((1, k.shape[1], tail, k.shape[3]), dtype=k.dtype)
+            end = buffer.n - tail
+            k = mx.concatenate([pad, k[:, :, :end], k[:, :, buffer.n :]], axis=2)
+            v = mx.concatenate([pad, v[:, :, :end], v[:, :, buffer.n :]], axis=2)
+        rows_k.append(k)
+        rows_v.append(v)
+    buffer.keys = mx.concatenate(rows_k, axis=0)
+    buffer.values = mx.concatenate(rows_v, axis=0)
+    buffer.pads = [p + t for p, t in zip(buffer.pads, buffer.tails)]
+    buffer.tails = []
+    _publish(state, buffer)
 
 
 def newest(state, count: int):

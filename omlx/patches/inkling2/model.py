@@ -38,6 +38,11 @@ from . import expert_mma, fused, kernels, loopcd, verify_experts
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
+try:
+    from .. import qwen35_deferred_realign as deferred
+except ImportError:  # inference workers run without mlx-vlm
+    deferred = None
+
 _NVFP4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 _MXFP8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 # ModelOpt NVFP4 tensor scale: amax / (FP8 E4M3 max * FP4 E2M1 max).
@@ -688,6 +693,26 @@ def _row_slice(proj: nn.QuantizedLinear, start: int, end: int | None):
     return sub
 
 
+def _kv_tails(kv):
+    return deferred.tails(kv) if deferred else None
+
+
+def _trim_kv_rows(kv, drops) -> None:
+    ends = [t + d for t, d in zip(_kv_tails(kv) or [0] * len(drops), drops)]
+    common = min(ends)
+    kv._idx -= common
+    rest = [e - common for e in ends]
+    kv.offset = kv.offset - mx.array(drops, dtype=kv.offset.dtype)
+    if not any(rest):
+        kv.__dict__.pop(deferred.TAIL, None)
+        return
+    kv.__dict__[deferred.TAIL] = rest
+    # A replaced update_and_fetch cannot write ragged rows apart.
+    aware = getattr(type(kv), deferred.TAIL_UPDATE, None)
+    if max(rest) > deferred._MAX_TAIL or type(kv).update_and_fetch is not aware:
+        deferred.realign(kv)
+
+
 class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -852,15 +877,25 @@ class Inkling2Attention(nn.Module):
         )
 
     def attend(self, q, k, v, rel, sink, kv, state=None):
-        left_padding = None
+        left_padding = tails = None
         if kv is not None:
+            if _kv_tails(kv) is not None and not kernels.ragged_attention_ok(q, k):
+                deferred.realign(kv)
             k, v = kv.update_and_fetch(k, v)
             left_padding = getattr(kv, "left_padding", None)
+            tails = _kv_tails(kv)
         elif state is not None:
+            if windows.tails(state) is not None and not kernels.ragged_attention_ok(
+                q, k
+            ):
+                windows.realign(state)
             k, v, left_padding = windows.append(state, k, v)
-        out = self._long_attention(q, k, v, rel, sink, left_padding)
-        if out is not None:
-            return out
+            tails = windows.tails(state)
+        if tails is None:
+            # The long-context kernel reads aligned rows only.
+            out = self._long_attention(q, k, v, rel, sink, left_padding)
+            if out is not None:
+                return out
         return kernels.banded_sink_attention(
             q,
             k,
@@ -870,6 +905,7 @@ class Inkling2Attention(nn.Module):
             scale=self.scale,
             window=self.window,
             left_padding=left_padding,
+            tails=tails,
         )
 
     def _long_attention(self, q, k, v, rel, sink, left_padding):
@@ -919,19 +955,6 @@ class Inkling2Attention(nn.Module):
             gate.dtype
         )
         return _linear(self.o_proj, out)
-
-
-def _row_picks(starts: list[int], width: int) -> mx.array | int:
-    if len(set(starts)) == 1:
-        return starts[0]
-    return mx.array(starts, dtype=mx.int32)[:, None] + mx.arange(width)
-
-
-def _rows_from(x: mx.array, picks: mx.array | int, width: int) -> mx.array:
-    if isinstance(picks, int):
-        return x[:, picks : picks + width]
-    index = picks.reshape(*picks.shape, *([1] * (x.ndim - 2)))
-    return mx.take_along_axis(x, index, axis=1)
 
 
 def _cumsum(xs):
@@ -1355,12 +1378,19 @@ class Model(nn.Module):
     # Verify windows up to the compiled width keep the compiled forward, and
     # mtp_partial_rollback recuts the conv tails for any rejected count.
     _omlx_mtp_max_verify_rows = _COMPILED_MAX_TOKENS
+    # Batched requests verify one draft each; deeper shared blocks measured slower.
+    _omlx_mtp_batch_max_depth = 1
 
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
         quant = args.quantization
+        # Batch KV caches need the per-row tail patch before any batch is merged.
+        if deferred is None:
+            self._omlx_drafter_single_row = True
+        else:
+            deferred.apply_qwen35_deferred_realign_patch()
         self.model = Inkling2TextModel(args.text, quant)
         self.lm_head = nn.Linear(
             args.text.hidden_size, args.text.vocab_size, bias=False
@@ -1523,14 +1553,13 @@ class Model(nn.Module):
         ``accepted`` is one count for every row, or a list with one per row.
         """
         counts = accepted if isinstance(accepted, (list, tuple)) else [accepted]
-        rejected = [int(num_drafts) - int(count) for count in counts]
-        if max(rejected) <= 0:
+        if len(set(counts)) > 1:
+            return self._ragged_rollback(cache, list(counts), int(num_drafts))
+        rejected = int(num_drafts) - int(counts[0])
+        if rejected <= 0:
             return True
-        keep = [int(count) + 1 for count in counts]
-        common = min(rejected)
-        extra = [count - common for count in rejected]
+        keep = int(counts[0]) + 1
         width = self.args.text.sconv_kernel_size - 1
-        picks = _row_picks(keep, width)
         for kv, conv in self.model.visit_caches(cache):
             padded = getattr(conv, "_omlx_verify_xp", None)
             if padded is None:
@@ -1538,25 +1567,47 @@ class Model(nn.Module):
             if kv is None:
                 if not windows.trim(conv, rejected):
                     return False
-            elif kv.trim(common) != common:
+            elif kv.trim(rejected) != rejected:
                 return False
-            elif any(extra):
-                kv.prepare(right_padding=extra)
-                kv.finalize()
             base = windows.CONV if kv is None else 0
             for slot, xp in padded.items():
-                conv[base + slot] = _rows_from(xp, picks, width)
+                # A verify window is a few rows, so the state may stay a view.
+                conv[base + slot] = xp[:, keep : keep + width]
             conv._omlx_verify_xp = None
         if self.model._caches_thinking_flags:
-            flags = cache[-1]._omlx_verify_xp
-            last = _row_picks([start - 1 for start in keep], 1)
-            cache[-1][0] = _rows_from(flags, last, 1)
+            cache[-1][0] = cache[-1]._omlx_verify_xp[:, keep - 1 : keep]
         return True
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
-        if not self.mtp_partial_rollback(caches, accepted, int(block_size) - 1):
+        counts = list(accepted) if isinstance(accepted, list) else [int(accepted)]
+        if not self.mtp_partial_rollback(caches, counts, int(block_size) - 1):
             raise RuntimeError("Inkling 2 verify rollback found no conv windows")
-        return accepted
+        return max(counts)
+
+    def _ragged_rollback(self, cache, accepted: list[int], num_drafts: int) -> bool:
+        drops = [num_drafts - a for a in accepted]
+        keep = mx.array([a + 1 for a in accepted], dtype=mx.int32)
+        width = self.args.text.sconv_kernel_size - 1
+        cut = (keep[:, None] + mx.arange(width, dtype=mx.int32)[None])[:, :, None]
+        for kv, conv in self.model.visit_caches(cache):
+            padded = getattr(conv, "_omlx_verify_xp", None)
+            if padded is None:
+                return False
+            if kv is None:
+                if not windows.trim_rows(conv, drops):
+                    return False
+            else:
+                _trim_kv_rows(kv, drops)
+            base = windows.CONV if kv is None else 0
+            for slot, xp in padded.items():
+                conv[base + slot] = mx.take_along_axis(xp, cut, axis=1)
+            conv._omlx_verify_xp = None
+        if self.model._caches_thinking_flags:
+            flags = cache[-1]._omlx_verify_xp
+            cache[-1][0] = mx.take_along_axis(
+                flags, (keep - 1).reshape((-1,) + (1,) * (flags.ndim - 1)), axis=1
+            )
+        return True
 
     @property
     def layers(self):
