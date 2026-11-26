@@ -151,12 +151,16 @@ void dispatch_qmv_wide_t5(
 
     int n_tiles = (M + 4) / 5;
     int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
-    int k_lanes = 8;
+    bool batch4_lut = M == 4 && x.dtype() == float16 && group_size == 128;
+    int k_lanes = (batch4_lut && N >= 4096) ? 4 : 8;
     int num_simdgroups = 4;
     int rows_per_tg = (32 / k_lanes) * num_simdgroups;
 
     std::string kname = qmv_wide_t5_kname(
         type_str(x.dtype()), group_size, vecs_per_tg, k_lanes);
+    if (batch4_lut) {
+        kname += "_batch4_lut";
+    }
 
     auto kernel = get_lowbit_kernel(d, kname);
     auto& enc = metal::get_command_encoder(s);
