@@ -4882,6 +4882,8 @@ def _run_verify_cycle_chain(
     # backbone cache yet, so materialize it before the queue reaches it.
     materialize_boundary_emit = align > 0 and to_boundary > 0 and to_boundary == m + 1
     state.boundary_emit_pending = materialize_boundary_emit
+    if materialize_boundary_emit:
+        draft_jobs = None
 
     # --- stats ---
     state.stats.cycles += 1
