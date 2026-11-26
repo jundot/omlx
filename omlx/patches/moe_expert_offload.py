@@ -479,6 +479,19 @@ class ExpertCache:
         self._resize(self.full_capacity)
         return added
 
+    def cast_slots(self, dtype) -> int:
+        """Recast the bfloat16 slots to ``dtype``; return how many changed.
+
+        Experts fetched later take the slot dtype when they are written."""
+        changed = []
+        for triple in self.resident.values():
+            for i, a in enumerate(triple):
+                if a is not None and a.dtype == mx.bfloat16:
+                    triple[i] = a.astype(dtype)
+                    changed.append(triple[i])
+        mx.eval(changed)
+        return len(changed)
+
     def _plans(self, e: int) -> list:
         """Read plans for expert ``e``'s tensors, in slot-write order."""
         out = []

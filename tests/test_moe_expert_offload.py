@@ -47,6 +47,7 @@ if HAS_MLX:
         release_moe_offload_slots,
         restore_moe_offload_slots,
     )
+    from omlx.utils.model_loading import cast_bf16_params_to_fp16
 
 # toy geometry: E large enough that a 25% fraction clears the capacity floor
 E, D, INTER, K, GROUP = 32, 64, 32, 2, 32
@@ -217,6 +218,30 @@ class TestApplyAndForward:
             assert bool(mx.array_equal(ref, got))
         stats = moe_offload_stats(model)
         assert stats["layers"] == 2 and stats["misses"] > 0
+
+    def test_fp16_recast_reaches_offload_slots(self, tmp_path):
+        def bf16_model():
+            glus = [_make_glu(seed=i) for i in range(2)]
+            for glu in glus:
+                glu.set_dtype(mx.bfloat16)
+            return _MiniMoE(glus)
+
+        resident = bf16_model()
+        tensors = {}
+        for i, layer in enumerate(resident.layers):
+            prefix = f"layers.{i}.experts.switch_glu"
+            tensors.update(_glu_tensors(layer.experts.switch_glu, prefix))
+        _save_checkpoint(tmp_path, tensors)
+        model = bf16_model()
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        cast_bf16_params_to_fp16(resident)
+        cast_bf16_params_to_fp16(model)
+        x, i = mx.random.normal((4, 1, D)).astype(mx.float16), _ri(4, 1, K)
+        ref, got = resident(x, i), model(x, i)
+        mx.eval(ref, got)
+        assert got.dtype == mx.float16
+        assert bool(mx.array_equal(ref, got))
+        assert moe_offload_stats(model)["misses"] > 0
 
     def test_chunked_prefill_bit_exact_below_sort_threshold(self, tmp_path):
         # 27 tokens x k=2 = 54 indices: below the sort threshold, above the

@@ -57,6 +57,21 @@ class SlotCache:
             view.plan(src, field, 0).nbytes for _, field, src in self._writes
         )
 
+    def cast_slots(self, dtype) -> int:
+        """Recast the bfloat16 slots to ``dtype``; return how many changed.
+
+        The slots are the projections' own tensors, so both references move."""
+        changed = []
+        for proj, arrays in self.resident.items():
+            lin = self.glu[proj]
+            for i, field in enumerate(_fields(lin)):
+                if arrays[i].dtype == mx.bfloat16:
+                    arrays[i] = arrays[i].astype(dtype)
+                    setattr(lin, field, arrays[i])
+                    changed.append(arrays[i])
+        mx.eval(changed)
+        return len(changed)
+
     def ensure(self, idx: mx.array) -> None:
         if self.warm:
             return

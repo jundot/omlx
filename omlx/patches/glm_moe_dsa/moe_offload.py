@@ -50,6 +50,7 @@ from ..moe_expert_offload import (
     _minimum_experts,
     _resolve_model_dir,
 )
+from ..moe_slot_cache import SlotCache
 from .kernels import fast as glm_fast
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,7 @@ class _SlotCache:
     """LRU slots living inside the module's own projection tensors."""
 
     moe_offload_cache = True
+    cast_slots = SlotCache.cast_slots
 
     def __init__(self, glu, capacity: int, view: _GLUStoreView):
         self.glu = glu
