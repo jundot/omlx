@@ -1726,12 +1726,17 @@ from mlx_lm.models import deepseek_v41
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
 prompt = np.random.default_rng(16).integers(3, 60, 13).tolist()
+second = np.random.default_rng(17).integers(3, 60, 11).tolist()
 full, _ = load(sys.argv[1], ced_prefill=True)
 lm = full.language_model
-cache = lm.make_cache()
-for a, b in ((0, 7), (7, 12)):
-    lm._omlx_prefill(mx.array([prompt[a:b]]), cache=cache)
-reference = lm(mx.array([prompt[12:]]), cache=cache)[0, -1].astype(mx.float32)
+def ced_reference(tokens):
+    cache = lm.make_cache()
+    for a in range(0, len(tokens) - 1, 7):
+        lm._omlx_prefill(mx.array([tokens[a : min(a + 7, len(tokens) - 1)]]), cache=cache)
+    logits = lm(mx.array([tokens[-1:]]), cache=cache)[0, -1].astype(mx.float32)
+    return logits - mx.logsumexp(logits)
+expected = ced_reference(prompt)
+second_expected = ced_reference(second)
 full.close()
 
 ced_layers = []
@@ -1752,11 +1757,10 @@ assert not model.language_model._config.a8_prefill
 assert model(mx.array([prompt[:7]]), cache=model.make_cache()).shape[1] == 7
 assert not ced_layers
 
-expected = reference - mx.logsumexp(reference)
-def check(got):
+def check(got, want=expected):
     got = got.astype(mx.float32)
-    assert mx.allclose(got, expected, atol=1e-3, rtol=1e-3).item(), mx.abs(
-        got - expected
+    assert mx.allclose(got, want, atol=1e-3, rtol=1e-3).item(), mx.abs(
+        got - want
     ).max()
 
 gen = BatchGenerator(model, max_tokens=1, prefill_step_size=7)
@@ -1779,6 +1783,18 @@ with _cache_only_prompt_prefill(mlx_generate):
     steps.close()
 assert ced_layers
 check(logprobs)
+
+ced_layers.clear()
+gen = BatchGenerator(model, max_tokens=1, prefill_step_size=7, prefill_batch_size=2)
+with _cache_only_prompt_prefill(mlx_generate):
+    first_uid, second_uid = gen.insert([prompt, second], max_tokens=[1, 1])
+    batched = {}
+    while len(batched) < 2:
+        batched.update((r.uid, r.logprobs) for r in gen.next()[1])
+gen.close()
+assert ced_layers
+check(batched[first_uid])
+check(batched[second_uid], second_expected)
 print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
 """
 

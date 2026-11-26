@@ -1706,6 +1706,13 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # rows rather than re-concatenating every slot of every layer each step.
             item.adopt_rows(rows[i])
             item.advance(input_ids.shape[1])
+        width = max(row.shape[1] for row in results)
+        results = [
+            row
+            if row.shape[1] == width
+            else mx.pad(row, [(0, 0), (width - row.shape[1], 0), (0, 0)])
+            for row in results
+        ]
         logits = mx.concatenate(results, 0)
         if capture:
             if skip_decoder:
