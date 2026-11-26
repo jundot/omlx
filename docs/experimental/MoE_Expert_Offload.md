@@ -172,6 +172,25 @@ The resident fraction applies to the routed experts in each backbone layer,
 with capacity floored at the number selected by one token. Shared experts,
 attention, and other backbone weights remain resident.
 
+An oQh checkpoint streams its routed experts in the same slots. Row-scale oQh
+stores packed codes plus one scale per output row, so an expert's slab is the
+same contiguous range an affine one is and lands in the slot buffer byte for
+byte. The rotation signs cover the whole input axis and have no expert axis:
+the plan reads them once per projection and keeps them resident, and the
+offloaded expert reinstalls the shared input rotation of `w1`/`w3` that the
+oQh load hook would otherwise have bound. Every projection is checked against
+`omlx_oqh.tensors` for its own bit width, so a mixed 2/3/4-bit export streams
+as shipped. V4.1 oQh exports keep the row scale throughout: oQ4 keeps the
+source FP4 experts, so no V4.1 export carries group scales.
+
+Decode reads each route with the per-row kernel, so a streamed oQh expert
+returns the resident bits. A prefill splits its routes into slot-sized
+chunks, and the gather order changes with them, so two residencies round
+differently like any other layout. On a 128-token probe of a 291 GiB
+checkpoint, 12.5% and 25% residency differed by 0.62 per logit on average
+(an affine checkpoint of the same size: 0.76), while decode stayed
+identical; each setting is deterministic.
+
 Non-resident experts are read with positional `pread` calls on a small
 reader pool of their own, not through the Engram row-gather mapping: an
 expert is megabytes of contiguous bytes, and a faulting `MADV_RANDOM` gather

@@ -10,10 +10,15 @@ import numpy as np
 import pytest
 from test_deepseek_v41 import write_checkpoint
 
+from omlx.custom_kernels.oqh import fast as oqh_fast
 from omlx.engine.vlm import wire_moe_offload_slot_hooks
 from omlx.patches.deepseek_v41.convert import convert
 from omlx.patches.deepseek_v41.loading import load
 from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
+
+_NEEDS_OQH = pytest.mark.skipif(
+    not oqh_fast.has_native(), reason="oQh kernels not built"
+)
 
 
 @pytest.mark.parametrize("converted", [False, True])
@@ -1174,3 +1179,283 @@ def test_resident_first_groups_restore_the_sorted_route_order(tmp_path, seed):
             assert disk.slots._ahead == {}
     finally:
         plan.close()
+
+
+def _synthetic_oqh_experts(
+    tmp_path, fraction, bits=3, block=128, version=1, seed=417
+):
+    """A one-layer row-scale oQh checkpoint with a resident reference Expert."""
+    from dataclasses import asdict
+
+    from omlx.oqh import format as fmt
+    from omlx.oqh import quantize
+    from omlx.oqh.modules import OqhSwitchLinear
+    from omlx.oqh.runtime import install_expert_rotation
+    from omlx.patches.deepseek_v41.config import ModelConfig
+    from omlx.patches.deepseek_v41.language import Expert
+    from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
+
+    mx.random.seed(seed)
+    dim, inter = 256, 128
+    config = ModelConfig(
+        dim=dim,
+        moe_inter_dim=inter,
+        n_layers=1,
+        n_routed_experts=8,
+        n_activated_experts=2,
+    )
+    reference = Expert(config, True)
+    prefix = "language_model.layers.0.ffn.experts"
+    tensors, specs = {}, {}
+    for proj in ("w1", "w3", "w2"):
+        # gate and up read the norm output, so they share one sign vector; the
+        # down projection reads the activation and rotates in its own basis.
+        in_dims, out_dims = (dim, inter) if proj in ("w1", "w3") else (inter, dim)
+        key = "layers.0.post" if proj in ("w1", "w3") else "layers.0.ffn.experts.w2"
+        weight = mx.random.normal((8, out_dims, in_dims)).astype(mx.float32) * 0.05
+        signs = mx.array(fmt.make_signs(key, in_dims)).astype(mx.float32)
+        packed, rscale, _, _ = quantize.quantize(
+            weight, mx.eye(in_dims)[None], bits, signs, block
+        )
+        # The V4.1 writer stores the signs as bfloat16; both the resident and
+        # the streamed module then rotate with that copy.
+        stored = signs.astype(mx.bfloat16)
+        lin = OqhSwitchLinear(in_dims, out_dims, 8, bits, block)
+        lin.weight, lin.rscale = packed, rscale
+        lin.oqh_signs = stored.reshape(-1, block)
+        setattr(reference, proj, lin)
+        tensors[f"{prefix}.{proj}.weight"] = packed
+        tensors[f"{prefix}.{proj}.rscale"] = rscale
+        tensors[f"{prefix}.{proj}.oqh_signs"] = stored.reshape(-1, block)
+        specs[f"{prefix}.{proj}"] = {"bits": bits, "block": block}
+    install_expert_rotation(reference)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    mapping = {key: "model.safetensors" for key in tensors}
+    raw = {
+        "model_type": "deepseek_v41",
+        "text_config": asdict(config),
+        "omlx_deepseek_v41": {"version": 1, "quantized_modules": {}},
+        "omlx_oqh": {"version": version, "tensors": specs},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": mapping})
+    )
+    plan = ExpertOffloadPlan(tmp_path, raw, mapping, config, fraction)
+    return reference, OffloadedExpert(Expert(config, True), plan, prefix), plan
+
+
+def test_oqh_plan_reads_row_scale_experts(tmp_path):
+    """The plan takes bits, block and row scales from ``omlx_oqh``, not affine metadata."""
+    from omlx.patches.deepseek_v41.moe_offload import _fields
+
+    _, _, plan = _synthetic_oqh_experts(tmp_path, 0.5)
+    prefix = "language_model.layers.0.ffn.experts"
+    try:
+        for proj in ("w1", "w3", "w2"):
+            spec = plan.layers[prefix][proj]
+            assert spec["mode"] == "oqh_row"
+            assert _fields(spec) == ["weight", "rscale"]
+        # The two axes differ, so a swapped w1/w2 layout cannot pass.
+        assert (plan.layers[prefix]["w1"]["input_dims"],
+                plan.layers[prefix]["w1"]["output_dims"]) == (256, 128)
+        assert (plan.layers[prefix]["w2"]["input_dims"],
+                plan.layers[prefix]["w2"]["output_dims"]) == (128, 256)
+        # The rotation has no expert axis, so the plan keeps it out of the load
+        # alongside the streamed fields.
+        assert {key.rsplit(".", 1)[-1] for key in plan.excluded_keys} == {
+            "weight",
+            "rscale",
+            "oqh_signs",
+        }
+        per_projection = ((128, 256), (128, 256), (256, 128))
+        streamed = sum(
+            8 * out * (inp * 3 // 32) * 4 + 8 * out * 2 for out, inp in per_projection
+        )
+        assert plan.full_bytes == streamed == 303104
+        assert plan.resident_bytes == 151552
+    finally:
+        plan.close()
+
+
+def test_oqh_slots_share_the_rotation_and_keep_it_across_resize(tmp_path):
+    """w1 and w3 rotate once per input; the shared signs outlive a slot resize."""
+    _, disk, plan = _synthetic_oqh_experts(tmp_path, 0.75)
+    expert, slots = disk.slots.expert, disk.slots
+    try:
+        assert expert.w1._oqh_key == expert.w3._oqh_key
+        assert expert.w2._oqh_key is None
+        signs = expert.w2["oqh_signs"]
+        slots.release_slots(2)
+        assert slots.capacity == 2
+        assert expert.w2["oqh_signs"] is signs
+        slots.restore_slots()
+        assert slots.capacity == plan.capacity == 6
+    finally:
+        plan.close()
+
+
+@_NEEDS_OQH
+def test_oqh_experts_match_the_resident_arithmetic(tmp_path):
+    """Streamed oQh experts compute the resident bits, decode and sorted prefill."""
+    reference, disk, plan = _synthetic_oqh_experts(tmp_path, 0.5)
+    try:
+        mx.random.seed(9)
+        width = 256
+        x = mx.random.normal((1, 2, 1, 1, width)).astype(mx.bfloat16) * 0.1
+        indices = mx.array([[[0, 7], [3, 0]]], dtype=mx.int32)
+        weights = mx.array([[[0.6, 0.4], [0.3, 0.7]]], dtype=mx.float32)
+        actual, expected = disk(x, indices, weights), reference(x, indices, weights)
+        mx.eval(actual, expected)
+        assert bool(mx.array_equal(actual, expected))
+        # Sorted prefill: the caller sorts the routes and passes one row each.
+        flat = indices.reshape(-1)
+        order = mx.argsort(flat)
+        top_k = indices.shape[-1]
+        rows = x.reshape(-1, width)[order // top_k][:, None, :]
+        ids, scores = flat[order], weights.reshape(-1)[order]
+        actual = disk(rows, ids, scores, sorted_indices=True)
+        expected = reference(rows, ids, scores, sorted_indices=True)
+        mx.eval(actual, expected)
+        assert bool(mx.array_equal(actual, expected))
+    finally:
+        plan.close()
+
+
+def test_oqh_unknown_format_version_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="Unsupported oQh format version: 2"):
+        _synthetic_oqh_experts(tmp_path, 0.5, version=2)
+
+
+def test_oqh_checkpoint_is_offload_eligible(tmp_path):
+    """The eligibility check reads oQh experts through the same plan."""
+    from omlx.patches.moe_offload_compat import moe_offload_compatibility
+
+    _, _, plan = _synthetic_oqh_experts(tmp_path, 0.5)
+    plan.close()
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+
+
+def test_oqh_checkpoint_with_a_missing_row_scale_is_refused(tmp_path):
+    from omlx.patches.moe_offload_compat import moe_offload_compatibility
+
+    _, _, plan = _synthetic_oqh_experts(tmp_path, 0.5)
+    plan.close()
+    shard = tmp_path / "model.safetensors"
+    tensors = dict(mx.load(str(shard)))
+    missing = "language_model.layers.0.ffn.experts.w1.rscale"
+    del tensors[missing]
+    mx.save_safetensors(str(shard), tensors)
+    index = tmp_path / "model.safetensors.index.json"
+    mapping = json.loads(index.read_text())
+    del mapping["weight_map"][missing]
+    index.write_text(json.dumps(mapping))
+    supported, reason = moe_offload_compatibility(tmp_path)
+    assert supported is False
+    assert "expert layout" in reason and "rscale" in reason
+
+
+def _convert_to_oqh(source, target, bits=3, block=128):
+    """Rewrite a converted export's routed experts into the row-scale oQh layout."""
+    from omlx.oqh import format as fmt
+    from omlx.oqh import quantize
+
+    convert(source, target)
+    shards = sorted(target.glob("*.safetensors"))
+    tensors = {}
+    for shard in shards:
+        tensors.update(mx.load(str(shard)))
+    raw = json.loads((target / "config.json").read_text())
+    text = raw.get("text_config") or raw
+    layers, experts = text["n_layers"], text["n_routed_experts"]
+    converted = raw.setdefault("omlx_deepseek_v41", {})
+    quantized = dict(converted.get("quantized_modules") or {})
+    source_weights = mx.load(str(source / "model.safetensors"))
+    entries = {}
+    for layer in range(layers):
+        for proj in ("w1", "w3", "w2"):
+            width = source_weights[f"layers.{layer}.ffn.experts.0.{proj}.weight"].shape[
+                -1
+            ]
+            # The oQh writer gives gate and up one sign vector; w2 reads the
+            # activation and rotates in its own basis.
+            key = (
+                f"layers.{layer}.post"
+                if proj in ("w1", "w3")
+                else f"layers.{layer}.ffn.experts.w2"
+            )
+            signs = mx.array(fmt.make_signs(key, width)).astype(mx.float32)
+            stacked = mx.stack(
+                [
+                    source_weights[f"layers.{layer}.ffn.experts.{expert}.{proj}.weight"]
+                    for expert in range(experts)
+                ]
+            )
+            packed, rscale, _, _ = quantize.quantize(
+                stacked, mx.eye(width)[None], bits, signs, block
+            )
+            base = f"language_model.layers.{layer}.ffn.experts.{proj}"
+            tensors[f"{base}.weight"] = packed
+            tensors[f"{base}.rscale"] = rscale
+            tensors[f"{base}.oqh_signs"] = signs.reshape(-1, block)
+            for field in ("scales", "biases"):
+                tensors.pop(f"{base}.{field}", None)
+            quantized.pop(base, None)
+            entries[base] = {"bits": bits, "block": block}
+    converted["quantized_modules"] = quantized
+    raw["omlx_oqh"] = {"version": 1, "tensors": entries}
+    (target / "config.json").write_text(json.dumps(raw))
+    for shard in shards:
+        shard.unlink()
+    mx.save_safetensors(str(target / "model.safetensors"), tensors)
+    (target / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "model.safetensors" for key in tensors}})
+    )
+
+
+@_NEEDS_OQH
+def test_oqh_checkpoint_loads_and_streams_its_experts(tmp_path):
+    """The loader skips the streamed oQh tensors and the plan reads them back."""
+    overrides = dict(
+        dim=128, moe_inter_dim=128, n_routed_experts=8, n_activated_experts=2
+    )
+    source, _ = write_checkpoint(tmp_path, vision=False, **overrides)
+    target = tmp_path / "converted"
+    _convert_to_oqh(source, target)
+    resident, _ = load(target)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        disk, _ = executor.submit(
+            load, target, moe_expert_offload_resident_fraction=0.25
+        ).result()
+    plan = disk._moe_offload_plan
+    try:
+        assert plan.capacity == 2 and plan.count == 8
+        assert isinstance(disk.language_model.layers[0].ffn.experts, OffloadedExpert)
+        caches = [model.language_model.make_cache() for model in (resident, disk)]
+        for ids in (mx.array([[3, 4] * 17]), mx.array([[6, 7]])):
+            out = [
+                model(ids, cache=cache)
+                for model, cache in zip((resident, disk), caches)
+            ]
+            mx.eval(out)
+            # A prefill splits its routes into slot-sized chunks, so a long run
+            # of one expert can take a different quantized-matmul path than the
+            # resident call. This compares to rounding, not bitwise.
+            np.testing.assert_allclose(
+                out[0].astype(mx.float32),
+                out[1].astype(mx.float32),
+                rtol=1e-3,
+                atol=1e-3,
+            )
+        # One token takes the per-row decode kernel, which does not depend on
+        # how the routes were grouped.
+        out = [
+            model(mx.array([[5]]), cache=cache)
+            for model, cache in zip((resident, disk), caches)
+        ]
+        mx.eval(out)
+        assert bool(mx.array_equal(out[0], out[1]))
+        assert disk.language_model.layers[0].ffn.experts.slots.misses >= 2
+    finally:
+        resident.close()
+        disk.close()

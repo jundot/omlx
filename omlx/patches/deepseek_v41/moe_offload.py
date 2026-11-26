@@ -25,6 +25,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ...oqh import format as oqh_format
+from ...oqh.modules import OqhSwitchLinear
+from ...oqh.runtime import install_expert_rotation
 from .convert import repack_weight, source_quantization_spec
 from .quantization import QuantizedProjection
 from .residency import (
@@ -62,6 +65,8 @@ def _fields(spec):
     """Tensor fields of a projection: packed weights plus quantization metadata."""
     if not spec:
         return ["weight"]
+    if spec["mode"] == "oqh_row":
+        return ["weight", "rscale"]
     return ["weight", "scales"] + (["biases"] if spec["mode"] == "affine" else [])
 
 
@@ -89,6 +94,12 @@ class ExpertOffloadPlan:
         self.path = Path(path)
         self.mapping = mapping
         self.converted = raw.get("omlx_deepseek_v41")
+        self.oqh = oqh_format.oqh_paths(raw)
+        if oqh_format.is_oqh_config(raw) and not self.oqh:
+            version = (raw.get(oqh_format.CONFIG_KEY) or {}).get("version")
+            if int(version or 0) != oqh_format.FORMAT_VERSION:
+                raise ValueError(f"Unsupported oQh format version: {version}")
+            raise ValueError("oQh config lists no expert tensors")
         self.config = raw
         self.count = config.n_routed_experts
         self.floor = config.n_activated_experts
@@ -150,6 +161,8 @@ class ExpertOffloadPlan:
     def _projection(self, prefix, proj, logical):
         if self.converted is not None:
             name = f"{prefix}.{proj}"
+            if name in self.oqh:
+                return self._oqh_projection(prefix, name, logical)
             spec = self.converted.get("quantized_modules", {}).get(name)
             entries = {f: self._entry(f"{name}.{f}") for f in _fields(spec)}
             for field, entry in entries.items():
@@ -252,6 +265,53 @@ class ExpertOffloadPlan:
         self.full_bytes += size
         self.layer_bytes[prefix] += size
         return spec
+
+    def _oqh_projection(self, prefix, name, logical):
+        """Validate one routed projection's row-scale oQh headers."""
+        entry = self.oqh[name]
+        bits, block = int(entry["bits"]), int(entry["block"])
+        if bits not in oqh_format.SUPPORTED_BITS:
+            raise ValueError(f"Unsupported oQh bits: {name}")
+        output, width = logical
+        if block not in (128, 256) or width % block:
+            raise ValueError(f"Unsupported oQh rotation block: {name}")
+        weight = self._entry(f"{name}.weight")
+        rscale = self._entry(f"{name}.rscale")
+        signs = self._entry(f"{name}.oqh_signs")
+        if weight["dtype"] != "U32" or tuple(weight["shape"]) != (
+            self.count,
+            output,
+            width * bits // 32,
+        ):
+            raise ValueError(f"Invalid oQh expert weight: {name}")
+        if rscale["dtype"] not in _FLOAT_BYTES or tuple(rscale["shape"]) != (
+            self.count,
+            output,
+        ):
+            raise ValueError(f"Invalid oQh expert row scale: {name}")
+        if signs["dtype"] not in _FLOAT_BYTES or tuple(signs["shape"]) != (
+            width // block,
+            block,
+        ):
+            raise ValueError(f"Invalid oQh expert signs: {name}")
+        size = sum(
+            e["data_offsets"][1] - e["data_offsets"][0] for e in (weight, rscale)
+        )
+        self.full_bytes += size
+        self.layer_bytes[prefix] += size
+        return {
+            "mode": "oqh_row",
+            "bits": bits,
+            "block": block,
+            "input_dims": width,
+            "output_dims": output,
+        }
+
+    def shared(self, prefix, proj):
+        """Read the rotation signs whole: they have no expert axis to stream."""
+        key = f"{prefix}.{proj}.oqh_signs"
+        slab = self.slab(key)
+        return _to_array(slab, self.read(slab))
 
     def resident_bytes_at(self, capacity):
         """Expert bytes resident with ``capacity`` slots per layer."""
@@ -399,12 +459,24 @@ class _ExpertSlots:
                 for field, array in sample.items()
             }
             spec = plan.layers[prefix][proj]
-            if spec:
+            if spec and spec["mode"] == "oqh_row":
+                lin = OqhSwitchLinear(
+                    spec["input_dims"],
+                    spec["output_dims"],
+                    self.capacity,
+                    spec["bits"],
+                    spec["block"],
+                )
+                lin.weight, lin.rscale = values["weight"], values["rscale"]
+                lin.oqh_signs = plan.shared(prefix, proj)
+                setattr(expert, proj, lin)
+            elif spec:
                 setattr(expert, proj, QuantizedProjection(**values, **spec))
             else:
                 getattr(expert, proj).weight = values["weight"]
         mx.eval(expert.parameters())
         expert.eval()
+        install_expert_rotation(expert)
         # Decayed use counts per expert id: (count, update it was last scored).
         self._clock = 0
         self._uses = {}

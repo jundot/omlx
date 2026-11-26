@@ -199,6 +199,21 @@ def _is_oqh_expert_set(module) -> bool:
     )
 
 
+def install_expert_rotation(expert) -> bool:
+    """Give w1 and w3 of a DeepSeek V4.1 expert set one shared rotation key.
+
+    ``install`` calls it for every module it walks. An offloaded expert sits
+    behind its wrapper, out of that walk, and its tensors never reach the
+    load hook, so the offload plan installs the rotation itself.
+    """
+    if not _is_oqh_expert_set(expert):
+        return False
+    # w1 and w3 read the norm output; w2 reads the activation and keeps its own.
+    _bind_readers(None, [expert.w1, expert.w3])
+    _set(expert, "_oqh_installed", True)
+    return True
+
+
 def _verify_switch_glu(original):
     """Run oQh experts in row-exact MTP verify through the decode arithmetic."""
 
@@ -359,13 +374,8 @@ def install(model: nn.Module) -> int:
         _set(module, "_oqh_installed", True)
         count += 1
     for _, module in model.named_modules():
-        if _is_oqh_glu(module) and _install_mlp(module):
-            count += 1
-        elif _is_oqh_expert_set(module):
-            # Its forward weights routes before w2, so only the rotation of
-            # the shared input is shared.
-            _bind_readers(None, [module.w1, module.w3])
-            _set(module, "_oqh_installed", True)
+        installed = _is_oqh_glu(module) and _install_mlp(module)
+        if installed or install_expert_rotation(module):
             count += 1
     if count:
         verifier = Qwen3_5BatchInvariantForward
