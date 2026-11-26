@@ -34,7 +34,7 @@ from .. import row_exact_gemv
 from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
-from . import kernels, loopcd, verify_experts
+from . import fused, kernels, loopcd, verify_experts
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -42,6 +42,7 @@ _NVFP4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 _MXFP8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 # ModelOpt NVFP4 tensor scale: amax / (FP8 E4M3 max * FP4 E2M1 max).
 _NVFP4_DENOMINATOR = 448.0 * 6.0
+_LONG_ATTENTION_MIN_KEYS = 32768
 
 
 @dataclass
@@ -832,6 +833,9 @@ class Inkling2Attention(nn.Module):
             left_padding = getattr(kv, "left_padding", None)
         elif state is not None:
             k, v, left_padding = windows.append(state, k, v)
+        out = self._long_attention(q, k, v, rel, sink, left_padding)
+        if out is not None:
+            return out
         return kernels.banded_sink_attention(
             q,
             k,
@@ -842,6 +846,46 @@ class Inkling2Attention(nn.Module):
             window=self.window,
             left_padding=left_padding,
         )
+
+    def _long_attention(self, q, k, v, rel, sink, left_padding):
+        length, s = q.shape[2], k.shape[2]
+        if (
+            self.window
+            or length > _COMPILED_MAX_TOKENS
+            or s < _LONG_ATTENTION_MIN_KEYS
+            or not fused.long_attention_supported(q, k, v)
+        ):
+            return None
+        first = s - length + 1
+        below = _LONG_ATTENTION_MIN_KEYS - first
+        if below <= 0 or not is_row_exact_armed():
+            return fused.long_decode_attention(
+                q, k, v, rel, sink, scale=self.scale, left_padding=left_padding
+            )
+        outs = [
+            kernels.banded_sink_attention(
+                q[:, :, r : r + 1],
+                k[:, :, : first + r],
+                v[:, :, : first + r],
+                rel[:, r : r + 1],
+                sink[:, r : r + 1],
+                scale=self.scale,
+                left_padding=left_padding,
+            )
+            for r in range(below)
+        ]
+        outs.append(
+            fused.long_decode_attention(
+                q[:, :, below:],
+                k,
+                v,
+                rel[:, below:],
+                sink[:, below:],
+                scale=self.scale,
+                left_padding=left_padding,
+            )
+        )
+        return mx.concatenate(outs, axis=2)
 
     def output(self, out, gate):
         b, _, length, _ = out.shape
