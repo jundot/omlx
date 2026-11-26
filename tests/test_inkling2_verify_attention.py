@@ -65,9 +65,6 @@ def test_rows_match_decode_steps_bit_for_bit(dtype, window, rows, keys):
     out = verify_attention.rows_attention(
         q, k, v, rel, sink, scale=_D**-0.5, window=window
     )
-    if window and 32 * (_HQ // _HKV) * rows > 1024:
-        assert out is None
-        return
     assert out is not None
     assert mx.array_equal(out, _per_row(q, k, v, rel, sink, window))
 
