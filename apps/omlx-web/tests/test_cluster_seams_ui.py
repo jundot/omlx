@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 _DASHBOARD_SCRIPTS = (
     ROOT / "omlx_web" / "static" / "js" / "dashboard.js",
-    ROOT / "omlx_web" / "static" / "js" / "cluster_v2.js",
+    ROOT / "omlx_web" / "static" / "js" / "cluster.js",
 )
 
 _PREFIX = "/admin/api/cluster"
@@ -54,53 +54,16 @@ def test_every_cluster_url_the_dashboard_calls_is_a_real_route():
 
 
 def test_no_cluster_route_is_unreachable_from_the_dashboard():
-    """Every route should have a caller, or be deliberately listed here.
+    """Every route should have a caller.
 
     A route with no caller is either dead or a feature that was never wired up —
     both worth knowing about.
     """
 
-    # These are compatibility/manual operator APIs retained after the v1
-    # dashboard console was removed. Cluster v2 uses discovery/pairing,
-    # autoconfigure and the deployment lifecycle; scripts and older clients
-    # may still use these explicit low-level probes. CUDA worker enrollment,
-    # the ConnectX/RDMA link checks and the diagnostics report have had no
-    # dashboard panel since the advanced tools were removed.
-    allowed_without_caller: set[str] = {
-        "/admin/api/cluster/cuda-fabric/verify",
-        "/admin/api/cluster/diagnostics",
-        "/admin/api/cluster/join-keys",
-        "/admin/api/cluster/join-keys/{parameter}",
-        "/admin/api/cluster/join-status",
-        "/admin/api/cluster/rdma-links",
-        "/admin/api/cluster/rdma-links/verify",
-        "/admin/api/cluster/backend-selection",
-        "/admin/api/cluster/collective-smoke",
-        "/admin/api/cluster/discover",
-        "/admin/api/cluster/fabric",
-        "/admin/api/cluster/guidance",
-        "/admin/api/cluster/incidents",
-        "/admin/api/cluster/incidents/{parameter}/dismiss",
-        "/admin/api/cluster/link-setup",
-        "/admin/api/cluster/link-status",
-        "/admin/api/cluster/pairing-token",
-        "/admin/api/cluster/peer-health",
-        "/admin/api/cluster/pipeline-smoke",
-        "/admin/api/cluster/plan",
-        "/admin/api/cluster/ssh-key",
-        "/admin/api/cluster/ssh-key/exchange",
-        "/admin/api/cluster/ssh-key/exchange-token",
-        "/admin/api/cluster/ssh-key/generate",
-        "/admin/api/cluster/ssh-key/store-keychain",
-        "/admin/api/cluster/status",
-        "/admin/api/cluster/transports",
-        "/admin/api/cluster/verify-pairing-token",
-        "/admin/api/cluster/worker-smoke",
-    }
-    unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
+    unreachable = _registered_routes() - _js_called_paths()
     assert not unreachable, (
         f"cluster routes nothing calls: {sorted(unreachable)} — wire them up or "
-        f"add them to allowed_without_caller with a reason"
+        f"delete them"
     )
 
 

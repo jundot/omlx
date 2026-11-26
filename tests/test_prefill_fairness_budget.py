@@ -439,11 +439,12 @@ def test_cancel_after_admission_turn_preserves_inflight_prefill(clock):
     assert "decoder" in scheduler.running
 
 
-def test_uncontended_short_request_is_admitted_before_inflight_chunk(clock):
-    """With nothing decoding, a short arrival goes ahead of the chunk (#5148)."""
+@pytest.mark.parametrize("tokens", [3, 3000], ids=["short", "one_chunk"])
+def test_uncontended_short_request_is_admitted_before_inflight_chunk(clock, tokens):
+    """With nothing decoding, an arrival within one chunk goes first (#5148)."""
     scheduler = make_scheduler(prefill_step_size=4096)
     add_prefill(scheduler, "inflight")
-    scheduler.add_request(make_request("waiting", 3))
+    scheduler.add_request(make_request("waiting", tokens))
     events = []
     chunk_sizes = []
 

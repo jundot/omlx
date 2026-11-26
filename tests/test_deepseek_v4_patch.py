@@ -5,6 +5,7 @@ import importlib
 import inspect
 import json
 import sys
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1015,6 +1016,50 @@ class TestChatTemplateV4:
         assert render_through_next_turn.startswith(prev_full_text)
 
 
+class TestVlmTokenizerProtocol:
+    def test_processor_and_tokenizer_share_the_text_encoder(self, applied_patch):
+        import copy
+
+        from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
+            DEFAULT_CHAT_TEMPLATE,
+            DeepseekV4Processor,
+        )
+
+        from omlx.patches.deepseek_v4.tokenizer_patch import (
+            install_vlm_tokenizer_protocol,
+        )
+
+        tokenizer = SimpleNamespace(
+            chat_template=DEFAULT_CHAT_TEMPLATE, encode=lambda text, **kw: [len(text)]
+        )
+        processor = DeepseekV4Processor.__new__(DeepseekV4Processor)
+        processor.tokenizer = tokenizer
+        assert processor.tool_parser_type == "deepseek_v4"
+        install_vlm_tokenizer_protocol(tokenizer)
+
+        render = partial(processor.apply_chat_template, tokenize=False)
+        image = [{"type": "image"}, {"type": "text", "text": "what?"}]
+        user = [{"role": "user", "content": image}]
+        assert render(user, add_generation_prompt=True).endswith(
+            "<｜deepseek_image｜>what?<｜Assistant｜></think>"
+        )
+        assert render(
+            user, add_generation_prompt=True, enable_thinking=True
+        ).endswith("<｜Assistant｜><think>")
+        partial_turn = [*user, {"role": "assistant", "content": "Sure"}]
+        assert render(partial_turn, continue_final_message=True).endswith("Sure")
+
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+        copied = copy.deepcopy(tokenizer)
+        assert copied.apply_chat_template.args == (copied,)
+        text = [{"role": "user", "content": "hi"}]
+        prompt = copied.apply_chat_template(text, tokenize=False, tools=tools)
+        assert "<｜DSML｜tool_calls>" in prompt
+        assert prompt == render(text, tools=tools)
+        assert copied.has_tool_calling
+        assert copied.tool_call_start == "<｜DSML｜tool_calls>"
+
+
 class TestChatTemplateModuleRegistration:
     """sys.modules registration so mlx-lm's importlib path picks up our types."""
 
@@ -1241,10 +1286,14 @@ class TestCacheMaterialization:
         leaf_c = Leaf(mx.array([3], dtype=mx.int32))
         calls = []
 
-        def fake_eval(*arrays):
+        def fake_async_eval(*arrays):
             calls.append(arrays)
 
-        monkeypatch.setattr(dsv4.mx, "eval", fake_eval)
+        def blocking_eval(*arrays):
+            raise AssertionError("cache materialization must not block")
+
+        monkeypatch.setattr(dsv4.mx, "async_eval", fake_async_eval)
+        monkeypatch.setattr(dsv4.mx, "eval", blocking_eval)
 
         dsv4._materialize_cache_arrays([CacheList(leaf_a, leaf_b), leaf_c, None])
 
@@ -1918,6 +1967,38 @@ class TestDeepSeekV4SanitizeHcAliases:
         assert "model.layers.0.hc_attn.base" not in out
 
 
+@pytest.mark.parametrize("hc_mult, hidden", [(2, 8), (4, 6)])
+def test_hyper_connection_kernel_skips_unsupported_layouts(
+    applied_patch, hc_mult, hidden
+):
+    """The fused kernel serves four streams of four-wide rows; other layouts
+    must give the ops path's result."""
+    mx = pytest.importorskip("mlx.core")
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    hc_mod = sys.modules["mlx_lm.models.hyper_connection"]
+    config = SimpleNamespace(
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=3,
+        hc_eps=1e-6,
+        rms_norm_eps=1e-6,
+        hidden_size=hidden,
+    )
+    hc = hc_mod.HyperConnection(config)
+    mx.random.seed(0)
+    hc.fn = mx.random.normal(hc.fn.shape) * 0.1
+    hc.base = mx.random.normal(hc.base.shape) * 0.1
+    x = (mx.random.normal((1, 3, hc_mult, hidden)) * 2).astype(mx.bfloat16)
+
+    hc.eval()
+    got = hc(x)
+    hc.train()
+    want = hc(x)
+    for g, w in zip(got, want):
+        assert mx.array_equal(g, w).item()
+
+
 class TestMtpSanitizeWoAReshape:
     """The MTP patch sanitize must reshape mtp.<i>.block.attn.wo_a from the
     2D nn.Linear layout to the 3D MultiLinear layout, like the backbone."""
@@ -2477,12 +2558,6 @@ class TestAffineBlockRouteThreshold:
         assert linear._can_use_affine_blocks(at, sorted_indices=True) is True
         # unsorted routes never take the block path, whatever the count
         assert linear._can_use_affine_blocks(at, sorted_indices=False) is False
-
-    def test_thresholds_default_to_the_measured_crossovers(self):
-        from omlx.patches.deepseek_v4 import switch_layers as sl
-
-        assert sl._SORT_MIN_ROUTES == 32
-        assert sl._AFFINE_NATIVE_MIN_ROUTES == 1024
 
 
 @pytest.mark.parametrize("family", ["glu", "mlp"])

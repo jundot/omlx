@@ -3013,6 +3013,28 @@ class TestPrefixCacheCacheList:
         seq_len = prefix_cache._get_cache_seq_len(cache_data)
         assert seq_len == 96
 
+    def test_get_cache_seq_len_cache_list_wins_over_rotating_window(
+        self, prefix_cache, mx
+    ):
+        """hy_v4_flash: CacheList layers hold the sequence, rotating layers a window."""
+        full_keys = mx.zeros((1, 1, 2048, 64))
+        rot_keys = mx.zeros((1, 8, 512, 64))
+
+        cache_data = [
+            {
+                "state": [(full_keys, full_keys), (full_keys, full_keys)],
+                "cache_type": "CacheList",
+                "class_name": "CacheList",
+            },
+            {
+                "state": (rot_keys, rot_keys),
+                "cache_type": "RotatingKVCache",
+                "class_name": "RotatingKVCache",
+            },
+        ]
+
+        assert prefix_cache._get_cache_seq_len(cache_data) == 2048
+
     def test_extract_block_tensor_slice_cache_list_last_block(self, prefix_cache, mx):
         """Test _extract_block_tensor_slice for CacheList on last block."""
         from omlx.cache.hybrid_cache import ModelCacheConfig

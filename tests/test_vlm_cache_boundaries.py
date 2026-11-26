@@ -169,6 +169,19 @@ def test_grid_boundaries_at_block_edges(text_prefix, patch_grid):
     assert calls == 1
 
 
+def test_qwen4_exp_image_keys_skip_kv_without_hw_mrope():
+    """0.8.0/0.8.1 keyed Qwen4 image KV (no h/w MRoPE axes) by the plain image
+    hash: only the text before the image may be reused."""
+    full = [1] * 4 + [99] * 4 + [2] * 8
+    result, images, _ = prepare_case(
+        full, {1: [7] * 100}, counts=(1,), grid=[[1, 4, 4]], model_type="qwen4_exp"
+    )
+    tokens, _, _, whole_hash, _, ranges = result
+    old_hash = compute_image_hash(images)
+    old = [(start, old_hash) for start, _ in ranges]
+    assert reused_tokens(tokens, old, ranges, old_hash, whole_hash) == 4
+
+
 def test_generic_receding_boundary_salts_with_all_images():
     result, images, _ = prepare_case(
         [1] * 4 + [99] * 4 + [2] * 4 + [99] * 4,
@@ -298,3 +311,51 @@ def test_unmatched_audio_runs_key_from_first_audio_token_or_start(audio_token_id
     )
     assert [start for start, _ in ranges] == [1 if audio_token_id else 0]
     assert ranges[0][1] != other[0][1]
+
+
+def prepare_sound_clips_case(ids, clips):
+    # Nemotron-3 Nano Omni's processor exposes raw waveforms as
+    # ``sound_clips`` (issue #5122).
+    engine = VLMBatchedEngine(model_name="sound-clip-boundary-test")
+    engine._processor = MagicMock()
+    engine._processor.apply_chat_template.return_value = "prompt"
+    engine._vlm_model = MagicMock()
+    engine._vlm_model.config.model_type = "gemma4"
+    engine._vlm_model.config.sound_context_token_id = AUDIO
+    engine._vlm_model.get_input_embeddings.return_value = SimpleNamespace(
+        inputs_embeds=mx.zeros((1, len(ids), 1))
+    )
+    engine._vision_cache = None
+    messages = [{"role": "user", "content": "text"}]
+    engine._format_messages_for_vlm_template = MagicMock(return_value=(messages, []))
+
+    def prepare(processor, images=None, prompts=None, **kwargs):
+        return {"input_ids": mx.array([ids]), "sound_clips": clips}
+
+    with patch("mlx_vlm.utils.prepare_inputs", side_effect=prepare):
+        return engine._prepare_vision_inputs(
+            messages, [], audio=[(c, c.size) for c in clips]
+        )
+
+
+def test_equal_length_sound_clips_do_not_share_cached_blocks():
+    # Both clips tokenize identically: placeholders depend only on length.
+    ids = [1] * 4 + [AUDIO] * 4 + [2] * 4
+    a = prepare_sound_clips_case(ids, [mx.zeros((16000,))])
+    b = prepare_sound_clips_case(ids, [mx.ones((16000,))])
+    assert a[4] == b[4] == 4
+    assert [start for start, _ in a[5]] == [4]
+    assert reused_tokens(ids, a[5], b[5], a[3], b[3]) == 4
+    assert reused_tokens(ids, a[5], a[5], a[3], a[3]) == 12
+
+
+def test_mixed_length_sound_clips_key_each_run():
+    # The short row is right-padded to the long one; masking must trim
+    # it back so each run keys on its own clip only.
+    ids = [1] * 4 + [AUDIO] * 2 + [2] * 4 + [AUDIO] * 3 + [3] * 4
+    short, long = mx.ones((8000,)), mx.zeros((16000,))
+    a = prepare_sound_clips_case(ids, [short, long])
+    assert [start for start, _ in a[5]] == [4, 10]
+    # The padded short row hashes as the same clip sent alone.
+    solo = prepare_sound_clips_case([1] * 4 + [AUDIO] * 2 + [3] * 4, [short])
+    assert a[5][0] == solo[5][0]

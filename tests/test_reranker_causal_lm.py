@@ -1531,3 +1531,36 @@ class TestCausalLMSharedPrefix:
 
         assert (result.scores, result.indices, result.total_tokens) == ([], [], 0)
         assert model.runs == []
+
+
+class TestCausalLMScorePrecision:
+    class _GapModel:
+        """Tiny model whose last-position logits have a given yes - no gap."""
+
+        def __init__(self, inner, gaps):
+            self.inner = inner
+            self.gaps = list(gaps)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def __call__(self, input_ids, cache=None):
+            shape = self.inner(input_ids, cache=cache).shape
+            logits = np.zeros(shape, dtype=np.float32)
+            logits[0, -1, 1] = self.gaps.pop(0)  # token 1 is "yes", 0 is "no"
+            return mx.array(logits).astype(mx.bfloat16)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_score_is_the_yes_probability(self, tmp_path):
+        helpers = TestCausalLMSharedPrefix()
+        gaps = [-2.0, 0.0, 3.0, 6.0]
+        reranker = helpers._make_reranker(
+            tmp_path,
+            self._GapModel(helpers._tiny_qwen3(), gaps),
+            helpers._PromptTokenizer(helpers._SHARED),
+        )
+        result = reranker._rerank_causal_lm("query", ["d"] * len(gaps))
+
+        assert result.scores == pytest.approx(
+            [0.11920292, 0.5, 0.95257413, 0.99752738], abs=1e-7
+        )

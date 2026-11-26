@@ -188,8 +188,16 @@ def _register_mtp_classes_for_vlm(q35moe_lang: Any) -> None:
                 cache = [None] * len(self.layers)
 
             mask = create_attention_mask(fused, cache[0] if cache else None)
+            # mlx-vlm builds a single (3, 1, L) row from an int cache offset, but
+            # its fused MRoPE kernel reads one row per batch row.
+            offset = getattr(cache[0], "offset", 0) if cache else 0
+            position_ids = None
+            if isinstance(offset, int):
+                batch, length = fused.shape[:2]
+                positions = mx.arange(offset, offset + length)
+                position_ids = mx.broadcast_to(positions, (3, batch, length))
             for layer, c in zip(self.layers, cache):
-                fused = layer(fused, mask, c)
+                fused = layer(fused, mask, c, position_ids)
 
             return self.norm(fused)
 

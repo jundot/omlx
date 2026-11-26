@@ -813,26 +813,24 @@ def test_sliding_window_slice_parity(applied):
 
 
 def test_attention_bias_transient_registration():
-    """The banded-mask transient must be priced into the SDPA estimate
-    when registered, and cleared registrations must restore the base
-    estimate (process-wide registry across model swaps)."""
-    from omlx.memory_monitor import (
-        MemoryMonitor,
-        register_attention_bias_transient,
-    )
+    """The banded-mask transient must be priced into the SDPA estimate of the
+    model that registered it only, capped when it is built in blocks."""
+    from omlx.memory_monitor import MemoryMonitor
 
-    monitor = MemoryMonitor.__new__(MemoryMonitor)
-    monitor._head_dim = 128
-    monitor._num_attention_heads = 32
-    monitor._num_kv_heads = 8
-    monitor._score_dtype_size = 2
+    monitor, other = (MemoryMonitor.__new__(MemoryMonitor) for _ in range(2))
+    for m in (monitor, other):
+        m._head_dim = 128
+        m._num_attention_heads = 32
+        m._num_kv_heads = 8
+        m._score_dtype_size = 2
 
-    try:
-        register_attention_bias_transient(None)
-        base = monitor._estimate_sdpa_activation_bytes(2048, 65536)
-        register_attention_bias_transient(2)
-        with_bias = monitor._estimate_sdpa_activation_bytes(2048, 65536)
-        assert with_bias - base == 32 * 2048 * 65536 * 2
-    finally:
-        register_attention_bias_transient(None)
+    base = other._estimate_sdpa_activation_bytes(2048, 65536)
+    monitor.set_attention_bias_transient(2)
+    with_bias = monitor._estimate_sdpa_activation_bytes(2048, 65536)
+    assert with_bias - base == 32 * 2048 * 65536 * 2
+    assert other._estimate_sdpa_activation_bytes(2048, 65536) == base
+    monitor.set_attention_bias_transient(2, 1 << 29)
+    capped = monitor._estimate_sdpa_activation_bytes(2048, 65536)
+    assert capped - base == (1 << 29) * 2
+    monitor.set_attention_bias_transient(None)
     assert monitor._estimate_sdpa_activation_bytes(2048, 65536) == base

@@ -267,16 +267,27 @@ def get_graphics_footprint() -> int:
         Bytes, or 0 on non-Darwin platforms, older kernels without the rev3
         ledger fields, or if the task_info call fails.
     """
+    info = _read_task_vm_info()
+    return max(0, int(info.ledger_tag_graphics_footprint)) if info else 0
+
+
+def get_graphics_footprint_compressed() -> int:
+    """Return this process's compressed graphics footprint in bytes."""
+    info = _read_task_vm_info()
+    return max(0, int(info.ledger_tag_graphics_footprint_compressed)) if info else 0
+
+
+def _read_task_vm_info() -> "_TaskVMInfo | None":
     if _task_info is None or _mach_task_self is None:
-        return 0
+        return None
     info = _TaskVMInfo()
     count = ctypes.c_uint(_TASK_VM_INFO_COUNT)
     rc = _task_info(
         _mach_task_self.value, _TASK_VM_INFO, ctypes.byref(info), ctypes.byref(count)
     )
     if rc != 0 or count.value < _TASK_VM_INFO_GRAPHICS_COUNT:
-        return 0
-    return max(0, int(info.ledger_tag_graphics_footprint))
+        return None
+    return info
 
 
 def release_free_malloc_memory() -> None:

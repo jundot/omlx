@@ -4,6 +4,7 @@
 from ..adapter import StageAdapter
 from .deepseek_v41 import DeepseekV41Adapter
 from .glm5_next import Glm5NextAdapter
+from .inkling2 import Inkling2Adapter
 from .minimax_m3 import MiniMaxM3Adapter
 from .qwen3_5 import Qwen35Adapter
 from .qwen4_exp import Qwen4ExpAdapter
@@ -13,6 +14,7 @@ _ADAPTERS: dict[str, StageAdapter] = {
     for adapter in (
         DeepseekV41Adapter(),
         Glm5NextAdapter(),
+        Inkling2Adapter(),
         MiniMaxM3Adapter(),
         Qwen35Adapter(),
         Qwen4ExpAdapter(),

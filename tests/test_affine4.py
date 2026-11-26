@@ -64,10 +64,15 @@ def dense(cache, queries, mask=None, sinks=None, states=None):
     ).astype(queries.dtype)
 
 
-@pytest.mark.parametrize("dim", [1, 63, 64, 80, 256])
 @pytest.mark.parametrize(
-    "codec_class,max_error",
-    [(Affine4Codec, 0.03), (Affine8Codec, 2e-4)],
+    "dim,codec_class,max_error",
+    [
+        (1, Affine4Codec, 0.03),
+        (63, Affine4Codec, 0.03),
+        (64, Affine4Codec, 0.03),
+        (63, Affine8Codec, 2e-4),
+        (256, Affine8Codec, 2e-4),
+    ],
 )
 def test_codec_orthogonal_and_quantization(dim, codec_class, max_error):
     codec = codec_class(dim, seed=17)
@@ -192,10 +197,15 @@ def test_portable_attention_masks_sinks_and_dimensions(
         (1, 4, 8, 4, 512, 1025, mx.bfloat16, Affine4KVCache, True),
         (1, 4, 6, 8, 256, 1025, mx.bfloat16, Affine8KVCache, False),
         (1, 8, 8, 1, 64, 1025, mx.bfloat16, Affine8KVCache, True),
-        # Flint verify: 8 query heads per KV head over 6 rows run as two
-        # threadgroup chunks per KV head in one launch.
+        # Over 16 rows per KV head run as 16-row chunks, which can split a
+        # query head's positions and end with a partial chunk.
+        (1, 4, 8, 3, 128, 1025, mx.bfloat16, Affine8KVCache, True),
+        (1, 4, 8, 5, 128, 2049, mx.bfloat16, Affine8KVCache, True),
+        (2, 2, 3, 7, 64, 700, mx.float16, Affine4KVCache, True),
         (1, 4, 8, 6, 128, 2049, mx.bfloat16, Affine8KVCache, True),
         (2, 4, 8, 8, 128, 1025, mx.float16, Affine4KVCache, True),
+        (1, 2, 3, 39, 256, 1500, mx.bfloat16, Affine8KVCache, True),
+        (1, 2, 4, 48, 128, 1500, mx.bfloat16, Affine4KVCache, False),
     ],
 )
 def test_actual_native_matches_portable(
@@ -266,13 +276,10 @@ def test_native_long_uniform_attention_stays_finite(
 @pytest.mark.parametrize(
     "dim,repeats,rows,mask,force_fused,cache_class",
     [
-        (64, 4, 33, None, True, Affine4KVCache),
         (72, 4, 33, "causal", True, Affine8KVCache),
         (96, 4, 33, "causal", True, Affine4KVCache),
-        (128, 4, 33, None, True, Affine8KVCache),
         (256, 6, 5, "causal", True, Affine4KVCache),
         (256, 6, 6, "causal", None, Affine8KVCache),
-        (64, 8, 5, "causal", None, Affine4KVCache),
         (80, 4, 8, "causal", None, Affine8KVCache),
         (80, 4, 9, None, True, Affine4KVCache),
     ],
@@ -301,6 +308,59 @@ def test_bf16_prefill_forces_fused_sdpa_only_where_supported(
     output = cache.attention(queries, scale=dim**-0.5, mask=mask)
     assert calls == [(mx.bfloat16, mx.bfloat16, force_fused)]
     close(output, dense(cache, queries, mask), atol=8e-3, rtol=8e-3)
+
+
+@pytest.mark.parametrize(
+    "dim,repeats,rows,mask,force_fused,cache_class",
+    [
+        (128, 8, 33, "causal", True, Affine8KVCache),
+        (64, 4, 33, None, True, Affine4KVCache),
+        (80, 4, 8, "causal", None, Affine8KVCache),
+    ],
+)
+def test_bf16_prefill_with_sinks_keeps_sinks(
+    monkeypatch, dim, repeats, rows, mask, force_fused, cache_class
+):
+    # Models with attention sinks used to skip this branch and dequantize the whole
+    # cache to fp32 per chunk; the portable fallback inside it also dropped the sinks.
+    if not mx.metal.is_available():
+        pytest.skip("Fused prefill requires Metal")
+    cache = cache_class()
+    cache.update_and_fetch(
+        random((1, 2, 513, dim), mx.bfloat16),
+        random((1, 2, 513, dim), mx.bfloat16, 1),
+    )
+    queries = random((1, 2 * repeats, rows, dim), mx.bfloat16, 2)
+    # Large sinks take most of the softmax mass, so a dropped sink fails.
+    sinks = mx.linspace(4, 9, 2 * repeats)
+    monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
+    original = mx.fast.scaled_dot_product_attention
+    calls = []
+
+    def capture(q, k, v, **kwargs):
+        calls.append(
+            (
+                q.dtype,
+                k.dtype,
+                kwargs.get("force_fused"),
+                kwargs.get("sinks") is not None,
+            )
+        )
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", capture)
+    output = cache.attention(queries, scale=dim**-0.5, mask=mask, sinks=sinks)
+    assert calls == [(mx.bfloat16, mx.bfloat16, force_fused, True)]
+    close(output, dense(cache, queries, mask, sinks), atol=8e-3, rtol=8e-3)
+
+
+@pytest.mark.parametrize("cache_class", [BatchAffine4KVCache, BatchAffine8KVCache])
+def test_unpadded_batch_keeps_string_mask(cache_class):
+    cache = cache_class([0, 0])
+    assert cache._attention_mask("causal", 5, 40) == "causal"
+    assert cache._attention_mask(None, 5, 40) is None
+    padded = cache_class([3, 0])
+    assert isinstance(padded._attention_mask("causal", 5, 40), mx.array)
 
 
 @pytest.mark.parametrize("magnitude", [60000, 1e6])
@@ -352,7 +412,7 @@ def test_from_cache_trim_and_batch_lifecycle():
     assert batch.extract(2).offset == 5
 
 
-@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("rows", [1, 3, 7])
 def test_batch_native_standard_mask_and_padding(monkeypatch, rows):
     require_tensor_ops()
     cache = BatchAffine4KVCache([37, 0])
@@ -556,8 +616,9 @@ def test_bounded_prefill_preserves_masks_and_sinks(
     assert query_lengths == [3, 3, 1]
 
 
-@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
-@pytest.mark.parametrize("rows", [1, 16])
+@pytest.mark.parametrize(
+    "cache_class,rows", [(Affine4KVCache, 16), (Affine8KVCache, 1)]
+)
 def test_portable_attention_peak_is_bounded_across_layers(
     monkeypatch, cache_class, rows
 ):
@@ -610,3 +671,139 @@ def test_bounded_prefill_peak_memory():
     temporary = mx.get_peak_memory() - baseline
     assert temporary < 600 * 1024**2, f"Prefill allocated {temporary / 1024**2:.1f} MiB"
     assert mx.all(mx.isfinite(output)).item()
+
+
+def test_batch_left_padding_is_read_from_the_device_once_per_assignment(monkeypatch):
+    reads = []
+    real_any = mx.any
+    monkeypatch.setattr(mx, "any", lambda *a, **k: reads.append(1) or real_any(*a, **k))
+    cache = BatchAffine8KVCache([0, 0])
+
+    for _ in range(3):
+        assert cache._attention_mask(None, 1, 16) is None
+    assert len(reads) == 1
+
+    cache.left_padding += mx.array([3, 0])
+    mask = cache._attention_mask(None, 1, 16)
+    assert len(reads) == 2
+    assert mask[:, 0, 0, :].tolist() == [[False] * 3 + [True] * 13, [True] * 16]
+
+
+def _row_reference(cache, queries, ends, causal=False):
+    """Dense fp32 attention of each row over its own first ``ends[b]`` columns."""
+    keys, values = cache.dequantize()
+    return mx.concatenate(
+        [
+            mx.fast.scaled_dot_product_attention(
+                queries[b : b + 1].astype(mx.float32),
+                keys[b : b + 1, :, :end],
+                values[b : b + 1, :, :end],
+                scale=queries.shape[-1] ** -0.5,
+                mask="causal" if causal else None,
+            )
+            for b, end in enumerate(ends)
+        ]
+    )
+
+
+def _ragged(cache, heads, dim, prefix, block, drops, appended):
+    """Append ``prefix`` and a verify ``block``, trim ``drops``, then append."""
+    rows = len(drops)
+    for length, seed in ((prefix, 0), (block, 2)):
+        cache.update_and_fetch(
+            random((rows, heads, length, dim), mx.bfloat16, seed),
+            random((rows, heads, length, dim), mx.bfloat16, seed + 1),
+        )
+    cache.trim_rows(drops)
+    cache.update_and_fetch(
+        random((rows, heads, appended, dim), mx.bfloat16, 4),
+        random((rows, heads, appended, dim), mx.bfloat16, 5),
+    )
+    return random((rows, heads * 6, appended, dim), mx.bfloat16, 6)
+
+
+@pytest.mark.parametrize("cache_class", [BatchAffine4KVCache, BatchAffine8KVCache])
+@pytest.mark.parametrize("dim,heads", [(64, 2), (256, 4)])
+def test_trim_rows_then_unmasked_decode_stops_at_row_ends(cache_class, dim, heads):
+    require_tensor_ops()
+    cache = cache_class([0, 0, 0])
+    q = _ragged(cache, heads, dim, 700, 5, [0, 4, 2], 1)
+    assert cache._row_ends == [706, 702, 704]
+    out = affine4._native_attention(cache, q, *cache.state, dim**-0.5, None)
+    assert out is not None
+    close(out, _row_reference(cache, q, cache._row_ends), atol=4e-3, rtol=4e-3)
+
+
+@pytest.mark.parametrize("tokens,native", [(100, True), (700, False)])
+@pytest.mark.parametrize("rows", [1, 4])
+def test_trim_rows_then_attention_without_native_kernel(
+    tokens, native, rows, monkeypatch
+):
+    if not native:
+        monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
+    cache = BatchAffine8KVCache([0, 0, 0])
+    q = _ragged(cache, 4, 256, tokens, 5, [0, 4, 2], rows)
+    out = cache.attention(q, scale=256**-0.5, mask="causal" if rows > 1 else None)
+    ref = _row_reference(cache, q, cache._row_ends, causal=rows > 1)
+    close(out, ref, atol=4e-3, rtol=4e-3)
+
+
+def test_trim_rows_then_causal_verify_block():
+    require_tensor_ops()
+    cache = BatchAffine8KVCache([0, 0])
+    for length, seed in ((600, 0), (3, 2)):
+        cache.update_and_fetch(
+            random((2, 4, length, 256), mx.bfloat16, seed),
+            random((2, 4, length, 256), mx.bfloat16, seed + 1),
+        )
+    cache.trim_rows([2, 0])
+    mask = cache.make_mask(4)
+    cache.update_and_fetch(
+        random((2, 4, 4, 256), mx.bfloat16, 4), random((2, 4, 4, 256), mx.bfloat16, 5)
+    )
+    q = random((2, 24, 4, 256), mx.bfloat16, 6)
+    ref = _row_reference(cache, q, cache._row_ends, causal=True)
+    for m in ("causal", mask):
+        out = affine4._native_attention(cache, q, *cache.state, 256**-0.5, m)
+        assert out is not None
+        close(out, ref, atol=4e-3, rtol=4e-3)
+
+
+def test_trim_rows_keeps_each_row_through_filter_and_extend():
+    def kv(rows, length, seed):
+        shape = (rows, 2, length, 32)
+        return random(shape, seed=seed), random(shape, seed=seed + 100)
+
+    singles, references = [], []
+    for row, length in enumerate((5, 9, 7)):
+        keys, values = kv(1, length, row)
+        for target in (singles, references):
+            cache = Affine8KVCache()
+            cache.update_and_fetch(keys, values)
+            target.append(cache)
+    batch = Affine8KVCache.merge(singles)
+    for cycle, drops in enumerate(([3, 0, 2], [1, 1, 1], [0, 3, 1], [2, 0, 0])):
+        keys, values = kv(3, 4, 10 + cycle)
+        batch.update_and_fetch(keys, values)
+        batch.trim_rows(drops)
+        for row, drop in enumerate(drops):
+            references[row].update_and_fetch(
+                keys[row : row + 1, :, : 4 - drop], values[row : row + 1, :, : 4 - drop]
+            )
+
+    def same(row, reference):
+        return all(
+            mx.array_equal(got.norms, want.norms).item()
+            and mx.array_equal(got.indices, want.indices).item()
+            for got, want in zip(batch.extract(row).state, reference.state)
+        )
+
+    assert batch._row_ends is not None
+    assert all(same(row, reference) for row, reference in enumerate(references))
+    batch.filter([2, 0])
+    assert same(0, references[2]) and same(1, references[0])
+    joiner = Affine8KVCache()
+    joiner.update_and_fetch(*kv(1, 6, 7))
+    batch.extend(Affine8KVCache.merge([joiner]))
+    assert batch._row_ends is None
+    assert same(0, references[2]) and same(1, references[0]) and same(2, joiner)

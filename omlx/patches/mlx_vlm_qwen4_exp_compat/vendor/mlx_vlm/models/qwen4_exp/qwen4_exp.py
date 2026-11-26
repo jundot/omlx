@@ -220,6 +220,17 @@ class Model(Qwen3_5Model):
                             down_key
                         )
                         break
+                for suffix in ("scales", "biases"):
+                    key = f"{prefix}.experts.gate_up_proj.{suffix}"
+                    if key in weights:
+                        gate, up = mx.split(weights.pop(key), 2, axis=-2)
+                        weights[f"{prefix}.switch_mlp.gate_proj.{suffix}"] = gate
+                        weights[f"{prefix}.switch_mlp.up_proj.{suffix}"] = up
+                    key = f"{prefix}.experts.down_proj.{suffix}"
+                    if key in weights:
+                        weights[f"{prefix}.switch_mlp.down_proj.{suffix}"] = (
+                            weights.pop(key)
+                        )
                 return
 
             if f"{prefix}.experts.0.gate_proj.weight" not in weights:

@@ -1,12 +1,9 @@
 // PR 9 — Integrations.
 //
-// Routes Claude Code requests to local models or to the cloud, exposes the
-// other named integrations (Codex / OpenCode / OpenClaw / Hermes / Pi /
-// Copilot) as model popups with per-tool launch commands, and renders the
-// Claude Code setup command — both the simple `omlx launch claude` form and
-// an "Advanced" env-var recipe that targets the real `claude` binary
-// directly. The model popups read their options from /admin/api/models so
-// the user can only pick something the server actually has on disk.
+// One Applications card holds every tool that talks to oMLX. Selecting a tile
+// opens its panel with the default model and launcher command. The model
+// popups read their options from /admin/api/models so the user can only pick
+// something the server actually has on disk.
 //
 // The OpenAI Compatibility section + Connected Apps from the design canvas
 // are skipped: there are no matching server fields. We keep every shipped
@@ -22,9 +19,8 @@ struct IntegrationsScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             ExternalEnginesSection(vm: vm, client: services.client)
             MarkItDownSection(vm: vm, client: services.client)
-            ClaudeCodeSection(vm: vm, client: services.client)
-            ClaudeSetupCommandSection(vm: vm)
-            OtherIntegrationsSection(vm: vm, client: services.client)
+            WebSearchSection(vm: vm, client: services.client)
+            ApplicationsSection(vm: vm, client: services.client)
             MCPSection(vm: vm, client: services.client)
 
             FooterBar(error: vm.lastError)
@@ -146,6 +142,17 @@ private struct ExternalEnginesSection: View {
                 }), width: .controlCompact, options: [("int8", "int8"), ("bf16", "bf16")])
             }
 
+            Row(label: String(localized: "integrations.splash.activations",
+                              defaultValue: "Activation Precision",
+                              comment: "Row label for the Splash attention activation precision"),
+                sublabel: String(localized: "integrations.splash.activations.sub",
+                                 defaultValue: "bf16 keeps attention in bf16 on M5 and later; auto lets Splash use int8 where it is faster. Applies to Splash 1.6.1 and later.",
+                                 comment: "Sublabel for the Splash attention activation precision")) {
+                Popup(selection: vm.bind($vm.splashActivations, save: {
+                    Task { await vm.save(.splashActivations, client: client) }
+                }), width: .controlCompact, options: [("bf16", "bf16"), ("auto", "auto")])
+            }
+
             Row(label: String(localized: "integrations.splash.max_memory",
                               defaultValue: "Memory Limit",
                               comment: "Row label for the Splash memory limit"),
@@ -175,6 +182,21 @@ private struct ExternalEnginesSection: View {
                                               comment: "Placeholder for an automatic Splash size"),
                           suffix: "GB",
                           width: .controlNarrow)
+            }
+
+            Row(label: String(localized: "integrations.splash.max_concurrent",
+                              defaultValue: "Concurrent Requests",
+                              comment: "Row label for the Splash concurrent request limit"),
+                sublabel: String(localized: "integrations.splash.max_concurrent.sub",
+                                 defaultValue: "How many requests each Splash model serves at once. Auto uses Splash's default of 4. Applies to Splash 1.7.1 and later.",
+                                 comment: "Sublabel for the Splash concurrent request limit")) {
+                Popup(selection: vm.bind($vm.splashMaxConcurrentRequests, save: {
+                    Task { await vm.save(.splashMaxConcurrentRequests, client: client) }
+                }), width: .controlCompact,
+                      options: [("", String(localized: "integrations.splash.auto",
+                                            defaultValue: "Auto",
+                                            comment: "Placeholder for an automatic Splash size"))]
+                          + (1...8).map { (String($0), String($0)) })
             }
 
             let running = vm.splash?.models ?? []
@@ -306,162 +328,671 @@ private struct MarkItDownSection: View {
     }
 }
 
-// MARK: - Claude Code
+// MARK: - Web Search
 
-private struct ClaudeCodeSection: View {
+private struct WebSearchSection: View {
     @Bindable var vm: IntegrationsScreenVM
     let client: OMLXClient
 
-    var body: some View {
-        SectionHeader(
-            String(localized: "integrations.section.claude_code",
-                   defaultValue: "Claude Code",
-                   comment: "Section header for the Claude Code integration"),
-            subtitle: String(localized: "integrations.section.claude_code.sub",
-                             defaultValue: "Route Claude Code requests to local models or the cloud",
-                             comment: "Subtitle for the Claude Code section")
-        )
+    @Environment(\.omlxTheme) private var theme
+    @FocusState private var focusedField: IntegrationsScreenVM.WebSearchField?
 
+    var body: some View {
+        SectionHeader(String(localized: "integrations.websearch.section_label", defaultValue: "Web Search", comment: "Web search settings"))
         ListGroup {
-            Row(label: String(localized: "integrations.claude.mode",
-                              defaultValue: "Mode",
-                              comment: "Row label for the Claude Code mode segmented control")) {
-                Segmented(
-                    selection: vm.bind($vm.claudeMode, save: {
-                        Task { await vm.save(.claudeMode, client: client) }
-                    }),
-                    options: [
-                        ("cloud", String(localized: "integrations.claude.mode.cloud",
-                                          defaultValue: "Cloud",
-                                          comment: "Claude Code mode option: route to cloud")),
-                        ("local", String(localized: "integrations.claude.mode.local",
-                                          defaultValue: "Local",
-                                          comment: "Claude Code mode option: route to local server")),
-                    ]
-                )
+            Row(label: String(localized: "integrations.websearch.provider", defaultValue: "Search provider", comment: "Web search settings"),
+                sublabel: String(localized: "integrations.websearch.provider_hint", defaultValue: "Backend used by the chat web search tool. DDGS Total queries every available engine and needs no key.", comment: "Web search settings")) {
+                Popup("integrations.websearch.provider", selection: vm.bind($vm.webSearch.provider, save: { save(.provider) }),
+                      width: .controlMedium, options: [
+                    ("ddgs", String(localized: "integrations.websearch.provider_ddgs_total", defaultValue: "DDGS Total", comment: "Web search settings")),
+                    ("ddgs_custom", String(localized: "integrations.websearch.provider_ddgs_custom", defaultValue: "DDGS Custom", comment: "Web search settings")),
+                    ("duckduckgo", String(localized: "integrations.websearch.provider_duckduckgo", defaultValue: "DuckDuckGo", comment: "Web search settings")),
+                    ("brave", String(localized: "integrations.websearch.provider_brave", defaultValue: "Brave Search", comment: "Web search settings")),
+                    ("searxng", String(localized: "integrations.websearch.provider_searxng", defaultValue: "SearXNG", comment: "Web search settings"))
+                ])
+                .disabled(vm.savingWebSearchFields.contains(.provider))
+                .accessibilityLabel(Text("integrations.websearch.provider"))
             }
-            if vm.claudeMode == "local" {
-                Row(label: String(localized: "integrations.claude.opus",
-                                  defaultValue: "Opus tier",
-                                  comment: "Row label for the Opus model picker")) {
-                    Popup(
-                        selection: vm.bind($vm.opusModel, save: {
-                            Task { await vm.save(.opusModel, client: client) }
-                        }),
-                        width: .controlMedium,
-                        options: vm.modelOptions
-                    )
-                }
-                Row(label: String(localized: "integrations.claude.sonnet",
-                                  defaultValue: "Sonnet tier",
-                                  comment: "Row label for the Sonnet model picker")) {
-                    Popup(
-                        selection: vm.bind($vm.sonnetModel, save: {
-                            Task { await vm.save(.sonnetModel, client: client) }
-                        }),
-                        width: .controlMedium,
-                        options: vm.modelOptions
-                    )
-                }
-                Row(
-                    label: String(localized: "integrations.claude.haiku",
-                                  defaultValue: "Haiku tier",
-                                  comment: "Row label for the Haiku model picker"),
-                    sublabel: String(localized: "integrations.claude.haiku.sub",
-                                     defaultValue: "Used for background tasks and tool calls",
-                                     comment: "Sublabel for the Haiku tier picker"),
-                    isLast: true
-                ) {
-                    Popup(
-                        selection: vm.bind($vm.haikuModel, save: {
-                            Task { await vm.save(.haikuModel, client: client) }
-                        }),
-                        width: .controlMedium,
-                        options: vm.modelOptions
-                    )
-                }
-                Row(
-                    label: String(localized: "integrations.claude.desktop",
-                                  defaultValue: "Claude Desktop",
-                                  comment: "Row label for the Claude Desktop tier-alias toggle"),
-                    sublabel: String(localized: "integrations.claude.desktop.sub",
-                                     defaultValue: "Expose claude-opus / claude-sonnet / claude-haiku as aliases of the tier models",
-                                     comment: "Sublabel explaining the Claude Desktop tier-alias toggle")
-                ) {
-                    Toggle("", isOn: vm.bind($vm.desktopEnabled, save: {
-                        Task { await vm.save(.desktopEnabled, client: client) }
-                    }))
-                    .labelsHidden().toggleStyle(.switch)
-                }
-                if vm.desktopEnabled {
-                    FreeRow {
-                        CommandBlock(
-                            command: vm.claudeDesktopLaunchCommand,
-                            caption: String(localized: "integrations.claude.desktop.command",
-                                            defaultValue: "Claude Desktop",
-                                            comment: "Caption above the Claude Desktop launcher command block")
-                        )
+            if vm.webSearch.provider == "ddgs_custom" {
+                FreeRow {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(String(localized: "integrations.websearch.ddgs_backends", defaultValue: "Search engines", comment: "Web search settings"))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                            .foregroundStyle(theme.text)
+                        Text(String(localized: "integrations.websearch.ddgs_backends_hint", defaultValue: "Pick at least one engine to query. All of these work without an API key.", comment: "Web search settings"))
+                            .font(.omlxText(11.5))
+                            .foregroundStyle(theme.textSecondary)
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), alignment: .leading)], alignment: .leading) {
+                            ForEach(IntegrationsScreenVM.ddgsBackends, id: \.self) { backend in
+                                Toggle(backend, isOn: Binding(
+                                    get: { vm.ddgsBackendChecked(backend) },
+                                    set: { selected in
+                                        vm.setDdgsBackend(backend, selected: selected)
+                                        save(.ddgsBackends)
+                                    }
+                                ))
+                                .toggleStyle(.checkbox)
+                            }
+                        }
+                        .disabled(vm.savingWebSearchFields.contains(.ddgsBackends))
                     }
                 }
             }
+            if vm.webSearch.provider == "brave" {
+                Row(label: String(localized: "integrations.websearch.brave_api_key", defaultValue: "Brave API key", comment: "Web search settings"),
+                    sublabel: String(localized: "integrations.websearch.brave_api_key_hint", defaultValue: "Subscription token from the Brave Search API dashboard.", comment: "Web search settings")) {
+                    TextInput("integrations.websearch.brave_api_key", text: $vm.webSearch.braveApiKey, isSecure: true, width: .controlMedium)
+                        .focused($focusedField, equals: .braveApiKey)
+                        .onSubmit { save(.braveApiKey) }
+                        .onDisappear { save(.braveApiKey) }
+                        .disabled(vm.savingWebSearchFields.contains(.braveApiKey))
+                        .accessibilityLabel(Text("integrations.websearch.brave_api_key"))
+                }
+            }
+            if vm.webSearch.provider == "searxng" {
+                Row(label: String(localized: "integrations.websearch.searxng_url", defaultValue: "SearXNG instance URL", comment: "Web search settings"),
+                    sublabel: String(localized: "integrations.websearch.searxng_url_hint", defaultValue: "Base URL of a SearXNG instance with the JSON output format enabled.", comment: "Web search settings")) {
+                    TextInput("integrations.websearch.searxng_url", text: $vm.webSearch.searxngUrl, placeholder: "http://localhost:8888", width: .controlMedium)
+                        .focused($focusedField, equals: .searxngUrl)
+                        .onSubmit { save(.searxngUrl) }
+                        .onDisappear { save(.searxngUrl) }
+                        .disabled(vm.savingWebSearchFields.contains(.searxngUrl))
+                        .accessibilityLabel(Text("integrations.websearch.searxng_url"))
+                }
+            }
+            Row(label: String(localized: "integrations.websearch.max_results", defaultValue: "Results per search", comment: "Web search settings"),
+                sublabel: String(localized: "integrations.websearch.max_results_hint", defaultValue: "How many sources one web_search call returns (1-10).", comment: "Web search settings")) {
+                TextInput("integrations.websearch.max_results", text: $vm.webSearch.maxResults, isNumeric: true, range: 1...10, step: 1, width: .controlNarrow,
+                          onStep: { save(.maxResults) })
+                    .focused($focusedField, equals: .maxResults)
+                    .onSubmit { save(.maxResults) }
+                    .onDisappear { save(.maxResults) }
+                    .disabled(vm.savingWebSearchFields.contains(.maxResults))
+                    .accessibilityLabel(Text("integrations.websearch.max_results"))
+            }
+            Row(label: String(localized: "integrations.websearch.content_mode", defaultValue: "Result content", comment: "Web search settings"),
+                sublabel: String(localized: "integrations.websearch.content_mode_hint", defaultValue: "Snippets keep the prompt small. Full page content fetches and inlines each result page.", comment: "Web search settings")) {
+                Popup("integrations.websearch.content_mode", selection: vm.bind($vm.webSearch.contentMode, save: { save(.contentMode) }),
+                      width: .controlMedium, options: [
+                    ("snippet", String(localized: "integrations.websearch.content_mode_snippet", defaultValue: "Snippets only", comment: "Web search settings")),
+                    ("full", String(localized: "integrations.websearch.content_mode_full", defaultValue: "Full page content", comment: "Web search settings"))
+                ])
+                .disabled(vm.savingWebSearchFields.contains(.contentMode))
+                .accessibilityLabel(Text("integrations.websearch.content_mode"))
+            }
+            if vm.webSearch.contentMode == "full" {
+                Row(label: String(localized: "integrations.websearch.content_truncate", defaultValue: "Truncate page content", comment: "Web search settings"),
+                    sublabel: String(localized: "integrations.websearch.content_truncate_hint", defaultValue: "Cut each fetched page at the limit below. Turning this off can flood the model context.", comment: "Web search settings")) {
+                    RowSwitch(isOn: vm.bind($vm.webSearch.contentTruncate, save: { save(.contentTruncate) }))
+                        .disabled(vm.savingWebSearchFields.contains(.contentTruncate))
+                        .accessibilityLabel(Text("integrations.websearch.content_truncate"))
+                }
+                if vm.webSearch.contentTruncate {
+                    Row(label: String(localized: "integrations.websearch.content_max_chars", defaultValue: "Content limit", comment: "Web search settings"),
+                        sublabel: String(localized: "integrations.websearch.content_max_chars_hint", defaultValue: "Maximum characters kept per fetched page.", comment: "Web search settings")) {
+                        TextInput("integrations.websearch.content_max_chars", text: $vm.webSearch.contentMaxChars, isNumeric: true, range: 1...Double(Int.max), step: 1000,
+                                  suffix: String(localized: "integrations.websearch.chars_suffix", defaultValue: "chars", comment: "Web search settings"), width: .controlCompact,
+                                  onStep: { save(.contentMaxChars) })
+                            .focused($focusedField, equals: .contentMaxChars)
+                            .onSubmit { save(.contentMaxChars) }
+                            .onDisappear { save(.contentMaxChars) }
+                            .disabled(vm.savingWebSearchFields.contains(.contentMaxChars))
+                            .accessibilityLabel(Text("integrations.websearch.content_max_chars"))
+                    }
+                }
+            }
+            FreeRow(isLast: true) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(String(localized: "integrations.websearch.test_label", defaultValue: "Run a test search with the settings above", comment: "Web search settings"))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                            .foregroundStyle(theme.text)
+                        if let message = vm.webSearchTestMessage {
+                            Text(message)
+                                .font(.omlxText(11.5))
+                                .foregroundStyle(vm.webSearchTestOK == true ? theme.successText : theme.warningText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                    Button(vm.webSearchTesting ? String(localized: "integrations.websearch.testing", defaultValue: "Testing...", comment: "Web search settings") : String(localized: "integrations.websearch.test_button", defaultValue: "Test search", comment: "Web search settings")) {
+                        Task { await vm.testWebSearch(client: client) }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(vm.webSearchTesting)
+                }
+            }
         }
+        .onChange(of: focusedField) { previous, _ in
+            if let previous { save(previous) }
+        }
+    }
+
+    private func save(_ field: IntegrationsScreenVM.WebSearchField) {
+        Task { await vm.saveWebSearch(field, client: client) }
     }
 }
 
-// MARK: - Setup command (Claude Code)
+// MARK: - Applications
 
-/// Houses both the primary `omlx launch claude` block and the "Advanced"
-/// env-var recipe that points the real `claude` binary at the local server.
-/// Mirrors `claudeCodeCommand` in `apps/omlx-web/omlx_web/static/js/dashboard.js`.
-private struct ClaudeSetupCommandSection: View {
-    var vm: IntegrationsScreenVM
-    @State private var showAdvanced = false
+/// One tile per tool, with the selected tool's panel underneath. Mirrors the
+/// web dashboard's Applications card.
+private struct ApplicationsSection: View {
+    @Bindable var vm: IntegrationsScreenVM
+    let client: OMLXClient
+
+    @State private var selected: IntegrationTool?
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        SectionHeader(String(localized: "integrations.section.setup_command",
-                              defaultValue: "Setup Command",
-                              comment: "Section header for the Claude Code setup command block"))
+        SectionHeader(
+            String(localized: "integrations.section.applications",
+                   defaultValue: "Applications",
+                   comment: "Section header for the per-tool launcher grid"),
+            subtitle: String(localized: "integrations.section.applications.sub",
+                             defaultValue: "Model and launcher command for each tool that talks to oMLX.",
+                             comment: "Subtitle for the Applications section")
+        )
 
-        VStack(alignment: .leading, spacing: 10) {
-            CommandBlock(command: vm.claudeLaunchCommand)
-
-            DisclosureGroup(isExpanded: $showAdvanced) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(vm.claudeMode == "cloud"
-                         ? String(localized: "integrations.setup.advanced.cloud",
-                                  defaultValue: "Resets Anthropic env vars so the real `claude` binary talks to the cloud.",
-                                  comment: "Explanation of the advanced env recipe in cloud mode")
-                         : String(localized: "integrations.setup.advanced.local",
-                                  defaultValue: "Points the real `claude` binary at your local oMLX server.",
-                                  comment: "Explanation of the advanced env recipe in local mode"))
-                        .font(.omlxText(11.5))
-                        .foregroundStyle(theme.textSecondary)
-                    CommandBlock(command: vm.claudeEnvRecipe)
+        ListGroup {
+            FreeRow(verticalPadding: 12) {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 108, maximum: 140), spacing: 8)],
+                    alignment: .leading,
+                    spacing: 8
+                ) {
+                    ForEach(IntegrationTool.allCases) { tool in
+                        ApplicationTile(tool: tool, isSelected: selected == tool) {
+                            selected = selected == tool ? nil : tool
+                        }
+                    }
                 }
-                .padding(.top, 6)
-            } label: {
-                Text(String(localized: "integrations.setup.advanced.label",
-                            defaultValue: "Advanced — run `claude` directly",
-                            comment: "Disclosure label revealing the advanced env-var recipe for running claude directly"))
-                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
-                    .foregroundStyle(theme.textSecondary)
             }
-            .padding(.horizontal, 4)
+            if let selected {
+                panel(for: selected)
+            } else {
+                FreeRow(isLast: true, verticalPadding: 8) {
+                    Text(String(localized: "integrations.applications.hint",
+                                defaultValue: "Pick a tool to see its launcher command.",
+                                comment: "Hint under the tool grid while no tool is selected"))
+                        .font(.omlxText(11.5))
+                        .foregroundStyle(theme.textTertiary)
+                }
+            }
         }
-        .padding(.horizontal, 14)
+    }
+
+    @ViewBuilder
+    private func panel(for tool: IntegrationTool) -> some View {
+        switch tool {
+        case .claude:
+            ClaudeApplicationPanel(vm: vm, client: client)
+        case .codex:
+            ApplicationPanelRows(
+                tool: tool,
+                modelBinding: vm.bind($vm.codexModel, save: {
+                    Task { await vm.save(.codexModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                commands: [
+                    LauncherCommand(
+                        String(localized: "integrations.codex.cli",
+                               defaultValue: "CLI",
+                               comment: "Label for the Codex CLI launcher command"),
+                        vm.codexCommand
+                    ),
+                    LauncherCommand(
+                        String(localized: "integrations.codex.app",
+                               defaultValue: "Desktop App",
+                               comment: "Label for the Codex desktop app launcher command"),
+                        vm.codexAppCommand
+                    ),
+                ]
+            )
+        case .dsh:
+            ApplicationPanelRows(
+                tool: tool,
+                modelBinding: vm.bind($vm.dshModel, save: {
+                    Task { await vm.save(.dshModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                commands: [LauncherCommand(nil, vm.dshCommand)]
+            )
+        case .opencode:
+            ApplicationPanelRows(
+                tool: tool,
+                modelBinding: vm.bind($vm.opencodeModel, save: {
+                    Task { await vm.save(.opencodeModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                commands: [LauncherCommand(nil, vm.opencodeCommand)]
+            )
+        case .openclaw:
+            ApplicationPanelRows(
+                tool: tool,
+                modelBinding: vm.bind($vm.openclawModel, save: {
+                    Task { await vm.save(.openclawModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                commands: [LauncherCommand(nil, vm.openclawCommand)],
+                profile: ApplicationProfilePicker(
+                    label: String(localized: "integrations.openclaw.profile_label",
+                                  defaultValue: "Tools profile",
+                                  comment: "Row label for the OpenClaw tools-profile picker"),
+                    sublabel: String(localized: "integrations.openclaw.profile_sub",
+                                     defaultValue: "Built-in MCP tools the OpenClaw launcher exposes",
+                                     comment: "Sublabel for the OpenClaw tools-profile picker"),
+                    binding: vm.bind($vm.openclawToolsProfile, save: {
+                        Task { await vm.save(.openclawToolsProfile, client: client) }
+                    }),
+                    options: [
+                        ("minimal", String(localized: "integrations.openclaw.profile.minimal",
+                                           defaultValue: "Minimal",
+                                           comment: "OpenClaw tools profile option: minimal")),
+                        ("coding", String(localized: "integrations.openclaw.profile.coding",
+                                          defaultValue: "Coding",
+                                          comment: "OpenClaw tools profile option: coding")),
+                        ("messaging", String(localized: "integrations.openclaw.profile.messaging",
+                                             defaultValue: "Messaging",
+                                             comment: "OpenClaw tools profile option: messaging")),
+                        ("full", String(localized: "integrations.openclaw.profile.full",
+                                        defaultValue: "Full",
+                                        comment: "OpenClaw tools profile option: full")),
+                    ]
+                )
+            )
+        case .hermes:
+            ApplicationPanelRows(
+                tool: tool,
+                modelBinding: vm.bind($vm.hermesModel, save: {
+                    Task { await vm.save(.hermesModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                commands: [LauncherCommand(nil, vm.hermesCommand)]
+            )
+        case .pi:
+            ApplicationPanelRows(
+                tool: tool,
+                modelBinding: vm.bind($vm.piModel, save: {
+                    Task { await vm.save(.piModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                commands: [LauncherCommand(nil, vm.piCommand)]
+            )
+        case .vibe:
+            ApplicationPanelRows(
+                tool: tool,
+                modelBinding: vm.bind($vm.vibeModel, save: {
+                    Task { await vm.save(.vibeModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                commands: [LauncherCommand(nil, vm.vibeCommand)]
+            )
+        case .copilot:
+            ApplicationPanelRows(
+                tool: tool,
+                modelBinding: vm.bind($vm.copilotModel, save: {
+                    Task { await vm.save(.copilotModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                commands: [LauncherCommand(nil, vm.copilotCommand)]
+            )
+        }
     }
 }
 
-/// Shared monospaced command block with a copy button. Used by both the
-/// Claude Code section and each per-tool row in OtherIntegrationsSection.
+/// The launcher's tools, in the web card's order.
+private enum IntegrationTool: String, CaseIterable, Identifiable {
+    case claude, codex, dsh, opencode, openclaw, hermes, pi, vibe, copilot
+
+    var id: String { rawValue }
+
+    var assetName: String {
+        switch self {
+        case .claude: return "IntegrationClaude"
+        case .codex: return "IntegrationCodex"
+        case .dsh: return "IntegrationDsh"
+        case .opencode: return "IntegrationOpenCode"
+        case .openclaw: return "IntegrationOpenClaw"
+        case .hermes: return "IntegrationHermes"
+        case .pi: return "IntegrationPi"
+        case .vibe: return "IntegrationVibe"
+        case .copilot: return "IntegrationCopilot"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .claude:
+            return String(localized: "integrations.tool.claude",
+                          defaultValue: "Claude Code",
+                          comment: "Display name for the Claude Code integration")
+        case .codex:
+            return String(localized: "integrations.tool.codex",
+                          defaultValue: "Codex",
+                          comment: "Display name for the Codex integration")
+        case .dsh:
+            return String(localized: "integrations.tool.dsh",
+                          defaultValue: "DeepSeek Harness",
+                          comment: "Display name for the DeepSeek Harness (dsh) integration")
+        case .opencode:
+            return String(localized: "integrations.tool.opencode",
+                          defaultValue: "OpenCode",
+                          comment: "Display name for the OpenCode integration")
+        case .openclaw:
+            return String(localized: "integrations.tool.openclaw",
+                          defaultValue: "OpenClaw",
+                          comment: "Display name for the OpenClaw integration")
+        case .hermes:
+            return String(localized: "integrations.tool.hermes",
+                          defaultValue: "Hermes Agent",
+                          comment: "Display name for the Hermes Agent integration")
+        case .pi:
+            return String(localized: "integrations.tool.pi",
+                          defaultValue: "Pi",
+                          comment: "Display name for the Pi integration")
+        case .vibe:
+            return String(localized: "integrations.tool.vibe",
+                          defaultValue: "Mistral Vibe",
+                          comment: "Display name for the Mistral Vibe integration")
+        case .copilot:
+            return String(localized: "integrations.tool.copilot",
+                          defaultValue: "Copilot CLI",
+                          comment: "Display name for the Copilot CLI integration")
+        }
+    }
+}
+
+private struct ApplicationTile: View {
+    let tool: IntegrationTool
+    let isSelected: Bool
+    let action: () -> Void
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                IntegrationIcon(asset: tool.assetName, size: 40)
+                Text(tool.title)
+                    .font(.omlxText(11.5, weight: .medium))
+                    .foregroundStyle(isSelected ? theme.text : theme.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2, reservesSpace: true)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(.vertical, 8)
+            .padding(.horizontal, 6)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? theme.selBg : Color.clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(isSelected ? theme.accent.opacity(0.55) : Color.clear,
+                                  lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(tool.title)
+        .accessibilityLabel(Text(tool.title))
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+    }
+}
+
+/// Rounded white chip that holds a tool mark, as in the web launcher's tiles.
+private struct IntegrationIcon: View {
+    let asset: String
+    var size: CGFloat = 40
+
+    @Environment(\.omlxTheme) private var theme
+
+    /// The console draws the mark on a white chip in light appearance and on
+    /// its dark tile colour in dark, and the assets carry that background, so
+    /// the chip fill has to follow or the rounded corners would show a seam.
+    private var chipBackground: Color {
+        theme.isDark ? Color(red: 29 / 255, green: 29 / 255, blue: 32 / 255) : .white
+    }
+
+    /// The web tile rounds its chip to 8 of 36 points; keep that ratio here.
+    private var cornerRadius: CGFloat { size * 8 / 36 }
+
+    var body: some View {
+        Image(asset)
+            .resizable()
+            .interpolation(.high)
+            .scaledToFill()
+            .frame(width: size, height: size)
+            .background(chipBackground)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(theme.groupBorder, lineWidth: 0.5)
+            )
+            .accessibilityHidden(true)
+    }
+}
+
+private struct LauncherCommand {
+    let caption: String?
+    let command: String
+
+    init(_ caption: String?, _ command: String) {
+        self.caption = caption
+        self.command = command
+    }
+}
+
+private struct ApplicationProfilePicker {
+    let label: String
+    let sublabel: String
+    let binding: Binding<String>
+    let options: [(String, String)]
+}
+
+/// Panel for every tool except Claude Code.
+private struct ApplicationPanelRows: View {
+    let tool: IntegrationTool
+    let modelBinding: Binding<String>
+    let modelOptions: [(String, String)]
+    let commands: [LauncherCommand]
+    var profile: ApplicationProfilePicker? = nil
+
+    var body: some View {
+        FreeRow {
+            ApplicationPanelHead(tool: tool)
+        }
+        Row(label: String(localized: "integrations.panel.model",
+                          defaultValue: "Default model",
+                          comment: "Row label for the per-tool default model picker")) {
+            Popup(selection: modelBinding, width: .controlMedium, options: modelOptions)
+                .accessibilityLabel(Text("integrations.panel.model"))
+        }
+        if let profile {
+            Row(label: profile.label, sublabel: profile.sublabel) {
+                Popup(selection: profile.binding, width: .controlMedium, options: profile.options)
+                    .accessibilityLabel(Text(profile.label))
+            }
+        }
+        ForEach(commands.indices, id: \.self) { index in
+            FreeRow(isLast: index == commands.count - 1) {
+                CommandBlock(
+                    command: commands[index].command,
+                    caption: commands[index].caption
+                )
+            }
+        }
+    }
+}
+
+/// Claude Code's panel: launcher, mode, tier models, env recipe and Desktop aliases.
+private struct ClaudeApplicationPanel: View {
+    @Bindable var vm: IntegrationsScreenVM
+    let client: OMLXClient
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        FreeRow {
+            ApplicationPanelHead(tool: .claude)
+        }
+        FreeRow {
+            CommandBlock(command: vm.claudeLaunchCommand)
+        }
+        Row(label: modeLabel) {
+            Segmented(
+                selection: vm.bind($vm.claudeMode, save: {
+                    Task { await vm.save(.claudeMode, client: client) }
+                }),
+                options: [
+                    ("cloud", String(localized: "integrations.claude.mode.cloud",
+                                     defaultValue: "Cloud",
+                                     comment: "Claude Code mode option: route to cloud")),
+                    ("local", String(localized: "integrations.claude.mode.local",
+                                     defaultValue: "Local",
+                                     comment: "Claude Code mode option: route to local server")),
+                ]
+            )
+        }
+        if vm.claudeMode == "local" {
+            Row(label: opusLabel) {
+                Popup(
+                    selection: vm.bind($vm.opusModel, save: {
+                        Task { await vm.save(.opusModel, client: client) }
+                    }),
+                    width: .controlMedium,
+                    options: vm.modelOptions
+                )
+            }
+            Row(label: sonnetLabel) {
+                Popup(
+                    selection: vm.bind($vm.sonnetModel, save: {
+                        Task { await vm.save(.sonnetModel, client: client) }
+                    }),
+                    width: .controlMedium,
+                    options: vm.modelOptions
+                )
+            }
+            Row(label: haikuLabel, sublabel: haikuSublabel) {
+                Popup(
+                    selection: vm.bind($vm.haikuModel, save: {
+                        Task { await vm.save(.haikuModel, client: client) }
+                    }),
+                    width: .controlMedium,
+                    options: vm.modelOptions
+                )
+            }
+        }
+        FreeRow(isLast: vm.claudeMode != "local") {
+            VStack(alignment: .leading, spacing: 6) {
+                CommandBlock(command: vm.claudeEnvRecipeDisplay,
+                             copyLoader: { try await vm.claudeEnvRecipeForCopy(client: client) })
+                Text(vm.claudeMode == "cloud" ? envRecipeCloud : envRecipeLocal)
+                    .font(.omlxText(11))
+                    .foregroundStyle(theme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        // Claude Desktop aliases the tier models, which exist only in Local mode.
+        if vm.claudeMode == "local" {
+            Row(label: desktopLabel, sublabel: desktopSublabel, isLast: !vm.desktopEnabled) {
+                Toggle("", isOn: vm.bind($vm.desktopEnabled, save: {
+                    Task { await vm.save(.desktopEnabled, client: client) }
+                }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .accessibilityLabel(Text(desktopLabel))
+            }
+            if vm.desktopEnabled {
+                FreeRow(isLast: true) {
+                    CommandBlock(command: vm.claudeDesktopLaunchCommand, caption: desktopLabel)
+                }
+            }
+        }
+    }
+
+    private var modeLabel: String {
+        String(localized: "integrations.claude.mode",
+               defaultValue: "Mode",
+               comment: "Row label for the Claude Code mode segmented control")
+    }
+
+    private var opusLabel: String {
+        String(localized: "integrations.claude.opus",
+               defaultValue: "Opus tier",
+               comment: "Row label for the Opus model picker")
+    }
+
+    private var sonnetLabel: String {
+        String(localized: "integrations.claude.sonnet",
+               defaultValue: "Sonnet tier",
+               comment: "Row label for the Sonnet model picker")
+    }
+
+    private var haikuLabel: String {
+        String(localized: "integrations.claude.haiku",
+               defaultValue: "Haiku tier",
+               comment: "Row label for the Haiku model picker")
+    }
+
+    private var haikuSublabel: String {
+        String(localized: "integrations.claude.haiku.sub",
+               defaultValue: "Used for background tasks and tool calls",
+               comment: "Sublabel for the Haiku tier picker")
+    }
+
+    private var desktopLabel: String {
+        String(localized: "integrations.claude.desktop",
+               defaultValue: "Claude Desktop",
+               comment: "Row label for the Claude Desktop tier-alias toggle")
+    }
+
+    private var desktopSublabel: String {
+        String(localized: "integrations.claude.desktop.sub",
+               defaultValue: "Expose claude-opus / claude-sonnet / claude-haiku as aliases of the tier models",
+               comment: "Sublabel explaining the Claude Desktop tier-alias toggle")
+    }
+
+    private var envRecipeCloud: String {
+        String(localized: "integrations.setup.advanced.cloud",
+               defaultValue: "Resets Anthropic env vars so the real `claude` binary talks to the cloud.",
+               comment: "Explanation of the advanced env recipe in cloud mode")
+    }
+
+    private var envRecipeLocal: String {
+        String(localized: "integrations.setup.advanced.local",
+               defaultValue: "Points the real `claude` binary at your local oMLX server.",
+               comment: "Explanation of the advanced env recipe in local mode")
+    }
+}
+
+private struct ApplicationPanelHead: View {
+    let tool: IntegrationTool
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        HStack(spacing: 10) {
+            IntegrationIcon(asset: tool.assetName, size: 28)
+            Text(tool.title)
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .semibold))
+                .foregroundStyle(theme.text)
+            Spacer(minLength: 0)
+        }
+    }
+}
+
 private struct CommandBlock: View {
     let command: String
+    var copyLoader: (() async throws -> String)? = nil
     var caption: String? = nil
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(caption ?? String(localized: "integrations.command.terminal_caption",
                                        defaultValue: "$ Terminal",
@@ -474,222 +1005,24 @@ private struct CommandBlock: View {
                     .font(.omlxMono(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.text)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(12)
-            .background(theme.codeBg)
-            .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
-                    .strokeBorder(theme.groupBorder, lineWidth: 0.5)
-            )
-
-            // Same quiet copy affordance as `CodeChip`/`CopyIconButton`
-            // everywhere else — the previous locally-drawn boxed button was a
-            // second copy-button style.
             CopyIconButton(
                 value: command,
+                valueLoader: copyLoader,
                 helpText: String(localized: "integrations.command.copy",
                                  defaultValue: "Copy command",
                                  comment: "Tooltip for the copy button on a shell command block")
             )
-            .padding(.top, 4)
-            .padding(.trailing, 4)
         }
-    }
-}
-
-// MARK: - Other integrations
-
-private struct OtherIntegrationsSection: View {
-    @Bindable var vm: IntegrationsScreenVM
-    let client: OMLXClient
-
-    var body: some View {
-        SectionHeader(
-            String(localized: "integrations.section.other",
-                   defaultValue: "Other Integrations",
-                   comment: "Section header for the additional integrations list"),
-            subtitle: String(localized: "integrations.section.other.sub",
-                             defaultValue: "Default model + launcher command for each named integration",
-                             comment: "Subtitle for the Other Integrations section")
+        .padding(12)
+        .background(theme.codeBg)
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
+                .strokeBorder(theme.groupBorder, lineWidth: 0.5)
         )
-
-        ListGroup {
-            IntegrationRow(
-                name: String(localized: "integrations.tool.codex",
-                             defaultValue: "Codex",
-                             comment: "Display name for the Codex integration"),
-                modelBinding: vm.bind($vm.codexModel, save: {
-                    Task { await vm.save(.codexModel, client: client) }
-                }),
-                modelOptions: vm.modelOptions,
-                command: vm.codexCommand,
-                commandLabel: String(localized: "integrations.codex.cli",
-                                     defaultValue: "CLI",
-                                     comment: "Label for the Codex CLI launcher command"),
-                secondaryCommand: vm.codexAppCommand,
-                secondaryCommandLabel: String(localized: "integrations.codex.app",
-                                             defaultValue: "Desktop App",
-                                             comment: "Label for the Codex desktop app launcher command")
-            )
-            IntegrationRow(
-                name: String(localized: "integrations.tool.opencode",
-                             defaultValue: "OpenCode",
-                             comment: "Display name for the OpenCode integration"),
-                modelBinding: vm.bind($vm.opencodeModel, save: {
-                    Task { await vm.save(.opencodeModel, client: client) }
-                }),
-                modelOptions: vm.modelOptions,
-                command: vm.opencodeCommand
-            )
-            IntegrationRow(
-                name: String(localized: "integrations.tool.openclaw",
-                             defaultValue: "OpenClaw",
-                             comment: "Display name for the OpenClaw integration"),
-                modelBinding: vm.bind($vm.openclawModel, save: {
-                    Task { await vm.save(.openclawModel, client: client) }
-                }),
-                modelOptions: vm.modelOptions,
-                command: vm.openclawCommand,
-                profileBinding: vm.bind($vm.openclawToolsProfile, save: {
-                    Task { await vm.save(.openclawToolsProfile, client: client) }
-                }),
-                profileSublabel: String(localized: "integrations.openclaw.profile_sub",
-                                         defaultValue: "Built-in MCP tools the OpenClaw launcher exposes",
-                                         comment: "Sublabel for the OpenClaw tools-profile picker")
-            )
-            IntegrationRow(
-                name: String(localized: "integrations.tool.hermes",
-                             defaultValue: "Hermes Agent",
-                             comment: "Display name for the Hermes Agent integration"),
-                modelBinding: vm.bind($vm.hermesModel, save: {
-                    Task { await vm.save(.hermesModel, client: client) }
-                }),
-                modelOptions: vm.modelOptions,
-                command: vm.hermesCommand
-            )
-            IntegrationRow(
-                name: String(localized: "integrations.tool.pi",
-                             defaultValue: "Pi",
-                             comment: "Display name for the Pi integration"),
-                modelBinding: vm.bind($vm.piModel, save: {
-                    Task { await vm.save(.piModel, client: client) }
-                }),
-                modelOptions: vm.modelOptions,
-                command: vm.piCommand
-            )
-            IntegrationRow(
-                name: String(localized: "integrations.tool.vibe",
-                             defaultValue: "Mistral Vibe",
-                             comment: "Display name for the Mistral Vibe integration"),
-                modelBinding: vm.bind($vm.vibeModel, save: {
-                    Task { await vm.save(.vibeModel, client: client) }
-                }),
-                modelOptions: vm.modelOptions,
-                command: vm.vibeCommand
-            )
-            IntegrationRow(
-                name: String(localized: "integrations.tool.copilot",
-                             defaultValue: "Copilot CLI",
-                             comment: "Display name for the Copilot CLI integration"),
-                modelBinding: vm.bind($vm.copilotModel, save: {
-                    Task { await vm.save(.copilotModel, client: client) }
-                }),
-                modelOptions: vm.modelOptions,
-                command: vm.copilotCommand
-            )
-            IntegrationRow(
-                name: String(localized: "integrations.tool.dsh",
-                             defaultValue: "DeepSeek Harness",
-                             comment: "Display name for the DeepSeek Harness (dsh) integration"),
-                modelBinding: vm.bind($vm.dshModel, save: {
-                    Task { await vm.save(.dshModel, client: client) }
-                }),
-                modelOptions: vm.modelOptions,
-                command: vm.dshCommand,
-                isLast: true
-            )
-        }
-    }
-}
-
-/// Per-integration FreeRow: name + model picker on the top half, monospaced
-/// launcher command + copy button below. Optional OpenClaw tools-profile
-/// popup folds in under the model picker.
-private struct IntegrationRow: View {
-    let name: String
-    let modelBinding: Binding<String>
-    let modelOptions: [(String, String)]
-    let command: String
-    var commandLabel: String? = nil
-    var secondaryCommand: String? = nil
-    var secondaryCommandLabel: String? = nil
-    var profileBinding: Binding<String>? = nil
-    var profileSublabel: String? = nil
-    var isLast: Bool = false
-
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        FreeRow(isLast: isLast) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 12) {
-                    Text(name)
-                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
-                        .foregroundStyle(theme.text)
-                    Spacer(minLength: 12)
-                    Popup(
-                        selection: modelBinding,
-                        width: .controlMedium,
-                        options: modelOptions
-                    )
-                }
-                if let profileBinding {
-                    HStack(spacing: 12) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(String(localized: "integrations.openclaw.profile_label",
-                                        defaultValue: "Tools profile",
-                                        comment: "Row label for the OpenClaw tools-profile picker"))
-                                .font(.omlxText(DesignTokens.FontSize.callout))
-                                .foregroundStyle(theme.textSecondary)
-                            if let profileSublabel {
-                                Text(profileSublabel)
-                                    .font(.omlxText(DesignTokens.FontSize.subheadline))
-                                    .foregroundStyle(theme.textTertiary)
-                            }
-                        }
-                        Spacer(minLength: 12)
-                        Popup(
-                            selection: profileBinding,
-                            width: .controlMedium,
-                            options: [
-                                ("minimal",   String(localized: "integrations.openclaw.profile.minimal",
-                                                     defaultValue: "Minimal",
-                                                     comment: "OpenClaw tools profile option: minimal")),
-                                ("coding",    String(localized: "integrations.openclaw.profile.coding",
-                                                     defaultValue: "Coding",
-                                                     comment: "OpenClaw tools profile option: coding")),
-                                ("messaging", String(localized: "integrations.openclaw.profile.messaging",
-                                                     defaultValue: "Messaging",
-                                                     comment: "OpenClaw tools profile option: messaging")),
-                                ("full",      String(localized: "integrations.openclaw.profile.full",
-                                                     defaultValue: "Full",
-                                                     comment: "OpenClaw tools profile option: full")),
-                            ]
-                        )
-                    }
-                }
-                if let secondaryCommand {
-                    VStack(alignment: .leading, spacing: 6) {
-                        CommandBlock(command: command, caption: commandLabel)
-                        CommandBlock(command: secondaryCommand, caption: secondaryCommandLabel)
-                    }
-                } else {
-                    CommandBlock(command: command, caption: commandLabel)
-                }
-            }
-        }
     }
 }
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import struct
@@ -414,18 +415,69 @@ class ExpertCache:
         self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
         self.warm = False
 
-    def release_slots(self) -> int:
-        """Shrink to ``floor`` empty slots; return the slot bytes given up."""
-        if self.capacity <= self.floor:
+    def _resize(self, capacity: int) -> None:
+        """Change the slot count, keeping the hottest resident experts that fit.
+
+        Kept experts move to the first slots in slot order, so growing a full
+        cache keeps every expert in its slot. A failed eval leaves the old state.
+        """
+        slots = np.flatnonzero(self.slot_expert >= 0)
+        if len(slots) > capacity:
+            counts = self.score[self.slot_expert[slots]]
+            slots = np.sort(slots[np.argsort(-counts, kind="stable")[:capacity]])
+        experts = self.slot_expert[slots]
+        n = len(slots)
+        in_place = n == 0 or int(slots[-1]) == n - 1  # slots 0..n-1
+        index = mx.array(slots, dtype=mx.int32)
+
+        def rows(a: mx.array) -> mx.array:
+            if n == capacity and not in_place:
+                return mx.take(a, index, axis=0)
+            out = mx.zeros((capacity,) + a.shape[1:], dtype=a.dtype)
+            if n:
+                out[:n] = a[:n] if in_place else mx.take(a, index, axis=0)
+            return out
+
+        resident = {
+            name: [None if a is None else rows(a) for a in triple]
+            for name, triple in self.resident.items()
+        }
+        slot_map = np.full(self.n_experts, -1, dtype=np.int32)
+        slot_map[experts] = np.arange(n, dtype=np.int32)
+        expert_map = mx.array(slot_map)
+        mx.eval(
+            expert_map,
+            *(a for triple in resident.values() for a in triple if a is not None),
+        )
+        self.resident = resident
+        self.map = expert_map
+        self.capacity = capacity
+        self.slot_of = {int(e): s for s, e in enumerate(experts.tolist())}
+        self.slot_expert = np.full(capacity, -1, dtype=np.int64)
+        self.slot_expert[:n] = experts
+        self.free = list(range(n, capacity))
+        self.warm = n == self.n_experts
+
+    def release_slots(self, capacity: int | None = None) -> int:
+        """Shrink to ``capacity`` slots (default ``floor``); return the bytes given up.
+
+        The resident experts with the highest routing counts stay resident."""
+        capacity = self.floor if capacity is None else max(capacity, self.floor)
+        if capacity >= self.capacity:
             return 0
-        freed = (self.capacity - self.floor) * self.expert_bytes
-        self._allocate(self.floor)
+        freed = (self.capacity - capacity) * self.expert_bytes
+        self._resize(capacity)
         return freed
 
-    def restore_slots(self) -> None:
-        """Return to the full capacity after :meth:`release_slots`."""
-        if self.capacity < self.full_capacity:
-            self._allocate(self.full_capacity)
+    def restore_slots(self) -> int:
+        """Grow back to the full capacity, keeping the resident experts.
+
+        Returns the bytes the slots grew by."""
+        if self.capacity >= self.full_capacity:
+            return 0
+        added = (self.full_capacity - self.capacity) * self.expert_bytes
+        self._resize(self.full_capacity)
+        return added
 
     def _plans(self, e: int) -> list:
         """Read plans for expert ``e``'s tensors, in slot-write order."""
@@ -1089,6 +1141,12 @@ def apply_moe_expert_offload(
     wrapped += apply_deepseek_v4_moe_expert_offload(
         model, model_dir, resident_fraction, mtp_resident=mtp_resident
     )
+    if kind == "inkling2_loop":
+        from .inkling2.moe_offload import apply_inkling2_moe_expert_offload
+
+        wrapped += apply_inkling2_moe_expert_offload(
+            model, model_dir, resident_fraction
+        )
     total_bytes = resident_bytes = 0
     staging_sizes = {}
     staging_requested = (
@@ -1196,12 +1254,15 @@ def estimate_offload_admission_bytes(
             return full_size
         minimum = _minimum_experts(model_dir)
         config_path = Path(model_dir) / "config.json"
+        projs, nvfp4_ok = _PROJS, False
         if config_path.exists():
             kind = json.loads(config_path.read_text()).get("model_type", "")
             if kind == "deepseek_v41":
                 # V4.1 admission is owned by its own adapter's estimator.
                 return full_size
-            if kind == "qwen3_5_moe":
+            if kind == "inkling2_loop":
+                projs, nvfp4_ok = ("w13", "w2"), True
+            if kind in ("qwen3_5_moe", "inkling2_loop"):
                 from .moe_offload_compat import moe_offload_compatibility
 
                 if not moe_offload_compatibility(model_dir)[0]:
@@ -1247,7 +1308,7 @@ def estimate_offload_admission_bytes(
                     nvfp4.add(name.rsplit(".", 2)[0])
                 elif len(shape) == 3:
                     parts = name.rsplit(".", 2)
-                    if len(parts) == 3 and parts[1] in _PROJS and parts[2] in (
+                    if len(parts) == 3 and parts[1] in projs and parts[2] in (
                         "weight", "scales", "biases"
                     ):
                         b = stacked.setdefault(
@@ -1257,10 +1318,10 @@ def estimate_offload_admission_bytes(
                         b["fields"].add((parts[1], parts[2]))
                         b["e"].add(int(shape[0]))
 
-        required = {(p, f) for p in _PROJS for f in ("weight", "scales")}
+        required = {(p, f) for p in projs for f in ("weight", "scales")}
         saved = 0.0
         for container, b in stacked.items():
-            if not required <= b["fields"] or container in nvfp4:
+            if not required <= b["fields"] or (container in nvfp4 and not nvfp4_ok):
                 continue  # unquantized, partial or NVFP4: wraps nothing
             if len(b["e"]) != 1:  # projections disagree on E
                 continue
@@ -1327,18 +1388,60 @@ def moe_offload_caches(model) -> list:
     return caches
 
 
-def release_moe_offload_slots(caches) -> int:
-    """Shrink every cache to its floor for a prefill; return the bytes given up.
-
-    Expert-major prefill streams almost every expert anyway; decode restores them."""
-    return sum(c.release_slots() for c in caches if hasattr(c, "release_slots"))
+# A sized release gives up the smallest of these shares of every cache's
+# slots above its floor whose bytes cover the shortfall.
+_RELEASE_STEPS = (0.25, 0.5, 0.75, 1.0)
 
 
-def restore_moe_offload_slots(caches) -> None:
-    """Return every cache shrunk by :func:`release_moe_offload_slots` to full size."""
+def release_moe_offload_slots(caches, need_bytes=None, reclaim=None) -> int:
+    """Shrink the caches for a prefill; return the bytes given up.
+
+    Without ``need_bytes`` every cache shrinks to its floor. With it, every
+    cache shrinks to the smallest :data:`_RELEASE_STEPS` share that frees
+    ``need_bytes`` more in all, or to its floor. ``reclaim`` runs after each
+    cache that shrank, so its old slots go back before the next one allocates."""
+    caches = [c for c in caches if hasattr(c, "release_slots")]
+    if need_bytes is None:
+        targets = [c.floor for c in caches]
+    elif need_bytes <= 0:
+        return 0
+    else:
+        for step in _RELEASE_STEPS:
+            targets = [
+                c.full_capacity - math.ceil(step * (c.full_capacity - c.floor))
+                for c in caches
+            ]
+            covered = sum(
+                max(0, c.capacity - t) * c.expert_bytes
+                for c, t in zip(caches, targets)
+            )
+            if covered >= need_bytes:
+                break
+    released = 0
+    for c, target in zip(caches, targets):
+        freed = c.release_slots(target)
+        if freed and reclaim is not None:
+            reclaim()
+        released += freed
+    return released
+
+
+def releasable_moe_offload_bytes(caches) -> int:
+    """Bytes the caches can still give up above their floors."""
+    return sum(
+        (c.capacity - c.floor) * c.expert_bytes
+        for c in caches
+        if hasattr(c, "release_slots")
+    )
+
+
+def restore_moe_offload_slots(caches, reclaim=None) -> None:
+    """Return every cache shrunk by :func:`release_moe_offload_slots` to full size.
+
+    ``reclaim`` runs after each cache that grew, as in the release."""
     for c in caches:
-        if hasattr(c, "restore_slots"):
-            c.restore_slots()
+        if hasattr(c, "restore_slots") and c.restore_slots() and reclaim is not None:
+            reclaim()
 
 
 def moe_offload_stats(model=None, caches=None) -> dict:
@@ -1364,6 +1467,7 @@ __all__ = [
     "materialize_offload_state",
     "moe_offload_caches",
     "moe_offload_stats",
+    "releasable_moe_offload_bytes",
     "release_moe_offload_slots",
     "restore_moe_offload_slots",
 ]

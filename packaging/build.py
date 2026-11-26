@@ -628,8 +628,8 @@ def _venvstacks_driver() -> list[str]:
         return ["venvstacks"]
     print(
         "  ✗ No venvstacks driver found. Install with one of:\n"
-        "      pip install -e \".[dev]\"     (pip-managed venv)\n"
-        "      uv sync --dev                (uv-managed venv)\n"
+        "      pip install -e . --group dev (pip-managed venv, pip 25.1+)\n"
+        "      uv sync                      (uv-managed venv)\n"
         "      pipx install venvstacks       (host-global tool)",
         file=sys.stderr,
     )
@@ -730,7 +730,7 @@ def build_venvstacks():
 
 
 # mlx-audio git commit — aligned with pyproject.toml [audio] extra
-_MLX_AUDIO_GIT = "git+https://github.com/Neywa-Labs/mlx-audio@8c244a1faff44cfa69e3151c195f52a4c1c90be5"
+_MLX_AUDIO_GIT = "git+https://github.com/Neywa-Labs/mlx-audio@1157775c1999654b1ebde41ed03d88108e23f88b"
 
 
 def _install_mlx_audio(export_dir: Path):
@@ -821,7 +821,7 @@ try:
     _XGRAMMAR_VERSION = _TARGET_XGRAMMAR_VERSIONS[0]
     _TVM_FFI_VERSION = _TARGET_TVM_FFI_VERSIONS[0]
 except Exception:  # pragma: no cover — build runs may not have omlx on path yet
-    _XGRAMMAR_VERSION = "0.2.8"
+    _XGRAMMAR_VERSION = "0.2.9"
     _TVM_FFI_VERSION = "0.1.11"
 
 
@@ -976,6 +976,12 @@ _STRIP_DIST_PREFIXES = [
     "torch-", "sympy-", "pyarrow-", "pandas-", "datasets-",
 ]
 
+_JIEBA_DIRS_UNUSED_BY_MISAKI = [
+    "jieba/analyse",
+    "jieba/lac_small",
+    "jieba/posseg",
+]
+
 
 def _strip_unused_packages(export_dir: Path):
     """Remove large packages not needed for inference from exported framework."""
@@ -1006,6 +1012,13 @@ def _strip_unused_packages(export_dir: Path):
                 item.unlink()
             saved += size
             print(f"    Removed {name} ({size / 1024 / 1024:.0f} MB)")
+
+    for rel in _JIEBA_DIRS_UNUSED_BY_MISAKI:
+        item = fw_site / rel
+        size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
+        shutil.rmtree(item)
+        saved += size
+        print(f"    Removed {rel} ({size / 1024 / 1024:.0f} MB)")
 
     print(f"  ✓ Stripped {saved / 1024 / 1024:.0f} MB total")
 

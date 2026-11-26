@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stable per-node identity for oMLX cluster v2.
+"""Stable per-node identity for the oMLX cluster.
 
 Every node owns a ``NodeIdentity`` persisted at
 ``~/.omlx/cluster/identity.json`` (mode 0600, atomic write). The ``node_id``

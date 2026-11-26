@@ -894,7 +894,7 @@ class _PositionMappedRoPE:
         self._original = original_rope
         self._all_positions = all_positions
         self._cache_start = _scalar_offset(cache_start)
-        self._has_custom_freqs = hasattr(original_rope, "_freqs")
+        self._has_custom_freqs = getattr(original_rope, "_freqs", None) is not None
 
         if self._has_custom_freqs:
             self._freqs = original_rope._freqs

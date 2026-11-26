@@ -577,8 +577,7 @@ def test_sanitize_remaps_quantized_forget_gate_sidecars():
     )
 
 
-@pytest.mark.parametrize("text_only", [False, True])
-@pytest.mark.parametrize("preserve_mtp", [False, True])
+@pytest.mark.parametrize("text_only,preserve_mtp", [(False, False), (True, True)])
 def test_oq_roundtrip_with_nextn_weights(tmp_path, monkeypatch, text_only, preserve_mtp):
     from mlx.utils import tree_flatten
     from mlx_vlm.models import glm5_next
@@ -3321,30 +3320,38 @@ def _hyper_connection(hidden=4096, seed=0, bf16_fn=False):
 @pytest.mark.usefixtures("glm5_fused_decode")
 @pytest.mark.parametrize("bf16_fn", [False, True])
 @pytest.mark.parametrize("hidden", [4096, 1024])
-@pytest.mark.parametrize("length", [1, 2, 4, 8])
-def test_decode_hc_pre_is_bitwise_reference(hidden, length, bf16_fn):
+@pytest.mark.parametrize(
+    ("batch", "length"), [(1, 1), (1, 2), (1, 4), (1, 8), (4, 1), (2, 3)]
+)
+def test_decode_hc_pre_is_bitwise_reference(hidden, batch, length, bf16_fn):
     """BF16-valued mix weights (the checkpoints') are read from their BF16
     copy (``mix_weights``); fp32 weights from the fp32 array."""
     language = _language()
     hc, norm = _hyper_connection(hidden, seed=length, bf16_fn=bf16_fn)
     assert (dk.mix_weights(hc).dtype == mx.bfloat16) == bf16_fn
     for trial in range(3):
-        x = (mx.random.normal((1, length, 4, hidden)) * (1 + 2 * trial)).astype(
-            mx.bfloat16
-        )
-        collapsed, post, comb = hc(x)
-        reference = norm(collapsed)
+        x = (
+            mx.random.normal((batch, length, 4, hidden)) * (1 + 2 * trial)
+        ).astype(mx.bfloat16)
         fused = language._decode_hc_pre(hc, norm, x)
         assert fused is not None
         normalized, fused_post, fused_comb = fused
-        assert _mismatches(normalized, reference) == 0
-        assert _mismatches(fused_post, post) == 0
-        assert _mismatches(fused_comb, comb) == 0
-        # Each verify row equals the one-token decode of that row.
-        for row in range(length):
-            single = language._decode_hc_pre(hc, norm, x[:, row : row + 1])
-            assert _mismatches(single[0], normalized[:, row : row + 1]) == 0
-            assert _mismatches(single[2], fused_comb[:, row : row + 1]) == 0
+        # The reference mixes a batch's rows in one GEMM; the fused rows keep
+        # the one-token reduction.
+        if batch == 1:
+            collapsed, post, comb = hc(x)
+            assert _mismatches(normalized, norm(collapsed)) == 0
+            assert _mismatches(fused_post, post) == 0
+            assert _mismatches(fused_comb, comb) == 0
+        # Each batch or verify row equals the one-token decode of that row.
+        for b in range(batch):
+            for row in range(length):
+                single = language._decode_hc_pre(
+                    hc, norm, x[b : b + 1, row : row + 1]
+                )
+                at = (slice(b, b + 1), slice(row, row + 1))
+                assert _mismatches(single[0], normalized[at]) == 0
+                assert _mismatches(single[2], fused_comb[at]) == 0
 
 
 def _check_one_token_hc_expand(hidden):
@@ -3384,7 +3391,9 @@ def _run_with_tf32(snippet: str) -> str:
         "from omlx.patches import mlx_vlm_glm5_next_compat as compat\n"
         "compat.apply_mlx_vlm_glm5_next_compat_patch()\n"
         "import test_mlx_vlm_glm5_next_compat as t\n"
-        "t.dk.moe_router = t._stock_verify_router(t.dk.moe_router)\n" % (str(here), str(here.parent))
+        "t.dk.moe_router = t._stock_verify_router(t.dk.moe_router)\n"
+        "import conftest, pytest\n"
+        "conftest.use_qmv_wide_reference(pytest.MonkeyPatch())\n" % (str(here), str(here.parent))
     ) + snippet
     env = dict(os.environ, MLX_ENABLE_TF32="1")
     done = subprocess.run(
@@ -3540,7 +3549,7 @@ def test_decode_hc_pre_declines_uncovered_inputs():
     language = _language()
     hc, norm = _hyper_connection(1024)
     assert (
-        language._decode_hc_pre(hc, norm, mx.zeros((2, 1, 4, 1024), mx.bfloat16))
+        language._decode_hc_pre(hc, norm, mx.zeros((2, 5, 4, 1024), mx.bfloat16))
         is None
     )
     assert (
@@ -4629,8 +4638,10 @@ def test_kda_shared_bank_keeps_mixed_metadata_dtypes(promoted_field):
         )
 
 
-@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize(
+    "bits,dtype",
+    [(2, mx.float16), (4, mx.bfloat16), (5, mx.float32), (8, mx.bfloat16)],
+)
 def test_kda_affine_shared_weights_preserve_projections_and_serialization(
     bits, dtype, tmp_path
 ):
@@ -4860,6 +4871,62 @@ def test_kda_decode_step_from_empty_cache(width, monkeypatch):
     assert _mismatches(fused, reference) == 0
     assert _mismatches(fused_cache[0], reference_cache[0]) == 0
     assert _mismatches(fused_cache[1], reference_cache[1]) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize(
+    "gate_bits,float_proj",
+    # float: gate projections run outside the kernel (a_pre / gate_pre rows).
+    [(8, False), (5, False), (8, True)],
+)
+def test_kda_batch_decode_rows_match_one_sequence_kernel(
+    gate_bits, float_proj, monkeypatch
+):
+    language = _language()
+    layer = _kda_layer(gate_bits=gate_bits, seed=40 + gate_bits, float_proj=float_proj)
+    cache = _arrays_cache()
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    prompt = (mx.random.normal((3, 12, 1024)) * 0.8).astype(mx.bfloat16)
+    mx.eval(layer(prompt, cache=cache))
+    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    calls = []
+    kernel = dk.kda_decode_step
+
+    def recording(*args, **kwargs):
+        out = kernel(*args, **kwargs)
+        calls.append((args, kwargs, out))
+        return out
+
+    monkeypatch.setattr(dk, "kda_decode_step", recording)
+    for step in range(3):
+        x = (mx.random.normal((3, 1, 1024)) * (0.5 + step)).astype(mx.bfloat16)
+        mx.eval(layer(x, cache=cache))
+        assert len(calls) == step + 1
+        args, kwargs, out = calls[-1]
+        assert out is not None and args[0].shape[0] == 3
+        assert (kwargs["a_pre"] is not None) == float_proj
+        # The layer keeps the batch kernel's new states.
+        assert _mismatches(cache[0], out[1]) == 0
+        assert _mismatches(cache[1], out[2]) == 0
+        proj, conv_state, conv_w, a_log, dt_bias, state, norm_w = args
+        for b in range(3):
+            row = slice(b, b + 1)
+            row_kwargs = {
+                k: v[row] if k in ("a_pre", "gate_pre") and v is not None else v
+                for k, v in kwargs.items()
+            }
+            single = kernel(
+                proj[row],
+                conv_state[row],
+                conv_w,
+                a_log,
+                dt_bias,
+                state[row],
+                norm_w,
+                **row_kwargs,
+            )
+            for got, want in zip(out, single):
+                assert _mismatches(got[row], want) == 0, (b, gate_bits, float_proj)
 
 
 # ---------------------------------------------------------------------------

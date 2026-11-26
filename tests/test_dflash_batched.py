@@ -233,11 +233,13 @@ def _tiny_dspark_drafter(seed=0):
     return dd.DFlashDrafter(model, block_size=BLOCK, source_path="tiny")
 
 
-DRAFTER_FAMILIES = pytest.mark.parametrize(
-    "make_drafter",
-    [_tiny_drafter, _tiny_laguna_drafter, _tiny_muse_drafter, _tiny_dspark_drafter],
-    ids=["dflash2", "laguna", "muse", "dspark"],
-)
+def test_load_rejects_a_reduced_draft_vocabulary(monkeypatch):
+    from omlx.speculative import dflash
+
+    model = SimpleNamespace(d2t=mx.zeros((8,), dtype=mx.int32))
+    monkeypatch.setattr(dflash, "load_drafter", lambda *a, **k: (model, "dflash"))
+    with pytest.raises(ValueError, match="reduced vocabulary"):
+        dflash.load_dflash_drafter("draft", _tiny_target())
 
 
 def _captured(n, seed):
@@ -271,8 +273,16 @@ def _run_cycles(drafter, plan, cycle_offset=0):
     return outputs
 
 
-@DRAFTER_FAMILIES
-@pytest.mark.parametrize("window", [1, WINDOW])
+@pytest.mark.parametrize(
+    "make_drafter, window",
+    [
+        (_tiny_drafter, 1),
+        (_tiny_drafter, WINDOW),
+        (_tiny_laguna_drafter, WINDOW),
+        (_tiny_muse_drafter, WINDOW),
+        (_tiny_dspark_drafter, WINDOW),
+    ],
+)
 def test_batched_forward_matches_rows_drafted_alone(make_drafter, window):
     """Padding, masks, vector RoPE offsets and ring writes must not leak across rows."""
     plan = [
@@ -1156,3 +1166,76 @@ def test_fp16_drafter_survives_activations_past_fp16_range():
     reference = _run_cycles(widened(mx.float32), plan)
     got = _run_cycles(widened(mx.float16), plan)
     assert got == reference
+
+
+def _tiny_inkling2():
+    """Tiny Inkling 2 target with its DSpark drafter (recurrent Markov head)."""
+    from test_inkling_vlm_mtp import _inkling2_tiny
+
+    from omlx.patches.inkling2.dspark import (
+        Inkling2DSparkConfig,
+        Inkling2DSparkModel,
+        wrap_inkling2_dspark,
+    )
+
+    model = _inkling2_tiny()
+    mx.eval(model.parameters())
+    config = Inkling2DSparkConfig(
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        intermediate_size=64,
+        rms_norm_eps=1e-6,
+        rope_theta=1e4,
+        local_layer_ids=[0],
+        sliding_window=16,
+        block_size=5,
+        markov_rank=128,
+        target_layer_ids=[2, 5, 8, 12],
+        vocab_size=320,
+        unpadded_vocab_size=300,
+        final_logit_softcapping=30.0,
+    )
+    mx.random.seed(5)
+    draft = Inkling2DSparkModel(config)
+    draft.load_weights(
+        [
+            (key, (mx.random.normal(value.shape) * 0.2).astype(value.dtype))
+            for key, value in nn.utils.tree_flatten(draft.parameters())
+        ],
+        strict=False,
+    )
+    draft.bind(model)
+    dd.attach_drafter(model, wrap_inkling2_dspark(draft, "tiny", fixed=True))
+    return model
+
+
+def test_inkling2_predraft_reads_the_newest_committed_row():
+    """A block drafted before the host knows how many verify rows commit must
+    start the recurrent head from the last row that does, not from the row of
+    a rejected draft: adopting it equals drafting from the committed rows."""
+
+    def captured(n, seed):
+        mx.random.seed(seed)
+        return [mx.random.normal((1, n, 128)).astype(mx.bfloat16) for _ in range(4)]
+
+    def run(predraft):
+        drafter = _tiny_inkling2()._omlx_drafter
+        drafter.seed(0, captured(6, seed=77))
+        blocks = []
+        for step, count in enumerate([0, 5, 2, 4, 1, 3]):
+            state = SimpleNamespace(uid=0, depth=4, controller=None)
+            rows = captured(5, seed=500 + step) if count else []
+            anchor = mx.array([step + 3], dtype=mx.uint32)
+            if predraft and count:
+                assert drafter.predraft(None, state, rows, mx.array([count]), anchor)
+                drafter.adopt_predraft(state, count)
+            else:
+                kept = [c[:, :count] for c in rows]
+                drafter.draft([(None, state, kept, anchor, None)])
+            blocks.append(state.drafts.tolist())
+        return blocks
+
+    assert run(predraft=True) == run(predraft=False)

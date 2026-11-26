@@ -10,6 +10,7 @@ user agrees. While this Mac loads the model, the helper is copied to and
 started on the other Mac, and the loaded model takes it over; nothing is
 copied or started twice. The measured speeds of each model and helper Mac are kept on disk, so
 a restarted helper splits its first prompt by them instead of guessing.
+On Auto, a helper that runs out of GPU memory at start tries one layer fewer.
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ from typing import Any
 from ..cluster.identity import get_node_identity
 from ..cluster.pairing import get_pairing_manager
 from ..cluster.registry import default_devices_path
+from ..exceptions import is_metal_out_of_memory
+from ..oqh import format as oqh_format
 from . import agent
 from . import launcher as default_launcher
 from .adapter import StageAdapter
@@ -39,15 +42,21 @@ from .session import PrefillHelperSession
 
 logger = logging.getLogger(__name__)
 
-# Activations of one chunk and allocator headroom on the helper.
+# Activations of one chunk and allocator headroom on a helper that does not
+# say what it keeps.
 _RESERVE_BYTES = 8 << 30
-# macOS and the helper Mac's other apps; the GPU budget alone let the helper
-# swap (105 GiB of layers on a 128 GB Mac).
+# The OS and other apps on a helper with unified memory; the GPU budget alone
+# let the helper swap (105 GiB of layers on a 128 GB Mac or DGX Spark).
 _OS_BYTES = 16 << 30
 # Disk a model copy leaves free on the helper Mac without asking.
 _DISK_SPARE_BYTES = 50 << 30
 _RETRY_DELAYS_S = (15.0, 30.0, 60.0, 120.0, 300.0)
+# A prompt that could use a helper in backoff retries it at most this often.
+_RETRY_ON_USE_S = 15.0
 _WATCH_S = 2.0
+# Long prompts that run here while the helper is not ready log each of its
+# states at most this often.
+_NOTE_LOCAL_S = 60.0
 # A helper with open jobs that sends nothing for this long is gone.
 _STALL_S = 60.0
 _SPEEDS_LOCK = threading.Lock()
@@ -79,8 +88,12 @@ def transport_for(node_id: str) -> Any:
 def helper_budget(info: dict) -> list[int]:
     """Bytes the helper may hold on each of its GPUs, from its ``remote_info``."""
     if "budgets" in info:
-        # A helper daemon reports the free memory of each GPU itself.
-        return [int(b) for b in info["budgets"]]
+        # A helper daemon reports the free memory of each GPU itself. An
+        # integrated GPU (DGX Spark) holds its layers in the RAM the OS needs.
+        budgets = [int(b) for b in info["budgets"]]
+        if info.get("integrated"):
+            budgets = [min(b, int(info["memory"]) - _OS_BYTES) for b in budgets]
+        return budgets
     budget = int(info["budget"])
     if info.get("memory"):
         budget = min(budget, int(info["memory"]) - _OS_BYTES)
@@ -91,6 +104,19 @@ def helper_budget(info: dict) -> list[int]:
         freed = int(float(lending.get("active_gib") or 0) * 2**30)
         budget = min(budget, int(info["available"]) + freed)
     return [budget]
+
+
+def helper_reserve(info: dict) -> int:
+    """Bytes the helper keeps free on each GPU besides its layers; a helper
+    daemon reports the reserve it plans its stages with."""
+    reserve = info.get("reserve")
+    return _RESERVE_BYTES if reserve is None else int(reserve)
+
+
+def no_gpu(info: dict, name: str) -> str:
+    """Why a helper daemon that answers has no GPU left."""
+    error = info.get("gpu_error")
+    return f"{name} lost its GPU, restart its helper" + (f": {error}" if error else "")
 
 
 def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
@@ -114,7 +140,11 @@ def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
 
 
 def fit_layers(
-    shared: int, per_layer: list[int], budgets: list[int], limit: int
+    shared: int,
+    per_layer: list[int],
+    budgets: list[int],
+    limit: int,
+    reserve: int = _RESERVE_BYTES,
 ) -> int:
     """How many leading layers fit in a helper's memory, one GPU after another.
 
@@ -123,7 +153,7 @@ def fit_layers(
     """
     held, layers = 0, per_layer[:limit]
     for index, budget in enumerate(sorted(budgets, reverse=True)[:2]):
-        start, used = held, _RESERVE_BYTES + (shared if index == 0 else 0)
+        start, used = held, reserve + (shared if index == 0 else 0)
         while held < len(layers) and used + layers[held] <= budget:
             used, held = used + layers[held], held + 1
         if held == start:
@@ -142,14 +172,18 @@ def _with_time_left(status: dict[str, Any]) -> dict[str, Any]:
 def held_layers(
     adapter: StageAdapter,
     model_path: str,
-    budgets: list[int],
+    info: dict,
     name: str,
     fixed: int | None = None,
 ) -> int:
     """Layers the helper holds: as many as fit, or the fixed number."""
     shared, per_layer = adapter.memory_plan(model_path)
     limit = adapter.split_limit(len(per_layer))
-    held = fit_layers(shared, per_layer, budgets, limit)
+    budgets = helper_budget(info)
+    if not budgets:
+        # A helper daemon starts only with a GPU, so a lost one may come back.
+        raise UnreachableError(no_gpu(info, name))
+    held = fit_layers(shared, per_layer, budgets, limit, helper_reserve(info))
     if fixed is not None:
         if fixed > limit:
             raise _PermanentError(
@@ -165,6 +199,46 @@ def held_layers(
     return held
 
 
+def _launch_fitting(
+    launcher: Any,
+    target: Any,
+    model_dir: str,
+    model_type: str,
+    held: int,
+    *,
+    auto: bool,
+    report: Callable[..., None],
+    cancelled: Callable[[], bool],
+    **launch: Any,
+) -> tuple:
+    """The started helper and the layers it holds.
+
+    The file sizes leave out what loaded layers allocate besides weights.
+    On Auto, a helper out of GPU memory at start tries one layer fewer.
+    """
+    while True:
+        report("starting", layers=held)
+        try:
+            return launcher.launch(target, model_dir, model_type, held, **launch), held
+        except launcher.LaunchError as error:
+            # The error ends with the helper's last lines of stderr.
+            if not auto or not is_metal_out_of_memory(error):
+                raise
+            if held == 1:
+                raise _PermanentError(
+                    f"Not even one layer fits in {target.name}'s GPU memory."
+                ) from error
+        logger.warning(
+            "Prefill helper on %s ran out of GPU memory with %d layers; trying %d",
+            target.name,
+            held,
+            held - 1,
+        )
+        if cancelled():
+            raise _CancelledError("cancelled while starting the helper")
+        held -= 1
+
+
 def this_host() -> dict | None:
     """This Mac as the helper Mac records it, once the cluster identity exists."""
     try:
@@ -175,9 +249,13 @@ def this_host() -> dict | None:
 
 
 def _reach(
-    launcher: Any, node_id: str, report: Callable[..., None], adapter: StageAdapter
+    launcher: Any,
+    node_id: str,
+    report: Callable[..., None],
+    adapter: StageAdapter,
+    model_path: str,
 ) -> tuple:
-    """The helper and its ``remote_info``, if it can serve this family."""
+    """The helper and its ``remote_info``, if it can serve this model."""
     try:
         target = launcher.resolve_target(node_id)
     except UnreachableError:
@@ -188,9 +266,13 @@ def _reach(
     forget_host(node_id)
     report("connecting", name=target.name, link=target.link)
     info = launcher.remote_info(target, host=this_host())
-    problem = launcher.incompatible(info, adapter, target.name)
+    oqh = oqh_format.checkpoint_version(model_path)
+    problem = launcher.incompatible(info, adapter, target.name, oqh)
     if problem is not None:
         raise _PermanentError(problem)
+    update = agent.outdated(info) if "contracts" in info else None
+    if update:
+        logger.warning("Prefill helper on %s is outdated. %s", target.name, update)
     return target, info
 
 
@@ -356,11 +438,13 @@ class FilePrep:
         try:
             if self._cancel.is_set():
                 raise _CancelledError
-            target, info = _reach(self.launcher, self.node_id, self._set, self.adapter)
+            target, info = _reach(
+                self.launcher, self.node_id, self._set, self.adapter, self.model_path
+            )
             held = held_layers(
                 self.adapter,
                 self.model_path,
-                helper_budget(info),
+                info,
                 target.name,
                 self.layers,
             )
@@ -382,12 +466,15 @@ class FilePrep:
             if launch is None:
                 self._set("files_ready", held=held)
                 return
-            self._set("starting", layers=held)
-            process = self.launcher.launch(
+            process, held = _launch_fitting(
+                self.launcher,
                 target,
                 model_dir,
                 launch["model_type"],
                 held,
+                auto=self.layers is None,
+                report=self._set,
+                cancelled=self._cancel.is_set,
                 host_name=computer_name(),
                 warm_tokens=launch["warm_tokens"],
                 a8_min_tokens=launch["a8_min_tokens"],
@@ -497,6 +584,7 @@ class PrefillHelperManager:
         self._process = None
         self._session: PrefillHelperSession | None = None
         self._copy_ok = threading.Event()
+        self._noted: dict[str, float] = {}
         self._lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run, name="omlx-prefill-helper", daemon=True
@@ -519,6 +607,34 @@ class PrefillHelperManager:
     def retry(self) -> None:
         self._commands.put(("retry",))
 
+    def retry_if_offline(self) -> None:
+        """Log that a long prompt runs here, and retry a helper that is offline.
+
+        Only when offline: any queued command cancels a copy waiting for the user.
+        """
+        with self._lock:
+            status = self._status
+            state, now = status["state"], time.monotonic()
+            # A helper that is being detached still says ready.
+            if (
+                state not in ("off", "stopped", "ready")
+                and now - self._noted.get(state, float("-inf")) >= _NOTE_LOCAL_S
+            ):
+                self._noted[state] = now
+                logger.warning(
+                    "Prefill helper for %s is not ready (%s); a long prompt runs "
+                    "on this Mac alone",
+                    Path(self.model_path).name,
+                    status.get("reason") or state,
+                )
+            if (
+                state == "offline"
+                and time.time() - status["since"] >= _RETRY_ON_USE_S
+                and self._commands.empty()
+            ):
+                # Unlike Retry, a tick keeps the backoff growing if it fails.
+                self._commands.put(("tick",))
+
     def stop(self) -> None:
         """Stop the helper but keep the choice; Retry starts it again."""
         self._commands.put(("stop",))
@@ -534,6 +650,8 @@ class PrefillHelperManager:
         if session is not None and status.get("state") == "ready":
             status["layers"] = session.pick_layers()
             status["last_prompt"] = session.last_prompt
+            # A prompt went past the helper's memory and ran on this Mac.
+            status["out_of_memory"] = session.client.out_of_memory
             if session.client.job_count():
                 status["state"] = "working"
         return status
@@ -644,11 +762,13 @@ class PrefillHelperManager:
         if adopted is not None:
             target, info, held, process = adopted
         else:
-            target, info = _reach(launcher, self.node_id, self._report, self.adapter)
+            target, info = _reach(
+                launcher, self.node_id, self._report, self.adapter, self.model_path
+            )
             held = held_layers(
                 self.adapter,
                 self.model_path,
-                helper_budget(info),
+                info,
                 target.name,
                 self.fixed_layers,
             )
@@ -661,12 +781,15 @@ class PrefillHelperManager:
                 self._report,
                 self._ask,
             )
-            self._set("starting", node_id=self.node_id, layers=held)
-            process = launcher.launch(
+            process, held = _launch_fitting(
+                launcher,
                 target,
                 model_dir,
                 self.model_type,
                 held,
+                auto=self.fixed_layers is None,
+                report=self._report,
+                cancelled=lambda: not self._commands.empty(),
                 host_name=computer_name(),
                 warm_tokens=self.chunk_tokens,
                 a8_min_tokens=self.a8_min_tokens,

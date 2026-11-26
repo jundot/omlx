@@ -1687,6 +1687,7 @@ class TestClaudeCodeIntegration:
         assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "qwen3.5"
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
+        assert env["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
         # Bundled-python vars must be stripped so claude code subprocess hooks
         # don't inherit our cpython-3.11 stack.
         assert "PYTHONHOME" not in env
@@ -1776,7 +1777,7 @@ class TestClaudeCodeIntegration:
             )
 
         env = captured["env"]
-        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "49152"
+        assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "49152"
 
     def test_launch_sets_max_context_tokens_64k(self):
@@ -1803,7 +1804,7 @@ class TestClaudeCodeIntegration:
             )
 
         env = captured["env"]
-        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "65536"
+        assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
 
     def test_launch_sets_max_context_tokens_for_canonical_claude_alias(self):

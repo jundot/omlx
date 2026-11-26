@@ -125,5 +125,13 @@ def test_checkpoint_has_bf16_leaves_reads_safetensors_headers(tmp_path):
     _write(fp16_dir / "model-00001.safetensors", "F16")
     assert checkpoint_has_bf16_leaves(str(fp16_dir)) is False
 
+    bad_dir = tmp_path / "bad"
+    bad_dir.mkdir()
+    (bad_dir / "model-00001.safetensors").write_bytes(b"version https://git-lfs")
+    (bad_dir / "model-00002.safetensors").write_bytes(struct.pack("<Q", 2) + b"[]")
+    assert checkpoint_has_bf16_leaves(str(bad_dir)) is False
+    _write(bad_dir / "model-00003.safetensors", "BF16")
+    assert checkpoint_has_bf16_leaves(str(bad_dir)) is True
+
     assert checkpoint_has_bf16_leaves("") is False
     assert checkpoint_has_bf16_leaves(str(tmp_path / "missing")) is False

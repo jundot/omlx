@@ -23,6 +23,16 @@ _MINIMAX_CLOSE_TAG = "</mm:think>"
 _HY3_OPEN_TAG = "<think:opensource>"
 _HY3_CLOSE_TAG = "</think:opensource>"
 
+
+def normalize_think_tags(text: str) -> str:
+    return (
+        text.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG)
+        .replace(_MINIMAX_CLOSE_TAG, _CLOSE_TAG)
+        .replace(_HY3_OPEN_TAG, _OPEN_TAG)
+        .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
+    )
+
+
 # Regex for non-streaming extraction (complete text)
 _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 # Handle case where <think> is missing but </think> is present
@@ -206,12 +216,7 @@ def extract_thinking(
     if not text:
         return ("", "")
 
-    text = (
-        text.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG)
-        .replace(_MINIMAX_CLOSE_TAG, _CLOSE_TAG)
-        .replace(_HY3_OPEN_TAG, _OPEN_TAG)
-        .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
-    )
+    text = normalize_think_tags(text)
 
     if start_in_thinking and not text.lstrip().startswith(_OPEN_TAG):
         text = _OPEN_TAG + text
@@ -700,3 +705,12 @@ class ThinkingBudgetProcessor:
                 # Lazily-created attr absent from the snapshot: drop it so
                 # the next __call__ re-baselines from the history it sees.
                 delattr(self, name)
+
+    def inert_for(self, positions: int) -> bool:
+        """Whether the next ``positions`` calls leave every logit unchanged."""
+        if self._forcing or self._waiting_utf8:
+            return False
+        if self._done:
+            # A re-entry into thinking restarts the count at zero.
+            return positions < self._budget
+        return self._thinking_tokens + positions < self._budget

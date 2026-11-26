@@ -2,7 +2,59 @@
 """DeepSeek V4.1 configuration; field defaults follow the official reference."""
 
 from dataclasses import dataclass, fields, replace
-from typing import Literal
+from typing import Any, Literal
+
+
+@dataclass(frozen=True)
+class TensorSplit:
+    """An uneven tensor-parallel split, as each rank's share in whole units.
+
+    ``attention`` counts output groups (each holds ``n_heads / o_groups``
+    heads) and ``experts`` counts equal blocks of every routed and shared
+    expert's neurons. The planner picks the block width, so ``experts`` totals
+    ``moe_inter_dim / width``. Both are listed in rank order.
+    """
+
+    attention: tuple[int, ...]
+    experts: tuple[int, ...]
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "TensorSplit | None":
+        if not payload:
+            return None
+        try:
+            attention = tuple(int(part) for part in payload["attention"])
+            experts = tuple(int(part) for part in payload["experts"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid DeepSeek V4.1 tensor split") from exc
+        return cls(attention, experts)
+
+    def validate(self, config: "ModelConfig", size: int) -> None:
+        if len(self.attention) != size or len(self.experts) != size:
+            raise ValueError(f"DeepSeek V4.1 tensor split must list {size} ranks")
+        if min(self.attention + self.experts) < 1:
+            raise ValueError("every DeepSeek V4.1 tensor-parallel rank needs a share")
+        if config.n_heads % config.o_groups or sum(self.attention) != config.o_groups:
+            raise ValueError(
+                f"DeepSeek V4.1 attention split must total {config.o_groups} "
+                "output groups"
+            )
+        if config.moe_inter_dim % sum(self.experts):
+            raise ValueError(
+                f"DeepSeek V4.1 expert split of {sum(self.experts)} blocks does "
+                f"not divide {config.moe_inter_dim} neurons"
+            )
+
+    def bounds(self, kind: str, rank: int, length: int) -> tuple[int, int]:
+        """``rank``'s [start, end) of an axis of ``length`` split by ``kind``."""
+
+        parts = self.experts if kind == "experts" else self.attention
+        total = sum(parts)
+        if length % total:
+            raise ValueError(f"axis of {length} cannot be split in {total} parts")
+        step = length // total
+        start = sum(parts[:rank]) * step
+        return start, start + parts[rank] * step
 
 
 @dataclass
@@ -246,23 +298,37 @@ class ModelConfig:
             )
         )
 
-    def tensor_shard(self, size: int) -> "ModelConfig":
-        """The shapes one of ``size`` tensor-parallel ranks holds.
+    def tensor_shard(
+        self, size: int, rank: int = 0, split: "TensorSplit | None" = None
+    ) -> "ModelConfig":
+        """The shapes tensor-parallel ``rank`` of ``size`` holds.
 
         A rank keeps whole attention heads, output groups and expert neurons.
+        Without ``split`` every rank holds an equal share; with one, ``rank``
+        holds its own share of output groups and expert units.
         """
 
-        for name in ("n_heads", "o_groups", "moe_inter_dim"):
-            if getattr(self, name) % size:
-                raise ValueError(
-                    f"DeepSeek V4.1 {name} ({getattr(self, name)}) is not "
-                    f"divisible by {size} ranks"
-                )
+        if split is None:
+            for name in ("n_heads", "o_groups", "moe_inter_dim"):
+                if getattr(self, name) % size:
+                    raise ValueError(
+                        f"DeepSeek V4.1 {name} ({getattr(self, name)}) is not "
+                        f"divisible by {size} ranks"
+                    )
+            return replace(
+                self,
+                n_heads=self.n_heads // size,
+                o_groups=self.o_groups // size,
+                moe_inter_dim=self.moe_inter_dim // size,
+            )
+        split.validate(self, size)
         return replace(
             self,
-            n_heads=self.n_heads // size,
-            o_groups=self.o_groups // size,
-            moe_inter_dim=self.moe_inter_dim // size,
+            n_heads=split.attention[rank] * (self.n_heads // self.o_groups),
+            o_groups=split.attention[rank],
+            moe_inter_dim=self.moe_inter_dim
+            // sum(split.experts)
+            * split.experts[rank],
         )
 
     def ced_layout_supported(self) -> bool:

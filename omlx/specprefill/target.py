@@ -118,24 +118,27 @@ def run_specprefill_target_prefill(
         static_prefix_cached_tokens = 0
         if exact_prefix_cache is not None and static_prefix_tokens:
             full_static_prefix_tokens = list(static_prefix_tokens)
-            restored_cache = exact_prefix_cache.restore_exact_prefix(
-                f"{request.request_id}:specprefill-static-restore",
-                full_static_prefix_tokens,
-                promote_to_hot_cache=promote_static_prefix_to_hot_cache,
-            )
-            if restored_cache is not None:
-                restore_cache = getattr(target_model, "restore_cache", None)
-                prompt_cache = (
-                    restore_cache(restored_cache)
-                    if callable(restore_cache)
-                    else restored_cache
+            # Build the lazy restore chain on the target stream; otherwise the
+            # prefill below waits on it through a cross-stream fence (#2330).
+            with mx.stream(stream):
+                restored_cache = exact_prefix_cache.restore_exact_prefix(
+                    f"{request.request_id}:specprefill-static-restore",
+                    full_static_prefix_tokens,
+                    promote_to_hot_cache=promote_static_prefix_to_hot_cache,
                 )
-                static_prefix_cached_tokens = len(full_static_prefix_tokens)
-                report_system_progress(system_token_count, system_token_count)
-                log.info(
-                    f"SpecPrefill: restored {static_prefix_cached_tokens} "
-                    "static system-prefix tokens from tiered cache"
-                )
+                if restored_cache is not None:
+                    restore_cache = getattr(target_model, "restore_cache", None)
+                    prompt_cache = (
+                        restore_cache(restored_cache)
+                        if callable(restore_cache)
+                        else restored_cache
+                    )
+                    static_prefix_cached_tokens = len(full_static_prefix_tokens)
+                    report_system_progress(system_token_count, system_token_count)
+                    log.info(
+                        f"SpecPrefill: restored {static_prefix_cached_tokens} "
+                        "static system-prefix tokens from tiered cache"
+                    )
         if prompt_cache is None:
             prompt_cache = make_prompt_cache(target_model)
         if prepare_prompt_cache is not None:

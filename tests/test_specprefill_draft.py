@@ -9,12 +9,13 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
 
 import omlx.specprefill.draft as draft_workflow
+from omlx.model_settings import ModelSettings
 from omlx.request import Request, SamplingParams
 from omlx.specprefill.policy import plan_specprefill_scoring
 
@@ -439,7 +440,7 @@ class TestDraftCacheReuse:
                 "model_type": "qwen3_5",
                 "hidden_size": 64,
                 "intermediate_size": 128,
-                "num_hidden_layers": 4,
+                "num_hidden_layers": 2,
                 "num_attention_heads": 4,
                 "num_key_value_heads": 2,
                 "vocab_size": 256,
@@ -578,7 +579,7 @@ class TestDraftCacheReuse:
                     assert mx.array_equal(a, b).item()
 
     @pytest.mark.parametrize(
-        "stored,n,restored", [(1024, 1024, 768), (1154, 1216, 1024)]
+        "stored,n,restored", [(768, 768, 512), (898, 960, 768)]
     )
     def test_disk_reuse_matches_cold_scoring(self, tmp_path, stored, n, restored):
         model = self._model()
@@ -621,3 +622,27 @@ class TestDraftCacheReuse:
             ValueError, match="leave at least the last prompt token uncached"
         ):
             score_tokens(model, tokens[:64], existing_cache=cache)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "engine stopped"])
+def test_attach_draft_without_a_usable_model(outcome):
+    scheduler = SimpleNamespace(set_specprefill_draft_model=MagicMock())
+    engine = SimpleNamespace(
+        specprefill_failed_draft=None,
+        _model_settings=ModelSettings(),
+        _trust_remote_code=False,
+        _engine=SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler)),
+    )
+
+    def load(*_args):
+        if outcome == "failed":
+            raise OSError("no such draft")
+        engine._engine = None
+
+    with patch.object(draft_workflow, "_load_draft", side_effect=load):
+        draft_workflow.attach_specprefill_draft(engine, "/draft")
+
+    scheduler.set_specprefill_draft_model.assert_not_called()
+    assert engine.specprefill_failed_draft == (
+        "/draft" if outcome == "failed" else None
+    )

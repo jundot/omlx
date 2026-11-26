@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.metadata
 import ipaddress
 import json
 import logging
-import math
 import os
 import platform
 import random
@@ -26,7 +24,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,8 +50,6 @@ _LOG_LINE_LIMIT = 8192
 _LOG_HISTORY = 200
 _FAILURE_OUTPUT_GRACE_SECONDS = 2.0
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
-_FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
-_DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
 _LAUNCHER_RANK_EXIT_RE = re.compile(
     r"Node with rank\s+(?P<rank>\d+)\s+exited with code\s+(?P<code>-?\d+)"
 )
@@ -86,7 +82,7 @@ class DistributedTeardownError(DistributedLaunchError):
 
 @dataclass(frozen=True)
 class _LocalProcessState:
-    """One read-only row from the macOS/Linux process table."""
+    """One read-only row from the local process table."""
 
     pid: int
     ppid: int
@@ -205,52 +201,6 @@ def _survivor_description(process: _LocalProcessState) -> str:
 
 def _is_macos_exit_wedge(process: _LocalProcessState) -> bool:
     return "E" in process.status.upper() and process.rss_kib == 0
-
-
-@dataclass(frozen=True)
-class CudaFabricProbeHost:
-    """One CUDA worker and its direct-link NCCL endpoint."""
-
-    node_id: str
-    ssh: str
-    ips: tuple[str, ...]
-    interfaces: tuple[str, ...]
-    rdma_devices: tuple[str, ...]
-    python_executable: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.node_id.strip() or len(self.node_id) > 128:
-            raise ValueError("CUDA fabric member requires a node ID")
-        object.__setattr__(self, "ssh", validate_ssh_target(self.ssh.strip()))
-        if not self.ips or not (
-            len(self.ips) == len(self.interfaces) == len(self.rdma_devices)
-        ):
-            raise ValueError(
-                "CUDA fabric member requires matching IP, interface, and RDMA lists"
-            )
-        normalized_ips: list[str] = []
-        for raw_ip in self.ips:
-            try:
-                normalized_ips.append(str(ipaddress.ip_address(raw_ip.strip())))
-            except ValueError as exc:
-                raise ValueError(
-                    "CUDA fabric member requires valid IP addresses"
-                ) from exc
-        object.__setattr__(self, "ips", tuple(normalized_ips))
-        interfaces = tuple(interface.strip() for interface in self.interfaces)
-        if any(not _FABRIC_INTERFACE_RE.fullmatch(item) for item in interfaces):
-            raise ValueError("CUDA fabric member has an invalid interface name")
-        object.__setattr__(self, "interfaces", interfaces)
-        rdma_devices = tuple(device.strip() for device in self.rdma_devices)
-        if any(not _FABRIC_INTERFACE_RE.fullmatch(item) for item in rdma_devices):
-            raise ValueError("CUDA fabric member has an invalid RDMA device name")
-        object.__setattr__(self, "rdma_devices", rdma_devices)
-        if self.python_executable is not None:
-            object.__setattr__(
-                self,
-                "python_executable",
-                _validate_python_executable(self.python_executable.strip()),
-            )
 
 
 def _process_group_alive(process_group: int) -> bool:
@@ -1533,171 +1483,6 @@ def run_cluster_performance_probe(
     }
 
 
-def run_cuda_fabric_probe(
-    hosts: tuple[CudaFabricProbeHost, CudaFabricProbeHost],
-    *,
-    timeout: float = 90.0,
-    payload_mib: int = 64,
-    repeats: int = 3,
-    minimum_bytes_per_second: float = _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND,
-    python_executable: str = sys.executable,
-    cwd: Path | None = None,
-    runner: PerformanceProbeRunner = _run_performance_launcher,
-) -> dict[str, Any]:
-    """Launch an isolated two-worker NCCL test over explicit ConnectX IPs.
-
-    This is intentionally separate from the heterogeneous outer Ring. A Ring
-    subgroup still uses Ring and therefore cannot prove that NCCL or the direct
-    ConnectX path is active. The dashboard calls this before it marks a CUDA
-    pair verified.
-    """
-
-    if len(hosts) != 2:
-        raise ValueError("CUDA fabric verification requires exactly two workers")
-    if len({host.ssh for host in hosts}) != 2:
-        raise ValueError("CUDA fabric workers must use distinct SSH targets")
-    if set(hosts[0].ips) & set(hosts[1].ips):
-        raise ValueError("CUDA fabric workers must use distinct direct-link IPs")
-    if timeout <= 0:
-        raise ValueError("CUDA fabric probe timeout must be positive")
-    if not 1 <= payload_mib <= 1024:
-        raise ValueError("CUDA fabric payload must be between 1 and 1024 MiB")
-    if not 1 <= repeats <= 20:
-        raise ValueError("CUDA fabric repeats must be between 1 and 20")
-    if not math.isfinite(minimum_bytes_per_second) or minimum_bytes_per_second <= 0:
-        raise ValueError("CUDA fabric throughput floor must be finite and positive")
-    python_executable = _validate_python_executable(python_executable)
-    if cwd is not None and not cwd.is_absolute():
-        raise ValueError("distributed working directory must be absolute")
-
-    with tempfile.TemporaryDirectory(prefix="omlx-cuda-fabric-") as temporary_name:
-        temporary = Path(temporary_name)
-        _install_cluster_ssh_wrapper(temporary)
-        hostfile = temporary / "hostfile.json"
-        hostfile.write_text(
-            json.dumps(
-                {
-                    "backend": "nccl",
-                    "envs": [],
-                    "hosts": [
-                        {"ssh": host.ssh, "ips": list(host.ips), "rdma": []}
-                        for host in hosts
-                    ],
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            encoding="utf-8",
-        )
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-            listener.bind(("127.0.0.1", 0))
-            nccl_port = int(listener.getsockname()[1])
-        launcher = (
-            "from mlx._distributed_utils.launch import main; "
-            "raise SystemExit(main() or 0)"
-        )
-        argv = [
-            python_executable,
-            "-c",
-            launcher,
-            "--backend",
-            "nccl",
-            "--hostfile",
-            str(hostfile),
-            "--nccl-port",
-            str(nccl_port),
-        ]
-        if cwd is not None:
-            argv.extend(["--cwd", str(cwd)])
-        argv.extend(
-            [
-                "--",
-                *_rank_python_module_argv(
-                    [host.python_executable for host in hosts],
-                    fallback=python_executable,
-                    module="omlx.cluster.nccl_fabric_worker",
-                ),
-                "--interfaces",
-                json.dumps([list(host.interfaces) for host in hosts]),
-                "--rdma-devices",
-                json.dumps([list(host.rdma_devices) for host in hosts]),
-                "--payload-mib",
-                str(payload_mib),
-                "--repeats",
-                str(repeats),
-            ]
-        )
-        environment = os.environ.copy()
-        environment["PATH"] = f"{temporary}{os.pathsep}{environment.get('PATH', '')}"
-        environment["SSH_ASKPASS_REQUIRE"] = "never"
-        environment["PYTHONUNBUFFERED"] = "1"
-        try:
-            completed = runner(argv, timeout=timeout, env=environment)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise DistributedLaunchError(
-                f"could not launch CUDA fabric probe: {exc}"
-            ) from exc
-
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        suffix = f": {detail[-2000:]}" if detail else ""
-        raise DistributedLaunchError(
-            f"CUDA fabric probe exited with code {completed.returncode}{suffix}"
-        )
-    if (
-        len(completed.stdout.encode()) + len(completed.stderr.encode())
-        > _REMOTE_OUTPUT_LIMIT
-    ):
-        raise DistributedLaunchError("CUDA fabric probe output exceeded the safe limit")
-    records: list[dict[str, Any]] = []
-    for line in completed.stdout.splitlines():
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict) and value.get("type") == "nccl_fabric_result":
-            records.append(value)
-    ranks = {int(record.get("rank", -1)) for record in records}
-    if ranks != {0, 1} or len(records) != 2:
-        raise DistributedLaunchError(
-            "CUDA fabric probe did not return one result from each worker"
-        )
-    observed = min(
-        float(record.get("payload_bytes_per_second") or 0) for record in records
-    )
-    verified = observed >= minimum_bytes_per_second
-    identity = "\0".join(sorted(host.ssh for host in hosts)).encode()
-    group_id = f"connectx-{hashlib.sha256(identity).hexdigest()[:16]}"
-    return {
-        "ok": True,
-        "verified": verified,
-        "group_id": group_id,
-        "transport": "nccl",
-        "members": [
-            {
-                "node_id": host.node_id,
-                "ssh": host.ssh,
-                "ips": list(host.ips),
-                "interfaces": list(host.interfaces),
-                "rdma_devices": list(host.rdma_devices),
-                "rank": index,
-            }
-            for index, host in enumerate(hosts)
-        ],
-        "payload_mib": payload_mib,
-        "repeats": repeats,
-        "payload_bytes_per_second": observed,
-        "minimum_bytes_per_second": minimum_bytes_per_second,
-        "reason": (
-            "NCCL completed over the selected direct-link interfaces"
-            if verified
-            else "NCCL completed, but measured throughput did not clear the "
-            "ConnectX verification floor"
-        ),
-        "records": sorted(records, key=lambda item: int(item["rank"])),
-    }
-
-
 SSHRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -1793,11 +1578,8 @@ def discover_remote_python_executable(
         preferred,
         "~/.omlx/bin/omlx-cluster-python",
         "~/.omlx/bin/omlx-source-python",
-        "/opt/omlx-cluster-worker/venv/bin/python",
-        "/opt/omlx/bin/python",
         "/usr/local/bin/python3",
         "/usr/bin/python3",
-        "~/omlx-distributed/.venv/bin/python",
         "python3",
     )
     seen: set[str] = set()
@@ -1883,16 +1665,7 @@ def discover_remote_system_python(
 
 
 _REMOTE_SYSTEM_PROBE = r"""
-import json, os, platform, socket, subprocess, sys
-
-def run(argv):
-    try:
-        value = subprocess.run(
-            argv, capture_output=True, text=True, check=False, timeout=8
-        )
-        return value.returncode, value.stdout
-    except Exception:
-        return 127, ""
+import json, os, platform, socket, sys
 
 def memory_bytes():
     try:
@@ -1916,7 +1689,6 @@ def worker_runtime_evidence():
         os.path.expanduser("~/.omlx/bin/omlx-cluster-python"),
         "/Applications/oMLX.app",
         os.path.expanduser("~/Applications/oMLX.app"),
-        "/opt/omlx-cluster-worker/venv/bin/python",
     ):
         try:
             if os.path.exists(path):
@@ -1935,63 +1707,16 @@ def worker_runtime_evidence():
         note("cannot look up the omlx package: %r" % (exc,))
     return found
 
-gpu_code, gpu_output = run([
-    "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"
-])
-cuda = gpu_code == 0 and bool(gpu_output.strip())
-chip = gpu_output.splitlines()[0].strip() if cuda else (
-    "Apple Silicon" if platform.system() == "Darwin" else platform.machine()
-)
-rdma_code, rdma_output = run(["rdma", "-j", "link", "show"])
-try:
-    raw_links = json.loads(rdma_output) if rdma_code == 0 else []
-except Exception:
-    raw_links = []
-devices = []
-addresses = {}
-interfaces = {}
-for item in raw_links if isinstance(raw_links, list) else []:
-    if not isinstance(item, dict):
-        continue
-    device = str(item.get("ifname") or item.get("dev") or "").split("/", 1)[0]
-    interface = str(item.get("netdev") or item.get("netdev_name") or "")
-    if not device or not interface:
-        continue
-    devices.append(device)
-    interfaces[device] = interface
-    code, output = run(["ip", "-j", "address", "show", "dev", interface])
-    try:
-        rows = json.loads(output) if code == 0 else []
-    except Exception:
-        rows = []
-    for row in rows if isinstance(rows, list) else []:
-        for address in row.get("addr_info", []) if isinstance(row, dict) else []:
-            value = str(address.get("local") or "") if isinstance(address, dict) else ""
-            if value and address.get("scope") in (None, "global", "link"):
-                addresses[device] = value
-                break
-        if device in addresses:
-            break
 physical = memory_bytes()
-system = platform.system().lower() or "unknown"
-accelerator = "cuda" if cuda else "metal" if system == "darwin" else "cpu"
 payload = {
     "protocol_version": None,
     "node": {
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
-        "chip_name": chip,
+        "chip_name": "Apple Silicon" if platform.system() == "Darwin" else platform.machine(),
         "physical_memory_bytes": physical,
         "recommended_working_set_bytes": int(physical * 0.90),
         "admission_ceiling_bytes": 0,
-        "accelerator": accelerator,
-        "accelerator_vendor": "nvidia" if cuda else "apple" if system == "darwin" else "unknown",
-        "memory_kind": "unified" if accelerator in ("metal", "cuda") and platform.machine().lower() in ("arm64", "aarch64") else "system",
-        "distributed_backends": [],
-        "fabric_kind": "connectx-7" if cuda and addresses else None,
-        "fabric_group_id": None,
-        "fabric_verified": False,
-        "worker_runtime_ready": False,
         "worker_runtime_evidence": worker_runtime_evidence(),
     },
     "runtime": {
@@ -2001,17 +1726,14 @@ payload = {
         "python_version": platform.python_version(),
         "python_executable": sys.executable,
         "macos_version": platform.mac_ver()[0] or "unknown",
-        "os_name": system,
-        "os_version": platform.release() or "unknown",
     },
     "transport": {
-        "state": "enabled_no_peer" if devices else "unavailable",
+        "state": "unavailable",
         "rdma": {
-            "control_status": "enabled" if devices else "unavailable",
-            "enabled": bool(devices),
-            "devices": devices,
-            "addresses": addresses,
-            "network_interfaces": interfaces,
+            "control_status": "unavailable",
+            "enabled": False,
+            "devices": [],
+            "addresses": {},
         },
         "thunderbolt": {"ports": [], "peer_connected": False},
         "route": None,
@@ -2090,7 +1812,6 @@ def probe_remote_system_host(
         # branch produced the result before reading it.
         "runtime_warnings": [],
         "worker_runtime_evidence": evidence,
-        "bootstrap_required": True,
     }
 
 
@@ -2415,8 +2136,8 @@ def preflight_remote_hosts(
     script = _PREFLIGHT_SCRIPT
     local_python_version = platform.python_version()
     results: list[dict[str, Any]] = []
-    # Cluster v2: each rank validates against its own path_map entry; nodes
-    # without an entry share the coordinator path, as before v2.
+    # Each rank validates against its own path_map entry; nodes without an
+    # entry share the coordinator path.
     local_model_path = deployment.model_path_for(deployment.hosts[0].node_id)
     local_model_exists = Path(local_model_path).is_dir()
     assignments = sorted(deployment.assignments, key=lambda item: item.rank)
@@ -2660,8 +2381,6 @@ class DistributedJobStatus:
     stderr_tail: tuple[str, ...]
     failure_reason: str | None = None
     ranks: tuple[dict[str, Any], ...] = ()
-    # What the pre-launch RDMA check decided for this launch, and why.
-    stage_links: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2675,50 +2394,7 @@ class DistributedJobStatus:
             "stderr_tail": list(self.stderr_tail),
             "failure_reason": self.failure_reason,
             "ranks": [dict(rank) for rank in self.ranks],
-            "stage_links": self.stage_links,
         }
-
-
-def _attach_rdma_stage_links(
-    deployment: ClusterDeployment,
-) -> tuple[ClusterDeployment, dict[str, Any]]:
-    """Re-verify RDMA stage links for one launch; any error keeps MLX's transport."""
-    try:
-        from .rdma.launch_links import attach_stage_links
-
-        return attach_stage_links(deployment)
-    except Exception as exc:
-        logger.warning(
-            "RDMA stage-link check failed; launching over MLX's transport",
-            exc_info=True,
-        )
-        _release_rdma_stage_links(deployment.deployment_id)
-        report = {
-            "active": False,
-            "reason": f"RDMA stage-link check failed: {exc}",
-            "edges": [],
-        }
-        return replace(deployment, stage_links=()), report
-
-
-def _effective_rdma_report(
-    report: dict[str, Any] | None, ranks: tuple[dict[str, Any], ...]
-) -> dict[str, Any] | None:
-    """The pre-launch RDMA report, corrected by the ranks' own vote."""
-    if not report:
-        return report
-    from .rdma.launch_links import effective_report
-
-    return effective_report(report, ranks)
-
-
-def _release_rdma_stage_links(deployment_id: str) -> None:
-    """Free the RDMA links a finished launch held."""
-    # Nothing can have been claimed if the RDMA module does not import.
-    with suppress(ImportError):
-        from .rdma.launch_links import release_links
-
-        release_links(deployment_id)
 
 
 class DistributedJobSupervisor:
@@ -2734,15 +2410,10 @@ class DistributedJobSupervisor:
         load_timeout: float = 1800.0,
         stop_timeout: float = 10.0,
         preflight: bool = True,
-        attach_stage_links: Callable[
-            [ClusterDeployment], tuple[ClusterDeployment, dict[str, Any]]
-        ] = _attach_rdma_stage_links,
     ) -> None:
         if load_timeout <= 0 or stop_timeout <= 0:
             raise ValueError("supervisor timeouts must be positive")
         self.deployment = deployment
-        self._attach_stage_links = attach_stage_links
-        self.stage_link_report: dict[str, Any] | None = None
         self.python_executable = _validate_python_executable(python_executable)
         self.cwd = cwd
         self.state_dir = state_dir
@@ -2812,28 +2483,19 @@ class DistributedJobSupervisor:
         # Mint a fresh launch-scoped secret so an unauthenticated peer on the
         # fabric cannot join rank control by reading the signed plan.
         self.control_token = secrets.token_hex(32)
-        # Stage links are re-verified for every launch, never reused from a stored plan.
-        self.deployment, self.stage_link_report = self._attach_stage_links(
-            self.deployment
+        argv = build_mlx_launch_argv(
+            self.deployment,
+            hostfile=hostfile,
+            api_port=self.port,
+            collective_port=self.collective_port,
+            python_executable=self.python_executable,
+            cwd=self.cwd,
+            state_dir=self.state_dir,
+            control_host=control_host,
+            control_port=self.control_port,
+            control_token=self.control_token,
+            load_timeout=self.load_timeout,
         )
-        try:
-            argv = build_mlx_launch_argv(
-                self.deployment,
-                hostfile=hostfile,
-                api_port=self.port,
-                collective_port=self.collective_port,
-                python_executable=self.python_executable,
-                cwd=self.cwd,
-                state_dir=self.state_dir,
-                control_host=control_host,
-                control_port=self.control_port,
-                control_token=self.control_token,
-                load_timeout=self.load_timeout,
-            )
-        except Exception:
-            # No rank exists yet, so the links this launch claimed are free again.
-            _release_rdma_stage_links(self.deployment.deployment_id)
-            raise
         self._phase = "loading"
         try:
             environment = os.environ.copy()
@@ -3212,8 +2874,6 @@ class DistributedJobSupervisor:
         self.failure_event = None
         self._phase = "stopped"
         self._remove_launch_manifest()
-        # Every rank is proven gone, so its RDMA link may carry the next launch.
-        _release_rdma_stage_links(self.deployment.deployment_id)
         with suppress(Exception):
             _set_serve_release(
                 self.deployment, self.state_dir, None, local_only=local_only
@@ -3488,13 +3148,6 @@ class DistributedJobSupervisor:
             ranks=tuple(
                 dict(self.rank_ready_events[rank])
                 for rank in sorted(self.rank_ready_events)
-            ),
-            stage_links=_effective_rdma_report(
-                self.stage_link_report,
-                tuple(
-                    self.rank_ready_events[rank]
-                    for rank in sorted(self.rank_ready_events)
-                ),
             ),
         )
 

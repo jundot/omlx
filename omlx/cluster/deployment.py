@@ -24,8 +24,8 @@ from .planner import (
     PipelineAssignment,
     normalize_memory_guard_tier,
     normalize_node_role,
+    tensor_split_from_dict,
 )
-from .rdma.stage_plan import StageLink, validate_stage_links
 
 DistributedBackend = Literal["ring", "jaccl", "jaccl-ring"]
 
@@ -51,7 +51,10 @@ _MAX_PLAN_BYTES = 256 * 1024
 # keeps their value, and everyone else gets the default.
 #
 # Match MLX's disabled fast-sync default: fast fences can deadlock across
-# CPU/GPU streams (https://github.com/ml-explore/mlx/pull/4005).
+# CPU/GPU streams (https://github.com/ml-explore/mlx/pull/4005), and a TCP ring
+# stalled in long prefill with them. JACCL tensor parallelism turns them on:
+# every layer hands its all_sum to the CPU stream, and the default fence made
+# two-Mac DeepSeek V4.1 decode about 1.6x slower.
 #
 # MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER bound how much work lands in
 # one Metal command buffer. An unbounded buffer overruns the GPU driver's
@@ -75,10 +78,13 @@ _RANK_ENV_DEFAULTS = (
 )
 
 
-def _hostfile_envs() -> list[str]:
+def _hostfile_envs(fast_synch: bool = False) -> list[str]:
+    defaults = dict(_RANK_ENV_DEFAULTS)
+    if fast_synch:
+        defaults["MLX_METAL_FAST_SYNCH"] = "1"
     return [
         f"{name}={os.environ.get(name) or default}"
-        for name, default in _RANK_ENV_DEFAULTS
+        for name, default in defaults.items()
     ]
 
 
@@ -314,6 +320,9 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             kv_cache_bytes=int(payload.get("kv_cache_bytes", 0)),
             kv_bytes_per_token=int(payload.get("kv_bytes_per_token", 0)),
             max_context_tokens=int(payload.get("max_context_tokens", 0)),
+            tensor_parallel_split=tensor_split_from_dict(
+                payload.get("tensor_parallel_split")
+            ),
             **predicted,
         )
     except (TypeError, ValueError) as exc:
@@ -360,11 +369,9 @@ class ClusterDeployment:
     tensor_parallel_size: int = 1
     target_context_tokens: int = 8192
     # node_id → absolute model path on that node. Empty means every node uses
-    # ``model`` — the pre-v2 same-absolute-path requirement. Entries override
+    # ``model``, the original same-absolute-path requirement. Entries override
     # only the nodes they name; the coordinator path stays the fallback.
     path_map: dict[str, str] = field(default_factory=dict)
-    # RDMA stage edges for one launch only; never stored or compared.
-    stage_links: tuple[StageLink, ...] = field(default=(), compare=False)
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.deployment_id) is None:
@@ -410,9 +417,6 @@ class ClusterDeployment:
             char not in "0123456789abcdef" for char in self.plan_hash
         ):
             raise ValueError("plan_hash must be a lowercase SHA-256 digest")
-        object.__setattr__(
-            self, "stage_links", validate_stage_links(self.stage_links, len(self.hosts))
-        )
 
         assignments = sorted(self.assignments, key=lambda item: item.rank)
         if [item.rank for item in assignments] != list(range(len(self.hosts))):
@@ -476,7 +480,9 @@ class ClusterDeployment:
     def hostfile_dict(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
-            "envs": _hostfile_envs(),
+            "envs": _hostfile_envs(
+                fast_synch=self.backend == "jaccl" and self.tensor_parallel_size > 1
+            ),
             "hosts": [
                 {
                     "ssh": host.ssh,
@@ -571,7 +577,6 @@ class ClusterDeployment:
                 ],
                 "tensor_parallel_size": self.tensor_parallel_size,
                 "path_map": dict(sorted(self.path_map.items())),
-                "stage_links": [link.to_dict() for link in self.stage_links],
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -672,17 +677,3 @@ def decode_worker_path_map(encoded: str) -> dict[str, str]:
     return validate_model_path_map(payload.get("path_map"))
 
 
-def decode_worker_stage_links(encoded: str) -> tuple[StageLink, ...]:
-    """Stage edges this launch verified onto RDMA; older contracts carry none."""
-
-    payload = _decode_worker_payload(encoded)
-    return validate_stage_links(
-        payload.get("stage_links"), len(payload.get("assignments", []))
-    )
-
-
-def decode_worker_plan(encoded: str) -> tuple[str, tuple[PipelineAssignment, ...]]:
-    """Backward-compatible assignment-only worker plan decoder."""
-
-    plan_hash, assignments, _, _ = decode_worker_contract(encoded)
-    return plan_hash, assignments

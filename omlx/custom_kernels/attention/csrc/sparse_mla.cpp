@@ -58,14 +58,16 @@ class SparseMlaAttentionPrimitive : public Primitive {
       bool topk_valid_prefix,
       bool causal_prefix_indices,
       bool has_topk_length,
-      int causal_prefix_rows)
+      int causal_prefix_rows,
+      bool has_sinks)
       : Primitive(stream),
         scale_(scale),
         do_causal_(do_causal),
         topk_valid_prefix_(topk_valid_prefix),
         causal_prefix_indices_(causal_prefix_indices),
         has_topk_length_(has_topk_length),
-        causal_prefix_rows_(causal_prefix_rows) {}
+        causal_prefix_rows_(causal_prefix_rows),
+        has_sinks_(has_sinks) {}
 
   static bool unsupported(
       const array& q_latent,
@@ -153,8 +155,9 @@ class SparseMlaAttentionPrimitive : public Primitive {
     const auto& kv_latent = inputs[2];
     const auto& k_pe = inputs[3];
     const auto& topk = inputs[4];
-    const bool has_topk_length = inputs.size() > 5;
+    const bool has_topk_length = has_topk_length_;
     const array& topk_length = has_topk_length ? inputs[5] : topk;
+    const bool has_sinks = has_sinks_;
     auto& o = outputs[0];
 
     // BK sets the key-tile size AND the threadgroup-memory footprint (KV slab
@@ -219,6 +222,7 @@ class SparseMlaAttentionPrimitive : public Primitive {
     const bool do_causal = do_causal_;
     metal::MTLFCList func_consts = {
         {&do_causal, MTL::DataType::DataTypeBool, 301},
+        {&has_sinks, MTL::DataType::DataTypeBool, 302},
     };
 
     std::string base_name;
@@ -244,7 +248,9 @@ class SparseMlaAttentionPrimitive : public Primitive {
         hash_name,
         base_name,
         "_do_causal_",
-        (do_causal ? 't' : 'n'));
+        (do_causal ? 't' : 'n'),
+        "_sinks_",
+        (has_sinks ? 't' : 'n'));
 
     auto lib = d.get_library("omlx_attention_kernels", binary_dir());
     auto& compute_encoder = metal::get_command_encoder(s);
@@ -291,6 +297,9 @@ class SparseMlaAttentionPrimitive : public Primitive {
     compute_encoder.set_input_array(topk_length, 5);
     compute_encoder.set_output_array(o, 6);
     compute_encoder.set_bytes(params, 7);
+    if (has_sinks) {
+      compute_encoder.set_input_array(inputs.back(), 8);
+    }
 
     MTL::Size grid_dims = MTL::Size(qL, B, 1);
     MTL::Size group_dims = MTL::Size(32, wm, 1);
@@ -306,7 +315,8 @@ class SparseMlaAttentionPrimitive : public Primitive {
         topk_valid_prefix_ == rhs.topk_valid_prefix_ &&
         causal_prefix_indices_ == rhs.causal_prefix_indices_ &&
         has_topk_length_ == rhs.has_topk_length_ &&
-        causal_prefix_rows_ == rhs.causal_prefix_rows_;
+        causal_prefix_rows_ == rhs.causal_prefix_rows_ &&
+        has_sinks_ == rhs.has_sinks_;
   }
   auto state() const {
     return std::make_tuple(
@@ -316,7 +326,8 @@ class SparseMlaAttentionPrimitive : public Primitive {
         topk_valid_prefix_,
         causal_prefix_indices_,
         has_topk_length_,
-        causal_prefix_rows_);
+        causal_prefix_rows_,
+        has_sinks_);
   }
 
  private:
@@ -326,6 +337,7 @@ class SparseMlaAttentionPrimitive : public Primitive {
   bool causal_prefix_indices_;
   bool has_topk_length_;
   int causal_prefix_rows_;
+  bool has_sinks_;
 };
 
 } // namespace
@@ -342,6 +354,7 @@ array sparse_mla_attention(
     bool causal_prefix_indices,
     const std::optional<array>& topk_length,
     int causal_prefix_rows,
+    const std::optional<array>& sinks,
     StreamOrDevice s) {
   for (const auto& tensor : {q_latent, q_pe, kv_latent, k_pe}) {
     if (tensor.ndim() != 4) {
@@ -433,6 +446,15 @@ array sparse_mla_attention(
   if (topk_length.has_value()) {
     inputs.push_back(*topk_length);
   }
+  if (sinks.has_value()) {
+    if (sinks->ndim() != 1 || sinks->shape(0) != ql.shape(1)) {
+      std::ostringstream msg;
+      msg << "[attention.sparse_mla_attention] sinks with shape "
+          << sinks->shape() << " expected [H].";
+      throw std::invalid_argument(msg.str());
+    }
+    inputs.push_back(astype(*sinks, float32, stream));
+  }
   if (SparseMlaAttentionPrimitive::unsupported(
           ql,
           qp,
@@ -460,7 +482,8 @@ array sparse_mla_attention(
           topk_valid_prefix,
           causal_prefix_indices,
           topk_length.has_value(),
-          causal_prefix_rows),
+          causal_prefix_rows,
+          sinks.has_value()),
       std::move(inputs));
 }
 

@@ -54,8 +54,8 @@ def keyboard_page():
             };
             return data;
         };
-        const originalCluster = clusterV2Wizard;
-        clusterV2Wizard = () => {
+        const originalCluster = clusterWizard;
+        clusterWizard = () => {
             const data = originalCluster();
             data.init = () => {};
             return data;

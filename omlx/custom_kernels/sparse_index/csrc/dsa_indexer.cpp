@@ -82,7 +82,9 @@ class DSAIndexerScoresPrimitive : public Primitive {
       return true;
     }
     const bool weights_lh = weights.ndim() == 3;
-    if ((q.shape(1) != 32 && q.shape(1) != 64) || k.shape(1) != 1) {
+    // The head loop runs to H at runtime; Hy4-flash's compressed indexer has 16.
+    const int heads = q.shape(1);
+    if ((heads != 16 && heads != 32 && heads != 64) || k.shape(1) != 1) {
       return true;
     }
     if (weights_lh) {

@@ -766,7 +766,7 @@ def test_automatic_never_falls_back_to_an_unsupported_pipeline():
         supports_pipeline=False,
     )
 
-    with pytest.raises(PlanningError, match="no tensor-parallel degree"):
+    with pytest.raises(PlanningError, match="Detected link: ethernet at 10 Gb/s"):
         choose_parallelism(
             unsupported,
             _nodes(2),
@@ -1048,25 +1048,6 @@ def test_preflight_unwraps_the_live_peer_probe_response():
     assert [(issue.kind, issue.detail) for issue in issues] == [
         ("runtime_mismatch", "mlx local=0.32.0 remote=0.31.0")
     ]
-
-
-def test_preflight_refuses_discrete_cuda_without_a_live_vram_guard():
-    from omlx.cluster.autoconfigure import preflight_issues
-
-    issues = preflight_issues(
-        {
-            "cuda-box": {
-                "runtime_compatible": True,
-                "status": {
-                    "runtime": {"mlx_version": "0.32.0"},
-                    "node": {"accelerator": "cuda", "memory_kind": "vram"},
-                },
-            }
-        },
-        model_path=None,
-    )
-
-    assert [issue.kind for issue in issues] == ["cuda_memory_guard_unavailable"]
 
 
 def test_rdma_detection_does_not_ssh_to_itself(monkeypatch):

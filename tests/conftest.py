@@ -1,3 +1,5 @@
+import gc
+import math
 import os
 import struct
 import subprocess
@@ -19,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
+import mlx.core as mx
 import pytest
 
 # Install the torch stub before any test imports xgrammar (e.g. via @patch
@@ -110,12 +113,14 @@ _GPU_SERIAL_TESTS = {
     "test_qwen35_moe_verify_window.py": {
         "test_batched_decode_rows_equal_one_token_decode",
         "test_kernel_failure_falls_back_to_the_composed_verifier",
+        "test_quantized_router_window_rows_equal_one_token_decode",
         "test_router_ties_and_high_experts",
         "test_top8_window_and_batched_rows_equal_one_token_decode",
         "test_window_rows_equal_one_token_decode",
     },
     "test_qwen35_verify_sdpa_split.py": {
         "test_chain_tail_matches_cache_writes",
+        "test_wide_causal_matches_per_row",
     },
     "test_qwen4_batch_qsa_indexer.py": {
         "test_indexer_capacity_matches_concatenate_bit_for_bit",
@@ -158,8 +163,28 @@ def pytest_collection_modifyitems(config, items):
         items.sort(key=lambda item: not _gpu_serial(item))
 
 
+def pytest_collection_finish():
+    gc.collect()
+    gc.freeze()
+
+
+def use_qmv_wide_reference(monkeypatch):
+    # mlx: affine matmuls of 4-8 rows sum in another order than 2-3 rows
+    stock = mx.quantized_matmul
+
+    def quantized_matmul(x, w, *args, **kwargs):
+        rows = x.size // x.shape[-1]
+        if not 4 <= rows <= 8 or w.ndim != 2 or kwargs.get("mode", "affine") != "affine":
+            return stock(x, w, *args, **kwargs)
+        pieces = mx.split(x.reshape(rows, -1), list(range(2, rows - 1, 2)))
+        out = mx.concatenate([stock(piece, w, *args, **kwargs) for piece in pieces])
+        return out.reshape(*x.shape[:-1], -1)
+
+    monkeypatch.setattr(mx, "quantized_matmul", quantized_matmul)
+
+
 @pytest.fixture
-def glm5_fused_decode():
+def glm5_fused_decode(monkeypatch):
     """GLM-5.3's fused decode/verify kernels, which run (and replay the
     reference bit for bit) on M3 and newer GPUs."""
     from omlx.patches.mlx_vlm_glm5_next_compat import (
@@ -171,6 +196,7 @@ def glm5_fused_decode():
 
     if not language._DECODE_FUSION:
         pytest.skip("the fused GLM-5.3 decode kernels run on M3 and newer GPUs")
+    use_qmv_wide_reference(monkeypatch)
     return language
 
 
@@ -227,7 +253,6 @@ def cluster_home(tmp_path, monkeypatch):
     ssh_dir = home / ".ssh"
     monkeypatch.setattr(ssh_keys, "_SSH_DIR", ssh_dir)
     monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
-    monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
     return home
 
 
@@ -380,12 +405,19 @@ def _gguf_value(value) -> bytes:
 
 @pytest.fixture
 def write_gguf():
-    """Write a GGUF file of a header with ``metadata`` and ``size`` bytes in all."""
-
-    def write(path: Path, metadata: dict, size: int = 0) -> Path:
-        header = b"GGUF" + struct.pack("<IQQ", 3, 0, len(metadata))
+    def write(path: Path, metadata: dict, size: int = 0, tensors=()) -> Path:
+        header = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(metadata))
         for key, value in metadata.items():
             header += struct.pack("<Q", len(key)) + key.encode() + _gguf_value(value)
+        data = b""
+        for name, shape in tensors:
+            header += struct.pack("<Q", len(name)) + name.encode()
+            header += struct.pack(f"<I{len(shape)}QI", len(shape), *shape, 0)
+            header += struct.pack("<Q", len(data))
+            data += b"\0" * (4 * math.prod(shape))
+        if tensors:
+            header += b"\0" * (-len(header) % 32)
+        header += data
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(header + b"\0" * max(0, size - len(header)))
         return path
@@ -532,6 +564,8 @@ def _hermetic_metal_release_accounting(monkeypatch):
         module = sys.modules.get(name)
         if module is not None and hasattr(module, "get_graphics_footprint"):
             monkeypatch.setattr(module, "get_graphics_footprint", lambda: 0)
+        if module is not None and hasattr(module, "get_graphics_footprint_compressed"):
+            monkeypatch.setattr(module, "get_graphics_footprint_compressed", lambda: 0)
     metal_sync = sys.modules.get("omlx.utils.metal_sync")
     if metal_sync is not None:
         metal_sync._residuals.clear()

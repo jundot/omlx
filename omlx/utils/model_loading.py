@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +14,19 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
+from ..patches.inkling2 import INKLING2_MODEL_TYPES
+from ..patches.inkling2.loader import is_mlx_vlm_quantization, mlx_vlm_quantization
+from ..patches.inkling2.loopcd import apply_loopcd
+from ..patches.inkling2.model import TextArgs
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
+
+try:
+    import mlx_vlm.utils as mlx_vlm_utils
+except ImportError:
+    # mlx-vlm: absent from a CUDA cluster worker's venv (#4739).
+    mlx_vlm_utils = None
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +39,7 @@ _RUNTIME_TEXT_PREFIX = "language_model.model."
 _MATERIALIZE_EVAL_CHUNK = 8
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
+_vlm_trust_remote_code = ContextVar("omlx_vlm_trust_remote_code", default=False)
 
 _REMOTE_CODE_METADATA_PATTERNS = [
     "*.json",
@@ -55,6 +67,36 @@ def ensure_model_code_trusted(
             f"module ({model_file!r}) to build its architecture. This is disabled "
             "by default. Enable Trust Remote Code for this model if you trust it."
         )
+
+
+def _patch_mlx_vlm_model_file_trust() -> None:
+    get_model_and_args = mlx_vlm_utils.get_model_and_args
+    load_model = mlx_vlm_utils.load_model
+
+    def checked_get_model_and_args(config, model_path=None):
+        if model_path is not None:
+            ensure_model_code_trusted(
+                config,
+                model_path=model_path,
+                trust_remote_code=_vlm_trust_remote_code.get(),
+            )
+        return get_model_and_args(config, model_path=model_path)
+
+    def load_model_with_trust(model_path, *args, trust_remote_code=False, **kwargs):
+        token = _vlm_trust_remote_code.set(trust_remote_code)
+        try:
+            return load_model(
+                model_path, *args, trust_remote_code=trust_remote_code, **kwargs
+            )
+        finally:
+            _vlm_trust_remote_code.reset(token)
+
+    mlx_vlm_utils.get_model_and_args = checked_get_model_and_args
+    mlx_vlm_utils.load_model = load_model_with_trust
+
+
+if mlx_vlm_utils is not None:
+    _patch_mlx_vlm_model_file_trust()
 
 
 def preflight_text_remote_code(
@@ -445,6 +487,60 @@ def normalize_mimo_mxfp4_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_inkling2_modelopt_quant(cfg: dict) -> dict:
+    """Drop the ModelOpt quantization_config of Inkling 2 releases.
+
+    The releases declare their native NVFP4 and MXFP8 experts as ModelOpt NVFP4.
+    The Inkling 2 loader builds the expert carriers itself, and mlx-lm's ModelOpt
+    branch would otherwise infer a format for them and fail.
+    """
+    if cfg.get("model_type") not in INKLING2_MODEL_TYPES or isinstance(
+        cfg.get("quantization"), dict
+    ):
+        return cfg
+    qc = cfg.get("quantization_config")
+    if isinstance(qc, dict) and qc.get("quant_method") == "modelopt":
+        del cfg["quantization_config"]
+    return cfg
+
+
+def normalize_inkling2_mlx_vlm_quant(cfg: dict) -> dict:
+    """Move an mlx-vlm-layout Inkling 2 quantization onto runtime paths.
+
+    Checkpoints quantized through mlx-vlm key ``quantization`` by mlx-vlm's
+    module names (``language_model.model.layers.N.self_attn.q_proj``). The
+    runtime fuses some of those modules, and mlx-lm applies the per-path specs
+    to the runtime module tree, so the keys are rewritten before it does.
+    """
+    if cfg.get("model_type") not in INKLING2_MODEL_TYPES:
+        return cfg
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict) or not is_mlx_vlm_quantization(quant):
+        return cfg
+    text = TextArgs.from_dict(cfg.get("text_config") or {})
+    cfg["quantization"] = mlx_vlm_quantization(quant, text)
+    return cfg
+
+
+def normalize_inkling2_expert_quant(cfg: dict) -> dict:
+    """Keep mlx-lm from quantizing the Inkling 2 expert carriers.
+
+    The Inkling 2 model builds its expert carriers from the checkpoint. mlx-lm
+    infers a spec for a quantized module the config does not name, and that
+    fails on the native NVFP4 and MXFP8 experts that mlx-lm conversions keep.
+    """
+    if cfg.get("model_type") not in INKLING2_MODEL_TYPES:
+        return cfg
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict):
+        return cfg
+    layers = TextArgs.from_dict(cfg.get("text_config") or {}).num_hidden_layers
+    for idx in range(layers):
+        for which in ("w13", "w2"):
+            quant.setdefault(f"model.layers.{idx}.mlp.experts.{which}", False)
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -464,11 +560,14 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_hy_v3_rope_config(cfg)
         # Cluster ranks load MiniMax through mlx-lm, not the patched mlx-vlm.
         adopt_expert_global_scales(cfg)
+        normalize_inkling2_mlx_vlm_quant(cfg)
+        normalize_inkling2_expert_quant(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
         normalize_mimo_mxfp4_quant(cfg)
+        normalize_inkling2_modelopt_quant(cfg)
         normalize_raon1_mini_model_file(cfg)
         return cfg
 
@@ -564,6 +663,11 @@ def maybe_apply_pre_load_patches(
     Safe to call repeatedly; the patches are idempotent.
     """
     from ..model_settings import validate_moe_expert_offload
+    from ..oqh.loading import install_load_hook, require_native
+
+    # Before any patch captures a model class's load_weights (see the Bonsai
+    # note below). The hook only acts on weights that hold oQh tensors.
+    install_load_hook()
 
     if model_settings is not None:
         validate_moe_expert_offload(
@@ -654,6 +758,7 @@ def maybe_apply_pre_load_patches(
         return
 
     normalize_qwen35_text_config(config)
+    require_native(config)
 
     # Bonsai t5 load patch must run FIRST — before any other patch that wraps
     # load_weights on a model subclass (e.g. mlx_vlm_mtp qwen35_vlm_runtime).
@@ -764,6 +869,21 @@ def maybe_apply_pre_load_patches(
 
         if apply_hy_v3_patch():
             logger.info("Hy3 pre-load patch applied for %s", model_name)
+
+    if model_type in ("hy_v4_vl", "hy_v4_flash"):
+        from ..patches.hy_v4 import apply_patch as apply_hy_v4_patch
+
+        if apply_hy_v4_patch():
+            logger.info("Hy4 pre-load patch applied for %s", model_name)
+
+    # Cluster autoconfigure reads these guards from the source, so the types
+    # are a literal here and not INKLING2_MODEL_TYPES.
+    inkling2_types = {"inkling2", "inkling2_loop"}
+    if model_type in inkling2_types:
+        from ..patches.inkling2 import apply_inkling2_patch
+
+        if apply_inkling2_patch():
+            logger.info("Inkling 2 pre-load patch applied for %s", model_name)
 
     text_config = config.get("text_config")
     text_model_type = (
@@ -945,6 +1065,11 @@ def maybe_apply_pre_load_patches(
         from ..patches.minimax_m3_dspark import bundled_dspark_path
 
         minimax_dspark = bundled_dspark_path(model_name)
+    if model_type in inkling2_types:
+        from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
+
+        # Inkling 2 bundles its DSpark draft as mtp.safetensors.
+        minimax_dspark = bundled_inkling2_dspark_path(model_name)
     if _is_mtp_compatible(config, model_type) or dflash_batched or minimax_dspark:
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
@@ -1001,6 +1126,10 @@ def maybe_apply_pre_load_patches(
                 # The M5 packed verify kernels keep a 5-row verify close to
                 # a 4-row one on dense Qwen, so depth 4 pays there.
                 set_mtp_depth(4)
+            elif model_type == "deepseek_v41":
+                # DSpark drafts a whole dspark_block_size block per cycle.
+                block = (text_config or config).get("dspark_block_size")
+                set_mtp_depth(int(block) if block else 3)
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
@@ -1191,6 +1320,9 @@ def _has_mtp_heads(config: dict) -> bool:
     """True iff the model config declares any MTP head layers."""
     if _has_dspark_heads(config):
         return True
+    # Hy4 and Hy4-flash ship a DFly2 block drafter.
+    if int(config.get("dfly_num_hidden_layers", 0) or 0) > 0:
+        return True
     if int(config.get("mtp_num_hidden_layers", 0) or 0) > 0:
         return True
     if int(config.get("num_nextn_predict_layers", 0) or 0) > 0:
@@ -1212,6 +1344,8 @@ _MTP_WEIGHT_PREFIXES = (
     "language_model.mtp.",
     "model.mtp.",
     "model.language_model.mtp.",
+    "model.dfly_layers.",
+    "language_model.dfly.",
 )
 
 
@@ -1387,6 +1521,8 @@ def dflash_draft_for(
     if model_settings is None or not getattr(model_settings, "dflash_enabled", False):
         return None
     configured = getattr(model_settings, "dflash_draft_model", None)
+    if configured and configured.startswith("~"):
+        configured = str(Path(configured).expanduser())
     return configured or bundled_dflash_draft(model_path)
 
 
@@ -1429,6 +1565,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
         or model_type == "bailing_hybrid"
+        or model_type in ("hy_v4_vl", "hy_v4_flash")
     )
 
 
@@ -1448,6 +1585,10 @@ def lightning_mtp_supported(model_path: str | Path) -> bool:
     if str(quantization.get("quant_method") or "").lower() == "paroquant":
         return False
     model_type = config.get("model_type")
+    if model_type in INKLING2_MODEL_TYPES:
+        from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
+
+        return bundled_inkling2_dspark_path(model_path) is not None
     if model_type == "qwen4_exp":
         if not _has_mtp_heads(config):
             return False
@@ -1572,8 +1713,14 @@ def checkpoint_has_bf16_leaves(model_path: str) -> bool:
         try:
             with open(shard, "rb") as handle:
                 header_len = int.from_bytes(handle.read(8), "little")
+                # A non-safetensors file, such as a git-lfs pointer, reads as a
+                # huge length.
+                if header_len > shard.stat().st_size:
+                    continue
                 header = json.loads(handle.read(header_len))
         except (OSError, ValueError):
+            continue
+        if not isinstance(header, dict):
             continue
         for name, spec in header.items():
             if (
@@ -1689,6 +1836,7 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
         if applied:
             logger.info(f"IndexCache applied: freq={index_cache_freq}")
 
+    apply_loopcd(model, model_settings)
     return model
 
 

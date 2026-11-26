@@ -30,11 +30,12 @@ import numpy as np
 
 # One verify window carries the pending token plus the drafts. Qwen4-Exp's
 # row-exact verify kernels (MoE routed window, router, row-exact qmv, fused
-# attention, GDN verify, hyper-connections) cover 16 rows, so there a copy
-# proposes at most 15 tokens. An 8-row window costs about 55% of a 16-row one
-# (M5 Ultra), so the wide window is kept for verbatim runs, where it is
-# accepted whole. Other targets keep 8-row windows (GLM-5.3's sparse caches
-# cannot undo a longer verify block), so their copies stay at 7 tokens.
+# attention, GDN verify, hyper-connections) and Inkling 2's compiled verify
+# cover 16 rows, so there a copy proposes at most 15 tokens. An 8-row window
+# costs about 55% of a 16-row one (M5 Ultra), so the wide window is kept for
+# verbatim runs, where it is accepted whole. Other targets keep 8-row windows
+# (GLM-5.3's sparse caches cannot undo a longer verify block), so their copies
+# stay at 7 tokens.
 MAX_COPY = 15
 _NARROW_COPY = 7
 _MAX_MATCH = 64
@@ -70,6 +71,10 @@ class ContextCopy:
         self._misses = 0
         self._quiet = 0
         self._wide = False
+
+    @property
+    def wide_window(self) -> bool:
+        return self._wide_window
 
     def _rebuild(self, history: Sequence[int]) -> None:
         self._ids = list(history)
@@ -111,8 +116,12 @@ class ContextCopy:
                     bucket.append(end)
         return bool(rebuilt)
 
-    def propose(self, limit: int) -> List[int]:
-        """Tokens that followed the longest earlier match of the tail."""
+    def propose(self, limit: int, wide_limit: int | None = None) -> List[int]:
+        """Tokens that followed the longest earlier match of the tail.
+
+        ``wide_limit`` (default ``limit``) caps a verbatim wide copy, so a
+        block drafter's caller can let one run past its block.
+        """
         if self._quiet:
             self._quiet -= 1
             return []
@@ -144,7 +153,10 @@ class ContextCopy:
         if best_len < _ENTER_MATCH:
             return []
         verbatim = self._wide_window and self._wide and best_len == _MAX_MATCH
-        take = min(limit, MAX_COPY if verbatim else _NARROW_COPY)
+        if verbatim:
+            take = min(limit if wide_limit is None else wide_limit, MAX_COPY)
+        else:
+            take = min(limit, _NARROW_COPY)
         copied = ids[best_end + 1 : best_end + 1 + take]
         return copied if len(copied) >= _MIN_COPY else []
 

@@ -33,7 +33,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
@@ -54,7 +54,7 @@ from ..engine.vlm import (
 )
 from ..exceptions import InvalidRequestError, ModelNotFoundError
 from ..server_metrics import get_server_metrics
-from ..utils import gpu_power
+from ..utils import gpu_power, macos_say
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
 logger = logging.getLogger(__name__)
@@ -521,11 +521,13 @@ async def create_transcription(
     stream: bool = Form(False),
     max_tokens: Optional[int] = Form(None, gt=0),
     word_timestamps: bool = Form(False),
+    chunking_strategy: str | None = Form(None),
 ):
     """OpenAI-compatible audio transcription endpoint (Speech-to-Text).
 
-    Note: ``response_format`` and ``temperature`` are accepted for OpenAI API
-    compatibility but are not yet implemented — they are silently ignored.
+    ``response_format=diarized_json`` returns speaker turns from backends with
+    timed speaker labels, without streaming and with ``chunking_strategy``
+    omitted or ``auto``. Other formats and ``temperature`` are ignored.
 
     ``stream=true`` switches the response to OpenAI's transcription SSE
     format: ``transcript.text.delta`` events with incremental text followed
@@ -554,6 +556,13 @@ async def create_transcription(
     from omlx.engine.stt import STTEngine
     from omlx.exceptions import ModelNotFoundError
 
+    diarized = response_format == "diarized_json"
+    if diarized and (stream or chunking_strategy not in (None, "auto")):
+        raise HTTPException(
+            status_code=400,
+            detail="Diarized transcription supports non-streaming requests with automatic or omitted chunking only.",
+        )
+
     pool = _get_engine_pool()
     resolved_model = _resolve_model(model)
 
@@ -575,6 +584,13 @@ async def create_transcription(
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a speech-to-text model",
+        )
+    if diarized and not (
+        isinstance(engine, STTEngine) and engine.supports_diarization()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{resolved_model}' does not return timed speaker labels.",
         )
 
     # Save uploaded file to a temp path so the engine can open it by path.
@@ -607,6 +623,8 @@ async def create_transcription(
                     pass
 
         transcribe_kwargs: dict = {"language": language}
+        if diarized:
+            transcribe_kwargs["diarize"] = True
         if prompt is not None:
             transcribe_kwargs["prompt"] = prompt
         if effective_max_tokens is not None:
@@ -649,6 +667,49 @@ async def create_transcription(
 
     # Build response directly from the dict returned by STTEngine
     segments = result.get("segments") or None
+    if diarized:
+        duration = result["duration"]
+        annotated = []
+        for segment in segments or []:
+            speaker, start, end, text = (
+                segment[key] for key in ("speaker", "start", "end", "text")
+            )
+            if (
+                not isinstance(text, str)
+                or not isinstance(start, (int, float))
+                or not isinstance(end, (int, float))
+                or not 0 <= start <= end
+            ):
+                raise HTTPException(
+                    status_code=502,
+                    detail="The transcription engine returned incomplete diarization.",
+                )
+            # Model-printed times can round past the decoded length.
+            annotated.append(
+                {
+                    "type": "transcript.text.segment",
+                    "id": f"seg_{len(annotated)}",
+                    "speaker": str(speaker),
+                    "start": min(start, duration),
+                    "end": min(end, duration),
+                    "text": text,
+                }
+            )
+        text = result["text"]
+        if text and not annotated:
+            raise HTTPException(
+                status_code=502,
+                detail="The transcription engine returned text without speaker segments.",
+            )
+        return JSONResponse(
+            {
+                "task": "transcribe",
+                "text": text,
+                "duration": duration,
+                "segments": annotated,
+                "usage": {"type": "duration", "seconds": math.ceil(duration)},
+            }
+        )
 
     return AudioTranscriptionResponse(
         text=result.get("text", ""),
@@ -1554,6 +1615,32 @@ async def create_speech(request: AudioSpeechRequest):
                 detail="Streaming TTS currently only supports response_format='wav'",
             )
         streaming_interval = _resolve_tts_streaming_interval(request)
+
+    from omlx.server import _server_state
+
+    if request.model == macos_say.MODEL_ID and macos_say.enabled(
+        _server_state.global_settings
+    ):
+        try:
+            wav_bytes = await asyncio.to_thread(
+                macos_say.synthesize,
+                request.input,
+                request.voice,
+                request.language,
+                request.speed,
+            )
+            if response_format != "wav":
+                wav_bytes = await asyncio.to_thread(
+                    _transcode_speech_output, wav_bytes, response_format
+                )
+        except InvalidRequestError:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        _record_audio_request(macos_say.MODEL_ID)
+        return Response(
+            content=wav_bytes, media_type=_SPEECH_RESPONSE_FORMATS[response_format]
+        )
 
     audio_bytes = _decode_ref_audio_base64(request)
 

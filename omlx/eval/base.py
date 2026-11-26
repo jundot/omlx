@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from omlx.api.thinking import normalize_think_tags
+
 logger = logging.getLogger(__name__)
 
 # Token budget for thinking/reasoning models (industry reference: OpenCompass 8K~32K)
@@ -50,6 +52,8 @@ class BenchmarkResult:
     question_results: list[QuestionResult] = field(default_factory=list)
     category_scores: Optional[dict[str, float]] = None
     thinking_used: bool = False
+    # Per-question max_tokens under the final thinking mode.
+    max_tokens: int = 0
 
 
 class BaseBenchmark(ABC):
@@ -202,6 +206,7 @@ class BaseBenchmark(ABC):
     @staticmethod
     def _strip_think_tags(text: str) -> str:
         """Remove completed thinking spans from model output."""
+        text = normalize_think_tags(text)
         # Some chat templates open <think> in the prompt, so non-streaming
         # generation contains only ``reasoning</think>answer``.  Handle that
         # shape before the complete-block regex so reasoning drafts cannot
@@ -267,10 +272,31 @@ class BaseBenchmark(ABC):
             ),
         }
 
+    def _question_max_tokens(
+        self, engine: Any, enable_thinking: bool,
+        max_tokens_override: Optional[int] = None,
+    ) -> int:
+        # max_tokens is always benchmark-controlled - a model's small configured
+        # limit must not truncate long answers and corrupt scores.
+        max_tokens = self.get_max_tokens()
+        # Harmony models (gpt_oss) use analysis + final channels;
+        # analysis can consume the entire budget before final is emitted
+        if getattr(engine, "model_type", None) == "gpt_oss":
+            max_tokens = max(max_tokens * 4, 8192)
+        elif enable_thinking:
+            max_tokens = min(
+                max(max_tokens, THINKING_MIN_TOKENS), THINKING_MAX_TOKENS
+            )
+        # Floor applied last, so it can also lift the thinking cap.
+        if max_tokens_override is not None:
+            max_tokens = max(max_tokens, max_tokens_override)
+        return max_tokens
+
     async def _eval_single(
         self, engine: Any, item: dict, index: int,
         sampling_kwargs: Optional[dict] = None,
         enable_thinking: bool = False,
+        max_tokens_override: Optional[int] = None,
     ) -> tuple[int, dict, str, str, str, dict[str, Any]]:
         """Evaluate a single item.
 
@@ -282,18 +308,9 @@ class BaseBenchmark(ABC):
         messages = self.format_prompt(item)
         prompt_text = "\n".join(m.get("content", "") for m in messages)
         kwargs = dict(sampling_kwargs or {})
-        # max_tokens is always benchmark-controlled — a model's small configured
-        # limit must not truncate long answers and corrupt scores.
-        max_tokens = self.get_max_tokens()
-        # Harmony models (gpt_oss) use analysis + final channels;
-        # analysis can consume the entire budget before final is emitted
-        if getattr(engine, "model_type", None) == "gpt_oss":
-            max_tokens = max(max_tokens * 4, 8192)
-        elif enable_thinking:
-            max_tokens = min(
-                max(max_tokens, THINKING_MIN_TOKENS), THINKING_MAX_TOKENS
-            )
-        kwargs["max_tokens"] = max_tokens
+        kwargs["max_tokens"] = self._question_max_tokens(
+            engine, enable_thinking, max_tokens_override
+        )
         # Greedy/neutral defaults keep scores reproducible. setdefault (not
         # force-set) lets the caller's "model_settings" sampling profile supply
         # its own temperature/penalties; the default profile passes none, so
@@ -355,6 +372,7 @@ class BaseBenchmark(ABC):
         batch_size: int = 1,
         sampling_kwargs: Optional[dict] = None,
         enable_thinking: bool = False,
+        max_tokens_override: Optional[int] = None,
     ) -> BenchmarkResult:
         """Run the benchmark on all items.
 
@@ -371,6 +389,8 @@ class BaseBenchmark(ABC):
                 if any of them outputs <think> tags, thinking is switched on
                 and every question answered so far is re-run, so no
                 mixed-mode results remain.
+            max_tokens_override: Optional floor for each question's
+                max_tokens. Benchmark defaults are never lowered.
 
         Returns:
             BenchmarkResult with accuracy and per-question details.
@@ -398,7 +418,8 @@ class BaseBenchmark(ABC):
                 started = time.time()
                 try:
                     outcome = await self._eval_single(
-                        engine, items[idx], idx, sampling_kwargs, thinking
+                        engine, items[idx], idx, sampling_kwargs, thinking,
+                        max_tokens_override,
                     )
                 except Exception as exc:
                     done.put_nowait(exc)
@@ -497,6 +518,9 @@ class BaseBenchmark(ABC):
             question_results=ordered,
             category_scores=cat_scores,
             thinking_used=thinking_used,
+            max_tokens=self._question_max_tokens(
+                engine, thinking_used, max_tokens_override
+            ),
         )
 
     def _question_result(

@@ -4,7 +4,6 @@ import SwiftUI
 @Observable
 final class SecurityScreenVM {
     var apiKeySet: Bool = false
-    var apiKey: String?
     var skipApiKeyVerification: Bool = false
     var allowUnauthenticatedInference: Bool = false
     var subKeys: [SubKeyDTO] = []
@@ -28,7 +27,6 @@ final class SecurityScreenVM {
         do {
             let settings = try await client.getGlobalSettings()
             self.apiKeySet = settings.auth?.apiKeySet ?? false
-            self.apiKey = settings.auth?.apiKey
             self.skipApiKeyVerification = settings.auth?.skipApiKeyVerification ?? false
             self.allowUnauthenticatedInference =
                 settings.auth?.allowUnauthenticatedInference ?? false

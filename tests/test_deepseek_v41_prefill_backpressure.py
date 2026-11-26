@@ -43,18 +43,26 @@ def _current_cache_limit():
 
 def test_v41_prefill_evals_stream_per_layer(monkeypatch):
     """A lazy 40-layer prefill loop pins every intermediate until the logits
-    eval (the measured +14.5GB/chunk sawtooth). Prefill must eval the stream
-    per layer under one bounded pool, without a per-layer clear; narrower
-    calls stay lazy and leave the limit alone."""
+    eval (the measured +14.5GB/chunk sawtooth). Prefill must wait on the
+    stream per layer under one bounded pool, without a per-layer clear; each
+    wait is on the previous layer's submitted stream, so the GPU is never
+    left idle while the next layer is built. Narrower calls stay lazy and
+    leave the limit alone."""
     model = v41_lang.LanguageModel(tiny())
     n_layers = model._config.n_layers
     before = _current_cache_limit()
-    events = {"evals": 0, "clears": 0, "limits": []}
+    events = {"evals": 0, "clears": 0, "limits": [], "order": []}
     real_eval, real_clear, real_limit = mx.eval, mx.clear_cache, mx.set_cache_limit
+    real_async = mx.async_eval
 
     def eval_spy(*args, **kw):
         events["evals"] += 1
+        events["order"].append(("eval", tuple(id(a) for a in args)))
         return real_eval(*args, **kw)
+
+    def async_spy(*args, **kw):
+        events["order"].append(("async", tuple(id(a) for a in args)))
+        return real_async(*args, **kw)
 
     def clear_spy(*args, **kw):
         events["clears"] += 1
@@ -65,15 +73,27 @@ def test_v41_prefill_evals_stream_per_layer(monkeypatch):
         return real_limit(limit)
 
     monkeypatch.setattr(v41_lang.mx, "eval", eval_spy)
+    monkeypatch.setattr(v41_lang.mx, "async_eval", async_spy)
     monkeypatch.setattr(v41_lang.mx, "clear_cache", clear_spy)
     monkeypatch.setattr(v41_lang.mx, "set_cache_limit", limit_spy)
     monkeypatch.setattr(v41_lang, "_prefill_cache_limit", lambda: _TEST_CACHE_LIMIT)
 
     real_eval(model(mx.zeros((1, 300), dtype=mx.int32)))  # >= 256 prefill gate
-    assert events["evals"] >= n_layers, (
-        f"prefill width must eval the stream per layer, got {events['evals']}"
+    assert events["evals"] >= n_layers - 1, (
+        f"prefill width must wait on the stream per layer, got {events['evals']}"
         f" eval calls for {n_layers} layers"
     )
+    submitted = [ids for kind, ids in events["order"] if kind == "async"]
+    waits = [
+        (k, ids) for k, (kind, ids) in enumerate(events["order"]) if kind == "eval"
+    ]
+    for k, ids in waits[: n_layers - 1]:
+        earlier = [i for kind, i in events["order"][:k] if kind == "async"]
+        assert ids in earlier[:-1], (
+            "each prefill wait must be on a stream submitted before the latest"
+            " layer, so the latest layer is still running when the wait returns"
+        )
+    assert len(submitted) >= n_layers
     assert events["clears"] == 0, "prefill must not clear the pool per layer"
     assert events["limits"] == [_TEST_CACHE_LIMIT, before]
     assert _current_cache_limit() == before

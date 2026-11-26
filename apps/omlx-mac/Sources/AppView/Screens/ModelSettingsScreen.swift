@@ -1361,6 +1361,30 @@ private struct AdvancedPage: View {
             ChatTemplateKwargsEditor(vm: vm, client: client)
         }
 
+        if showsLLMRows {
+            SectionHeader(
+                String(localized: "settings.advanced.lora_adapter.section",
+                       defaultValue: "LoRA Adapter",
+                       comment: "Section header above the LoRA adapter picker"),
+                subtitle: String(localized: "settings.advanced.lora_adapter.subtitle",
+                                 defaultValue: "Apply a LoRA adapter from the model folders on top of these weights.",
+                                 comment: "Subtitle for the LoRA adapter section")
+            )
+            ListGroup {
+                Row(label: String(localized: "settings.advanced.lora_adapter.label",
+                                  defaultValue: "Adapter",
+                                  comment: "Row label for the LoRA adapter picker"),
+                    sublabel: vm.loraAdapterDetail,
+                    isLast: true) {
+                    Popup(
+                        selection: vm.bindProfile($vm.loraAdapter),
+                        width: .controlWide,
+                        options: vm.loraAdapterOptions()
+                    )
+                }
+            }
+        }
+
         if vm.embeddingAudioSupported {
             SectionHeader(String(localized: "settings.advanced.embedding_audio.section",
                                  defaultValue: "Audio",
@@ -1677,6 +1701,11 @@ private struct PrefillAcceleratorGroup: View {
                 text += " · " + String(localized: "settings.acceleration.prefill_helper.state.last_prompt",
                                        defaultValue: "last prompt \(last.tokens) tokens in \(seconds)s",
                                        comment: "Prefill Accelerator status suffix with the last prompt timing")
+            }
+            if status.outOfMemory == true {
+                text += " · " + String(localized: "settings.acceleration.prefill_helper.state.out_of_memory",
+                                       defaultValue: "ran out of GPU memory for a prompt",
+                                       comment: "Prefill Accelerator status suffix after a prompt went past the helper's GPU memory and ran on this Mac")
             }
             return text
         case "offline":
@@ -2806,6 +2835,27 @@ private struct ExperimentalSection: View {
                                       placeholder: "4", mono: true, width: .controlNarrow)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.indexCacheEnabled))
+                    }
+                }
+            }
+
+            if vm.loopcdSupported {
+                Row(label: String(localized: "settings.experimental.loopcd.label",
+                                  defaultValue: "LoopCD",
+                                  comment: "Row label for the LoopCD toggle"),
+                    sublabel: String(localized: "settings.experimental.loopcd.sub",
+                                     defaultValue: "Contrast the last loop pass with the first to choose tokens. Can improve answers, but is slower and uses more memory.",
+                                     comment: "Sublabel describing LoopCD")) {
+                    RowSwitch(isOn: vm.bindProfile($vm.loopcdEnabled))
+                }
+                if vm.loopcdEnabled {
+                    Row(label: String(localized: "settings.experimental.loopcd.skip_thinking.label",
+                                      defaultValue: "Exclude Thinking Blocks",
+                                      comment: "Row label for the toggle that keeps LoopCD out of thinking blocks"),
+                        sublabel: String(localized: "settings.experimental.loopcd.skip_thinking.sub",
+                                         defaultValue: "Apply LoopCD only to the answer and tool calls. Recommended by its authors for coding agents.",
+                                         comment: "Sublabel for the toggle that keeps LoopCD out of thinking blocks")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.loopcdSkipThinking))
                     }
                 }
             }

@@ -101,6 +101,17 @@
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.sampling_hint') }}</p>
                                     </div>
+                                    <!-- Per-question max_tokens floor (local runs) -->
+                                    <div x-show="!accExternalEnabled">
+                                        <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.max_tokens') }}</label>
+                                        <input type="number"
+                                               min="1" step="1"
+                                               x-model="accMaxTokens"
+                                               @input="accError = ''"
+                                               placeholder="65536"
+                                               class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                        <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.max_tokens_hint') }}</p>
+                                    </div>
                                     <!-- External OpenAI-compatible endpoint -->
                                     <div>
                                         <label class="inline-flex items-start gap-2 cursor-pointer">
@@ -364,6 +375,9 @@
                                                 </template>
                                                 <template x-if="r.external">
                                                     <span class="badge text-sky-600 bg-sky-50">{{ t('acc_bench.results.external_badge') }}</span>
+                                                </template>
+                                                <template x-if="!r.external && r.max_tokens">
+                                                    <span class="badge text-neutral-500 bg-neutral-100 tabular-nums" x-text="window.t('acc_bench.results.token_limit') + ' ' + r.max_tokens.toLocaleString()"></span>
                                                 </template>
                                             </div>
                                             <span class="text-xs text-neutral-400" x-text="window.t('acc_bench.results.correct_line').replace('{correct}', r.correct).replace('{total}', r.total).replace('{time}', r.time_s)"></span>

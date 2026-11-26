@@ -50,7 +50,7 @@ jobs:
 
       - name: Run unit tests
         run: >-
-          python -m pytest tests/ apps/omlx-web/tests apps/omlx-mac/Tests/python
+          python -m pytest
           -m "not slow and not integration"
           -n 3 --dist loadgroup --no-loadscope-reorder
           --durations=50 --junitxml=test-results.xml

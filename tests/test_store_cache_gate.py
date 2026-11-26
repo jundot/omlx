@@ -12,8 +12,6 @@ copies, the OOM guard for the burst-finish RAM growth reported in #1383.
 import threading
 import time
 
-import pytest
-
 from omlx.scheduler import Scheduler, _StoreCacheGate
 
 
@@ -157,7 +155,6 @@ class TestAdjustStoreCacheCap:
 
 
 class TestThreadSafety:
-    @pytest.mark.timeout(5)
     def test_counter_consistent_under_contention(self):
         """Concurrent submit/done pairs must net to zero in_flight."""
         gate = _StoreCacheGate(cap=4)

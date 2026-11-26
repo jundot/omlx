@@ -6,7 +6,7 @@ generated folder under ``<base path>/gguf`` with a config.json derived from
 the file's header and links to the file and its vision projectors, so
 discovery, settings and the engines handle it like any other model folder.
 
-A GGUF of the qwen35 or flint tokenizer profile also gets a tokenizer.json
+A GGUF of the qwen35, flint or inkling2 tokenizer profile also gets a tokenizer.json
 derived from its header, as Splash (https://github.com/incoai/splash,
 Apache-2.0) derives it in install/gguf.py.
 """
@@ -50,6 +50,7 @@ PROJECTOR_PREFERENCE = ("bf16", "f16", "f32")
 _MAX_KEYS = 1 << 20
 _MAX_STRING = 64 << 20
 _MAX_ARRAY = 1 << 26
+_MAX_TENSORS = 1 << 24
 
 _SCALARS = {
     0: "<B",
@@ -73,14 +74,15 @@ _HF_MODEL_TYPES = {
     "qwen35": "qwen3_5",
     "qwen35moe": "qwen3_5_moe",
     "qwen4exp": "qwen4_exp",
+    "inkling2": "inkling2_loop",
+    "inkling2_loop": "inkling2_loop",
 }
 
 # The generated folder's files besides the links to the source files.
 CONFIG_FILE = "config.json"
 _CHAT_TEMPLATE_FILE = "chat_template.jinja"
 _GENERATION_CONFIG_FILE = "generation_config.json"
-# Rebuild generated folders with Flint's tokenizer and attention layout.
-_FOLDER_LAYOUT = 3
+_FOLDER_LAYOUT = 6
 
 # The qwen35 pre-tokenizer: Qwen2's letter class extended to combining
 # marks, then byte-level BPE.
@@ -100,12 +102,17 @@ _FLINT_PATTERNS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
-# The GGUF tokenizer profiles (tokenizer.ggml.pre) oMLX derives a tokenizer
-# for, as Splash does: the patterns that split text, in order, and whether
-# text is NFC-normalized first.
-_TOKENIZER_PROFILES: dict[str, tuple[tuple[str, ...], bool]] = {
-    "qwen35": ((_QWEN35_PATTERN,), True),
-    "flint": (_FLINT_PATTERNS, False),
+_INKLING2_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_TOKENIZER_PROFILES: dict[str, tuple[tuple[str, ...], bool, bool]] = {
+    "qwen35": ((_QWEN35_PATTERN,), True, False),
+    "flint": (_FLINT_PATTERNS, False, False),
+    "inkling2": ((_INKLING2_PATTERN,), False, True),
 }
 # GGUF token types: control tokens are special added tokens, user-defined
 # ones added tokens that are not special.
@@ -114,9 +121,15 @@ _USER_DEFINED_TOKEN = 4
 _TOKENIZER_ARRAYS = frozenset(
     {"tokenizer.ggml.tokens", "tokenizer.ggml.token_type", "tokenizer.ggml.merges"}
 )
-# Per-layer arrays the derived config reads: which layers attend through a
-# sliding window (one boolean per layer, so cheap to keep).
-_LAYER_ARRAYS = frozenset({"flint.attention.sliding_window_pattern"})
+_LAYER_ARRAYS = frozenset(
+    {
+        "flint.attention.sliding_window_pattern",
+        "inkling2.attention.head_count",
+        "inkling2.attention.head_count_kv",
+        "inkling2_loop.attention.head_count",
+        "inkling2_loop.attention.head_count_kv",
+    }
+)
 
 
 class GgufError(ValueError):
@@ -414,6 +427,33 @@ def read_metadata(
     return metadata
 
 
+def tensor_bytes(path: Path, name: str) -> int:
+    """Bytes a GGUF stores for tensor ``name`` with its padding, or 0."""
+    with open(path, "rb") as stream:
+        reader = _Reader(stream)
+        reader.take(8)
+        count = reader.length(_MAX_TENSORS)
+        alignment = 32
+        for _ in range(reader.length(_MAX_KEYS)):
+            key = reader.string()
+            value = reader.value(reader.scalar("<I"), keep=False)
+            if key == "general.alignment":
+                alignment = value
+        start = None
+        offsets = []
+        for _ in range(count):
+            tensor = reader.string()
+            stream.seek(8 * reader.scalar("<I") + 4, os.SEEK_CUR)
+            offsets.append(reader.scalar("<Q"))
+            if tensor == name:
+                start = offsets[-1]
+        header = stream.tell()
+        data = os.fstat(stream.fileno()).st_size - header - -header % alignment
+    if start is None:
+        return 0
+    return min((offset for offset in offsets if offset > start), default=data) - start
+
+
 def _int(value) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -435,24 +475,42 @@ def derive_config(
     if layers is not None:
         # MTP layers are not part of the model the engines run.
         layers -= field("nextn_predict_layers") or 0
+    hf_type = _HF_MODEL_TYPES.get(arch)
+    inkling = hf_type == "inkling2_loop"
+    if arch == "inkling2" and layers is not None:
+        start = field("loop.core_start")
+        end = field("loop.core_end")
+        passes = field("num_loops")
+        if start is not None and end is not None and passes is not None:
+            layers -= (passes - 1) * (end - start)
+
     tokens = metadata.get("tokenizer.ggml.tokens")
     if isinstance(tokens, ArrayInfo):
         vocab_size = tokens.length
     else:
         vocab_size = len(tokens) if isinstance(tokens, list) else None
+
+    def head_count(name: str) -> int | None:
+        value = metadata.get(f"{arch}.attention.{name}")
+        if isinstance(value, list) and value:
+            first = _int(value[0])
+            return first if all(_int(count) == first for count in value) else None
+        return _int(value)
+
     sizes = {
         "hidden_size": field("embedding_length"),
         "num_hidden_layers": layers,
         "max_position_embeddings": field("context_length"),
-        "num_attention_heads": field("attention.head_count"),
-        "num_key_value_heads": field("attention.head_count_kv"),
+        "num_attention_heads": head_count("head_count"),
+        "num_key_value_heads": head_count("head_count_kv"),
         "head_dim": field("attention.key_length"),
         "full_attention_interval": field("full_attention_interval"),
         "num_experts": field("expert_count"),
         "num_experts_per_tok": field("expert_used_count"),
-        "vocab_size": vocab_size,
+        "vocab_size": field("vocab_size") if inkling else vocab_size,
     }
-    hf_type = _HF_MODEL_TYPES.get(arch)
+    if inkling:
+        sizes["n_routed_experts"] = sizes.pop("num_experts")
     text: dict[str, Any] = {
         key: value for key, value in sizes.items() if value is not None
     }
@@ -481,7 +539,9 @@ def derive_config(
     return config
 
 
-def _tokenizer_profile(metadata: dict[str, Any]) -> tuple[tuple[str, ...], bool] | None:
+def _tokenizer_profile(
+    metadata: dict[str, Any],
+) -> tuple[tuple[str, ...], bool, bool] | None:
     """The tokenizer profile oMLX derives a tokenizer for, or None."""
     if metadata.get("tokenizer.ggml.model") != "gpt2":
         return None
@@ -497,7 +557,7 @@ def tokenizer_files(metadata: dict[str, Any]) -> dict[str, str]:
     profile = _tokenizer_profile(metadata)
     if profile is None:
         raise GgufError("unsupported GGUF tokenizer profile")
-    patterns, nfc = profile
+    patterns, nfc, ignore_merges = profile
     tokens = metadata["tokenizer.ggml.tokens"]
     types = metadata["tokenizer.ggml.token_type"]
     merges = metadata["tokenizer.ggml.merges"]
@@ -507,7 +567,11 @@ def tokenizer_files(metadata: dict[str, Any]) -> dict[str, str]:
     if any(len(pair) != 2 for pair in pairs):
         raise GgufError("invalid GGUF BPE merge")
     backend = Tokenizer(
-        token_models.BPE({token: i for i, token in enumerate(tokens)}, pairs)
+        token_models.BPE(
+            {token: i for i, token in enumerate(tokens)},
+            pairs,
+            ignore_merges=ignore_merges,
+        )
     )
     if nfc:
         backend.normalizer = normalizers.NFC()

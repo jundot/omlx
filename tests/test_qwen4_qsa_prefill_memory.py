@@ -82,6 +82,9 @@ def test_bool_mask_uses_tiled_sdpa_and_matches_dense(monkeypatch):
 def test_long_bool_mask_turboquant_prefill_is_tiled_first(monkeypatch):
     from mlx_lm.models import base as mlx_base
 
+    # Replaces mlx-vlm's from_cache, which cannot unpack mlx-lm's 3-tuple
+    # KVCache.state. Import it here so the test does not rely on test order.
+    import omlx.turboquant_kv  # noqa: F401
     from omlx.patches import turboquant_attention as tq_attention
 
     tq_attention.apply_turboquant_attention_patch()

@@ -571,8 +571,8 @@
                                 </div>
                                 <select x-model="modelSettings.mtp_adaptive_max_depth"
                                         class="w-48 flex-shrink-0 px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-black">
-                                    <option value="3">{{ t('modal.model_settings.mtp_depth_adaptive') }}</option>
-                                    {% for depth in range(4, 7) %}
+                                    <option value="">{{ t('modal.model_settings.mtp_depth_adaptive') }}</option>
+                                    {% for depth in range(3, 9) %}
                                     <option value="{{ depth }}">{{ t('modal.model_settings.mtp_depth_option').replace('{n}', depth|string) }}</option>
                                     {% endfor %}
                                 </select>
@@ -1362,6 +1362,29 @@
                             <!-- Empty state -->
                             <p x-show="modelSettings.ctKwargEntries.length === 0" class="text-xs text-neutral-400 text-center py-1">{{ t('modal.model_settings.no_kwargs') }}</p>
                         </div>
+
+                        <!-- LoRA Adapter -->
+                        <div class="px-4 py-3.5 space-y-2" x-show="!modelSettings.is_diffusion_model" x-cloak>
+                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 sm:gap-6">
+                                <div class="min-w-0">
+                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.lora_adapter') }}</span>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.lora_adapter_hint') }}</p>
+                                </div>
+                                <select x-model="modelSettings.lora_adapter" class="{{ ms_field }}">
+                                    <option value="">{{ t('modal.model_settings.lora_adapter_none') }}</option>
+                                    <template x-for="a in loraAdapterOptions()" :key="a.path">
+                                        <option :value="a.path"
+                                                :disabled="!!a.problem && a.path !== modelSettings.lora_adapter"
+                                                :selected="modelSettings.lora_adapter === a.path"
+                                                x-text="loraAdapterLabel(a)"></option>
+                                    </template>
+                                </select>
+                            </div>
+                            <p x-show="selectedLoraAdapter()?.base_model" class="text-xs text-neutral-400"
+                               x-text="window.t('modal.model_settings.lora_adapter_info').replace('{base}', selectedLoraAdapter()?.base_model || '').replace('{targets}', (selectedLoraAdapter()?.targets || []).join(', '))"></p>
+                            <p x-show="loraAdapterProblem()" class="text-xs text-amber-700" x-text="loraAdapterProblem()"></p>
+                            <p x-show="loraAdapters.length === 0 && !modelSettings.lora_adapter" class="text-xs text-neutral-400">{{ t('modal.model_settings.lora_adapter_empty') }}</p>
+                        </div>
                     </div>
 
                     <!-- Embedding audio input (EmbeddingGemma 2) -->
@@ -1728,6 +1751,39 @@
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.index_cache_freq') }}</label>
                                     <input type="number" x-model.number="modelSettings.index_cache_freq" min="2" max="16" step="1" placeholder="4"
                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                            </div>
+                        </template>
+
+                        <template x-if="selectedModel?.config_model_type === 'inkling2_loop'">
+                            <div class="px-4 py-3.5 space-y-3">
+                                <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.loopcd') }}</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.loopcd_hint') }} (<a href="https://arxiv.org/abs/2610.02185" target="_blank" rel="noopener" class="text-neutral-700 hover:text-neutral-900 underline">arXiv</a>)</p>
+                                    </div>
+                                    <button type="button" @click="modelSettings.loopcd_enabled = !modelSettings.loopcd_enabled"
+                                            :class="modelSettings.loopcd_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="modelSettings.loopcd_enabled ? 'true' : 'false'"
+                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="modelSettings.loopcd_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div x-show="modelSettings.loopcd_enabled" x-transition class="flex items-start justify-between gap-3 pt-1">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.loopcd_skip_thinking') }}</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.loopcd_skip_thinking_hint') }}</p>
+                                    </div>
+                                    <button type="button" @click="modelSettings.loopcd_skip_thinking = !modelSettings.loopcd_skip_thinking"
+                                            :class="modelSettings.loopcd_skip_thinking ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="modelSettings.loopcd_skip_thinking ? 'true' : 'false'"
+                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="modelSettings.loopcd_skip_thinking ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
                                 </div>
                             </div>
                         </template>

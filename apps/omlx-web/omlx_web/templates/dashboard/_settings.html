@@ -60,7 +60,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.language.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-language')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-language' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-language' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-language'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-language'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -84,6 +84,7 @@
                                         <option value="fr">{{ t('settings.language.fr') }}</option>
                                         <option value="pt-BR">{{ t('settings.language.pt-BR') }}</option>
                                         <option value="cs">{{ t('settings.language.cs') }}</option>
+                                        <option value="it">{{ t('settings.language.it') }}</option>
                                     </select>
                                 </div>
                             </div>
@@ -97,7 +98,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.sections.appearance') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-appearance')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-appearance' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-appearance' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-appearance'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-appearance'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -142,7 +143,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.auth.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-auth')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-auth' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-auth' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-auth'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-auth'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -164,10 +165,11 @@
                                     </div>
                                     <div class="flex items-center gap-2">
                                         <input :type="showApiKey ? 'text' : 'password'"
-                                               x-model="globalSettings.auth.api_key"
+                                               :value="apiKeyInputDisplay"
+                                               @input="globalSettings.auth.api_key = $event.target.value; revealedStoredApiKey = ''"
                                                placeholder="{{ t('settings.auth.api_key_placeholder') }}"
                                                class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
-                                        <button type="button" @click="showApiKey = !showApiKey"
+                                        <button type="button" @click="toggleShowApiKey()"
                                                 class="p-2 rounded-lg hover:bg-neutral-100 transition-colors text-neutral-400 hover:text-neutral-600"
                                                 title="{{ t('settings.auth.toggle_visibility_tooltip') }}">
                                             <template x-if="!showApiKey">
@@ -298,7 +300,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.server.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-server')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-server' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-server' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-server'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-server'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -375,7 +377,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.model.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-model')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-model' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-model' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-model'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-model'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -468,7 +470,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.resource.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-resource')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-resource' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-resource' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-resource'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-resource'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -725,7 +727,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.cache.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-cache')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-cache' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-cache' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-cache'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-cache'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -784,7 +786,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.generation.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-generation')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-generation' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-generation' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-generation'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-generation'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -870,7 +872,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.mcp.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-mcp')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-mcp' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-mcp' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-mcp'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-mcp'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -912,7 +914,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.usage.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-usage')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-usage' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-usage' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-usage'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-usage'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -949,7 +951,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.network.section_label') }}</span>
                                     <button type="button" @click="settingsCopyAnchor('settings-network')"
                                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
-                                            :title="settingsCopiedAnchor === 'settings-network' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :title="settingsCopiedAnchor === 'settings-network' ? window.t('cluster.common.copied') : window.t('settings.sections.copy_link')"
                                             :aria-label="window.t('settings.sections.copy_link')">
                                         <i x-show="settingsCopiedAnchor !== 'settings-network'" data-lucide="link" class="w-3.5 h-3.5"></i>
                                         <i x-show="settingsCopiedAnchor === 'settings-network'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
@@ -1075,6 +1077,26 @@
                                                 <span :class="globalSettings.server.preserve_mid_system_cache ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
+                                        </div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.gpu_keep_warm_idle_window') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.gpu_keep_warm_idle_window_hint') }}</p>
+                                            </div>
+                                            <select x-model.number="globalSettings.server.gpu_keep_warm_idle_window"
+                                                    class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                <option value="0">{{ t('settings.advanced.gpu_keep_warm_idle_window_off') }}</option>
+                                                <option value="300">{{ t('settings.advanced.gpu_keep_warm_idle_window_default') }}</option>
+                                                <option value="900">{{ t('settings.model.idle_timeout_15m') }}</option>
+                                                <option value="1800">{{ t('settings.model.idle_timeout_30m') }}</option>
+                                                <option value="3600">{{ t('settings.model.idle_timeout_1h') }}</option>
+                                                <option value="7200">{{ t('settings.model.idle_timeout_2h') }}</option>
+                                                <!-- A settings.json value outside the presets. "selected" is needed because x-model runs before x-if inserts this option. -->
+                                                <template x-if="![0, 300, 900, 1800, 3600, 7200].includes(globalSettings.server.gpu_keep_warm_idle_window)">
+                                                    <option :value="globalSettings.server.gpu_keep_warm_idle_window" selected
+                                                            x-text="window.t('settings.advanced.gpu_keep_warm_idle_window_custom').replace('{seconds}', globalSettings.server.gpu_keep_warm_idle_window)"></option>
+                                                </template>
+                                            </select>
                                         </div>
                                     </div>
 
@@ -1393,6 +1415,18 @@
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
                                     <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.activations') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.activations_hint') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.integrations.splash_activations"
+                                            @change="saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="bf16">bf16</option>
+                                        <option value="auto">auto</option>
+                                    </select>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.max_memory') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.max_memory_hint') }}</p>
                                     </div>
@@ -1419,6 +1453,18 @@
                                                class="w-24 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         <span class="text-sm text-neutral-400">GB</span>
                                     </div>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.max_concurrent') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.max_concurrent_hint') }}</p>
+                                    </div>
+                                    <select :value="globalSettings.integrations.splash_max_concurrent_requests ?? ''"
+                                            @change="globalSettings.integrations.splash_max_concurrent_requests = optionalNumber($event.target.value); saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="">{{ t('settings.integrations.splash.auto') }}</option>
+                                        {% for n in range(1, 9) %}<option value="{{ n }}">{{ n }}</option>{% endfor %}
+                                    </select>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
                                     <div>
@@ -1540,6 +1586,31 @@
                                             <option :value="model.id" x-text="model.id"></option>
                                         </template>
                                     </select>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="audio-lines" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.macos_say.section_label') }}</span>
+                                </div>
+                                <span class="badge bg-neutral-200 text-neutral-600 border-neutral-300 font-mono">macos-say</span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.macos_say.enabled') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.macos_say.enabled_hint') }}</p>
+                                    </div>
+                                    <button type="button" role="switch"
+                                            :aria-checked="globalSettings.integrations.macos_say_enabled ? 'true' : 'false'"
+                                            @click="globalSettings.integrations.macos_say_enabled = !globalSettings.integrations.macos_say_enabled; saveIntegrationSettings()"
+                                            :class="globalSettings.integrations.macos_say_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.integrations.macos_say_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
                                 </div>
                             </div>
                         </div>

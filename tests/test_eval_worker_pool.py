@@ -18,6 +18,9 @@ from omlx.eval.livecodebench import LiveCodeBenchBenchmark
 from omlx.eval.mbpp import MBPPBenchmark
 
 WAIT = 1.0
+# Bounds a hang, not a speed: a cold interpreter start on a loaded CI runner
+# can take seconds.
+PROCESS_WAIT = 30.0
 
 CODE_BENCHMARKS = [HumanEvalBenchmark, MBPPBenchmark, LiveCodeBenchBenchmark]
 
@@ -448,7 +451,7 @@ async def test_real_code_scoring_subprocess_cleanup(cls, cancel, monkeypatch, tm
         try:
             await engine.wait_started("q0", "q1")
             engine.release("q0")
-            await asyncio.wait_for(wait_for_file(), 2)
+            await asyncio.wait_for(wait_for_file(), PROCESS_WAIT)
             pid = int(marker.read_text())
             os.kill(pid, 0)
             if cancel:
@@ -462,9 +465,9 @@ async def test_real_code_scoring_subprocess_cleanup(cls, cancel, monkeypatch, tm
             release.touch()
         if cancel:
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(run, 2)
+                await asyncio.wait_for(run, PROCESS_WAIT)
         else:
-            result = await asyncio.wait_for(run, 2)
+            result = await asyncio.wait_for(run, PROCESS_WAIT)
             assert result.correct_count == 2
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)

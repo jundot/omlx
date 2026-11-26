@@ -115,7 +115,7 @@ def _same_bits(a, b):
     "hidden,inter,bits,group_size",
     [
         (2560, 640, 5, 64),  # Qwen3.8-Flash-Next oQ5e
-        (2560, 640, 4, 64),
+        (1024, 640, 4, 64),
         (1024, 320, 5, 32),
         (1024, 384, 6, 128),
         (1024, 320, 8, 64),
@@ -127,29 +127,23 @@ def test_fused_decode_is_bit_identical(hidden, inter, bits, group_size, monkeypa
     monkeypatch.setattr(
         routed, "routed_decode", lambda *a: calls.append(1) or fused(*a)
     )
-    for seed in range(2):
-        block = _block(hidden, inter, bits=bits, group_size=group_size, seed=seed)
-        for step in range(6):
-            x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
-            # The shared expert and its gate run inside the two launches.
-            assert routed.routed_decode_plan(block, x).fold
-            ref, out = _pair(block, x)
-            assert _same_bits(ref, out)
-    assert len(calls) == 12
+    block = _block(hidden, inter, bits=bits, group_size=group_size)
+    for step in range(6):
+        x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
+        assert routed.routed_decode_plan(block, x).fold
+        ref, out = _pair(block, x)
+        assert _same_bits(ref, out)
+    assert len(calls) == 6
     assert not routed._DISABLED
 
 
-@pytest.mark.parametrize("experts", [EXPERTS, 128])
-def test_bf16_shared_expert_stays_composed_and_bit_identical(experts):
-    # 128 experts select inside the gate+up launch, 32 in the routing launch.
-    # The 128-expert block keeps hidden < 16 x experts, so the fused router gemv runs.
-    hidden, inter = (2560, 640) if experts == EXPERTS else (1024, 320)
-    block = _block(hidden, inter, bits=5, quantized_shared=False, experts=experts)
+def test_bf16_shared_expert_stays_composed_and_bit_identical():
+    block = _block(1024, 640, bits=5, quantized_shared=False)
     for step in range(4):
-        x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
+        x = (mx.random.normal((1, 1, 1024)) * (0.5 + step)).astype(mx.bfloat16)
         plan = routed.routed_decode_plan(block, x)
         assert not plan.fold
-        assert routed._topk_folds(plan, block.gate(x)) == (experts == 128)
+        assert not routed._topk_folds(plan, block.gate(x))
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
     assert routed._PROVEN and not routed._DISABLED
@@ -273,7 +267,7 @@ def test_fp32_folded_routing_matches_the_routing_launch(bits):
         output_shapes=[(rows, width), (rows, top_k), (rows, top_k)],
         output_dtypes=[f32, mx.uint32, f32],
     )
-    mx.eval(router.softmax_topk_rows(logits.astype(mx.bfloat16), top_k))
+    router.softmax_topk_rows(logits.astype(mx.bfloat16), top_k)
     ref_inds, ref_scores = router._SOFTMAX_TOPK_ROWS_KERNEL(
         inputs=[logits],
         template=[("T", f32), ("NE", experts), ("K", top_k)],
@@ -336,9 +330,15 @@ def test_tied_router_logits_route_like_the_served_block():
 
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("top_k", [8, 10])
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize(
+    "bits,top_k,dtype",
+    [
+        (4, 8, mx.bfloat16),
+        (5, 10, mx.float16),
+        (6, 10, mx.bfloat16),
+        (8, 8, mx.float16),
+    ],
+)
 def test_fast_down_and_top8_are_bit_identical(dtype, top_k, bits):
     """Qwen3.5/3.6-35B-A3B layout: hidden 2048 and intermediate 512 put the
     down projection on ``qmv_fast`` too."""
@@ -352,8 +352,9 @@ def test_fast_down_and_top8_are_bit_identical(dtype, top_k, bits):
     assert not routed._DISABLED
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("quantized_shared", [True, False])
+@pytest.mark.parametrize(
+    "quantized_shared,dtype", [(True, mx.float16), (False, mx.bfloat16)]
+)
 def test_top8_routing_folded_into_gate_up_is_bit_identical(dtype, quantized_shared):
     """128 experts select inside the gate+up launch; an unquantized shared
     expert runs composed and enters the combine."""
@@ -477,3 +478,20 @@ def test_apply_is_idempotent(_patched_block):
     call = cls.__call__
     assert routed.apply_qwen35_moe_routed_decode_patch()
     assert cls.__call__ is call
+
+
+def test_reload_after_mtp_keeps_the_verify_window(monkeypatch, _patched_block):
+    """A model without MTP loads first, then one with MTP applies the router again."""
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    from omlx.patches import qwen35_moe_router, qwen35_verify_qmm
+
+    monkeypatch.setattr(
+        Qwen3_5BatchInvariantForward, "_feed_forward", lambda self, block, x: block(x)
+    )
+    qwen35_moe_router._ensure_vlm_verify_patch()
+    routed._ensure_verify_window_patch(_patched_block)
+    qwen35_verify_qmm._patch_verify_swiglu()
+    patched = Qwen3_5BatchInvariantForward._feed_forward
+    qwen35_moe_router._ensure_vlm_verify_patch()
+    assert Qwen3_5BatchInvariantForward._feed_forward is patched

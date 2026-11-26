@@ -12,7 +12,9 @@ import logging
 
 import mlx.core as mx
 
+from ... import mx_linear, oqh
 from ...tensors import unpack
+from ..qwen4_exp import kernels as expert_kernels
 from . import kernels, ops, quant
 from .config import Config, expert_bits
 
@@ -30,6 +32,10 @@ class Projection:
     A quantized weight is unpacked once at load into the activation type (fp32
     with ``wide_input``), rounded once from fp32 as the host's kernel sees it.
     The product then runs in the types of its operands, as on the host.
+
+    An MXFP8 weight with FP8 input stays packed on GPUs with the block-scaled
+    mma: its codes multiply the input's FP8 codes, which are the same products.
+    Block.check_kernels unpacks it when the kernel does not reproduce them.
     """
 
     def __init__(
@@ -42,24 +48,66 @@ class Projection:
         weight = weights[f"{name}.weight"]
         spec = config.quantized.get(name)
         self.quantize_input = False
+        # (codes, scales) of a weight that runs on mx_linear.matmul.
+        self.mx: tuple[mx.array, mx.array] | None = None
+        self.weight_t = None
         if spec is not None:
             self.quantize_input = bool(spec.get("quantize_input", True))
-            weight = unpack(
+            self._packed = (
                 weight,
                 weights[f"{name}.scales"],
                 weights.get(f"{name}.biases"),
                 {"group_size": 32, **spec},
-                mx.float32 if wide_input else None,
             )
+            width = weight.shape[-1] * 32 // spec["bits"]
+            if (
+                self.quantize_input
+                and not wide_input
+                and mx_linear.available()
+                and mx_linear.fits(self._packed[3], weight.shape[0], width)
+            ):
+                self.mx = (mx_linear.codes(weight), self._packed[1])
+                return
+            weight = self.unpacked(mx.float32 if wide_input else None)
+            del self._packed
         elif wide_input:
             weight = weight.astype(mx.float32)
         self.weight_t = mx.contiguous(weight.T)
 
-    def __call__(self, x: mx.array, quantized: mx.array | None = None) -> mx.array:
-        """``quantized`` is the FP8 round trip of x when the caller has it."""
+    def unpacked(self, dtype: mx.Dtype | None = None) -> mx.array:
+        return unpack(*self._packed, dtype)
+
+    def use_unpacked(self) -> None:
+        self.weight_t = mx.contiguous(self.unpacked().T)
+        self.mx = None
+        del self._packed
+
+    def __call__(
+        self,
+        x: mx.array,
+        quantized: mx.array | None = None,
+        codes: tuple[mx.array, mx.array] | None = None,
+    ) -> mx.array:
+        """``quantized`` is the FP8 round trip of x and ``codes`` its codes and
+        scales from kernels.fp8_codes, when the caller has them."""
+        if self.mx is not None:
+            rows = x.reshape(-1, x.shape[-1])
+            y = mx_linear.matmul(*(codes or kernels.fp8_codes(rows)), *self.mx)
+            return y.reshape(*x.shape[:-1], y.shape[-1])
         if self.quantize_input:
             x = _quantize(x) if quantized is None else quantized
         return ops.matmul(x, self.weight_t)
+
+
+def _projections(value):
+    """Every Projection a layer object holds."""
+    if isinstance(value, Projection):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _projections(item)
+    elif isinstance(value, Block):
+        yield from _projections(list(vars(value).values()))
 
 
 def _arrays(value):
@@ -110,6 +158,13 @@ class ExpertBank:
         self.weight = weights[f"{name}.weight"]
         self.spec = config.quantized.get(name)
         self.quantize_input = False
+        # oQh: rotated codes; the rows it reads are rotated, never FP8.
+        self.rotation = None
+        found = oqh.load_bank(weights, name)
+        if found is not None:
+            self.weight, self.scales, self.biases, self.quant, self.rotation = found
+            self.bits = self.quant["bits"]
+            return
         if self.spec is None:
             return
         self.quantize_input = bool(self.spec.get("quantize_input", True))
@@ -140,8 +195,14 @@ class ExpertBank:
                 "needs 64-bit expert offsets"
             )
 
+    def bank(self) -> tuple:
+        """(weight, scales, biases, quantization) of an oQh bank."""
+        return self.weight, self.scales, self.biases, self.quant
+
     def __call__(self, x: mx.array, experts: mx.array) -> mx.array:
         """x [R, 1, in] through the expert of each row; ``experts`` ascends."""
+        if self.rotation is not None:
+            return oqh.bank_gather(x, self.bank(), experts)
         if self.spec is None:
             return x @ self.weight[experts].swapaxes(-1, -2)
         out = mx.gather_qmm(
@@ -159,11 +220,23 @@ class ExpertBank:
         return out.astype(x.dtype)
 
 
+def _codes(x: mx.array) -> tuple[mx.array, mx.array]:
+    """FP8 codes and scales of x [..., D] as rows [R, D]."""
+    return kernels.fp8_codes(x.reshape(-1, x.shape[-1]))
+
+
 def _quantize(x: mx.array, bits: int = 8) -> mx.array:
     """quant.quantize, on the CUDA kernel when it runs for this dtype."""
     if kernels.use_pointwise(x.dtype):
         return kernels.transform(x, bits)
     return quant.quantize(x, bits)
+
+
+def _pack(x: mx.array) -> mx.array:
+    """FP8 rows as quant.pack(x) packs them, on the CUDA kernel when it does so."""
+    if x.size and kernels.use_fp8_pack(x.dtype):
+        return kernels.pack_fp8(x)
+    return quant.pack(x)
 
 
 def _rope(x, positions, config, compressed, inverse=False, bits=0):
@@ -275,8 +348,25 @@ class Block:
         self.experts = [
             ExpertBank(weights, f"{base}ffn.experts.{n}", c) for n in ("w1", "w3", "w2")
         ]
-        # Set by check_kernels once the expert tile kernels reproduce gather_qmm.
-        self.tiles = False
+        # oQh: w1 | w3 as one bank for the expert kernel; w1 and w3 view it.
+        self.oqh_pair = None
+        self.oqh_kernel = False
+        w1, w3, _ = self.experts
+        if w1.rotation is not None:
+            oqh.check_shared(w1, w3)
+            weight = mx.concatenate([w1.weight, w3.weight], axis=1)
+            scales = mx.concatenate([w1.scales, w3.scales], axis=1)
+            biases = None
+            if w1.biases is not None:
+                biases = mx.concatenate([w1.biases, w3.biases], axis=1)
+            self.oqh_pair = (weight, scales, biases, w1.quant)
+            inner = w1.weight.shape[1]
+            for bank, part in ((w1, slice(0, inner)), (w3, slice(inner, None))):
+                bank.weight, bank.scales = weight[:, part], scales[:, part]
+                bank.biases = None if biases is None else biases[:, part]
+        # Set by check_kernels once the expert tile kernels reproduce gather_qmm;
+        # "mx" for the block-scaled tiles.
+        self.tiles: bool | str = False
         self.shared = [
             projection(f"ffn.shared_experts.{n}") for n in ("w1", "w3", "w2")
         ]
@@ -367,13 +457,15 @@ class Block:
     def _attention(self, x, cache, shared, start):
         c, ratio, length = self.config, self.ratio, x.shape[1]
         positions = range(start, start + length)
-        quantizes = self.wq_a.quantize_input or self.wkv.quantize_input
+        pair = (self.wq_a, self.wkv)
+        quantizes = any(p.quantize_input and p.mx is None for p in pair)
         xq = _quantize(x) if quantizes else None
-        qr = ops.norm(self.wq_a(x, xq), self.q_norm, c.norm_eps)
+        codes = _codes(x) if any(p.mx is not None for p in pair) else None
+        qr = ops.norm(self.wq_a(x, xq, codes), self.q_norm, c.norm_eps)
         q = self.wq_b(qr).reshape(1, length, c.n_heads, c.head_dim)
         q = _rope(q, positions, c, bool(ratio))
-        kv = ops.norm(self.wkv(x, xq), self.kv_norm, c.norm_eps)
-        new = quant.pack(_rope(kv, positions, c, bool(ratio)))
+        kv = ops.norm(self.wkv(x, xq, codes), self.kv_norm, c.norm_eps)
+        new = _pack(_rope(kv, positions, c, bool(ratio)))
         old = cache[WINDOW]
         old_len = min(start, c.window_size, 0 if old is None else old.shape[1])
         window = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
@@ -436,11 +528,12 @@ class Block:
             weights = weights / (mx.sum(weights, -1, keepdims=True) + 1e-20)
         return chosen, weights * c.route_scale
 
-    def _routed(self, flat, xq, chosen, weights, tiles):
+    def _routed(self, flat, xq, chosen, weights, tiles, codes=None):
         """(each route's expert output [R, D] sorted by expert, inverse order).
 
-        ``xq`` is the FP8 round trip of ``flat``; ``tiles`` runs the expert
-        tile kernels instead of gather_qmm.
+        ``xq`` is the FP8 round trip of ``flat`` and ``codes`` its FP8 codes;
+        ``tiles`` runs the expert tile kernels instead of gather_qmm, "mx" the
+        block-scaled ones.
         """
         c, k = self.config, chosen.shape[-1]
         w1, w3, w2 = self.experts
@@ -449,7 +542,22 @@ class Block:
         order = mx.argsort(experts)
         experts, token = experts[order], order // k
         route_weights = weights.reshape(-1)[order]
-        if tiles:
+        if w1.rotation is not None:
+            return self._oqh_routed(flat, experts, token, route_weights), mx.argsort(
+                order
+            )
+        if tiles == "mx":
+            codes, scales = kernels.expert_gate_up_mx(
+                *(codes or kernels.fp8_codes(flat)),
+                token.astype(mx.uint32),
+                experts,
+                w1,
+                w3,
+                route_weights,
+                c.swiglu_limit,
+            )
+            routed = kernels.expert_down_mx(codes, scales, experts, w2)
+        elif tiles:
             act = kernels.expert_gate_up(
                 xq if w1.quantize_input else flat,
                 token.astype(mx.uint32),
@@ -469,9 +577,78 @@ class Block:
             routed = w2(y, experts)
         return routed, mx.argsort(order)
 
+    def _oqh_routed(self, flat, experts, token, route_weights):
+        """Routed rows [R, 1, D] of oQh banks, as the host computes them: rows
+        rotated, the activation times its route weight rounded to the
+        activation dtype, then rotated for w2."""
+        c = self.config
+        w1, w3, w2 = self.experts
+        rows = oqh.rotate(flat.astype(mx.bfloat16), *w1.rotation)
+        if self.oqh_kernel:
+            offsets = expert_kernels.expert_offsets(experts, w2.weight.shape[0])
+            act = expert_kernels.expert_gemm(
+                rows,
+                self.oqh_pair,
+                offsets,
+                token.astype(mx.uint32),
+                act=2 if c.swiglu_limit is None else 3,
+                limit=c.swiglu_limit,
+            )
+            hidden = oqh.scale_rotate(act, route_weights, *w2.rotation, mx.bfloat16)
+            return expert_kernels.expert_gemm(hidden, w2.bank(), offsets)[:, None]
+        routed_rows = rows[token][:, None]
+        y = _swiglu(
+            w1(routed_rows, experts),
+            w3(routed_rows, experts),
+            route_weights,
+            c.swiglu_limit,
+            False,
+        )
+        return w2(oqh.rotate(y.astype(mx.bfloat16), *w2.rotation), experts)
+
+    def _check_oqh(self) -> None:
+        """Take the expert kernel for oQh banks when it reproduces the banks
+        rebuilt dense on a sample of routes."""
+        c = self.config
+        _, _, w2 = self.experts
+        if not (
+            kernels.available()
+            and expert_kernels.expert_gemm_fits(self.oqh_pair, c.dim, True)
+            and expert_kernels.expert_gemm_fits(w2.bank(), c.moe_inter_dim, True)
+        ):
+            return
+        keys = mx.random.split(mx.random.key(5), 3)
+        flat = mx.random.normal((96, c.dim), key=keys[0]).astype(self.attn_norm.dtype)
+        shape = (96, c.n_activated_experts)
+        # The reference rebuilds the experts in use dense: keep them few.
+        count = min(c.n_routed_experts, 2 * c.n_activated_experts)
+        chosen = mx.random.randint(0, count, shape, key=keys[1])
+        weights = mx.random.uniform(0.1, 1.0, shape, key=keys[2])
+        want = self._routed(flat, flat, chosen, weights, False)[0]
+        self.oqh_kernel = True
+        try:
+            error = kernels.relative_error(
+                self._routed(flat, flat, chosen, weights, False)[0], want
+            )
+        except RuntimeError as failure:
+            error, self.oqh_kernel = float("inf"), False
+            logger.warning("DeepSeek V4.1 oQh expert kernel is off: %r", failure)
+        if not error <= _TILE_ERROR:
+            self.oqh_kernel = False
+            logger.warning(
+                "DeepSeek V4.1 oQh expert kernel is off: layer %d differs by %.2e",
+                self.layer,
+                error,
+            )
+
     def check_kernels(self) -> None:
         """Turn the expert tile kernels on when they reproduce gather_qmm on a
-        sample of routes through this layer's banks."""
+        sample of routes through this layer's banks; unpack an MXFP8 weight
+        whose block-scaled matmul does not reproduce the unpacked product."""
+        self._check_linears()
+        if self.oqh_pair is not None:
+            self._check_oqh()
+            return
         w1, w3, _ = self.experts
         if not (
             kernels.available()
@@ -484,6 +661,8 @@ class Block:
         flat = mx.random.normal((96, c.dim), key=keys[0]).astype(self.attn_norm.dtype)
         shape = (96, c.n_activated_experts)
         chosen = mx.random.randint(0, c.n_routed_experts, shape, key=keys[1])
+        # Every row also routes to expert 0, so one expert fills two 64-route tiles.
+        chosen = mx.concatenate([mx.zeros_like(chosen[:, :1]), chosen[:, 1:]], 1)
         weights = mx.random.uniform(0.1, 1.0, shape, key=keys[2])
         xq = _quantize(flat)
         want = self._routed(flat, xq, chosen, weights, False)[0]
@@ -502,6 +681,50 @@ class Block:
                 self.layer,
                 error,
             )
+            return
+        # The block-scaled mma takes the activations' FP8 round trip as codes.
+        if not (
+            kernels.mx_experts_fit(self.experts)
+            and all(w.quantize_input for w in self.experts)
+        ):
+            return
+        try:
+            got = self._routed(flat, xq, chosen, weights, "mx")[0]
+            error = kernels.relative_error(got, want)
+        except RuntimeError as failure:
+            logger.warning("DeepSeek V4.1 MX expert tiles are off: %r", failure)
+            return
+        if error <= _TILE_ERROR:
+            self.tiles = "mx"
+        else:
+            logger.warning(
+                "DeepSeek V4.1 MX expert tiles are off: layer %d differs from "
+                "gather_qmm by %.2e",
+                self.layer,
+                error,
+            )
+
+    def _check_linears(self) -> None:
+        for p in _projections(self):
+            if p.mx is None:
+                continue
+            width = p.mx[0].shape[1]
+            x = mx.random.normal((130, width), key=mx.random.key(7))
+            x = x.astype(self.attn_norm.dtype)
+            want = ops.matmul(_quantize(x), p.unpacked().T)
+            try:
+                error = kernels.relative_error(p(x), want)
+            except RuntimeError as failure:
+                error, reason = float("inf"), repr(failure)
+            else:
+                reason = f"differs from the unpacked weight by {error:.2e}"
+            if not error <= _TILE_ERROR:
+                logger.warning(
+                    "DeepSeek V4.1 MXFP8 matmul is off for a layer %d weight: %s",
+                    self.layer,
+                    reason,
+                )
+                p.use_unpacked()
 
     def _moe(self, x):
         c, dtype = self.config, x.dtype
@@ -509,11 +732,22 @@ class Block:
         chosen, weights = self.route(flat)
         w1, w3, w2 = self.experts
         s1, s3, s2 = self.shared
-        quantizes = any(p.quantize_input for p in (w1, w3, s1, s3))
+        mx_tiles = self.tiles == "mx"
+        quantizes = any(p.quantize_input and p.mx is None for p in (s1, s3)) or (
+            not mx_tiles and (w1.quantize_input or w3.quantize_input)
+        )
         # Quantization is row-local, so one round trip serves every route.
         xq = _quantize(flat) if quantizes else flat
-        routed, inverse = self._routed(flat, xq, chosen, weights, self.tiles)
-        y = _swiglu(s1(flat, xq), s3(flat, xq), None, c.swiglu_limit, s2.quantize_input)
+        mx_shared = s1.mx is not None or s3.mx is not None
+        codes = kernels.fp8_codes(flat) if mx_tiles or mx_shared else None
+        routed, inverse = self._routed(flat, xq, chosen, weights, self.tiles, codes)
+        y = _swiglu(
+            s1(flat, xq, codes),
+            s3(flat, xq, codes),
+            None,
+            c.swiglu_limit,
+            s2.quantize_input and s2.mx is None,
+        )
         # y is already quantized when the down projection asks for it.
         shared = s2(y, y)
         if kernels.use_combine(dtype):

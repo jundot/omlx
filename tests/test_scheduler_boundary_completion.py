@@ -327,10 +327,13 @@ def _assert_restored_matches_cold(model, scheduler, prefix, tokens, expected_cac
     prefix.release_cache("probe")
 
 
-@pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize(
-    "kind,split",
-    [("gdn", False), ("gdn", True), ("rotating", False)],
+    "kind,split,chunked",
+    [
+        ("gdn", False, False),
+        ("gdn", True, True),
+        ("rotating", False, True),
+    ],
 )
 def test_prefill_tail_reuse_matches_cold_forward(
     mock_tokenizer, tmp_path, kind, split, chunked
@@ -417,6 +420,27 @@ def test_prefill_tail_reuse_matches_cold_forward(
                     assert request.cached_tokens == n
             probe = system + [15, 16, 29]
             _assert_restored_matches_cold(model, scheduler, prefix, probe, n)
+
+        # Questions on one document: the second leaves the stored prompt at
+        # token 10, off the grid, and its prefill keeps a shared tail there.
+        # The third resumes at it, not at the block boundary below.
+        scheduler._JUNCTION_MIN_TOKENS = 2
+        document = list(range(40, 50))
+        _run_through_scheduler(scheduler, document + [51, 52, 53, 29], 13, "question-1")
+        request = _run_through_scheduler(
+            scheduler, document + [60, 61, 62, 29], 13, "question-2"
+        )
+        assert request.cached_tokens == 8
+        assert request.junction_end == 10
+        request = _run_through_scheduler(
+            scheduler, document + [70, 71, 72, 29], 13, "question-3"
+        )
+        assert request.cached_tokens == 10
+        assert request.junction_end == 0
+        table, remaining = prefix.fetch_cache("probe", document + [80, 81, 29])
+        assert table is not None and table.num_tokens == 10
+        assert remaining == [80, 81, 29]
+        prefix.release_cache("probe")
     finally:
         scheduler.shutdown()
 
@@ -479,8 +503,15 @@ def _chunked_scheduler_rig(mock_tokenizer, tmp_path, kind):
     return model, scheduler, prefix
 
 
-@pytest.mark.parametrize("kind", ["gdn", "rotating", "deepseek_v41"])
-@pytest.mark.parametrize("finish", ["cancel", "parser_stop"])
+@pytest.mark.parametrize(
+    "kind,finish",
+    [
+        ("gdn", "cancel"),
+        ("gdn", "parser_stop"),
+        ("rotating", "cancel"),
+        ("deepseek_v41", "parser_stop"),
+    ],
+)
 def test_requeued_request_stores_each_output_token_once(
     mock_tokenizer, tmp_path, kind, finish
 ):

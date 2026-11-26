@@ -68,7 +68,7 @@ struct QuantizationScreen: View {
                 selectedModelPath: $vm.selectedModelPath,
                 sensitivityModelPath: $vm.sensitivityModelPath,
                 oqLevel: $vm.oqLevel,
-                enhanced: vm.enhanced,
+                variantSuffix: vm.variantSuffix,
                 isStarting: vm.isStarting,
                 modelsLoaded: vm.modelsLoaded,
                 onStart: { vm.startQuantization(client: services.client) }
@@ -84,6 +84,8 @@ struct QuantizationScreen: View {
 
             EnhancedQuantizationSection(
                 enabled: $vm.enhanced,
+                hadamard: $vm.hadamard,
+                supportsOqh: vm.selectedSupportsOqh,
                 reuseCache: $vm.imatrixReuseCache,
                 cachePath: $vm.imatrixCachePath,
                 strictCoverage: $vm.imatrixStrict
@@ -94,8 +96,10 @@ struct QuantizationScreen: View {
                 isOpen: $vm.advancedOpen,
                 selectedIsVLM: vm.selectedIsVLM,
                 selectedHasMTP: vm.selectedHasMTP,
+                selectedHasEngram: vm.selectedHasEngram,
                 textOnly: $vm.textOnly,
                 preserveMtp: $vm.preserveMtp,
+                preserveNgram: $vm.preserveNgram,
                 dtype: $vm.dtype
             )
             .padding(.bottom, 12)
@@ -139,6 +143,15 @@ struct QuantizationScreen: View {
         .onChange(of: vm.preserveMtp) { _, _ in
             vm.scheduleEstimateRefresh(client: services.client)
         }
+        .onChange(of: vm.preserveNgram) { _, _ in
+            vm.scheduleEstimateRefresh(client: services.client)
+        }
+        .onChange(of: vm.textOnly) { _, _ in
+            vm.scheduleEstimateRefresh(client: services.client)
+        }
+        .onChange(of: vm.dtype) { _, _ in
+            vm.scheduleEstimateRefresh(client: services.client)
+        }
         .sheet(item: $vm.uploadTarget) { task in
             UploadModalView(task: task, vm: vm, client: services.client)
         }
@@ -153,7 +166,7 @@ private struct SourceModelSection: View {
     @Binding var selectedModelPath: String
     @Binding var sensitivityModelPath: String
     @Binding var oqLevel: Double
-    let enhanced: Bool
+    let variantSuffix: String
     let isStarting: Bool
     let modelsLoaded: Bool
     let onStart: () -> Void
@@ -268,12 +281,12 @@ private struct SourceModelSection: View {
         return opts
     }
 
-    // Mirrors the HTML <option>s. oQe keeps the same bit levels, but makes
-    // the output variant explicit in the picker, as the web UI does.
+    // Mirrors the HTML <option>s. oQe and oQh keep the same bit levels, but
+    // make the output variant explicit in the picker, as the web UI does.
     private var levelOptions: [PopupOption<Double>] {
         Self.levelValues.map { level in
             let number = level.rounded() == level ? String(Int(level)) : String(level)
-            return PopupOption(value: level, label: "oQ\(number)\(enhanced ? "e" : "")")
+            return PopupOption(value: level, label: "oQ\(number)\(variantSuffix)")
         }
     }
 
@@ -335,8 +348,10 @@ private struct AdvancedSection: View {
     @Binding var isOpen: Bool
     let selectedIsVLM: Bool
     let selectedHasMTP: Bool
+    let selectedHasEngram: Bool
     @Binding var textOnly: Bool
     @Binding var preserveMtp: Bool
+    @Binding var preserveNgram: Bool
     @Binding var dtype: String
 
     @Environment(\.omlxTheme) private var theme
@@ -397,6 +412,19 @@ private struct AdvancedSection: View {
                             .disabled(!selectedHasMTP)
                     }
 
+                    if selectedHasEngram {
+                        Row(
+                            label: String(localized: "quant.advanced.preserve_ngram.label",
+                                          defaultValue: "Keep original Engram tables",
+                                          comment: "Toggle row label: keep DeepSeek V4.1 Engram tables in FP8"),
+                            sublabel: String(localized: "quant.advanced.preserve_ngram.sub",
+                                             defaultValue: "Keep the Engram tables in FP8 instead of 4-bit (larger on disk)",
+                                             comment: "Toggle row sublabel: effect of keeping the original Engram tables")
+                        ) {
+                            RowSwitch(isOn: $preserveNgram)
+                        }
+                    }
+
                     Row(
                         label: String(localized: "quant.advanced.dtype.label",
                                       defaultValue: "Non-quant dtype",
@@ -424,6 +452,8 @@ private struct AdvancedSection: View {
 /// intentionally sent rather than replaced with a client-specific path.
 private struct EnhancedQuantizationSection: View {
     @Binding var enabled: Bool
+    @Binding var hadamard: Bool
+    let supportsOqh: Bool
     @Binding var reuseCache: Bool
     @Binding var cachePath: String
     @Binding var strictCoverage: Bool
@@ -452,6 +482,19 @@ private struct EnhancedQuantizationSection: View {
             }
 
             if enabled {
+                if supportsOqh {
+                    Row(
+                        label: String(localized: "quant.enhanced.hadamard.label",
+                                      defaultValue: "Rotated codes (oQh)",
+                                      comment: "Toggle label that builds the oQh variant of an oQe model"),
+                        sublabel: String(localized: "quant.enhanced.hadamard.sub",
+                                         defaultValue: "Same size as oQe with lower error: weights are stored in a Hadamard-rotated basis with one scale per row. Needs the oQh kernels to run.",
+                                         comment: "Toggle sublabel explaining the oQh variant")
+                    ) {
+                        RowSwitch(isOn: $hadamard)
+                    }
+                }
+
                 Row(
                     label: String(localized: "quant.enhanced.reuse.label",
                                   defaultValue: "Reuse imatrix cache",

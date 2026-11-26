@@ -166,6 +166,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     var guidedGrammar: String? = nil
     var moeExpertOffloadEnabled: Bool? = nil
     var moeExpertOffloadResidentFraction: Double? = nil
+    var loopcdEnabled: Bool? = nil
+    var loopcdSkipThinking: Bool? = nil
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
     let turboquantKvScheme: String?
@@ -214,14 +216,16 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let vlmMtpEnabled: Bool?
     let vlmMtpDraftModel: String?
     let vlmMtpDraftBlockSize: Int?
+    // LoRA adapter folder applied on top of the weights at load.
+    let loraAdapter: String?
 }
 
 /// Patch body for PUT /admin/api/models/{id}/settings. Flat snake-cased
 /// keys (Encoder converts via `.convertToSnakeCase`). `nil` fields are
 /// omitted by `encodeIfPresent` so the server merges instead of resetting.
 struct ModelSettingsPatch: Encodable, Equatable, Sendable {
-    var modelAlias: String? = nil
-    var modelTypeOverride: String? = nil
+    var modelAlias: String?? = nil
+    var modelTypeOverride: String?? = nil
     var maxContextWindow: Int? = nil
     var maxTokens: Int? = nil
     var temperature: Double? = nil
@@ -298,12 +302,13 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var dflashVerifyMode: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil
-    var mtpAdaptiveMaxDepth: Int? = nil
+    var mtpAdaptiveMaxDepth: Int?? = nil // .some(nil) sends JSON null (model default).
     var mtpFixedDepth: Int?? = nil // .some(nil) sends JSON null (adaptive).
     // Experimental: VLM MTP
     var vlmMtpEnabled: Bool? = nil
     var vlmMtpDraftModel: String? = nil
     var vlmMtpDraftBlockSize: Int? = nil
+    var loraAdapter: String? = nil // "" clears the adapter.
 }
 
 /// GET /admin/api/models/{id}/generation_config: the sampling values a new
@@ -315,6 +320,22 @@ struct GenerationConfigDTO: Decodable, Equatable, Sendable {
     var topP: Double? = nil
     var topK: Int? = nil
     var repetitionPenalty: Double? = nil
+}
+
+/// GET /admin/api/models/{id}/lora-adapters: adapters in the model folders.
+/// `problem` says why one does not fit this model; nil when it does.
+struct LoRAAdapterDTO: Decodable, Equatable, Sendable, Identifiable {
+    let id: String
+    let path: String
+    let baseModel: String?
+    let rank: Int
+    let targets: [String]
+    let sizeFormatted: String?
+    let problem: String?
+}
+
+struct LoRAAdapterListResponse: Decodable, Sendable {
+    let adapters: [LoRAAdapterDTO]
 }
 
 /// Body for POST /admin/api/models/{id}/settings/recipe.
@@ -416,6 +437,8 @@ struct PrefillHelperStatusDTO: Codable, Equatable, Sendable {
     var secondsLeft: Int? = nil
     var onBattery: Bool? = nil
     var lastPrompt: LastPrompt? = nil
+    /// ready/working: a prompt went past the helper's GPU memory and ran here.
+    var outOfMemory: Bool? = nil
     /// needs_files only: make_room or low_space, the disk left after copying
     /// and the older copies make_room deletes first.
     var prompt: String? = nil

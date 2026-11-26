@@ -125,12 +125,9 @@ _PREP_SOURCE = r"""
         int freq_idx = slot;
         int d = freq_idx;
         int pair_d = d + half_dim;
-#if POS_NDIM == 3
-        int axis = int(position_selector[freq_idx]);
+        // POS_NDIM is a template argument, not a macro, so #if cannot test it.
+        const int axis = POS_NDIM == 3 ? int(position_selector[freq_idx]) : 0;
         float pos = static_cast<float>(position_ids[axis * q_len + t]);
-#else
-        float pos = static_cast<float>(position_ids[t]);
-#endif
         float angle = pos * static_cast<float>(inv_freq[freq_idx]);
         if (rope_scale[0] != 1.0f) {
             // YaRN runs mlx-vlm's eager MRoPE instead: precise cos/sin times

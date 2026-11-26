@@ -66,6 +66,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from omlx._version import __version__
 
@@ -94,6 +95,7 @@ from .api.anthropic_utils import (
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
+from .api.anthropic_web_search import maybe_handle_anthropic_web_search
 from .api.body_limit import RequestBodySizeLimitMiddleware
 from .api.embedding_models import (
     EmbeddingData,
@@ -243,13 +245,20 @@ from .exceptions import (
     RequestAbortedError,
     SchedulerQueueFullError,
 )
-from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .model_settings import (
+    forced_ct_keys,
+    merge_chat_template_request_kwargs,
+    specprefill_draft,
+)
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .patches.inkling2 import INKLING2_MODEL_TYPES
+from .patches.inkling2.grammar import compile_answer_grammar
+from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
 from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
 from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
-from .utils import gpu_power
+from .utils import gpu_power, macos_say
 from .utils.network import is_loopback_bind
 
 logging.basicConfig(level=logging.INFO)
@@ -598,7 +607,7 @@ async def lifespan(app: FastAPI):
 
         bonjour_task = asyncio.create_task(_bonjour_supervisor())
 
-    # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
+    # Cluster: always-on peer discovery (mDNS + IPv6 multicast fallback +
     # manual + Tailscale). Best-effort: discovery failures must never block
     # serving.
     discovery_service = None
@@ -899,7 +908,6 @@ def _register_cluster_routes() -> None:
     global _cluster_routes_registered
     if _cluster_routes_registered:
         return
-    from .cluster.routes import join_router as cluster_join_router
     from .cluster.routes import router as cluster_router
     from .cluster.routes import set_cluster_getters
 
@@ -911,27 +919,7 @@ def _register_cluster_routes() -> None:
             Depends(require_distributed_inference_enabled),
         ],
     )
-    # Cluster v2 model-sync manifest: admin-gated like the rest of the
-    # cluster surface; peers use it to compare model contents before sync.
-    from .cluster.modelsync import manifest_router as cluster_manifest_router
-    from .cluster.modelsync import set_modelsync_getters
-
-    set_modelsync_getters(get_engine_pool)
-    app.include_router(
-        cluster_manifest_router,
-        dependencies=[
-            Depends(require_admin),
-            Depends(require_distributed_inference_enabled),
-        ],
-    )
-    # The bootstrap bytes are public but pinned by SHA-256 in an admin-created
-    # command. Claim/source/complete authenticate with one-time enrollment
-    # credentials, not the browser's admin cookie.
-    app.include_router(
-        cluster_join_router,
-        dependencies=[Depends(require_distributed_inference_enabled)],
-    )
-    # Cluster v2: /api/cluster/node_id is a deliberately unauthenticated,
+    # Cluster: /api/cluster/node_id is a deliberately unauthenticated,
     # rate-limited probe peers use to verify announced addresses before any
     # pairing trust exists; /api/cluster/devices requires admin per-route.
     from .cluster.discovery_routes import discovery_router
@@ -940,10 +928,10 @@ def _register_cluster_routes() -> None:
         discovery_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
     )
-    # Cluster v2 pairing (Module B): pair/request carries only a salted PBKDF2
+    # Cluster pairing (Module B): pair/request carries only a salted PBKDF2
     # verifier bound to the node and SSH identities; pair/status returns a
-    # code-encrypted cluster key only after admin approval. Approve, deny, and
-    # unpair are admin-only like every other cluster mutation.
+    # code-encrypted cluster key only after admin approval. Approve and deny
+    # are admin-only like every other cluster mutation.
     from .cluster.pairing_routes import pair_admin_router, pair_router
 
     app.include_router(
@@ -1023,6 +1011,23 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
     }
 
 
+def _is_anthropic_route(request: FastAPIRequest) -> bool:
+    return request.url.path.startswith("/v1/messages")
+
+
+def _error_body_for(
+    request: FastAPIRequest, message, status_code: int, *, param=None, code=None
+) -> dict:
+    if not _is_api_route(request):
+        return {"detail": message}
+    content = _openai_error_body(message, status_code, param=param, code=code)
+    if _is_anthropic_route(request):
+        content["type"] = "error"
+        if status_code >= 500:
+            content["error"]["type"] = "api_error"
+    return content
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
@@ -1041,12 +1046,19 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.status_code,
             exc.detail,
         )
-    if _is_api_route(request):
-        content = _openai_error_body(
-            exc.detail, exc.status_code, code=getattr(exc, "code", None)
-        )
-    else:
-        content = {"detail": exc.detail}
+    content = _error_body_for(
+        request, exc.detail, exc.status_code, code=getattr(exc, "code", None)
+    )
+    return JSONResponse(
+        status_code=exc.status_code, content=content, headers=exc.headers
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(
+    request: FastAPIRequest, exc: StarletteHTTPException
+):
+    content = _error_body_for(request, exc.detail, exc.status_code)
     return JSONResponse(
         status_code=exc.status_code, content=content, headers=exc.headers
     )
@@ -1056,11 +1068,13 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
 async def validation_exception_handler(
     request: FastAPIRequest, exc: RequestValidationError
 ):
-    """Log request validation errors (422) before returning the response."""
+    """Log request validation errors (422, or 400 on Anthropic routes)."""
+    status_code = 400 if _is_anthropic_route(request) else 422
     logger.warning(
-        "%s %s → 422: %s",
+        "%s %s → %d: %s",
         request.method,
         request.url.path,
+        status_code,
         exc.errors(),
     )
     if _is_api_route(request):
@@ -1072,27 +1086,24 @@ async def validation_exception_handler(
             parts.append(f"{loc}: {msg}" if loc else msg)
         detail_str = "; ".join(parts)
         param = errors[0].get("loc", [None])[-1] if errors else None
-        content = _openai_error_body(detail_str, 422, param=param)
+        content = _error_body_for(request, detail_str, status_code, param=param)
     else:
         content = {"detail": jsonable_encoder(exc.errors())}
-    return JSONResponse(status_code=422, content=content)
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @app.exception_handler(InvalidRequestError)
 async def invalid_request_error_handler(
     request: FastAPIRequest, exc: InvalidRequestError
 ):
-    """Map internal request validation failures to OpenAI-compatible 400s."""
+    """Map internal request validation failures to the route's 400 envelope."""
     logger.warning(
         "%s %s -> 400: %s",
         request.method,
         request.url.path,
         exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body(str(exc), 400, param=exc.field)
-    else:
-        content = {"detail": str(exc)}
+    content = _error_body_for(request, str(exc), 400, param=exc.field)
     return JSONResponse(status_code=400, content=content)
 
 
@@ -1119,10 +1130,7 @@ async def scheduler_queue_full_handler(
         f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
         f"Try again shortly."
     )
-    if _is_api_route(request):
-        content = _openai_error_body(detail, 503)
-    else:
-        content = {"detail": detail}
+    content = _error_body_for(request, detail, 503)
     return JSONResponse(
         status_code=503,
         content=content,
@@ -1148,10 +1156,7 @@ async def distributed_unavailable_handler(
         request.url.path,
         exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body(str(exc), 503)
-    else:
-        content = {"detail": str(exc)}
+    content = _error_body_for(request, str(exc), 503)
     return JSONResponse(status_code=503, content=content)
 
 
@@ -1271,10 +1276,7 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
         exc,
         exc_info=exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body("Internal server error", 500)
-    else:
-        content = {"detail": "Internal server error"}
+    content = _error_body_for(request, "Internal server error", 500)
     return JSONResponse(status_code=500, content=content)
 
 
@@ -1472,6 +1474,7 @@ async def get_engine(
     engine_type: EngineType = EngineType.LLM,
     _lease: bool = False,
     _leased_out: list | None = None,
+    _allow_embedding: bool = False,
 ) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine, DecisionEngine]:
     """
     Get engine for the specified model and type.
@@ -1490,6 +1493,8 @@ async def get_engine(
             leased is appended to this list. Release using that id (not the
             request model) so the lease/release ids always match even when the
             pool falls back to the default model.
+        _allow_embedding: With EngineType.LLM, also accept an EmbeddingEngine
+            (for /tokenize and /detokenize). Model resolution stays LLM.
 
     Returns:
         The loaded engine of the appropriate type
@@ -1628,7 +1633,9 @@ async def get_engine(
             # fell through and crashed on `engine.model_type` with an unhandled
             # 500. Reject with a clear 400 pointing the caller at the right
             # endpoint.
-            if not isinstance(engine, BaseEngine):
+            if not isinstance(engine, BaseEngine) and not (
+                _allow_embedding and isinstance(engine, EmbeddingEngine)
+            ):
                 _endpoint_hint = _suggest_endpoint_for_engine(engine)
                 raise HTTPException(
                     status_code=400,
@@ -1767,6 +1774,7 @@ async def get_engine_for_model(
     model: str | None = None,
     *,
     lease: _LLMEngineLease | None = None,
+    allow_embedding: bool = False,
 ) -> BaseEngine:
     """
     Get LLM engine for the specified model (or default).
@@ -1775,6 +1783,7 @@ async def get_engine_for_model(
 
     Args:
         model: Model ID to get engine for, or None for default
+        allow_embedding: Also accept an EmbeddingEngine (tokenizer routes).
 
     Returns:
         The loaded engine
@@ -1783,7 +1792,7 @@ async def get_engine_for_model(
         HTTPException: If model not found or memory error
     """
     if lease is None:
-        return await get_engine(model, EngineType.LLM)
+        return await get_engine(model, EngineType.LLM, _allow_embedding=allow_embedding)
 
     leased: list[str] = []
     engine = await get_engine(
@@ -1791,6 +1800,7 @@ async def get_engine_for_model(
         EngineType.LLM,
         _lease=True,
         _leased_out=leased,
+        _allow_embedding=allow_embedding,
     )
     if leased:
         lease.model_id = leased[0]
@@ -2115,6 +2125,25 @@ def _no_repeat_ngram_kwargs(request) -> dict[str, int]:
 
 def _ignore_eos_kwargs(request) -> dict[str, bool]:
     return {"ignore_eos": True} if getattr(request, "ignore_eos", False) else {}
+
+
+def _specprefill_kwargs(
+    engine: BaseEngine, model_id: str, resolved_model: str
+) -> dict[str, bool | float]:
+    """Return the SpecPrefill values of the requested model or exposed profile.
+
+    The attached draft serves requests with different values, so each one carries its own.
+    """
+    sm = _server_state.settings_manager
+    if sm is None or not getattr(engine, "specprefill_draft_path", None):
+        return {}
+    runtime = sm.get_exposed_profile_runtime_settings_for_request(model_id)
+    settings = runtime[1] if runtime else sm.get_settings(resolved_model)
+    return {
+        "specprefill": specprefill_draft(settings) == engine.specprefill_draft_path,
+        "specprefill_keep_pct": settings.specprefill_keep_pct or DEFAULT_KEEP_RATE,
+        "specprefill_threshold": settings.specprefill_threshold or DEFAULT_THRESHOLD,
+    }
 
 
 # `off` keeps a one-shot request out of the prefix cache; lookups still run.
@@ -2632,12 +2661,14 @@ def init_server(
         scheduler_config=scheduler_config,
     )
     _server_state.engine_pool.configure_gpu_keep_warm(
-        global_settings.server.gpu_keep_warm_interval if global_settings else 0.5
+        global_settings.server.gpu_keep_warm_interval if global_settings else 0.5,
+        (
+            global_settings.server.gpu_keep_warm_idle_window
+            if global_settings
+            else 300.0
+        ),
     )
-    from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
-    from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
-    from .cluster.rdma.store import configure_rdma_link_store
     from .cluster.registry import (
         configure_cluster_registry,
         configure_device_registry,
@@ -2646,11 +2677,8 @@ def init_server(
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
-    configure_cluster_enrollment(base_path)
-    configure_rdma_link_store(base_path)
-    configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
-    # Cluster v2: stable node identity + trusted device inventory. Best
+    # Cluster: stable node identity + trusted device inventory. Best
     # effort — a failure here must never block local inference. Configured
     # before the pairing manager so pairing approvals persist into the real
     # device registry instead of the schema-compatible fallback store.
@@ -2660,12 +2688,12 @@ def init_server(
         configure_node_identity(base_path)
         configure_device_registry(base_path / "cluster" / "devices.json")
     except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Cluster v2 identity/device stores unavailable: %s", exc)
+        logger.warning("Cluster identity/device stores unavailable: %s", exc)
     try:
         device_registry = get_device_registry()
     except RuntimeError:
         device_registry = None
-    # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
+    # Cluster pairing manager, bridged onto Module A's DeviceRegistry when
     # available (DeviceRegistryBridge adapts the API and fails loudly on
     # drift); otherwise the schema-compatible fallback store is used. Resolve
     # capabilities lazily because the discovery service starts later.
@@ -2674,7 +2702,6 @@ def init_server(
     configure_pairing_manager(
         base_path,
         registry=device_registry,
-        enrollment_store=get_cluster_enrollment(),
         caps_provider=announced_caps,
         address_provider=announced_addrs,
         http_port=global_settings.server.port if global_settings else 8000,
@@ -3300,6 +3327,15 @@ async def _with_json_keepalive(
                 )
             )
             return
+        except Exception as e:
+            handler = next(
+                app.exception_handlers[cls]
+                for cls in type(e).__mro__
+                if cls in app.exception_handlers
+            )
+            response = await handler(http_request, e)
+            yield response.body.decode()
+            return
         if result is not None:
             yield result
     finally:
@@ -3465,13 +3501,13 @@ async def server_status(_: bool = Depends(verify_api_key)):
             engine = entry.engine
             if engine is None:
                 continue
+            active_requests += engine.active_request_count()
             async_core = getattr(engine, "_engine", None)
             if async_core is None:
                 continue
             core = getattr(async_core, "engine", None)
             if core is None:
                 continue
-            active_requests += len(getattr(core, "_output_collectors", {}))
             sched = getattr(core, "scheduler", None)
             if sched is not None:
                 waiting_requests += len(getattr(sched, "waiting", []))
@@ -3798,9 +3834,7 @@ async def _create_markitdown_chat_completion(
     )
 
 
-@app.get("/v1/models", response_model=None)
-async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
-    """List all available models with load status."""
+async def _list_visible_models() -> list[ModelInfo]:
     models = []
     favorite_ids: set[str] = set()
 
@@ -3950,9 +3984,22 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
             ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx", model_type="markitdown")
         )
 
+    if macos_say.enabled(_server_state.global_settings):
+        models.append(
+            ModelInfo(id=macos_say.MODEL_ID, owned_by="omlx", model_type="audio_tts")
+        )
+
     # Favorites first; stable sort keeps alphabetical order within groups.
     if favorite_ids:
         models.sort(key=lambda m: m.id not in favorite_ids)
+
+    return models
+
+
+@app.get("/v1/models", response_model=None)
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
+    """List all available models with load status."""
+    models = await _list_visible_models()
 
     # Serialize explicitly: FastAPI's jsonable_encoder and the
     # ``ModelsResponse`` container both serialize items as the base
@@ -4018,6 +4065,17 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["is_hidden"] = False
         m["max_tokens"] = max_tokens
     return status
+
+
+@app.get("/v1/models/{model_id:path}", response_model=None)
+async def retrieve_model(
+    model_id: str, _: bool = Depends(verify_inference_api_key)
+) -> JSONResponse:
+    """Return one visible model, matching an OpenAI retrieve call."""
+    for model in await _list_visible_models():
+        if model.id == model_id:
+            return JSONResponse(content=model.model_dump())
+    raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
 
 @app.post("/v1/models/{model_id}/unload")
@@ -4537,6 +4595,9 @@ async def _chat_model_decisions(
     multimodal = isinstance(engine, VLMBatchedEngine) or getattr(
         engine, "supports_multimodal_fallback", False
     )
+    chat_kwargs = _specprefill_kwargs(
+        engine, request.model, _serving_model_id(lease, request.model)
+    )
 
     def _prepare_readout(messages):
         try:
@@ -4553,7 +4614,9 @@ async def _chat_model_decisions(
                 ) from e
             raise
         validate_context_window(num_prompt_tokens, request.model)
-        return {} if prepared is None else {"_prepared_prompt": prepared}
+        if prepared is None:
+            return chat_kwargs
+        return {**chat_kwargs, "_prepared_prompt": prepared}
 
     async def _decide():
         await _raise_if_llm_lease_abort_requested(lease)
@@ -4744,6 +4807,9 @@ async def create_completion(
             gen_kwargs.update(_no_repeat_ngram_kwargs(request))
             gen_kwargs.update(_ignore_eos_kwargs(request))
             gen_kwargs.update(_cache_store_kwargs(http_request))
+            gen_kwargs.update(
+                _specprefill_kwargs(engine, request.model, resolved_model)
+            )
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -5241,6 +5307,7 @@ async def create_chat_completion(
         chat_kwargs.update(_no_repeat_ngram_kwargs(request))
         chat_kwargs.update(_ignore_eos_kwargs(request))
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_specprefill_kwargs(engine, request.model, resolved_model))
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -5455,7 +5522,7 @@ async def create_chat_completion(
             # Process response_format if specified
             if response_format and not tool_calls:
                 cleaned_text, _, is_valid, error = parse_json_output(
-                    cleaned_text or regular_content, response_format
+                    cleaned_text, response_format
                 )
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
@@ -5477,10 +5544,8 @@ async def create_chat_completion(
                 if tool_calls and output.finish_reason != "length"
                 else output.finish_reason
             )
-            reasoning_token_count = (
-                len(engine.tokenizer.encode(cleaned_thinking))
-                if cleaned_thinking
-                else 0
+            reasoning_token_count = _estimate_reasoning_tokens(
+                engine.tokenizer, cleaned_thinking, output.completion_tokens
             )
 
             return ChatCompletionResponse(
@@ -5587,6 +5652,15 @@ def _normalize_structured_outputs(
     if guided_grammar:
         return {"grammar": guided_grammar}
     return None
+
+
+def _estimate_reasoning_tokens(
+    tokenizer, reasoning_text: str, completion_tokens: int
+) -> int:
+    if not reasoning_text:
+        return 0
+    token_ids = tokenizer.encode(reasoning_text.strip(), add_special_tokens=False)
+    return min(len(token_ids), completion_tokens)
 
 
 def _choice_logprobs(entries) -> ChoiceLogprobs:
@@ -5810,6 +5884,8 @@ def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | Non
     # channel headers that a bare grammar would mask.
     if reasoning_parser is None and engine.model_type == "gpt_oss":
         return "harmony"
+    if reasoning_parser is None and engine.model_type in INKLING2_MODEL_TYPES:
+        return "inkling2"
     return reasoning_parser
 
 
@@ -5828,6 +5904,10 @@ def _compile_with_structural_tag(
     import xgrammar as xgr
 
     ct_kwargs = chat_template_kwargs or {}
+    if reasoning_parser == "inkling2":
+        return compile_answer_grammar(
+            compiler, fmt, ct_kwargs, max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT
+        )
     if reasoning_parser == "minimax_m3":
         reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
     else:
@@ -6148,6 +6228,9 @@ async def stream_completion(
     gen_kwargs.update(_ignore_eos_kwargs(request))
     if skip_cache_store:
         gen_kwargs["skip_cache_store"] = True
+    gen_kwargs.update(
+        _specprefill_kwargs(engine, request.model, resolved_model or request.model)
+    )
     outputs = engine.stream_generate(
         prompt=prompt,
         max_tokens=max_tokens,
@@ -7296,10 +7379,8 @@ async def stream_chat_completion(
             total_time = end_time - start_time
             pt = last_output.prompt_tokens
             ct = last_output.completion_tokens
-            reasoning_token_count = (
-                len(engine.tokenizer.encode(accumulated_reasoning))
-                if accumulated_reasoning
-                else 0
+            reasoning_token_count = _estimate_reasoning_tokens(
+                engine.tokenizer, accumulated_reasoning, ct
             )
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
@@ -8034,6 +8115,12 @@ async def create_anthropic_message(
         f"max_tokens={request.max_tokens}"
     )
 
+    web_search_response = await maybe_handle_anthropic_web_search(
+        request, _server_state.global_settings
+    )
+    if web_search_response is not None:
+        return web_search_response
+
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -8120,6 +8207,7 @@ async def create_anthropic_message(
             chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_specprefill_kwargs(engine, request.model, resolved_model))
 
         # Validate context window before sending to model
         num_prompt_tokens, prepared_prompt = await _prepare_prompt_off_loop(
@@ -8389,6 +8477,44 @@ def _token_strings(tokenizer, token_ids: list[int]) -> list[str]:
     return [tokenizer.decode([token_id]) for token_id in token_ids]
 
 
+def _embedding_tokenizer(engine: EmbeddingEngine, model: str | None):
+    # mlx-embeddings returns either a tokenizer or a processor that holds one.
+    # count_tokens() falls back to a whitespace estimate; /tokenize must not.
+    processor = engine.processor
+    # TokenizerWrapper forwards attributes but not len().
+    if type(processor).__name__ == "TokenizerWrapper":
+        processor = processor._tokenizer
+    for candidate in (processor, getattr(processor, "tokenizer", None)):
+        if callable(getattr(candidate, "encode", None)) and callable(
+            getattr(candidate, "decode", None)
+        ):
+            return candidate
+    raise InvalidRequestError(
+        f"Model '{model}' does not expose a tokenizer with encode/decode, "
+        "so it cannot be tokenized.",
+        field="model",
+    )
+
+
+def _encode_prompt(tokenizer, request) -> tuple[list[int], list[str] | None]:
+    token_ids = list(
+        tokenizer.encode(request.prompt, add_special_tokens=request.add_special_tokens)
+    )
+    if not request.return_token_strs:
+        return token_ids, None
+    return token_ids, _token_strings(tokenizer, token_ids)
+
+
+def _decode_token_ids(tokenizer, token_ids: list[int], vocab_size: int) -> str:
+    for i, token_id in enumerate(token_ids):
+        if token_id >= vocab_size:
+            raise InvalidRequestError(
+                f"Token id {token_id} is out of vocabulary (size {vocab_size}).",
+                field=f"tokens[{i}]",
+            )
+    return tokenizer.decode(token_ids)
+
+
 async def _tokenize_chat_messages(
     request: TokenizeChatRequest,
     engine: BaseEngine,
@@ -8454,6 +8580,9 @@ async def tokenize(
     /v1/chat/completions preparation and the engine's own prompt rendering, so
     the IDs are the ones generation would see. The context window is not
     enforced; ``max_model_len`` reports it instead.
+
+    Embedding models accept only ``prompt``, encoded with their tokenizer;
+    ``max_model_len`` is the per-input limit /v1/embeddings truncates at.
     """
     _reject_lone_surrogates(request)
     if isinstance(request, TokenizeChatRequest):
@@ -8472,27 +8601,44 @@ async def tokenize(
 
     lease = _LLMEngineLease()
     try:
-        engine = await get_engine_for_model(request.model, lease=lease)
+        engine = await get_engine_for_model(
+            request.model, lease=lease, allow_embedding=True
+        )
         await _raise_if_llm_lease_abort_requested(lease)
         resolved_model = _serving_model_id(lease, request.model)
-        tokenizer = engine.tokenizer
-        if isinstance(request, TokenizeChatRequest):
-            token_ids = await _tokenize_chat_messages(request, engine, resolved_model)
-        else:
-            token_ids = list(
-                tokenizer.encode(
-                    request.prompt, add_special_tokens=request.add_special_tokens
+        if isinstance(engine, EmbeddingEngine):
+            if isinstance(request, TokenizeChatRequest):
+                raise InvalidRequestError(
+                    "Embedding models have no chat template; tokenize a "
+                    "'prompt' instead of 'messages'.",
+                    field="messages",
                 )
+            tokenizer = _embedding_tokenizer(engine, request.model or resolved_model)
+            token_ids, token_strs = await engine.run_tokenizer(
+                lambda: _encode_prompt(tokenizer, request)
             )
+            max_model_len = engine.max_input_tokens(
+                get_embedding_max_length(request.model or resolved_model)
+            )
+        else:
+            tokenizer = engine.tokenizer
+            if isinstance(request, TokenizeChatRequest):
+                token_ids = await _tokenize_chat_messages(
+                    request, engine, resolved_model
+                )
+                token_strs = (
+                    _token_strings(tokenizer, token_ids)
+                    if request.return_token_strs
+                    else None
+                )
+            else:
+                token_ids, token_strs = _encode_prompt(tokenizer, request)
+            max_model_len = get_max_context_window(request.model or resolved_model)
         return TokenizeResponse(
             count=len(token_ids),
-            max_model_len=get_max_context_window(request.model or resolved_model),
+            max_model_len=max_model_len,
             tokens=token_ids,
-            token_strs=(
-                _token_strings(tokenizer, token_ids)
-                if request.return_token_strs
-                else None
-            ),
+            token_strs=token_strs,
         )
     finally:
         await lease.release()
@@ -8513,18 +8659,21 @@ async def detokenize(
 
     lease = _LLMEngineLease()
     try:
-        engine = await get_engine_for_model(request.model, lease=lease)
+        engine = await get_engine_for_model(
+            request.model, lease=lease, allow_embedding=True
+        )
         await _raise_if_llm_lease_abort_requested(lease)
-        tokenizer = engine.tokenizer
-        vocab_size = len(tokenizer)
-        for i, token_id in enumerate(request.tokens):
-            if token_id >= vocab_size:
-                raise InvalidRequestError(
-                    f"Token id {token_id} is out of vocabulary "
-                    f"(size {vocab_size}).",
-                    field=f"tokens[{i}]",
-                )
-        return DetokenizeResponse(prompt=tokenizer.decode(request.tokens))
+        if isinstance(engine, EmbeddingEngine):
+            tokenizer = _embedding_tokenizer(
+                engine, request.model or _serving_model_id(lease, request.model)
+            )
+            prompt = await engine.run_tokenizer(
+                lambda: _decode_token_ids(tokenizer, request.tokens, len(tokenizer))
+            )
+        else:
+            tokenizer = engine.tokenizer
+            prompt = _decode_token_ids(tokenizer, request.tokens, len(tokenizer))
+        return DetokenizeResponse(prompt=prompt)
     finally:
         await lease.release()
 
@@ -8885,6 +9034,7 @@ async def create_response(
             chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_specprefill_kwargs(engine, request.model, resolved_model))
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
@@ -9035,7 +9185,7 @@ async def create_response(
             # Process response_format if specified
             if response_format and not tool_calls:
                 cleaned_text, _, is_valid, error = parse_json_output(
-                    cleaned_text or regular_content, response_format
+                    cleaned_text, response_format
                 )
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
@@ -9073,8 +9223,8 @@ async def create_response(
                         )
                     )
 
-            reasoning_token_count = (
-                len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+            reasoning_token_count = _estimate_reasoning_tokens(
+                engine.tokenizer, reasoning_text, output.completion_tokens
             )
             usage = build_response_usage(
                 input_tokens=output.prompt_tokens,
@@ -9880,8 +10030,8 @@ async def stream_responses_api(
             f"{last_output.completion_tokens} tokens in {total_duration:.2f}s "
             f"({tokens_per_sec:.1f} tok/s)"
         )
-        reasoning_token_count = (
-            len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+        reasoning_token_count = _estimate_reasoning_tokens(
+            engine.tokenizer, reasoning_text, last_output.completion_tokens
         )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,
@@ -10055,7 +10205,7 @@ model and sampling defaults are managed via the admin page.
     # setup form crashing with a 500 (#2282). Passing api_key keeps the
     # two entry points enforcing the same auth. Scheduler/cache wiring
     # stays CLI-only on purpose; this entry point remains minimal.
-    from .settings import init_settings
+    from .settings import GRACEFUL_SHUTDOWN_TIMEOUT_S, init_settings
 
     settings = init_settings()
     if args.host is not None:
@@ -10089,7 +10239,12 @@ model and sampling defaults are managed via the admin page.
     # Start server
     import uvicorn
 
-    uvicorn.run(app, host=settings.server.host, port=args.port)
+    uvicorn.run(
+        app,
+        host=settings.server.host,
+        port=args.port,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT_S,
+    )
 
 
 if __name__ == "__main__":

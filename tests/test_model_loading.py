@@ -7,11 +7,14 @@ import sys
 import types
 from unittest.mock import MagicMock
 
+import mlx.core as mx
 import mlx_lm.utils as mlx_lm_utils
+import mlx_vlm.utils as mlx_vlm_utils
 import pytest
 
 from omlx.utils import model_loading
 from omlx.utils.model_loading import (
+    dflash_draft_for,
     ensure_model_code_trusted,
     maybe_apply_pre_load_patches,
     maybe_load_custom_quantization,
@@ -61,6 +64,23 @@ class TestRemoteCodePreflight:
                 model_path=tmp_path,
                 trust_remote_code=False,
             )
+
+    @pytest.mark.parametrize(
+        "trusted, error", [(False, ValueError), (True, AttributeError)]
+    )
+    def test_vlm_load_runs_the_model_file_only_when_trusted(
+        self, tmp_path, trusted, error
+    ):
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "custom_vlm", "model_file": "arch.py", "vision_config": {}}'
+        )
+        (tmp_path / "arch.py").write_text(
+            "import pathlib\npathlib.Path(__file__).with_name('ran').touch()\n"
+        )
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), {"w": mx.zeros(1)})
+        with pytest.raises(error):
+            mlx_vlm_utils.load_model(tmp_path, trust_remote_code=trusted)
+        assert (tmp_path / "ran").exists() is trusted
 
     def test_tokenizer_trust_failure_happens_before_mlx_lm_load(
         self, tmp_path, monkeypatch
@@ -609,6 +629,27 @@ class TestVlmMtpPreLoadDispatch:
             tmp_path,
             '{"model_type": "qwen3_5", "vision_config": {}, '
             '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=depth)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(expected)
+
+    @pytest.mark.parametrize(("depth", "expected"), [(None, 5), (3, 3)])
+    def test_deepseek_v41_default_depth_is_the_dspark_block(
+        self, tmp_path, monkeypatch, depth, expected
+    ):
+        self._stub_patches(monkeypatch)
+        monkeypatch.setitem(
+            sys.modules, "omlx.patches.deepseek_v41", MagicMock(apply_patch=MagicMock())
+        )
+        text = {"num_nextn_predict_layers": 3, "dspark_block_size": 5}
+        path = _write_config(
+            tmp_path,
+            json.dumps({"model_type": "deepseek_v41", "vision_config": {}, "text_config": text}),
         )
         _write_mtp_index(tmp_path, has_mtp=True)
         settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=depth)
@@ -1446,3 +1487,11 @@ class TestMoondreamCompatibility:
             token="test-token",
         )
         assert processor.tokenizer.convert_tokens_to_ids("<|md_reserved_2|>") == 3
+
+
+def test_dflash_draft_for_expands_a_home_relative_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings = types.SimpleNamespace(dflash_enabled=True, dflash_draft_model="~/d")
+    assert dflash_draft_for(settings, None) == str(tmp_path / "d")
+    settings.dflash_draft_model = "z-lab/d"
+    assert dflash_draft_for(settings, None) == "z-lab/d"

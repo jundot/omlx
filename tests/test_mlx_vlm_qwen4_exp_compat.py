@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import mmap
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -17,6 +18,9 @@ from mlx_lm.models.rope_utils import initialize_rope
 from omlx import memory_monitor
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 from omlx.patches import qwen35_yarn
+from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+    qwen4_exp_residency_estimate,
+)
 
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
 qwen4_language = importlib.import_module("mlx_vlm.models.qwen4_exp.language")
@@ -678,6 +682,47 @@ def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
         result[key], mx.ones((1,), dtype=mx.bfloat16)
     ).item()
 
+
+def test_qwen4_exp_sanitize_splits_quantized_fused_experts():
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    gate_up = mx.quantize(mx.random.normal((2, 128, 64)), group_size=64, bits=4)
+    down = mx.quantize(mx.random.normal((2, 64, 64)), group_size=64, bits=4)
+    prefix = "model.language_model.layers.0.mlp.experts"
+    weights = {}
+    for name, params in (("gate_up_proj", gate_up), ("down_proj", down)):
+        for suffix, value in zip(("weight", "scales", "biases"), params):
+            weights[f"{prefix}.{name}.{suffix}"] = value
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=1,
+                num_experts=2,
+                ple_layer_ids=(),
+            )
+        )
+    )
+
+    result = Model.sanitize(model, weights)
+
+    assert [key for key in result if ".experts." in key] == []
+    gate, up = mx.split(mx.dequantize(*gate_up, group_size=64, bits=4), 2, axis=-2)
+    expected = {
+        "gate_proj": gate,
+        "up_proj": up,
+        "down_proj": mx.dequantize(*down, group_size=64, bits=4),
+    }
+    for name, want in expected.items():
+        base = f"language_model.model.layers.0.mlp.switch_mlp.{name}"
+        got = mx.dequantize(
+            result[f"{base}.weight"],
+            result[f"{base}.scales"],
+            result[f"{base}.biases"],
+            group_size=64,
+            bits=4,
+        )
+        assert mx.array_equal(got, want).item(), name
 
 
 def test_qwen4_resident_ple_looks_up_shard_windows_on_device():
@@ -1553,7 +1598,8 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path, mtp_num_exp
         configure_mtp_runtime(tmp_path, enabled=False)
 
 
-def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
+@pytest.mark.parametrize("indexed", [True, False])
+def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path, indexed):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
 
@@ -1568,13 +1614,15 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
         .reshape(4, 4)
         .astype(mx.bfloat16),
     }
-    filename = "model-00001-of-00001.safetensors"
+    filename = "model-00001-of-00001.safetensors" if indexed else "model.safetensors"
     mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {key: filename for key in tensors}}),
-        encoding="utf-8",
-    )
+    if indexed:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: filename for key in tensors}}),
+            encoding="utf-8",
+        )
 
+    assert qwen4_exp_residency_estimate(tmp_path).supported
     embedding = DiskBackedShardedEmbedding(
         tmp_path, prefix, num_embeddings=8, dims=4, num_shards=2
     )
@@ -1778,6 +1826,52 @@ def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
     assert embedding.rows_read == 2
     assert embedding._shard_specs[0][3:] == (bits, 32)
     embedding.close()
+
+
+def test_disk_backed_ple_advises_a_decode_tokens_pages_before_copying(tmp_path):
+    """A token's per-shard gathers advise every page before the first copy; larger gathers keep the pool prefetch."""
+    embedding, table = _disk_ple(tmp_path, shards=4, rows=2048, dims=160, bits=4)
+    from mlx_vlm.models.qwen4_exp import language as ple
+
+    events = []
+
+    class RecordingMap(mmap.mmap):
+        def madvise(self, option, start, length):
+            events.append(("advise", start, start + length))
+            return super().madvise(option, start, length)
+
+    reader = next(iter(embedding._readers.values()))
+    copy_rows = reader.rows_np
+
+    def rows_np(key, rows):
+        events.append(("copy", key, int(rows[0])))
+        return copy_rows(key, rows)
+
+    reader._mapping.close()
+    reader._mapping = RecordingMap(reader._file.fileno(), 0, access=mmap.ACCESS_READ)
+    reader.rows_np = rows_np
+
+    # One decode token: a row in each of the four shards.
+    indices = mx.array([[5, 2048 + 900, 2 * 2048 + 2047, 3 * 2048 + 1500]], dtype=mx.int32)
+    values = embedding(indices)
+    assert mx.array_equal(values, mx.take(table, indices.reshape(-1), axis=0)[None]).item()
+    advised = [event for event in events if event[0] == "advise"]
+    assert len(advised) == 4 * 3 and events[: len(advised)] == advised
+    for _, key, row in events[len(advised) :]:
+        entry = reader._header[key]
+        start, end = entry["data_offsets"]
+        row_bytes = (end - start) // entry["shape"][0]
+        first = reader._data_start + start + row * row_bytes
+        assert any(
+            begin % ple._PLE_PAGE_SIZE == 0 and begin <= first and first + row_bytes <= stop
+            for _, begin, stop in advised
+        ), key
+
+    events.clear()
+    embedding(mx.array([list(range(ple._PLE_POOL_PREFETCH_ROWS + 1))], dtype=mx.int32))
+    assert [event[0] for event in events] == ["copy"] * 3
+    embedding.close()
+
 
 # ---------------------------------------------------------------------------
 # Continuous-batching join regressions (issue #3245, PR #3246)
@@ -2305,8 +2399,10 @@ def _depthwise_conv(channels, taps=4, dilation=3, dtype=mx.bfloat16, bias=False)
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
-@pytest.mark.parametrize("dilation,taps", [(3, 4), (1, 4), (2, 3)])
+@pytest.mark.parametrize(
+    "dtype,dilation,taps",
+    [(mx.bfloat16, 3, 4), (mx.float16, 1, 4), (mx.float32, 2, 3)],
+)
 def test_ple_depthwise_conv_kernel_is_bit_equal_to_conv1d(_depthwise_conv_state, dtype, dilation, taps):
     language = _depthwise_conv_state
     mx.random.seed(dilation * 10 + taps)

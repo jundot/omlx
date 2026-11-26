@@ -13,11 +13,9 @@ Auto depth and parking use the measured cost of the whole active batch.
 from __future__ import annotations
 
 import contextlib
-import functools
 import inspect
 import logging
 import math
-import threading
 import time
 import weakref
 from collections import deque
@@ -184,8 +182,7 @@ def apply() -> bool:
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        with _spec_command_buffers(model):
-                            return _mtp_batch_next(self, batch_state)
+                        return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
                     if not _reconcile_mtp_batch_to_standard(self):
@@ -200,6 +197,8 @@ def apply() -> bool:
                     )
                 _drop_mtp_batch_state(self, "batch-ineligible")
 
+            sent_uid = self.__dict__.pop("_omlx_first_token_sent", None)
+            first_sent = tuple(self.uids) == (sent_uid,)
             if _is_mtp_eligible(self):
                 handed_off = False
                 if _singleton_mtp_handoff_ready(self):
@@ -207,12 +206,19 @@ def apply() -> bool:
                     # singleton back to the standard step at the drained-queue
                     # boundary so the late join merges this very call (#2515).
                     handed_off = _handoff_mtp_for_late_join(self, self._omlx_mtp_state)
+                if not handed_off and not first_sent:
+                    first = _emit_first_token(self)
+                    if first is not None:
+                        return first
                 if not handed_off:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
-                            with _spec_command_buffers(model):
-                                return _mtp_next(self, state)
+                            if first_sent:
+                                state.queue.popleft()
+                                _bump_emit_stat(state, "init")
+                                first_sent = False
+                            return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
                         active = getattr(self, "_omlx_mtp_state", None)
@@ -229,6 +235,11 @@ def apply() -> bool:
                         _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
+            if first_sent:
+                # The standard step would emit the sent token again.
+                emitted = len(self.tokens[0])
+                self._step()
+                del self.tokens[0][emitted:]
             _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
             tax_probe = getattr(self, "_omlx_mtp_tax_probe", None)
@@ -432,78 +443,6 @@ def _cluster_shared_token(gen_batch: Any, tok: Any) -> Tuple[Any, Optional[int]]
     mx.eval(tok)
     ids, seed = sync.share_tokens(tok.tolist() if sync.is_leader else None)
     return mx.array(ids, dtype=mx.uint32), seed
-
-
-# MLX commits a command buffer every ~50 ops or 50 MB of inputs, weights
-# included, and blocks eval at ten in flight, so a cycle could not queue the
-# next draft behind a running verify. Prefill keeps MLX's caps: larger ones
-# raise its peak memory.
-_SPEC_BUFFER_CAPS = (200, 512)
-
-# Target model types supported by the Qwen Lightning MTP/DFlash paths.
-_SPEC_CAPS_TARGET_TYPES = frozenset(
-    {
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_5_vl",
-        "qwen3_6",
-        "qwen3_6_moe",
-        "qwen4_exp",
-        "qwen4_exp_text",
-    }
-)
-
-
-def _spec_caps_target(model: Any) -> bool:
-    """Whether the loaded target belongs to the selected Qwen family."""
-    return getattr(model, "model_type", None) in _SPEC_CAPS_TARGET_TYPES
-
-
-@functools.lru_cache(maxsize=1)
-def _raises_spec_buffer_caps() -> bool:
-    """True on GPUs where the raised caps were measured: M5 and the M3 family."""
-    import mlx.core as mx
-
-    from omlx.custom_kernels.nax import is_nax_available
-
-    if is_nax_available():
-        return True
-    try:
-        architecture = str(mx.device_info().get("architecture", ""))
-    except Exception:
-        return False
-    return architecture.startswith("applegpu_g15")
-
-
-# The caps live on the MLX device, so engines running cycles at the same time
-# share one raise and the last one out restores MLX's values.
-_spec_caps_lock = threading.Lock()
-_spec_caps_holders = 0
-_spec_caps_previous: Optional[Tuple[int, int]] = None
-
-
-@contextlib.contextmanager
-def _spec_command_buffers(model: Any = None):
-    """Raise caps for supported Qwen targets and GPUs, then restore them."""
-    global _spec_caps_holders, _spec_caps_previous
-    if not _spec_caps_target(model) or not _raises_spec_buffer_caps():
-        yield
-        return
-
-    from omlx.custom_kernels.quant_matmul.fast import set_command_buffer_caps
-
-    with _spec_caps_lock:
-        if _spec_caps_holders == 0:
-            _spec_caps_previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
-        _spec_caps_holders += 1
-    try:
-        yield
-    finally:
-        with _spec_caps_lock:
-            _spec_caps_holders -= 1
-            if _spec_caps_holders == 0 and _spec_caps_previous is not None:
-                set_command_buffer_caps(*_spec_caps_previous)
-                _spec_caps_previous = None
 
 
 def _drafter_for(model: Any) -> Optional[Any]:
@@ -1546,6 +1485,28 @@ def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
         return False
 
 
+def _emit_first_token(gen_batch: Any) -> Optional[List[Any]]:
+    """Stream the token sampled from the prompt; the next call starts drafting."""
+    if (
+        getattr(gen_batch, "_omlx_mtp_state", None) is not None
+        or gen_batch._num_tokens[0] != 0
+        # Only MTP init publishes the prefix snapshot.
+        or gen_batch.max_tokens[0] <= 1
+        or _cluster_mtp(gen_batch.model) is not None
+    ):
+        return None
+    # A boundary snapshot needs this token in the cache.
+    align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+    if align > 0 and (len(gen_batch.tokens[0]) + 1) % align == 0:
+        return None
+    result = _emit_response(
+        gen_batch, int(gen_batch._next_tokens.item()), gen_batch._next_logprobs[0]
+    )
+    if result[0].finish_reason is None:
+        gen_batch._omlx_first_token_sent = gen_batch.uids[0]
+    return result
+
+
 def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
     """Return a valid singleton MTP state, lazily initializing if needed."""
     state = getattr(gen_batch, "_omlx_mtp_state", None)
@@ -1711,6 +1672,40 @@ def _apply_processors(processors, prev_tokens, logits_2d):
     for proc in processors:
         logits_2d = proc(prev_tokens, logits_2d)
     return logits_2d
+
+
+def _live_processors(procs, positions: int):
+    """Processors that can change logits within the next ``positions`` calls."""
+    if not procs:
+        return procs
+    live = [
+        p for p in procs if not (hasattr(p, "inert_for") and p.inert_for(positions))
+    ]
+    return live or None
+
+
+class _HostTokens:
+    """Token history with host ints past ``base``, where processors read new tokens."""
+
+    def __init__(self, base: int, tail: List[int]):
+        self._base = base
+        self._tail = tail
+
+    def __len__(self) -> int:
+        return self._base + len(self._tail)
+
+    def __getitem__(self, i: int) -> int:
+        if i < self._base:
+            raise IndexError(f"position {i} precedes the host tail at {self._base}")
+        return self._tail[i - self._base]
+
+
+def _advance_processors(procs, base: int, emitted: List[int]) -> None:
+    """Advance inert processors one call per emitted token, as the verify rows would."""
+    for j in range(len(emitted)):
+        history = _HostTokens(base, emitted[: j + 1])
+        for proc in procs:
+            proc(history, None)
 
 
 def _snap_snapshotable(procs):
@@ -3110,6 +3105,39 @@ def _dspark_host(model: Any) -> Optional[Any]:
     return None
 
 
+def _dspark_draft_depth(host, state, depth=None):
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
+    return min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+
+
+def _queue_dspark_block(host, prepare, gen_batch, state, hidden, packet, k, *, greedy):
+    """Queue only the deterministic block. Sampling follows the actual commit."""
+    import mlx.core as mx
+
+    depth = _dspark_draft_depth(host, state)
+    if depth <= 0:
+        return None
+    m = packet[:1]
+    if greedy:
+        anchor = mx.take(packet[1 : k + 2], m)
+    else:
+        residual = packet[k + 1 : 2 * k + 1]
+        anchor = mx.where(
+            m < k,
+            mx.take(residual, mx.minimum(m, k - 1)),
+            packet[2 * k + 1 : 2 * k + 2],
+        )
+    build = prepare(gen_batch.prompt_cache, hidden, m, anchor, k, depth)
+    if build is None:
+        return None
+    # The host reads the acceptance packet without waiting for the new block.
+    mx.async_eval(packet)
+    block = build()
+    mx.async_eval(block)
+    return depth, block
+
+
 def _dspark_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -3117,6 +3145,9 @@ def _dspark_next_drafts(
     committed: Any,
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
+    logits: Optional[Any] = None,
+    *,
+    prepared_block=None,
 ) -> None:
     """Append committed target taps and sample one DSpark block.
 
@@ -3130,9 +3161,7 @@ def _dspark_next_drafts(
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
-    if depth is None:
-        depth = state.controller.cur if state.controller is not None else state.depth
-    depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+    depth = _dspark_draft_depth(host, state, depth)
     n = int(committed.shape[0])
     if depth <= 0:
         host.dspark_append_context(hidden_rows, state.mtp_cache)
@@ -3143,13 +3172,17 @@ def _dspark_next_drafts(
         return
 
     anchor = committed[-1:].reshape(1, 1)
-    logits, _ = host.dspark_forward(
-        hidden_rows,
-        anchor,
-        state.mtp_cache,
-        draft_length=depth,
-    )
-    state.hist_offset += n
+    if logits is None:
+        if prepared_block is not None and prepared_block[0] == depth:
+            logits = prepared_block[1]
+        else:
+            logits, _ = host.dspark_forward(
+                hidden_rows,
+                anchor,
+                state.mtp_cache,
+                draft_length=depth,
+            )
+        state.hist_offset += n
 
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
@@ -3162,17 +3195,25 @@ def _dspark_next_drafts(
     # distribution but must not advance the thinking budget (they would
     # count tokens that are only emitted if verified later). Checkpoint
     # before the loop and rewind after.
-    snap = _snap_snapshotable(procs)
+    draft_procs = _live_processors(procs, depth)
+    snap = _snap_snapshotable(draft_procs)
 
+    # Hosts whose next slot depends on the previous draft beyond an additive
+    # bias (DFly2 re-projects a corrected hidden) supply dspark_step_logits;
+    # dspark_forward's first result is then their opaque block state.
+    step_logits = getattr(host, "dspark_step_logits", None)
     for idx in range(depth):
-        bias, _ = host.dspark_markov(previous)
-        logits_2d = logits[:, idx, :] + bias
-        if procs is not None and prev_buf is not None:
+        if step_logits is not None:
+            logits_2d = step_logits(logits, idx, previous)
+        else:
+            bias, _ = host.dspark_markov(previous)
+            logits_2d = logits[:, idx, :] + bias
+        if draft_procs is not None and prev_buf is not None:
             prefix = mx.concatenate(
                 [prev_buf.astype(mx.int32), anchor.reshape(1).astype(mx.int32)]
                 + [token.reshape(1).astype(mx.int32) for token in draft_toks]
             )
-            logits_2d = _apply_processors(procs, prefix, logits_2d)
+            logits_2d = _apply_processors(draft_procs, prefix, logits_2d)
         lp_2d = _logprobs(logits_2d)
         token = _ensure_uint32(sampler(lp_2d))
         draft_toks.append(token)
@@ -3180,7 +3221,7 @@ def _dspark_next_drafts(
         draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
         previous = token.reshape(1)
 
-    _restore_snapshotable(procs, snap)
+    _restore_snapshotable(draft_procs, snap)
 
     state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
@@ -3191,13 +3232,10 @@ def _dspark_next_drafts(
 def _dspark_draft_jobs(jobs: List[tuple]) -> None:
     """``draft_next`` for several requests' chain jobs (``_run_verify_cycle_chain`` with
     ``draft_jobs``) on an embedded DSpark host.
-
-    The requests are greedy without logits processors. Each keeps its own context-copy
-    proposal and DSpark stages; requests at one depth share the vocabulary head and the
-    Markov steps, whose per-row arithmetic does not depend on the other rows.
     """
     import mlx.core as mx
 
+    host = _dspark_host(jobs[0][0].model)
     shared: List[tuple] = []
     for gen_batch, state, hidden_rows, committed, prev_buf in jobs:
         if not state.head_clone:
@@ -3210,13 +3248,14 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
             if copied:
                 state.drafts = mx.array(copied, dtype=mx.uint32)
                 state.draft_lps = []
-                state.draft_accept_lps = []
+                state.draft_accept_lps = (
+                    [] if _is_greedy(gen_batch) else _copy_draft_q(copied, int(host.args.vocab_size))
+                )
                 state.copy_drafts = True
             continue
-        shared.append((gen_batch, state, hidden_rows, committed))
+        shared.append((gen_batch, state, hidden_rows, committed, prev_buf))
     if not shared:
         return
-    host = _dspark_host(shared[0][0].model)
     depths = {}
     for job in shared:
         state = job[1]
@@ -3224,14 +3263,23 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
         depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
         depths.setdefault(depth, []).append(job)
     for depth, group in depths.items():
-        hidden, anchors = [], []
-        for gen_batch, state, hidden_rows, committed in group:
-            anchor = committed[-1:].reshape(1, 1)
-            hidden.append(host.dspark_hidden(hidden_rows, anchor, state.mtp_cache, draft_length=depth))
+        anchors = [committed[-1:].reshape(1, 1) for _, _, _, committed, _ in group]
+        hidden = host.dspark_hidden_rows(
+            [hidden_rows for _, _, hidden_rows, _, _ in group],
+            anchors,
+            [state.mtp_cache for _, state, _, _, _ in group],
+            draft_length=depth,
+        )
+        for _, state, _, committed, _ in group:
             state.hist_offset += int(committed.shape[0])
-            anchors.append(anchor.reshape(1))
-        logits = host.dspark_logits(mx.concatenate(hidden, 0))
-        previous = mx.concatenate(anchors)
+        logits = host.dspark_logits(hidden)
+        if not all(_is_greedy(job[0]) and _proc_list(job[0]) is None for job in group):
+            for r, (gen_batch, state, _, committed, prev_buf) in enumerate(group):
+                _dspark_next_drafts(
+                    gen_batch, state, None, committed, prev_buf, depth=depth, logits=logits[r : r + 1]
+                )
+            continue
+        previous = mx.concatenate([anchor.reshape(1) for anchor in anchors])
         tokens, lps = [], []
         for idx in range(depth):
             bias, _ = host.dspark_markov(previous)
@@ -3241,7 +3289,7 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
             lps.append(lp)
             previous = token
         drafts = mx.stack(tokens, axis=1)
-        for r, (gen_batch, state, _, _) in enumerate(group):
+        for r, (gen_batch, state, _, _, _) in enumerate(group):
             sampler = _resolve_sampler(gen_batch)
             state.drafts = drafts[r]
             state.draft_lps = [lp[r] for lp in lps]
@@ -3256,6 +3304,8 @@ def _chain_next_drafts(
     committed: Any,
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
+    *,
+    prepared_block=None,
 ) -> None:
     """Rebuild committed MTP-head history and draft the next chain.
 
@@ -3287,6 +3337,7 @@ def _chain_next_drafts(
             committed,
             prev_buf,
             depth,
+            prepared_block=prepared_block,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
@@ -3316,7 +3367,8 @@ def _chain_next_drafts(
     if begin is not None:
         begin(state.mtp_cache, depth)
 
-    sparse_k = _sparse_top_k(sampler) if procs is None else 0
+    draft_procs = _live_processors(procs, depth)
+    sparse_k = _sparse_top_k(sampler) if draft_procs is None else 0
     coarse = _coarse_draft_head(model) if 0 < sparse_k <= 32 else None
     n = committed.shape[0]
     if coarse is None:
@@ -3347,7 +3399,7 @@ def _chain_next_drafts(
         chain_cache = _chain_tail_caches(model, state.mtp_cache) or chain_cache
 
     # Speculative draft shaping — see _dspark_next_drafts.
-    snap = _snap_snapshotable(procs)
+    snap = _snap_snapshotable(draft_procs)
 
     sparse_ids: List[Any] = []
     for j in range(depth):
@@ -3359,12 +3411,12 @@ def _chain_next_drafts(
             sparse_ids.append(mx.take(cand_ids.reshape(-1), ids))
         else:
             logits_2d = logits[:, -1, :]
-            if procs is not None and prev_buf is not None:
+            if draft_procs is not None and prev_buf is not None:
                 prev = mx.concatenate(
                     [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
                     + [t.reshape(1).astype(mx.int32) for t in draft_toks]
                 )
-                logits_2d = _apply_processors(procs, prev, logits_2d)
+                logits_2d = _apply_processors(draft_procs, prev, logits_2d)
             lp_2d = _logprobs(logits_2d)
             if sparse_k:
                 tok, ids, accept_lp = _sample_draft_sparse(sampler, lp_2d, sparse_k)
@@ -3390,7 +3442,7 @@ def _chain_next_drafts(
             source, head_hidden = coarse.hidden(h, tok.reshape(1, 1), chain_cache)
         h = head_hidden[:, -1:]
 
-    _restore_snapshotable(procs, snap)
+    _restore_snapshotable(draft_procs, snap)
 
     if draft_toks:
         state.drafts = mx.concatenate(draft_toks)
@@ -3582,13 +3634,16 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     mtp_logits = gen_batch.model.mtp_forward(hidden_at_main, next_ids, mtp_cache)
     mtp_logits_2d = mtp_logits[:, -1, :]
     # The seed draft is speculative — shape but do not count.
-    snap = _snap_snapshotable(procs)
-    if procs is not None:
+    draft_procs = _live_processors(procs, 1)
+    snap = _snap_snapshotable(draft_procs)
+    if draft_procs is not None:
         prev_with_main_and_next = mx.concatenate(
             [prev_buf, _ensure_uint32(next_main_tok)]
         )
-        mtp_logits_2d = _apply_processors(procs, prev_with_main_and_next, mtp_logits_2d)
-    _restore_snapshotable(procs, snap)
+        mtp_logits_2d = _apply_processors(
+            draft_procs, prev_with_main_and_next, mtp_logits_2d
+        )
+    _restore_snapshotable(draft_procs, snap)
     draft_lp_2d = _logprobs(mtp_logits_2d)
     draft_tok = sampler(draft_lp_2d)
     # Filtered draft lp — what the sampler actually drew from. The next
@@ -4223,7 +4278,6 @@ def _stochastic_verify_tokens_sparse(
 
     from omlx.utils.sampling import top_k_indices
 
-    k = int(drafts.shape[0])
     top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
     temp = float(sampler.temp)
     ids = top_k_indices(combined_lp, top_k)
@@ -4236,7 +4290,14 @@ def _stochastic_verify_tokens_sparse(
         vals = mx.where(mx.cumsum(probs, axis=-1) - probs < top_p, vals, -float("inf"))
     scaled = vals * (1.0 / temp)
     logp = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)  # (k+1, top_k)
+    return _verify_on_support(ids, logp, drafts, draft_accept_lps)
 
+
+def _verify_on_support(ids, logp, drafts, draft_accept_lps):
+    """Verify drafts against a target density that is zero outside ``ids``."""
+    import mlx.core as mx
+
+    k = int(drafts.shape[0])
     d = drafts.astype(mx.int32)
     hit = ids[:k] == d[:, None]
     p_at = mx.where(
@@ -4283,6 +4344,84 @@ def _stochastic_verify_tokens_sparse(
             bonus_tok.astype(mx.int32),
         ]
     )
+
+
+_NUCLEUS_CANDIDATES = 512
+
+
+def _nucleus_verify_eligible(sampler, vocab: int) -> bool:
+    """Target filter is exactly top-p (no top-k, min-p or XTC) on a wide vocab."""
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    return (
+        vocab > 2 * _NUCLEUS_CANDIDATES
+        and float(getattr(sampler, "temp", 0.0) or 0.0) > 0.0
+        and 0.0 < top_p < 1.0
+        and int(getattr(sampler, "top_k", 0) or 0) == 0
+        and float(getattr(sampler, "min_p", 0.0) or 0.0) == 0.0
+        and float(getattr(sampler, "xtc_probability", 0.0) or 0.0) <= 0.0
+        and getattr(sampler, "_mtp_sampling_logits", None) is not None
+    )
+
+
+def _nucleus_support(sampler, combined_lp):
+    """Top-p density on the ``_NUCLEUS_CANDIDATES`` likeliest tokens of each row.
+
+    ``exact`` is 1 only when every row's nucleus fits inside its candidates.
+    """
+    import mlx.core as mx
+
+    from omlx.utils.sampling import top_k_indices_wide
+
+    top_p = float(sampler.top_p)
+    temp = float(sampler.temp)
+    ids = top_k_indices_wide(combined_lp, _NUCLEUS_CANDIDATES)
+    vals = mx.take_along_axis(combined_lp, ids, axis=-1)
+    order = mx.argsort(-vals.astype(mx.float32), axis=-1)
+    vals = mx.take_along_axis(vals, order, axis=-1)
+    ids = mx.take_along_axis(ids, order, axis=-1)
+    # Same rule as apply_top_p: drop a token once the mass above it reaches top_p.
+    probs = mx.exp(vals.astype(mx.float32))
+    total = mx.exp(combined_lp.astype(mx.float32)).sum(axis=-1, keepdims=True)
+    mass_above = mx.cumsum(probs, axis=-1, inclusive=False)
+    num_kept = (mass_above < top_p * total).sum(axis=-1, keepdims=True).astype(
+        mx.int32
+    )
+    cutoff = mx.take_along_axis(vals, num_kept - 1, axis=-1)
+    exact = mx.all(vals[:, -1:] < cutoff)
+    scaled = (mx.where(vals < cutoff, -float("inf"), vals) * (1.0 / temp)).astype(
+        mx.float32
+    )
+    logp = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+    return ids, logp, exact
+
+
+def _verify_stochastic(
+    sampler, combined_lp, drafts, draft_accept_lps, *, allow_nucleus=True
+):
+    """``_stochastic_verify_tokens`` packet plus a trailing 1 when it is valid."""
+    import mlx.core as mx
+
+    if allow_nucleus and int(drafts.shape[0]) > 0 and _nucleus_verify_eligible(
+        sampler, combined_lp.shape[-1]
+    ):
+        ids, logp, exact = _nucleus_support(sampler, combined_lp)
+        packet = _verify_on_support(ids, logp, drafts, draft_accept_lps)
+        return mx.concatenate([packet, exact.astype(mx.int32).reshape(1)])
+    packet = _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps)
+    return mx.concatenate([packet, mx.ones((1,), dtype=mx.int32)])
+
+
+def _settled_verify(host, sampler, combined_lp, drafts, draft_accept_lps):
+    """Host packet of ``_verify_stochastic``, redrawn densely when not valid.
+
+    Validity depends only on the logits, so the redraw keeps the distribution.
+    """
+    *packet, exact = host
+    if exact:
+        return packet
+    return _stochastic_verify_tokens(
+        sampler, combined_lp, drafts, draft_accept_lps
+    ).tolist()
 
 
 def _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps):
@@ -4374,15 +4513,20 @@ def _context_copy_drafts(
     so the Leviathan/Chen rule keeps the sampled distribution exact. Either
     way any draft source leaves the output distribution unchanged. Returns
     ``[]`` when the MTP head should draft instead. With ``block``, only a copy
-    of exactly that many tokens replaces the drafter's block.
+    of exactly that many tokens replaces the drafter's block, except a
+    verbatim copy on a target with 16-row windows, which may run past it.
     """
     if state.context_copy is None:
-        # A wide copy verifies MAX_COPY + 1 rows, so it must fit the target's
-        # verify cap (GLM-5.3's indexer pool rolls back at most 8 rows).
+        # A wide copy verifies MAX_COPY + 1 rows. A declared verify cap decides
+        # (GLM-5.3's indexer pool rolls back at most 8 rows, Inkling 2 verifies
+        # 16); without one only row-exact targets cover 16-row windows.
         cap = _max_verify_rows(gen_batch.model)
         state.context_copy = _context_copy.ContextCopy(
-            wide_window=_row_exact_verify(gen_batch.model)
-            and (cap is None or cap > _context_copy.MAX_COPY)
+            wide_window=(
+                cap > _context_copy.MAX_COPY
+                if cap is not None
+                else _row_exact_verify(gen_batch.model)
+            )
         )
     copier = state.context_copy
     state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
@@ -4396,7 +4540,12 @@ def _context_copy_drafts(
         block = state.depth
     if block is None:
         return copier.propose(room)
-    copied = copier.propose(min(room, block))
+    if copier.wide_window:
+        copied = copier.propose(min(room, block), wide_limit=room)
+        if len(copied) > block:
+            return copied
+    else:
+        copied = copier.propose(min(room, block))
     return copied if len(copied) == block else []
 
 
@@ -4468,8 +4617,13 @@ def _run_verify_cycle_chain(
     procs = _proc_list(gen_batch)
     is_greedy = _is_greedy(gen_batch)
     drafter = _drafter_for(gen_batch.model)
-    if drafter is not None and verify_result is None:
-        # A shared verify was already built from the drafts it was given.
+    if (
+        drafter is not None
+        and verify_result is None
+        and not (state.copy_drafts and int(state.drafts.shape[0]) > drafter.depth)
+    ):
+        # A shared verify was already built from the drafts it was given. A
+        # copy longer than the block is not the drafter's block to clip.
         _clip_block_drafts(
             state,
             state.controller.cur if state.controller is not None else state.depth,
@@ -4485,11 +4639,16 @@ def _run_verify_cycle_chain(
     # Token buffer per input position (mirrors PR 990 _step_backbone). Row j's
     # processor prefix is everything before that input position.
     prev_rows: List[Optional[Any]] = [None] * (k + 1)
+    rows_from = 0
     if procs is not None:
         buf = gen_batch._token_context[0]
+        rows_from = buf._size
         prev_rows[0] = buf.update_and_fetch(state.next_main)
         for j in range(k):
             prev_rows[j + 1] = buf.update_and_fetch(state.drafts[j : j + 1])
+    # Inert processors skip the rows and advance over the emitted tokens below.
+    verify_procs = _live_processors(procs, k + 1)
+    deferred_procs = [p for p in procs or [] if p not in (verify_procs or [])]
 
     # --- backbone verify forward + single host sync ---
     t0 = time.perf_counter()
@@ -4508,17 +4667,19 @@ def _run_verify_cycle_chain(
     state.stats.backbone_ms += verify_ms
     rows = logits[0]  # (k+1, vocab)
     row_snaps: List[Optional[Any]] = [None] * (k + 1)
-    if procs is not None:
+    if verify_procs is not None:
         applied = []
         for j in range(k + 1):
             applied.append(
-                _apply_processors(procs, prev_rows[j], rows[j : j + 1]).squeeze(0)
+                _apply_processors(verify_procs, prev_rows[j], rows[j : j + 1]).squeeze(
+                    0
+                )
             )
             # Checkpoint after each row: rows 0..m correspond to the m+1
             # tokens actually emitted this cycle (m accepted drafts + the
             # bonus/verify correction). Rows m+1..k are speculative — they
             # predict rejected drafts and are re-verified next cycle.
-            row_snaps[j] = _snap_snapshotable(procs)
+            row_snaps[j] = _snap_snapshotable(verify_procs)
         rows = mx.stack(applied)
     combined_lp = rows - mx.logsumexp(rows, axis=-1, keepdims=True)  # (k+1, V)
     # A block drafter can start the next block on the GPU while the host
@@ -4531,6 +4692,20 @@ def _run_verify_cycle_chain(
         and not defer_commit
     )
     predrafted = False
+    prepared_block = None
+    dspark = None
+    prepare_block = None
+    if (
+        k > 0
+        and drafter is None
+        and sync is None
+        and not defer_commit
+        and draft_jobs is None
+        and commit_cache is None
+        and gdn_states is None
+    ):
+        dspark = _dspark_host(gen_batch.model)
+        prepare_block = getattr(dspark, "dspark_prepare_block", None)
 
     if k == 0:
         # Depth-0 cycle (controller escape hatch): the forward above was a
@@ -4563,6 +4738,17 @@ def _run_verify_cycle_chain(
                     m_arr,
                     mx.take(targets, m_arr),
                 )
+            elif prepare_block is not None:
+                prepared_block = _queue_dspark_block(
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    host_arr,
+                    k,
+                    greedy=True,
+                )
             host = host_arr.tolist()
         else:
             host = greedy_result
@@ -4581,8 +4767,15 @@ def _run_verify_cycle_chain(
         # ONE host sync (mirrors the greedy path's sync structure).
         host = stochastic_result
         if host is None:
-            result = _stochastic_verify_tokens(
-                sampler, combined_lp, state.drafts, state.draft_accept_lps
+            result = _verify_stochastic(
+                sampler,
+                combined_lp,
+                state.drafts,
+                state.draft_accept_lps,
+                # A fast-path miss would also discard the queued pre-draft.
+                allow_nucleus=not (
+                    can_predraft and callable(getattr(drafter, "predraft", None))
+                ),
             )
             if can_predraft:
                 m_arr = result[:1]
@@ -4594,7 +4787,28 @@ def _run_verify_cycle_chain(
                 predrafted = _predraft(
                     gen_batch, state, drafter, captured, result, m_arr, anchor
                 )
-            host = result.tolist()
+            elif prepare_block is not None:
+                prepared_block = _queue_dspark_block(
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    result,
+                    k,
+                    greedy=False,
+                )
+            verify_packet = result.tolist()
+            if not verify_packet[-1]:
+                # The dense redraw can choose a different row or correction.
+                prepared_block = None
+            host = _settled_verify(
+                verify_packet,
+                sampler,
+                combined_lp,
+                state.drafts,
+                state.draft_accept_lps,
+            )
         m = int(host[0])
         draft_ids = host[1 : k + 1]
         res_ids = host[k + 1 : 2 * k + 1]
@@ -4665,13 +4879,20 @@ def _run_verify_cycle_chain(
     # MTPProcessingSampler's position-keyed snapshot/restore on vlm_mtp.
     # Uses the FINAL m (after the model clamp and boundary alignment above).
     if m < k and row_snaps[m] is not None:
-        _restore_snapshotable(procs, row_snaps[m])
+        _restore_snapshotable(verify_procs, row_snaps[m])
+    if deferred_procs:
+        # Rows 0..m consumed next_main and the m accepted drafts.
+        emitted_ids = [int(state.next_main.reshape(-1)[0].item())]
+        emitted_ids += [int(d) for d in draft_ids[:m]]
+        _advance_processors(deferred_procs, rows_from, emitted_ids)
 
     # A clamp can put the final verify token on the boundary, while a full
     # accept can put its bonus token there. Neither token is present in the
     # backbone cache yet, so materialize it before the queue reaches it.
     materialize_boundary_emit = align > 0 and to_boundary > 0 and to_boundary == m + 1
     state.boundary_emit_pending = materialize_boundary_emit
+    if materialize_boundary_emit:
+        draft_jobs = None
 
     # --- stats ---
     state.stats.cycles += 1
@@ -4750,6 +4971,7 @@ def _run_verify_cycle_chain(
                 committed,
                 prev_buf,
                 depth=0 if copied else None,
+                prepared_block=prepared_block if m == m_gpu and not copied else None,
             )
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
@@ -5156,11 +5378,12 @@ def _step_mtp(
     )
     mtp_logits_2d = mtp_logits[:, -1, :]
     # The draft is speculative — shape it but do not advance the budget.
-    snap = _snap_snapshotable(procs)
-    if procs is not None and prev_buf is not None:
+    draft_procs = _live_processors(procs, 1)
+    snap = _snap_snapshotable(draft_procs)
+    if draft_procs is not None and prev_buf is not None:
         prev_with_next = mx.concatenate([prev_buf, _ensure_uint32(next_main_tok)])
-        mtp_logits_2d = _apply_processors(procs, prev_with_next, mtp_logits_2d)
-    _restore_snapshotable(procs, snap)
+        mtp_logits_2d = _apply_processors(draft_procs, prev_with_next, mtp_logits_2d)
+    _restore_snapshotable(draft_procs, snap)
     new_lp = _logprobs(mtp_logits_2d)
     new_tok = sampler(new_lp)
     # Filtered draft lp — what the sampler actually drew from. The next

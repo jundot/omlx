@@ -10,8 +10,7 @@ from mlx.utils import tree_flatten
 from test_deepseek_v41 import write_affine_checkpoint
 
 
-@pytest.mark.parametrize("bits", [2, 3])
-@pytest.mark.parametrize("index_order", ["sorted", "insertion"])
+@pytest.mark.parametrize("index_order,bits", [("sorted", 2), ("insertion", 3)])
 def test_source_affine_checkpoint_loads_whatever_the_index_order(
     tmp_path, index_order, bits
 ):

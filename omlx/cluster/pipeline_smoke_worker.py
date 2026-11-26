@@ -75,11 +75,8 @@ def main() -> int:
         )
         with install_pipeline_compatibility(assignments):
             model = Model(args)
-            # MLX's Metal and CUDA random generators are not bit-identical.
-            # Giving each rank a random output head makes a healthy mixed
-            # pipeline appear divergent even though it transported the same
-            # hidden state.  Constant parameters keep this a transport/model
-            # execution assertion rather than an RNG conformance test.
+            # Constant parameters keep this a transport/model execution
+            # assertion rather than an RNG conformance test.
             model.update(
                 tree_map(
                     lambda value: mx.full(

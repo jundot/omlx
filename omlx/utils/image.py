@@ -536,3 +536,14 @@ def compute_per_image_hashes(images: List[Image.Image]) -> List[str]:
         hasher.update(rgb_img.tobytes())
         hashes.append(hasher.hexdigest())
     return hashes
+
+
+def image_hash_prefixes(images: list[Image.Image]) -> list[str]:
+    """``compute_image_hash(images[:k])`` for every k, in one pass."""
+    cumulative = hashlib.sha256()
+    prefixes: list[str] = []
+    for img in images:
+        cumulative.update(f"{img.size[0]}x{img.size[1]}".encode())
+        cumulative.update(img.convert("RGB").tobytes())
+        prefixes.append(cumulative.copy().hexdigest())
+    return prefixes

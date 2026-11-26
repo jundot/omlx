@@ -68,7 +68,13 @@ struct ThroughputBenchScreen: View {
                 promptLengths: $vm.promptLengths,
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
+                forceLmEngine: $vm.forceLmEngine,
+                externalEnabled: $vm.externalEnabled,
+                externalBaseUrl: $vm.externalBaseUrl,
+                externalApiKey: $vm.externalApiKey,
+                externalModel: $vm.externalModel,
                 running: vm.running,
+                queued: vm.queuedAhead != nil,
                 canRun: vm.canRun,
                 pendingFlags: vm.pendingFeatureFlags,
                 onRun: { vm.runBenchmark(client: services.client) },
@@ -79,6 +85,8 @@ struct ThroughputBenchScreen: View {
                 LiveProgressCard(
                     resultCount: vm.singleResults.count + vm.batchResults.count
                 )
+            } else if let ahead = vm.queuedAhead {
+                QueuedCard(ahead: ahead)
             }
 
             MessageBanner(error: vm.lastError)
@@ -166,12 +174,19 @@ private struct ConfigurationSection: View {
     @Binding var promptLengths: Set<Int>
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
+    @Binding var forceLmEngine: Bool
+    @Binding var externalEnabled: Bool
+    @Binding var externalBaseUrl: String
+    @Binding var externalApiKey: String
+    @Binding var externalModel: String
     let running: Bool
+    let queued: Bool
     let canRun: Bool
     let pendingFlags: [String]
     let onRun: () -> Void
     let onCancel: () -> Void
 
+    @State private var advancedOpen = false
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -200,8 +215,11 @@ private struct ConfigurationSection: View {
                     width: .controlWide,
                     options: modelOptions
                 )
+                .disabled(running || externalEnabled)
             }
-            GPUPowerBenchNotice(model: models.first { $0.id == selectedModelId })
+            if !externalEnabled {
+                GPUPowerBenchNotice(model: models.first { $0.id == selectedModelId })
+            }
 
             Row(label: String(localized: "bench.throughput.row.context.label",
                               defaultValue: "Benchmark Context",
@@ -288,10 +306,62 @@ private struct ConfigurationSection: View {
                 .disabled(running)
             }
 
+            FreeRow {
+                DisclosureGroup(isExpanded: $advancedOpen) {
+                    VStack(spacing: 0) {
+                        Row(label: String(localized: "bench.throughput.advanced.force_lm",
+                                          defaultValue: "Force mlx-lm engine",
+                                          comment: "Throughput benchmark option to force the LM engine"),
+                            sublabel: String(localized: "bench.throughput.advanced.force_lm_hint",
+                                             defaultValue: "Use mlx-lm for this benchmark. VLM MTP drafters are ignored, so results measure the LM-only baseline.",
+                                             comment: "Explanation of the force mlx-lm benchmark option")) {
+                            RowSwitch(isOn: $forceLmEngine)
+                                .disabled(externalEnabled)
+                        }
+                        Row(label: String(localized: "bench.throughput.advanced.external",
+                                          defaultValue: "Use external OpenAI-compatible endpoint",
+                                          comment: "Throughput benchmark option to target an external API"),
+                            sublabel: String(localized: "bench.throughput.advanced.external_hint",
+                                             defaultValue: "Benchmark a remote model. The endpoint must support streamed token usage. Results stay local.",
+                                             comment: "Requirements and upload behavior for external throughput benchmarks"),
+                            isLast: !externalEnabled) {
+                            RowSwitch(isOn: $externalEnabled)
+                        }
+                        if externalEnabled {
+                            Row(label: String(localized: "bench.throughput.advanced.base_url",
+                                              defaultValue: "Base URL",
+                                              comment: "External benchmark API base URL field label")) {
+                                TextInput(text: $externalBaseUrl, placeholder: "https://api.openai.com/v1",
+                                          width: .controlWide)
+                            }
+                            Row(label: String(localized: "bench.throughput.advanced.api_key",
+                                              defaultValue: "API key",
+                                              comment: "External benchmark API key field label")) {
+                                TextInput(text: $externalApiKey, isSecure: true, width: .controlWide)
+                            }
+                            Row(label: String(localized: "bench.throughput.advanced.model",
+                                              defaultValue: "Model ID",
+                                              comment: "External benchmark model identifier field label"),
+                                isLast: true) {
+                                TextInput(text: $externalModel, placeholder: "gpt-4o-mini", width: .controlWide)
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+                } label: {
+                    Text(String(localized: "bench.throughput.advanced.title",
+                                defaultValue: "Advanced options",
+                                comment: "Disclosure label for advanced throughput benchmark options"))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                        .foregroundStyle(theme.text)
+                }
+                .disabled(running)
+            }
+
             Row(isLast: true) {
                 HStack {
                     Spacer()
-                    if running {
+                    if running || queued {
                         Button {
                             onCancel()
                         } label: {
@@ -411,6 +481,31 @@ private struct Chip: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Queued
+
+private struct QueuedCard: View {
+    let ahead: Int
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        ListGroup {
+            FreeRow(isLast: true) {
+                HStack(spacing: 10) {
+                    Image(systemName: "hourglass")
+                        .foregroundStyle(theme.textSecondary)
+                    Text(String(localized: "bench.throughput.progress.queued",
+                                defaultValue: "Queued — \(ahead) run(s) ahead; starts automatically",
+                                comment: "Throughput Bench queue label; placeholder is the number of runs ahead"))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
+                        .foregroundStyle(theme.textSecondary)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
     }
 }
 
@@ -925,9 +1020,8 @@ private struct OwnerHashRow: View {
     }
 }
 
-/// Kept for the external-endpoint case, which still skips. Not reachable from
-/// this screen today (BenchStartRequest has no `external` field), but the
-/// server state exists and a silent EmptyView would be worse.
+/// Shown when the server skips the community upload. Unknown reasons fall
+/// back to a generic message.
 private struct SkippedBanner: View {
     let reason: String?
 
@@ -965,6 +1059,22 @@ private struct SkippedBanner: View {
             return String(localized: "bench.throughput.upload.skipped.external",
                           defaultValue: "External endpoint results are not submitted because they measure remote hardware.",
                           comment: "Skipped-upload reason when the benchmark ran against an external endpoint")
+        case "splash":
+            return String(localized: "bench.throughput.upload.skipped.splash",
+                          defaultValue: "Splash results are not submitted because they measure the Splash engine, not oMLX.",
+                          comment: "Skipped-upload reason when the benchmark ran on the Splash engine")
+        case "ane_aligned_prompt":
+            return String(localized: "bench.throughput.upload.skipped.ane_aligned_prompt",
+                          defaultValue: "ANE-aligned prompt results are not submitted because their prompt lengths do not match the standard PP buckets.",
+                          comment: "Skipped-upload reason when the benchmark used ANE-aligned prompt lengths")
+        case "custom_generation_length":
+            return String(localized: "bench.throughput.upload.skipped.custom_generation_length",
+                          defaultValue: "Results with a generation length other than 128 tokens are not submitted so they stay comparable with other submissions.",
+                          comment: "Skipped-upload reason when the benchmark used a generation length other than 128 tokens")
+        case "lora_adapter":
+            return String(localized: "bench.throughput.upload.skipped.lora_adapter",
+                          defaultValue: "Results with a LoRA adapter are not submitted because the leaderboard lists them under the base model.",
+                          comment: "Skipped-upload reason when the benchmarked model had a LoRA adapter")
         default:
             return String(localized: "bench.throughput.upload.skipped.default",
                           defaultValue: "The server skipped uploading these results.",

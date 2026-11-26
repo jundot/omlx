@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for the Enhanced Readability accessibility toggle.
+r"""Regression tests for the Enhanced Readability accessibility toggle.
 
 These are static-template assertions (no browser render, no server). They pin
 the three behaviors the upstream reviewer asked for:

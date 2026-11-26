@@ -128,7 +128,10 @@ def test_local_truncation_i18n_keys_exist_in_every_locale():
         "acc_bench.results.hit_token_limit",
         "acc_bench.results.finished_within_limit",
         "acc_bench.results.finished_accuracy",
+        "acc_bench.results.token_limit",
         "acc_bench.results.text_export.local_truncation_line",
+        "acc_bench.config.max_tokens",
+        "acc_bench.config.max_tokens_hint",
     }
     for locale_path in I18N_DIR.glob("*.json"):
         translations = json.loads(locale_path.read_text())
@@ -167,7 +170,7 @@ const summary = 'Hit token limit: 2/5 (1 of them scored correct) · '
     };
     const result = {
         model_id: 'demo', benchmark: 'mmlu', accuracy: 0.6, correct: 3,
-        total: 5, time_s: 1, external: false, truncated_count: 2,
+        total: 5, time_s: 1, external: false, max_tokens: 16384, truncated_count: 2,
         truncated_correct_count: 1, finished_count: 3,
         finished_accuracy: 0.6667, question_results: [question],
     };
@@ -178,6 +181,7 @@ const summary = 'Hit token limit: 2/5 (1 of them scored correct) · '
 
     state.accDownloadResult(result, 'json');
     const data = JSON.parse(await download.text());
+    assert.equal(data.max_tokens, 16384);
     assert.equal(data.truncated_count, 2);
     assert.equal(data.truncated_correct_count, 1);
     assert.equal(data.finished_count, 3);
@@ -190,6 +194,7 @@ const summary = 'Hit token limit: 2/5 (1 of them scored correct) · '
 
     state.accAllResults = [result];
     assert.ok(state.accBuildText().includes('  ' + summary));
+    assert.ok(/No\s+16384\n/.test(state.accBuildText()));
 
     const allCut = {...result, truncated_count: 5, truncated_correct_count: 0,
                     finished_count: 0, finished_accuracy: null};
@@ -200,6 +205,53 @@ const summary = 'Hit token limit: 2/5 (1 of them scored correct) · '
     const clean = {...result, truncated_count: 0, truncated_correct_count: 0};
     state.accDownloadResult(clean, 'txt');
     assert.ok(!(await download.text()).includes('Hit token limit'));
+})().catch(error => {console.error(error); process.exitCode = 1;});
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=ROOT, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_local_max_tokens_override_reaches_queue_request():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard behavior tests")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const catalog = JSON.parse(fs.readFileSync('omlx_web/i18n/en.json', 'utf8'));
+const sent = [];
+const context = {
+    window: {t: key => catalog[key] ?? key},
+    localStorage: {getItem: () => null},
+    fetch: async (url, opts) => {
+        sent.push(JSON.parse(opts.body));
+        return {ok: true, json: async () => ({queue: []})};
+    },
+};
+const source = fs.readFileSync('omlx_web/static/js/dashboard.js', 'utf8');
+const state = vm.runInNewContext(source + '\n dashboard;', context)();
+
+(async () => {
+    state.accModelId = 'demo';
+    state.accBenchmarks = {livecodebench: true};
+    state.accSampleSizes = {livecodebench: 100};
+
+    state.accMaxTokens = '65536';
+    await state.addToAccQueue();
+    assert.equal(sent[0].max_tokens_override, 65536);
+
+    state.accMaxTokens = '';
+    await state.addToAccQueue();
+    assert.equal(sent[1].max_tokens_override, null);
+
+    state.accMaxTokens = '0';
+    await state.addToAccQueue();
+    assert.equal(sent.length, 2);
+    assert.equal(state.accError, catalog['js.error.external_max_tokens_invalid']);
+    assert.equal(state.accAdvancedOptionsOpen, true);
 })().catch(error => {console.error(error); process.exitCode = 1;});
 """
     result = subprocess.run(

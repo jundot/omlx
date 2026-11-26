@@ -65,6 +65,7 @@ NB_MODULE(_ext, m) {
       "causal_prefix_indices"_a = false,
       "topk_length"_a = nb::none(),
       "causal_prefix_rows"_a = 0,
+      "sinks"_a = nb::none(),
       "stream"_a = nb::none());
   m.def(
       "block_mask_attention",
@@ -76,6 +77,7 @@ NB_MODULE(_ext, m) {
       "block_token_mask"_a,
       "scale"_a,
       "causal"_a = true,
+      "sinks"_a = nb::none(),
       "stream"_a = nb::none());
   m.def(
       "rowwise_gemm",

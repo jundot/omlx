@@ -77,7 +77,7 @@ def resolve_block_extra_keys(
 
 
 # Tail index bounds. Entries are advisory and verified on every lookup.
-_TAIL_INDEX_PER_PARENT = 8
+_TAIL_INDEX_PER_PARENT = 32
 _TAIL_INDEX_MAX_PARENTS = 4096
 
 

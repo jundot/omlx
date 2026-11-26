@@ -389,29 +389,8 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             r = self.self_attn(normed, mask, cache)
         # One token: hc_expand in one exact dispatch.
         x = g5_lang._decode_hc_expand(r, residual, post, comb)
-        # Reuse the stock decode compiler. Larger prefill/batch shapes stay
-        # eager to avoid compiling the full MoE at unbounded token counts.
-        if (
-            self.compile_ffn
-            and x.shape[0] == 1
-            and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
-        ):
-            # One trace per row-exact mode (see Glm5NextDecoderLayer.__call__).
-            exact = g5_lang._row_exact_armed()
-            shape = (x.shape, x.dtype, exact)
-            if x.shape[1] > 1 and shape not in self._ffn_eager_shapes:
-                # Kernel self-checks cannot evaluate their canaries inside a
-                # compiled trace, so each verify shape runs eagerly once.
-                self._ffn_eager_shapes.add(shape)
-                return self._ffn_block(x)
-            if exact:
-                if self._ffn_rc is None:
-                    self._ffn_rc = mx.compile(self._ffn_block)
-                return self._ffn_rc(x)
-            if self._ffn_c is None:
-                self._ffn_c = mx.compile(self._ffn_block)
-            return self._ffn_c(x)
-        return self._ffn_block(x)
+        # The stock FFN half: verify and decode rows share its compiled FFN.
+        return self._ffn_half(x)
 
     cls.__call__ = __call__
     cls._omlx_mtp_sink_patched = True

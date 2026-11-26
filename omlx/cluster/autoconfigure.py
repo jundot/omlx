@@ -151,6 +151,7 @@ def choose_parallelism(
     context_tokens: int = 8192,
     head_rank_extra_bytes: int = 0,
     engram_ssd_offload: bool = False,
+    tensor_split: Any = "auto",
 ) -> ParallelismChoice:
     """Pick the tensor-parallel degree and produce the plan it implies.
 
@@ -216,9 +217,12 @@ def choose_parallelism(
         candidates = tuple(size for size in candidates if size > 1)
         if not candidates:
             raise PlanningError(
-                "this model cannot use more than one Mac: its architecture "
-                "implements neither MLX-LM pipeline nor a compatible "
-                "tensor-parallel split"
+                "this model cannot use more than one Mac: "
+                + (
+                    model.unsupported_reason
+                    or "its architecture implements neither MLX-LM pipeline nor "
+                    "a compatible tensor-parallel split"
+                )
             )
 
     measured_choice = False
@@ -274,6 +278,7 @@ def choose_parallelism(
                 context_tokens=context_tokens,
                 head_rank_extra_bytes=head_rank_extra_bytes,
                 engram_ssd_offload=engram_ssd_offload,
+                tensor_split=tensor_split if tensor_parallel_size > 1 else "auto",
             )
         except PlanningError as exc:
             last_error = exc
@@ -340,9 +345,14 @@ def choose_parallelism(
         raise PlanningError(
             f"no workable split for {len(nodes)} nodes: {last_error}"
         )
+    # Only the link gate skips a candidate without recording an error.
     raise PlanningError(
-        f"no tensor-parallel degree divides {len(nodes)} nodes across "
-        f"architecture dimensions {model.tensor_parallel_divisors}"
+        f"tensor parallelism across {len(nodes)} nodes was not attempted "
+        "because the detected link is too slow for it, and this "
+        "architecture cannot use pipeline stages instead. Detected link: "
+        f"{describe_transports(transports)}. Choose the Tensor strategy "
+        "explicitly to proceed anyway, or check the connection between "
+        "the nodes."
     )
 
 
@@ -695,16 +705,6 @@ def preflight_issues(
                         )
                     )
 
-        node = payload.get("node") or {}
-        if node.get("accelerator") == "cuda" and node.get("memory_kind") == "vram":
-            issues.append(
-                PreflightIssue(
-                    node_id,
-                    "cuda_memory_guard_unavailable",
-                    "discrete CUDA VRAM cannot yet be monitored during model loading",
-                )
-            )
-
         models = payload.get("models")
         if model_path and isinstance(models, (list, tuple)) and model_path not in models:
             issues.append(
@@ -736,7 +736,6 @@ def describe_preflight(issues: Sequence[PreflightIssue]) -> str:
         "model_missing": "missing the model",
         "runtime_mismatch": "running a different MLX version",
         "import_missing": "missing a Python package this model needs",
-        "cuda_memory_guard_unavailable": "using unsupported discrete CUDA memory",
     }
     for kind, nodes in by_kind.items():
         parts.append(f"{', '.join(sorted(set(nodes)))} {labels.get(kind, kind)}")

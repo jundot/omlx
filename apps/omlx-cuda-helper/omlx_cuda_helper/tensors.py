@@ -9,15 +9,30 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from . import checkpoint
+from . import checkpoint, oqh
 from .wire import HostArray
 
+# Cache rows grow every chunk, so a freed buffer never fits again; cap what MLX keeps.
+_CACHE_BYTES = 1 << 30
 
-def memory_limit() -> int:
-    """GPU bytes a stage may hold before it gives a prompt back, or 0."""
-    info = mx.device_info()
-    total = info.get("total_memory") or info.get("memory_size") or 0
-    return int(total * 0.95)
+
+def limit_memory(limit: int) -> None:
+    """Hold MLX's buffers, cached ones included, under *limit* bytes: past it
+    the allocator frees its cache before it allocates."""
+    mx.set_cache_limit(_CACHE_BYTES)
+    if limit:
+        mx.set_memory_limit(limit)
+
+
+def release_cache() -> None:
+    mx.clear_cache()
+
+
+def peak_bytes() -> int:
+    """Peak GPU bytes since the last call."""
+    peak = mx.get_peak_memory()
+    mx.reset_peak_memory()
+    return peak
 
 
 def check_backend() -> None:
@@ -69,6 +84,10 @@ def from_host(value: HostArray) -> mx.array:
 # Set by the worker where kernels read CUDA managed memory slowly (an integrated
 # GPU, WSL): weights then load on the GPU stream, into the GPU's memory pool.
 weights_on_gpu = False
+
+# Set by the worker when a family keeps its affine weights packed to hold more
+# layers.
+packed_weights = False
 
 
 def load(model_dir: str | Path, names: list[str]) -> dict[str, mx.array]:
@@ -128,7 +147,17 @@ class Linear:
     ):
         weight = weights[f"{prefix}.weight"]
         self.quant = None
-        if f"{prefix}.scales" in weights:
+        # oQh: the input rotation (signs, block) and the row scale of wide codes.
+        self.rotation = None
+        self.post = None
+        if oqh.is_oqh(weights, prefix):
+            if not dense:
+                raise ValueError(f"oQh {prefix} is read only as a dense weight")
+            scales, biases, sizes, self.post = oqh.affine_view(weights, prefix)
+            signs = weights[f"{prefix}.{oqh.SIGNS}"]
+            self.rotation = (signs, int(signs.shape[-1]))
+            weight = unpack(weight, scales, biases, sizes, dtype or scales.dtype)
+        elif f"{prefix}.scales" in weights:
             scales, biases = weights[f"{prefix}.scales"], weights.get(
                 f"{prefix}.biases"
             )
@@ -140,11 +169,30 @@ class Linear:
             weight = weight.astype(dtype)
         self.weight = weight
 
+    @property
+    def dtype(self) -> mx.Dtype:
+        """The dtype the layer computes in: the scales' for a packed weight."""
+        return self.weight.dtype if self.quant is None else self.quant[0].dtype
+
     def parameters(self) -> list[mx.array]:
         extra = [a for a in self.quant[:2] if a is not None] if self.quant else []
+        if self.rotation is not None:
+            extra.append(self.rotation[0])
+        if self.post is not None:
+            extra.append(self.post)
         return [self.weight, *extra]
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def rotated(self, x: mx.array) -> mx.array | None:
+        """x in this layer's oQh basis, None for a layer without one."""
+        return None if self.rotation is None else oqh.rotate(x, *self.rotation)
+
+    def __call__(self, x: mx.array, rotated: mx.array | None = None) -> mx.array:
+        """x @ W.T; an oQh layer takes ``rotated`` (its basis) or rotates x."""
+        if self.rotation is not None:
+            x = self.rotated(x) if rotated is None else rotated
+            y = x @ self.weight.T
+            # The host rounds the product, then the row scale product.
+            return y if self.post is None else y * self.post
         if self.quant is None:
             return x @ self.weight.T
         scales, biases, quant = self.quant

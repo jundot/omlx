@@ -10,7 +10,7 @@ is the pure/data half of collapsing that into a single ``POST
 - :func:`nodes_from_deployment` / :func:`hosts_from_deployment` derive the
   plan inputs for the *next* plan from the *current* approved deployment, so
   a replan with no explicit overrides re-plans the same cluster the operator
-  already trusts. A pairing/membership inventory (the v2 discovery/pairing
+  already trusts. A pairing/membership inventory (the discovery/pairing
   modules) can later supply overrides for added or removed nodes; until then
   the explicit ``nodes``/``hosts`` request fields are how membership changes
   are expressed.

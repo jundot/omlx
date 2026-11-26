@@ -33,7 +33,8 @@
   <a href="README.md">English</a> ·
   <a href="README.zh.md">中文</a> ·
   <a href="README.ko.md">한국어</a> ·
-  <b>日本語</b>
+  <b>日本語</b> ·
+  <a href="README.it.md">Italiano</a>
 </p>
 
 ---
@@ -118,7 +119,7 @@ brew services restart omlx  # 再起動
 brew services info omlx     # ステータス確認
 ```
 
-サービスはデフォルト設定で`omlx serve`を実行します（`~/.omlx/models`、ポート8000）。カスタマイズするには、環境変数（`OMLX_MODEL_DIR`、`OMLX_PORT`など）を設定するか、`omlx serve --model-dir /your/path`を一度実行して`~/.omlx/settings.json`に設定を保存してください。
+サービスはデフォルト設定で`omlx serve`を実行します（`~/.omlx/models`、ポート8000）。カスタマイズするには、`omlx serve --model-dir /your/path`を一度実行して`~/.omlx/settings.json`に設定を保存してください。
 
 ログは2か所に記録されます：
 - **サービスログ**: `$(brew --prefix)/var/log/omlx.log`（stdout/stderr）
@@ -235,6 +236,7 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/rerank` | ドキュメントリランキング |
 | `POST /v1/systemone` | Decision モデルまたはチャットモデルによる型付き判定 (TypeSafe System One) |
 | `GET /v1/models` | 利用可能なモデル一覧 |
+| `GET /v1/models/{model_id}` | モデルを1件取得 |
 | `POST /tokenize`, `POST /detokenize` | vLLM 互換トークナイザー API（`/v1` 配下でも利用可） |
 
 設定、モデル、ダウンロード、量子化、ベンチマークを扱う管理APIは、メインAPIキーをBearerトークンとして受け付け、headlessモードでも動作します。[Admin API](docs/admin-api.md)を参照してください。

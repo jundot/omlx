@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "mlx/array.h"
 #include "mlx/stream.h"
 #include "mlx/utils.h"
@@ -16,6 +18,7 @@ mx::array block_mask_attention(
     const mx::array& block_token_mask,
     float scale,
     bool causal = true,
+    const std::optional<mx::array>& sinks = std::nullopt,
     mx::StreamOrDevice s = {});
 
 } // namespace omlx::attention

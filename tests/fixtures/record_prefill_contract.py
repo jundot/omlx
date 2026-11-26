@@ -108,6 +108,11 @@ CONFIGS = {
         },
     },
     "deepseek_v41": _deepseek_v41_config,
+    # The runtime layout (oQ's), with each layer's expert carrier.
+    "inkling2": lambda lm: {
+        "model_type": "inkling2",
+        "text_config": asdict(lm.args.text),
+    },
 }
 # family -> other files of the checkpoint folder a helper reads (name -> text).
 SIDECARS = {

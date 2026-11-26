@@ -50,9 +50,10 @@ enter the combine. Prefill, multi-row calls and every other shape keep the
 original body. If the first launch fails, the patch disables itself and the
 block keeps its composed body.
 
-Row-exact MTP verify windows (1..8 rows whose logits must equal serial
-decode) run the same arithmetic for the whole window in the same launches:
-the router gemv over all rows (``qwen35_moe_router.router_gemv``), then
+MTP verify windows (1..16 rows) run the same arithmetic for the whole window
+in the same launches: the router gemv over all rows
+(``qwen35_moe_router.router_gemv``, or the block's quantized gate through
+``row_exact_qmv``), then
 window variants of the launches above in which each threadgroup serves one
 row with the one-token source verbatim (threadgroups of one weight block for
 consecutive rows are adjacent, so shared experts are fetched once through
@@ -61,9 +62,9 @@ rows on the recomputed selections cost more than the routing launch
 (``softmax_topk_rows``) they save, so it runs on its own. Every row is
 bit-identical to the fused one-token call on that row. This replaces the
 verifier's composed MoE (about fifteen launches, two of them binding the
-whole stacked experts) only while row-exact verify is armed and the block
-folds its shared expert; one-row windows run the one-token launches. If the
-first window launch fails, the verifier keeps its composed MoE.
+whole stacked experts) in every armed verify, row-exact or not, when the
+block folds its shared expert; one-row windows run the one-token launches.
+If the first window launch fails, the verifier keeps its composed MoE.
 
 MLX commits a command buffer once the inputs bound to it exceed its size cap
 (50 MB by default), counting each input array whole. The stacked expert
@@ -97,7 +98,9 @@ from .qwen35_moe_router import (
     softmax_topk_row,
     softmax_topk_rows,
 )
+from .qwen35_verify_qmm import _is_armed as is_verify_armed
 from .qwen35_verify_qmm import is_row_exact_armed
+from .row_exact_qmv import quantized_linear as row_exact_linear
 
 logger = logging.getLogger(__name__)
 
@@ -906,7 +909,7 @@ def routed_window_logits(plan: _Plan, x, logits):
 
 
 def routed_verify_window(block, x):
-    """The block's output for a row-exact verify window ``x`` ([B, L, hidden],
+    """The block's output for a verify window ``x`` ([B, L, hidden],
     1..``WINDOW_MAX_ROWS`` rows), each row bit-identical to the fused
     one-token call on that row, or None outside the fused layout.
 
@@ -928,16 +931,19 @@ def routed_verify_window(block, x):
     ):
         return None
     plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
-    if (
-        plan is None
-        or plan.hidden != hidden
-        or plan.dtype != x.dtype
-        or not plan.fold
-        or plan.router_logits is None
-    ):
+    if plan is None or plan.hidden != hidden or plan.dtype != x.dtype or not plan.fold:
+        return None
+    gate = block.get("gate")
+    if plan.router_logits is None and not _quantized_ok(gate, nn.QuantizedLinear):
         return None
     x = x.reshape(rows, hidden)
-    logits = plan.router_logits(x)
+    if plan.router_logits is not None:
+        logits = plan.router_logits(x)
+    elif rows == 1:
+        logits = gate(x)
+    else:
+        # Stock quantized_matmul changes kernels with the row count.
+        logits = row_exact_linear(gate, x)
     folded = _topk_folds(plan, logits)
     if not folded:
         routing = softmax_topk_rows(logits, plan.top_k, WINDOW_MAX_ROWS)
@@ -963,11 +969,11 @@ def routed_verify_window(block, x):
 
 
 def _ensure_verify_window_patch(cls) -> None:
-    """Serve row-exact verify MoE blocks through ``routed_verify_window``.
+    """Serve verify MoE blocks through ``routed_verify_window``.
 
     Wraps the mlx-vlm verifier's ``_feed_forward`` (the router patch's verify
-    entry) for ``cls`` blocks while row-exact verify is armed; other verify
-    modes, blocks and shapes keep the wrapped body."""
+    entry) for ``cls`` blocks while a verify is armed; other blocks and shapes
+    keep the wrapped body."""
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 
     original = Qwen3_5BatchInvariantForward._feed_forward
@@ -976,7 +982,8 @@ def _ensure_verify_window_patch(cls) -> None:
 
     @wraps(original)
     def verify_window(self, feed_forward, x):
-        if is_row_exact_armed() and isinstance(feed_forward, cls):
+        armed = is_row_exact_armed() or is_verify_armed()
+        if armed and isinstance(feed_forward, cls):
             y = routed_verify_window(feed_forward, x)
             if y is not None:
                 return y.reshape(x.shape)

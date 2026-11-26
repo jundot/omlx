@@ -250,3 +250,42 @@ class TestDraftGenDoesNotCount:
             f"draft-gen leaked {delta} into the budget counter "
             f"(speculative drafts must not count until emitted)"
         )
+
+
+class TestDraftGenNearBudget:
+    """Near the budget the drafts still carry the forced close-think token."""
+
+    def test_budget_within_reach_forces_the_first_draft(self):
+        proc = _make_budget_processor(2)
+        batch, _cache, buf = _make_batch(proc, emitted=10, k=2)
+        state = _make_state(2, [FILL, FILL], 10)
+        buf.update_and_fetch(mx.array([5], dtype=mx.uint32))
+        proc(buf.tokens, _logits_for([FILL]))  # one emitted thinking token
+        hidden = mx.zeros((1, 1, 8), dtype=mx.float32)
+        committed = mx.array([5], dtype=mx.uint32)
+        bg._chain_next_drafts(batch, state, hidden, committed, buf.tokens)
+        assert state.drafts.tolist()[0] == CLOSE
+        assert proc._thinking_tokens == 1  # drafts still don't count
+
+
+class TestVerifyRowsFarFromBudget:
+    """Far from its budget the processor skips the verify rows and advances
+    over the emitted tokens afterwards; it must still see them all."""
+
+    def test_close_think_among_accepted_drafts_ends_thinking(self, monkeypatch):
+        proc = _make_budget_processor(10_000)
+        emitted, delta = _run_cycle(
+            monkeypatch, proc, emitted=10, k=2, accept_m=2, draft_ids=[FILL, CLOSE]
+        )
+        assert emitted == 3
+        assert proc._done
+        assert not proc._in_thinking
+
+    def test_rejected_drafts_are_not_seen(self, monkeypatch):
+        proc = _make_budget_processor(10_000)
+        emitted, delta = _run_cycle(
+            monkeypatch, proc, emitted=10, k=2, accept_m=0, draft_ids=[CLOSE, FILL]
+        )
+        assert emitted == 1
+        assert not proc._done  # the rejected CLOSE draft never happened
+        assert proc._in_thinking

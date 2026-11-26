@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import subprocess
+from types import SimpleNamespace
+
 from omlx.cluster import model_inventory
 from omlx.cluster.model_inventory import (
     engine_pool_model_inventory,
@@ -7,6 +11,7 @@ from omlx.cluster.model_inventory import (
     remote_model_inventory,
 )
 from omlx.cluster.planner import ModelLayout
+from omlx.cluster.staging import DEFAULT_REMOTE_PYTHON
 
 
 def _model(
@@ -176,6 +181,46 @@ def test_cluster_inventory_endpoint_unions_local_and_peer_models(monkeypatch):
     assert model["location_count"] == 2
 
 
+def test_cluster_inventory_reads_a_peer_without_a_probed_python(monkeypatch):
+    from omlx.cluster import routes
+
+    class Pool:
+        def get_status(self):
+            return {"models": []}
+
+    commands = []
+
+    def ssh(argv, **kwargs):
+        commands.append(argv[-1])
+        payload = [
+            {
+                "model_id": "m3",
+                "model_path": "/models/m3",
+                "model_type": "vlm",
+                "estimated_size": 236,
+            }
+        ]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: Pool())
+    monkeypatch.setattr(subprocess, "run", ssh)
+
+    response = _client().post(
+        "/admin/api/cluster/models",
+        json={
+            "hosts": [
+                {"node_id": "MacBook", "ssh": "127.0.0.1"},
+                {"node_id": "Mac Studio", "ssh": "studio"},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["errors"] == []
+    assert [model["id"] for model in response.json()["models"]] == ["m3"]
+    assert commands[0].startswith(f"{DEFAULT_REMOTE_PYTHON} -c ")
+
+
 def test_catalogue_measures_a_peer_owned_model_on_the_peer(monkeypatch):
     from omlx.cluster import routes
 
@@ -245,20 +290,18 @@ def test_plan_carries_the_selected_model_holder_to_remote_measurement(monkeypatc
         )
 
     monkeypatch.setattr(routes, "remote_model_layout", fake_layout)
-    response = _client().post(
-        "/admin/api/cluster/plan",
-        json={
-            "model_path": "/models/m3",
-            "model_source": "studio",
-            "model_source_python": "/opt/omlx/bin/python",
-            "nodes": [
+    routes._create_cluster_plan(
+        routes.ClusterPlanRequest(
+            model_path="/models/m3",
+            model_source="studio",
+            model_source_python="/opt/omlx/bin/python",
+            nodes=[
                 {"node_id": "MacBook", "capacity_bytes": 1 << 30},
                 {"node_id": "Studio", "capacity_bytes": 1 << 30},
             ],
-        },
+        )
     )
 
-    assert response.status_code == 200
     assert asked == {
         "host": "studio",
         "path": "/models/m3",

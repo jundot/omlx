@@ -22,6 +22,7 @@ mx::array sparse_mla_attention(
     bool causal_prefix_indices = false,
     const std::optional<mx::array>& topk_length = std::nullopt,
     int causal_prefix_rows = 0,
+    const std::optional<mx::array>& sinks = std::nullopt,
     mx::StreamOrDevice s = {});
 
 } // namespace omlx::attention

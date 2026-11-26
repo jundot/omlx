@@ -18,10 +18,11 @@ grow. Layout, per 128-column tile and 64-wide quant group:
 Projections that read the same input (GDN qkv/z, attention q/k/v, MLP
 gate/up) share one buffer, so a verify forward serves them in one dispatch.
 Every row count runs on packed kernels: one row on a SIMD matvec, 2..8 rows
-on a tensor-unit kernel, more rows on a tensor-unit GEMM that dequantizes
-each group tile into threadgroup memory. ``PackedLinear`` does not subclass
-``nn.QuantizedLinear``, so code that reads stock quantized weights directly
-skips it and calls the module instead.
+on a tensor-unit kernel, 9..48 rows on a skinny tensor-unit kernel that reads
+each weight once for all rows, more rows on a tensor-unit GEMM that
+dequantizes each group tile into threadgroup memory. ``PackedLinear`` does not
+subclass ``nn.QuantizedLinear``, so code that reads stock quantized weights
+directly skips it and calls the module instead.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from ..custom_kernels import nax_skinny_qmm
 
 logger = logging.getLogger(__name__)
 
@@ -386,11 +389,24 @@ def _gemm_tile(M: int) -> tuple[int, int, int, int]:
     return 128, 64, 2, 2
 
 
+# Up to 8 rows the small kernel stays: it applies scale and bias after the code
+# dot product, so it rounds less. From 64 rows the GEMM can be faster.
+_SKINNY_MAX_ROWS = nax_skinny_qmm.MAX_ROWS
+
+
+def _skinny(x2: mx.array, w, sc, bi, K: int, N: int) -> mx.array:
+    return nax_skinny_qmm.skinny_qmm(
+        x2, w, sc, bi, K, N, bits=4, packed=True, tile_n=TILE_N
+    )
+
+
 def packed_matmul(x2: mx.array, w, sc, bi, K: int, N: int) -> mx.array:
     """``x2`` (M, K) bf16 times a packed (N, K) weight -> (M, N) bf16."""
     kernels = _kernels()
     M = int(x2.shape[0])
     x2 = mx.contiguous(x2)
+    if _SMALL_ROWS < M <= _SKINNY_MAX_ROWS:
+        return _skinny(x2, w, sc, bi, K, N)
     if M > _SMALL_ROWS:
         bm, bn, wm, wn = _gemm_tile(M)
         (y,) = kernels["gemm"](
@@ -712,8 +728,8 @@ def pack_model(model: Any) -> int:
 
 
 # Row counts that select distinct pipelines: matvec, the tensor-unit kernel
-# with each K-split reduce, and the three GEMM tiles.
-_WARM_ROWS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 65, 513)
+# with each K-split reduce, the skinny 1..3 row fragments, and the GEMM tiles.
+_WARM_ROWS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 33, 49, 65, 513)
 
 
 def warmup(model: Any) -> None:

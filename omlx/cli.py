@@ -179,8 +179,17 @@ def serve_command(args):
     from ._version import __version__
     from . import process_title
     from .integrations.base import bracket_host
-    from .settings import burst_decode_env, init_settings
-    from .logging_config import configure_file_logging, AdminStatsAccessFilter
+    from .settings import (
+        GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        burst_decode_env,
+        init_settings,
+    )
+    from .logging_config import (
+        AdminStatsAccessFilter,
+        configure_file_logging,
+        console_log_level,
+        is_console_handler,
+    )
 
     process_title.set_process_title()
 
@@ -221,6 +230,9 @@ def serve_command(args):
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    for handler in logging.getLogger().handlers:
+        if is_console_handler(handler):
+            handler.setLevel(console_log_level(log_level))
     # Set omlx loggers
     for name in [
         "omlx",
@@ -286,9 +298,10 @@ def serve_command(args):
         sys.exit(1)
 
     # Save CLI args to settings.json if non-default values provided
+    saved_overrides: list[str] = []
     if _has_cli_overrides(args):
         try:
-            settings.save_cli_overrides(args)
+            saved_overrides = settings.save_cli_overrides(args)
             print("Saved CLI arguments to settings.json")
         except Exception as e:
             print(f"Warning: Failed to save settings: {e}")
@@ -302,6 +315,11 @@ def serve_command(args):
         retention_days=settings.logging.retention_days,
     )
     print(f"Log directory: {log_dir}")
+    for change in saved_overrides:
+        logging.getLogger("omlx.cli").info(
+            "CLI flag changed a saved setting, it also applies to future runs: %s",
+            change,
+        )
 
     # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
     # On Metal/MLX crashes (#511, #520), this dumps all Python thread
@@ -333,6 +351,7 @@ def serve_command(args):
         port=settings.server.port,
         log_level=uvicorn_level,
         access_log=show_access_log,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT_S,
     )
     # Bind a socket per host so an occupied port fails fast before model preload.
     # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
@@ -931,6 +950,10 @@ def diagnose_menubar() -> int:
     print()
     print("Note: Restore edits ControlCenter's own StatusKit approval, which")
     print("needs Full Disk Access. Without it, use the System Settings toggle.")
+    print()
+    print("If the log shows notch=true, the icon is behind the camera notch:")
+    print("  the menu bar is full. Quit or turn off a few other menu bar icons,")
+    print("  or use a menubar manager like Ice or Bartender.")
     return 0
 
 

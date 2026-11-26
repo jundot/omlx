@@ -30,34 +30,6 @@ _CLUSTER = _REPO / "omlx" / "cluster"
 # parens: /deployments/${encodeURIComponent(id)}
 
 
-def test_pairing_token_round_trips():
-    from omlx.cluster.discovery import generate_pairing_token, verify_pairing_token
-
-    secret = "correct-horse-battery-staple"
-    assert (
-        verify_pairing_token(
-            generate_pairing_token(shared_secret=secret),
-            shared_secret=secret,
-        )
-        is True
-    )
-
-
-def test_pairing_token_rejects_a_tampered_payload():
-    import base64
-    import json
-
-    from omlx.cluster.discovery import generate_pairing_token, verify_pairing_token
-
-    secret = "correct-horse-battery-staple"
-    payload = json.loads(
-        base64.urlsafe_b64decode(generate_pairing_token(shared_secret=secret))
-    )
-    payload["token"] = "substituted"
-    forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
-    assert verify_pairing_token(forged, shared_secret=secret) is False
-
-
 def test_worker_contract_round_trips_with_tensor_parallelism():
     """Encode/decode must preserve TP, and the hash must notice a change."""
 
@@ -145,24 +117,10 @@ def test_no_unreachable_functions_in_the_cluster_package():
     """
 
     allowed_uncalled = {
-        ("deployment.py", "decode_worker_plan"),
         # Maintainer-only real-collective regression gate. It deliberately is
         # not exposed in the GUI or production route surface.
         ("collective.py", "_run_local_minimax_decode_smoke"),
-        # known_hosts helpers, not yet wired into the pairing flow.
-        ("ssh_keys.py", "add_host_key"),
-        ("ssh_keys.py", "_ssh_executable"),
-        # Cache maintenance, used by tests and available to callers that know
-        # the topology changed.
-        ("discovery.py", "clear_peer_transport_cache"),
-        # Link discovery, exposed ahead of the hostfile builder that will
-        # replace its hand-typed addresses and its empty ClusterHost.rdma.
-        ("transport.py", "resolve_link_addresses"),
-        ("autoconfigure.py", "build_rdma_matrix"),
-        # Peer import preflight, exposed ahead of the /autoconfigure handler
-        # that will call it alongside preflight_issues.
-        ("autoconfigure.py", "peer_import_issues"),
-        # Test hooks that drop process-wide v2 singletons between cases; only
+        # Test hooks that drop process-wide cluster singletons between cases; only
         # the test suite calls them (production swaps via configure_*).
         ("identity.py", "reset_configured_identity"),
         ("registry.py", "reset_configured_device_registry"),
@@ -247,11 +205,6 @@ def test_every_get_route_answers_without_a_server_error(cluster_home):
     app = FastAPI()
     app.include_router(routes.router)
 
-    # Query args each GET needs; anything else is called bare.
-    query = {
-        "/admin/api/cluster/transports": {"hosts": "127.0.0.1"},
-    }
-
     checked = 0
     with TestClient(app) as client:
         for route in routes.router.routes:
@@ -259,19 +212,14 @@ def test_every_get_route_answers_without_a_server_error(cluster_home):
                 continue
             if "{" in route.path:  # needs a real deployment id
                 continue
-            response = client.get(route.path, params=query.get(route.path, {}))
+            response = client.get(route.path)
             # 503 is a legitimate "not configured on this host" answer; only a
             # 500 means the handler itself is mis-wired.
-            assert response.status_code != 500, (
-                f"GET {route.path} returned {response.status_code}: {response.text[:200]}"
-            )
-            if route.path == "/admin/api/cluster/ssh-key":
-                key_path = cluster_home / ".ssh/omlx_cluster"
-                assert response.json()["private_key_path"] == str(key_path)
-                assert key_path.is_file()
-                assert key_path.with_suffix(".pub").is_file()
+            assert (
+                response.status_code != 500
+            ), f"GET {route.path} returned {response.status_code}: {response.text[:200]}"
             checked += 1
-    assert checked >= 5, "expected to smoke several GET routes"
+    assert checked >= 3, "expected to smoke several GET routes"
 
 
 def test_post_routes_reject_a_bad_body_rather_than_crashing():
@@ -286,23 +234,12 @@ def test_post_routes_reject_a_bad_body_rather_than_crashing():
     app.include_router(routes.router)
 
     # Endpoints that act on the machine rather than validate a body. Poking
-    # these blindly is not a smoke test — /ssh-key/generate overwrites the
-    # user's cluster SSH key, and the smoke runners spawn real processes.
+    # these blindly is not a smoke test: they probe peers over SSH or launch
+    # ranks.
     side_effecting = {
-        "/admin/api/cluster/ssh-key/generate",
-        "/admin/api/cluster/ssh-key/store-keychain",
-        "/admin/api/cluster/ssh-key/exchange",
-        "/admin/api/cluster/ssh-key/exchange-token",
         "/admin/api/cluster/peer-probe",
-        "/admin/api/cluster/worker-smoke",
-        "/admin/api/cluster/collective-smoke",
-        "/admin/api/cluster/pipeline-smoke",
         "/admin/api/cluster/deployments",
-        "/admin/api/cluster/pairing-token",
-        "/admin/api/cluster/verify-pairing-token",
     }
-
-    permissive = {"/admin/api/cluster/guidance"}
 
     checked = 0
     with TestClient(app) as client:
@@ -310,12 +247,6 @@ def test_post_routes_reject_a_bad_body_rather_than_crashing():
             if "POST" not in getattr(route, "methods", set()) or "{" in route.path:
                 continue
             if route.path in side_effecting:
-                continue
-            if route.path in permissive:
-                # Explaining a failure must never itself fail — every field is
-                # optional and unknown keys are ignored by design.
-                assert client.post(route.path, json={"x": 1}).status_code == 200
-                checked += 1
                 continue
             response = client.post(route.path, json={"deliberately": "invalid"})
             assert response.status_code == 422, (
@@ -326,122 +257,3 @@ def test_post_routes_reject_a_bad_body_rather_than_crashing():
     assert checked >= 1
 
 
-def test_key_exchange_token_round_trips():
-    """create_key_exchange_token -> verify_key_exchange_token.
-
-    The other half of the pairing flow. Its sibling (the pairing token) was
-    broken in exactly this seam: a generator and a verifier that could never
-    agree, each fine in isolation.
-    """
-
-    import base64
-
-    from omlx.cluster import ssh_keys
-
-    # The fingerprint helper base64-decodes the key blob, so it must be valid.
-    blob = base64.b64encode(b"\x00" * 32).decode()
-    public_key = f"ssh-ed25519 {blob} omlx"
-    token = ssh_keys.create_key_exchange_token(
-        public_key=public_key,
-        node_id="peer-mac",
-        shared_secret="correct-horse-battery-staple",
-    )
-    assert isinstance(token, str) and token
-
-    decoded = ssh_keys.verify_key_exchange_token(
-        token,
-        shared_secret="correct-horse-battery-staple",
-    )
-    assert decoded is not None, "a freshly generated token must verify"
-    assert decoded.node_id == "peer-mac"
-    assert decoded.public_key == public_key
-
-
-def test_key_exchange_rejects_a_tampered_token():
-    import base64
-    import json
-
-    from omlx.cluster import ssh_keys
-
-    blob = base64.b64encode(b"\x00" * 32).decode()
-    token = ssh_keys.create_key_exchange_token(
-        public_key=f"ssh-ed25519 {blob} omlx",
-        node_id="peer-mac",
-        shared_secret="correct-horse-battery-staple",
-    )
-    payload = json.loads(base64.urlsafe_b64decode(token))
-    payload["node_id"] = "attacker-mac"
-    forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
-
-    assert (
-        ssh_keys.verify_key_exchange_token(
-            forged,
-            shared_secret="correct-horse-battery-staple",
-        )
-        is None
-    )
-
-
-def test_key_exchange_rejects_the_wrong_shared_secret():
-    import base64
-
-    from omlx.cluster import ssh_keys
-
-    blob = base64.b64encode(b"\x00" * 32).decode()
-    token = ssh_keys.create_key_exchange_token(
-        public_key=f"ssh-ed25519 {blob} omlx",
-        node_id="peer-mac",
-        shared_secret="correct-horse-battery-staple",
-    )
-
-    assert (
-        ssh_keys.verify_key_exchange_token(
-            token,
-            shared_secret="a-different-shared-secret",
-        )
-        is None
-    )
-
-
-def test_key_exchange_rejects_an_authenticated_ssh_option_target():
-    import base64
-    import hashlib
-    import hmac
-    import json
-
-    from omlx.cluster import ssh_keys
-
-    secret = "correct-horse-battery-staple"
-    blob = base64.b64encode(b"\x00" * 32).decode()
-    token = ssh_keys.create_key_exchange_token(
-        public_key=f"ssh-ed25519 {blob} omlx",
-        node_id="peer-mac",
-        shared_secret=secret,
-    )
-    payload = json.loads(base64.urlsafe_b64decode(token))
-    payload["node_id"] = "-oProxyCommand"
-    signed = {
-        key: payload[key]
-        for key in (
-            "token",
-            "public_key",
-            "fingerprint",
-            "node_id",
-            "created_at",
-            "expires_at",
-        )
-    }
-    payload["signature"] = hmac.new(
-        secret.encode(),
-        json.dumps(signed, sort_keys=True).encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
-
-    assert (
-        ssh_keys.verify_key_exchange_token(
-            forged,
-            shared_secret=secret,
-        )
-        is None
-    )

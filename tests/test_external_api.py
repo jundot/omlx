@@ -801,42 +801,6 @@ class TestExternalChatAdapter:
         assert output.external_status == "http_error"
         assert "429" in output.error_message
 
-    async def test_max_tokens_override_raises_small_budget(self):
-        """Thinking models: the 8192 floor must lift the MMLU 128 budget."""
-        captured = {}
-
-        def handler(request):
-            captured["body"] = json.loads(request.content)
-            return _completion_response()
-
-        adapter, client = self._adapter(handler, max_tokens_override=8192)
-        try:
-            await adapter.chat(
-                messages=[{"role": "user", "content": "q"}],
-                max_tokens=128,
-            )
-        finally:
-            await client.aclose()
-        assert captured["body"]["max_tokens"] == 8192
-
-    async def test_max_tokens_override_never_shrinks_budget(self):
-        """A floor below the benchmark default must not shrink it."""
-        captured = {}
-
-        def handler(request):
-            captured["body"] = json.loads(request.content)
-            return _completion_response()
-
-        adapter, client = self._adapter(handler, max_tokens_override=64)
-        try:
-            await adapter.chat(
-                messages=[{"role": "user", "content": "q"}],
-                max_tokens=128,
-            )
-        finally:
-            await client.aclose()
-        assert captured["body"]["max_tokens"] == 128
-
     async def test_no_override_keeps_benchmark_budget(self):
         captured = {}
 

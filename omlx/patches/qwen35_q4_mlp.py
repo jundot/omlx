@@ -1,10 +1,11 @@
 # ruff: noqa: N806
 """Qwen3.5/3.6 quantized MLP prefill matmul patch.
 
-This is an exact path: it replaces eligible affine QuantizedLinear calls
-inside the Qwen MLP with the same MLX quantized qmm implementation exposed via
-an oMLX native wrapper using a Qwen-friendly tile.  Decode and target-verify
-paths fall through to the original implementation.
+Replaces eligible affine QuantizedLinear calls inside the Qwen MLP with the
+same affine qmm math through an oMLX native wrapper with a Qwen-friendly tile.
+The tile changes the accumulation order, so outputs match stock MLX to
+rounding (about 1 ulp), not bit for bit. Decode and target-verify paths fall
+through to the original implementation.
 """
 
 from __future__ import annotations
@@ -133,6 +134,14 @@ def _qmm_supports_group_size(group_size: int) -> bool:
     return fast.qmm_supports_group_size(group_size)
 
 
+def _native_qmm_has_nax() -> bool:
+    try:
+        from omlx.custom_kernels.quant_matmul import fast
+    except Exception:
+        return False
+    return fast.nax_qmm_kernels_built()
+
+
 def _has_native_qmm() -> bool:
     return _native_qmm_for_bits(4) is not None
 
@@ -155,8 +164,9 @@ def _is_supported_affine_linear_shape(
         return False
     if not _qmm_supports_group_size(int(group_size)):
         return False
-    if group_size == 128 and is_nax_available():
-        # The custom gs128 tile cannot use NAX; stock MLX can on M5 hardware.
+    if is_nax_available() and (group_size == 128 or not _native_qmm_has_nax()):
+        # Stock MLX uses NAX on M5. The custom tile has a NAX kernel only for
+        # gs64, and only when the extension was built with an SDK that has it.
         return False
     bits = getattr(linear, "bits", None)
     if bits not in _SUPPORTED_QMM_BITS or getattr(linear, "mode", None) != "affine":

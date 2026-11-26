@@ -29,11 +29,13 @@ from functools import cache
 import mlx.core as mx
 import mlx.nn as nn
 
-from .moe_verify_gather import _BITS, _GROUP_SIZES, _HEADER, qmv_fast_layout
+from .moe_verify_gather import _GROUP_SIZES, _HEADER, qmv_fast_layout
 
 logger = logging.getLogger(__name__)
 
 MAX_ROWS = 16
+# Affine widths this kernel transcribes (oQ2 through oQ8 layers).
+_BITS = (2, 3, 4, 5, 6, 8)
 # Output columns per simdgroup (qmv's own tile: a threadgroup owns 8).
 _RPS = 4
 # Verify projections run in a dependent chain, so latency wins: below this
@@ -193,14 +195,37 @@ def _group_source(count: int) -> str:
 # qmv's ``qdot`` split in two: the weight terms of a full pack run are decoded
 # once per K block and output column, then every row accumulates them against
 # its own inputs. Each term and each accumulation step is qdot's, in qdot's
-# order (the 5/6-bit runs cover at most two packs, so qdot's cumulative
-# pointer steps are the 8i/5i and 4i/3i offsets used here).
+# order (the 3/5/6-bit runs cover at most two packs, so qdot's cumulative
+# pointer steps are the 8i/3i, 8i/5i and 4i/3i offsets used here).
 _DECODED_DOT = r"""
-constant constexpr int W_TERMS = (BITS == 5) ? 12 * VALUES_PER_THREAD / 8
-    : ((BITS == 6) ? 6 * VALUES_PER_THREAD / 4 : VALUES_PER_THREAD);
+constant constexpr int W_TERMS = (BITS == 3) ? 10 * VALUES_PER_THREAD / 8
+    : ((BITS == 5) ? 12 * VALUES_PER_THREAD / 8
+    : ((BITS == 6) ? 6 * VALUES_PER_THREAD / 4 : VALUES_PER_THREAD));
 
 inline void decode_w(const device uint8_t* w, thread float* wq) {
-  if (BITS == 4) {
+  if (BITS == 2) {
+    for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+      wq[4 * i] = w[i] & 0x03;
+      wq[4 * i + 1] = w[i] & 0x0c;
+      wq[4 * i + 2] = w[i] & 0x30;
+      wq[4 * i + 3] = w[i] & 0xc0;
+    }
+  } else if (BITS == 3) {
+    for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
+      const device uint8_t* wb = w + 3 * i;
+      thread float* wv = wq + 10 * i;
+      wv[0] = wb[0] & 0x07;
+      wv[1] = wb[0] & 0x38;
+      wv[2] = wb[0] & 0xc0;
+      wv[3] = wb[1] & 0x01;
+      wv[4] = wb[1] & 0x0e;
+      wv[5] = wb[1] & 0x70;
+      wv[6] = wb[1] & 0x80;
+      wv[7] = wb[2] & 0x03;
+      wv[8] = wb[2] & 0x1c;
+      wv[9] = wb[2] & 0xe0;
+    }
+  } else if (BITS == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
       wq[4 * i] = ws[i] & 0x000f;
@@ -245,7 +270,28 @@ inline void decode_w(const device uint8_t* w, thread float* wq) {
 
 inline float wdot(const thread float* wq, const thread float* x) {
   float accum = 0;
-  if (BITS == 4) {
+  if (BITS == 2) {
+    for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+      accum +=
+          (x[4 * i] * wq[4 * i] + x[4 * i + 1] * wq[4 * i + 1] +
+           x[4 * i + 2] * wq[4 * i + 2] + x[4 * i + 3] * wq[4 * i + 3]);
+    }
+  } else if (BITS == 3) {
+    for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
+      const thread float* xv = x + 8 * i;
+      const thread float* wv = wq + 10 * i;
+      accum += wv[0] * xv[0];
+      accum += wv[1] * xv[1];
+      accum += wv[2] * xv[2];
+      accum += wv[3] * (xv[2] * 256.0f);
+      accum += wv[4] * xv[3];
+      accum += wv[5] * xv[4];
+      accum += wv[6] * xv[5];
+      accum += wv[7] * (xv[5] * 256.0f);
+      accum += wv[8] * xv[6];
+      accum += wv[9] * xv[7];
+    }
+  } else if (BITS == 4) {
     for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
       accum +=
           (x[4 * i] * wq[4 * i] + x[4 * i + 1] * wq[4 * i + 1] +
@@ -388,7 +434,9 @@ def _group_kernel(bits: int, group_size: int, fast: bool, count: int, unrolled: 
 
 
 def _values_per_thread(bits: int, fast: bool) -> int:
-    return (8 if bits == 5 else (4 if bits == 6 else 32 // bits)) * (2 if fast else 1)
+    pack = 8 if bits in (3, 5) else (4 if bits == 6 else 32 // bits)
+    # qmv_fast reads one pack per thread at 2 bits, two otherwise.
+    return pack * (2 if fast and bits > 2 else 1)
 
 
 def _kernel_supported(linear: nn.QuantizedLinear, x: mx.array) -> bool:
@@ -405,6 +453,10 @@ def _kernel_supported(linear: nn.QuantizedLinear, x: mx.array) -> bool:
         return False
     n = int(linear.weight.shape[0])
     k = int(linear.scales.shape[-1]) * group_size
+    if k in (64, 128) and bits in (2, 4, 8):
+        # One-row calls of this width run MLX's qmv_quad, not the qmv order
+        # this kernel follows.
+        return False
     fast = qmv_fast_layout(k, n, bits)
     return (
         x.shape[-1] == k

@@ -12,7 +12,11 @@ from urllib.error import HTTPError, URLError
 import pytest
 
 from omlx.cluster.pairing import PairingRequestError
-from tests.test_cluster_pairing import _loopback_pair, _manager
+from tests.test_cluster_pairing import (  # noqa: F401
+    _loopback_pair,
+    _manager,
+    cheap_pbkdf2,
+)
 
 
 def _restart(tmp_path, old):
@@ -41,7 +45,7 @@ def test_restart_preserves_code_and_cancel_proof(tmp_path):
 
 
 def test_restart_can_complete_approval_with_original_code(tmp_path):
-    coordinator, joiner, _, enrollments, _ = _loopback_pair(tmp_path)
+    coordinator, joiner, enrollments, _ = _loopback_pair(tmp_path)
     shown = joiner.ui_session.begin("coordinator:8000")
     restored = _restart(tmp_path, joiner)
     coordinator.approve(joiner.node_id, shown["code"])
@@ -54,7 +58,7 @@ def test_restart_can_complete_approval_with_original_code(tmp_path):
 
 
 def test_join_completes_without_a_dashboard_asking_for_approval(tmp_path):
-    coordinator, joiner, _, enrollments, _ = _loopback_pair(tmp_path)
+    coordinator, joiner, enrollments, _ = _loopback_pair(tmp_path)
     joiner.join_watch_s = 0.01
     shown = joiner.ui_session.begin("coordinator:8000")
     coordinator.approve(joiner.node_id, shown["code"])

@@ -41,9 +41,11 @@ def sparse_mla_attention(
     topk_length: mx.array | None = None,
     causal_prefix_rows: int = 0,
     *,
+    sinks: mx.array | None = None,
     stream=None,
 ) -> mx.array:
     if _ext is not None:
+        extra = {} if sinks is None else {"sinks": sinks}
         return _ext.sparse_mla_attention(
             q_latent,
             q_pe,
@@ -56,6 +58,7 @@ def sparse_mla_attention(
             causal_prefix_indices=causal_prefix_indices,
             topk_length=topk_length,
             causal_prefix_rows=causal_prefix_rows,
+            **extra,
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("sparse_mla_attention native kernel is unavailable")
@@ -70,9 +73,11 @@ def block_mask_attention(
     scale: float,
     causal: bool = True,
     *,
+    sinks: mx.array | None = None,
     stream=None,
 ) -> mx.array:
     if _ext is not None and hasattr(_ext, "block_mask_attention"):
+        extra = {} if sinks is None else {"sinks": sinks}
         return _ext.block_mask_attention(
             q,
             k,
@@ -81,6 +86,7 @@ def block_mask_attention(
             block_token_mask,
             scale,
             causal=causal,
+            **extra,
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("block_mask_attention native kernel is unavailable")

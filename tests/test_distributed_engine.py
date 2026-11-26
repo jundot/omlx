@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from omlx.api.thinking import ThinkingParser, extract_thinking
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -1468,3 +1469,64 @@ async def test_local_stop_passes_scope_to_supervisor(monkeypatch):
     assert calls == [{"local_only": True}]
     assert engine._client is None
     assert not engine._loaded
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_recovers_reasoning_only_reply_as_content():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning": "Paris is the answer.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat([{"role": "user", "content": "Capital?"}])
+    finally:
+        await engine._client.aclose()
+
+    assert extract_thinking(output.text) == ("", "Paris is the answer.")
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_recovers_reasoning_only_reply_as_content():
+    events = [
+        {"choices": [{"delta": {"reasoning": "Paris "}, "finish_reason": None}]},
+        {"choices": [{"delta": {"reasoning": "is it."}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 2}},
+    ]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+
+    def handler(request):
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=content
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Capital?"}]
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    parser = ThinkingParser()
+    for output in outputs:
+        parser.feed(output.new_text)
+    assert parser.finish() == ("", "Paris is it.")

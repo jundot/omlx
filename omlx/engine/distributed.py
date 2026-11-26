@@ -909,14 +909,19 @@ raise SystemExit(2)
         return normalized or None
 
     @staticmethod
-    def _join_reasoning_and_content(reasoning: Any, content: Any) -> str:
+    def _join_reasoning_and_content(
+        reasoning: Any, content: Any, tool_calls: Any = None
+    ) -> str:
         """Carry private structured reasoning through GenerationOutput safely."""
 
         reasoning_text = reasoning if isinstance(reasoning, str) else ""
         content_text = content if isinstance(content, str) else ""
-        if reasoning_text:
+        if not reasoning_text:
+            return content_text
+        # A reasoning-only reply stays open so extract_thinking recovers it as content.
+        if content_text or tool_calls:
             return f"<think>{reasoning_text}</think>{content_text}"
-        return content_text
+        return f"<think>{reasoning_text}"
 
     async def _enter_request(self, request_id: str | None = None) -> str:
         async with self._active_lock:
@@ -1314,6 +1319,7 @@ raise SystemExit(2)
             text = self._join_reasoning_and_content(
                 message.get("reasoning") or message.get("reasoning_content"),
                 message.get("content"),
+                tool_calls=tool_calls,
             )
             return GenerationOutput(
                 text=text,
@@ -1568,10 +1574,7 @@ raise SystemExit(2)
             self._mark_backend_finished(request_id)
             await self._leave_request(request_id)
 
-        pending_final_text = ""
-        if reasoning_open:
-            pending_final_text = "</think>"
-            full_text += pending_final_text
+        # Keep an open think block open; the thinking parser recovers it as content.
         tool_calls = self._normalize_backend_tool_calls(
             [backend_tool_calls[index] for index in sorted(backend_tool_calls)]
         )
@@ -1586,7 +1589,7 @@ raise SystemExit(2)
         )
         yield GenerationOutput(
             text=full_text,
-            new_text=pending_final_text,
+            new_text="",
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             finish_reason=("tool_calls" if tool_calls else (finish_reason or "stop")),
@@ -2052,6 +2055,11 @@ raise SystemExit(2)
         self._validate_request_features(kwargs)
         await self._require_healthy_cluster()
         return None
+
+    def active_request_count(self) -> int:
+        if self.runtime_failed_reason is not None:
+            return 0
+        return self._active_requests
 
     def has_active_requests(self) -> bool:
         if self.runtime_failed_reason is not None:

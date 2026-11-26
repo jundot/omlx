@@ -130,7 +130,6 @@ def test_wide_affine_prefetch_keeps_rows_and_enforces_bound(
 
     monkeypatch.setattr(disk, "_read_rows", observe)
     try:
-        expected = read(unique_ids)
         with prefetch.forward():
             prefetch.submit(disk, ids)
             assert (prefetch._pending is not None) is admitted
@@ -138,12 +137,12 @@ def test_wide_affine_prefetch_keeps_rows_and_enforces_bound(
                 actual = prefetch._pending[1].result(timeout=10)
                 np.testing.assert_array_equal(disk._prefetched[0], unique_ids)
                 assert threads == ["v41-engram_0"]
+                expected = read(unique_ids)
+                for (got, got_dtype), (want, want_dtype) in zip(actual, expected):
+                    assert got_dtype == want_dtype
+                    np.testing.assert_array_equal(got, want)
             else:
                 assert threads == []
-                actual = disk._read_rows(unique_ids)
-            for (got, got_dtype), (want, want_dtype) in zip(actual, expected):
-                assert got_dtype == want_dtype
-                np.testing.assert_array_equal(got, want)
         assert prefetch._pending is None and disk._prefetched is None
     finally:
         prefetch.close()
@@ -868,7 +867,7 @@ def test_parallel_pages_preserve_order_short_reads_and_warm_hits(tmp_path, monke
         return original(fd, min(count, 4096), offset)
 
     monkeypatch.setattr(storage.os, "pread", short_read)
-    ids = np.tile(np.array([4095, 0, 255, 256, 1023, 256]), 32)
+    ids = np.tile(np.array([4095, 0, 255, 256, 1023, 256]), 80)
     try:
         actual, dtype = reader.read("w", ids)
         assert dtype == "U8" and calls
@@ -884,24 +883,39 @@ def test_parallel_pages_preserve_order_short_reads_and_warm_hits(tmp_path, monke
     assert reader._seen_pages is None
 
 
-def test_decode_rows_prefetch_their_pages(tmp_path, monkeypatch):
-    reader, raw = page_table(tmp_path)
-    original = storage.os.pread
-    calls = []
+def test_decode_lookup_advises_every_page_before_copying(tmp_path, monkeypatch):
+    path = tmp_path / "affine.safetensors"
+    weights = np.arange(4096 * 16, dtype=np.uint32).reshape(4096, 16)
+    tensors = {"w": (weights, "U32")}
+    tensors |= {k: (np.ones((4096, 4), dtype=np.float16), "F16") for k in "sb"}
+    raw_safetensors(path, tensors)
+    events, reads = [], []
+    advise, read = storage.TensorFile.advise_rows, storage.TensorFile.read
 
-    def counted(fd, count, offset):
-        calls.append(offset)
-        return original(fd, count, offset)
+    def advised(self, key, rows):
+        events.append(("advise", key))
+        return advise(self, key, rows)
 
-    monkeypatch.setattr(storage.os, "pread", counted)
+    def copied(self, key, *args, **kwargs):
+        events.append(("read", key))
+        return read(self, key, *args, **kwargs)
+
+    monkeypatch.setattr(storage.TensorFile, "advise_rows", advised)
+    monkeypatch.setattr(storage.TensorFile, "read", copied)
+    monkeypatch.setattr(storage.os, "pread", lambda *args: reads.append(args))
+    embed = storage.DiskEngramEmbedding(
+        path, "w", "s", bias_key="b", bits=4, group_size=32
+    )
     try:
-        # One decode token selects 24 Engram rows per table.
-        ids = np.arange(24)
-        actual, _ = reader.read("w", ids)
-        np.testing.assert_array_equal(actual, raw[ids])
-        assert calls
+        # A full decode or verify batch, spread over many pages.
+        ids = np.arange(0, 3840, 10).reshape(16, 24)
+        data = embed._read_rows(ids)
+        np.testing.assert_array_equal(data[0][0], weights[ids.reshape(-1)])
+        # The I/O pool reads one tensor at a time; advice starts all of them.
+        assert not reads
+        assert [kind for kind, _ in events] == ["advise"] * 3 + ["read"] * 3
     finally:
-        reader.close()
+        embed.close()
 
 
 def test_wide_mixed_reads_only_read_rows_on_new_pages(tmp_path, monkeypatch):
@@ -928,16 +942,12 @@ def test_wide_mixed_reads_only_read_rows_on_new_pages(tmp_path, monkeypatch):
         actual, _ = reader.read("w", rows)
         np.testing.assert_array_equal(actual, raw[rows])
         assert calls == [(offset, offset + row_bytes)]
-        # Narrow mixed reads, such as decode, still read every row.
+        # Narrow reads, such as decode, copy every row from the mapping.
         calls.clear()
         narrow = np.array([2, 3000, 15])
         actual, _ = reader.read("w", narrow)
         np.testing.assert_array_equal(actual, raw[narrow])
-        for row in narrow:
-            begin = reader._start + int(row) * row_bytes
-            assert any(
-                low <= begin and begin + row_bytes <= high for low, high in calls
-            )
+        assert not calls
     finally:
         reader.close()
 
@@ -1026,7 +1036,7 @@ def test_page_read_failure_drains_workers_before_close(tmp_path, monkeypatch):
 
 def test_slow_warm_gather_rearms_page_prefetch(tmp_path, monkeypatch):
     reader, _ = page_table(tmp_path)
-    ids = np.arange(256)
+    ids = np.arange(512)
     try:
         reader.read("w", ids)
         assert reader._seen_pages is not None

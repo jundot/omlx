@@ -32,8 +32,6 @@ class RuntimeCapability:
     mlx_lm_version: str
     python_version: str
     macos_version: str
-    os_name: str = "darwin"
-    os_version: str = "unknown"
     python_executable: str = ""
 
     def to_dict(self) -> dict[str, str]:
@@ -43,8 +41,6 @@ class RuntimeCapability:
             "mlx_lm_version": self.mlx_lm_version,
             "python_version": self.python_version,
             "macos_version": self.macos_version,
-            "os_name": self.os_name,
-            "os_version": self.os_version,
             "python_executable": self.python_executable,
         }
 
@@ -54,7 +50,6 @@ class RDMACapability:
     control_status: str
     devices: tuple[str, ...]
     addresses: tuple[tuple[str, str], ...] = ()
-    network_interfaces: tuple[tuple[str, str], ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -66,7 +61,6 @@ class RDMACapability:
             "enabled": self.enabled,
             "devices": list(self.devices),
             "addresses": dict(self.addresses),
-            "network_interfaces": dict(self.network_interfaces),
         }
 
 
@@ -126,19 +120,6 @@ class ClusterStatus:
     admission_ceiling_bytes: int = 0
     warnings: tuple[str, ...] = ()
     protocol_version: str = CLUSTER_PROTOCOL_VERSION
-    # Accelerator identity is deliberately explicit. Inferring CUDA from a
-    # chip-name substring made the dashboard presentation drive scheduling
-    # policy and could turn an unrecognised NVIDIA device into a Mac.
-    accelerator: str = "metal"
-    accelerator_vendor: str = "apple"
-    memory_kind: str = "unified"
-    distributed_backends: tuple[str, ...] = ()
-    # A worker may advertise a verified high-speed fabric group. Members with
-    # the same ID are presented as one logical supernode while retaining their
-    # individual rank, memory, and health records.
-    fabric_kind: str | None = None
-    fabric_group_id: str | None = None
-    fabric_verified: bool = False
 
     @property
     def thunderbolt_peer_connected(self) -> bool:
@@ -155,13 +136,6 @@ class ClusterStatus:
                 "physical_memory_bytes": self.physical_memory_bytes,
                 "recommended_working_set_bytes": self.recommended_working_set_bytes,
                 "admission_ceiling_bytes": self.admission_ceiling_bytes,
-                "accelerator": self.accelerator,
-                "accelerator_vendor": self.accelerator_vendor,
-                "memory_kind": self.memory_kind,
-                "distributed_backends": list(self.distributed_backends),
-                "fabric_kind": self.fabric_kind,
-                "fabric_group_id": self.fabric_group_id,
-                "fabric_verified": self.fabric_verified,
             },
             "runtime": self.runtime.to_dict(),
             "transport": {

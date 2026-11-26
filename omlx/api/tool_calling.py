@@ -205,6 +205,13 @@ _SCHEMA_CONTAINER_TYPES = {"object", "array", "arr"}
 _SCHEMA_INT_PREFIXES = ("int", "uint", "long", "short", "unsigned")
 
 
+def _is_container_type(ptype: Any) -> bool:
+    """True when a declared parameter type is a container (array/object)."""
+    return isinstance(ptype, str) and (
+        ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list"))
+    )
+
+
 def _tool_param_properties(func_name: str, tools: Optional[List]) -> dict:
     """Return the declared parameter properties for a tool, or {}."""
     if not tools:
@@ -408,17 +415,23 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             return int(num) if num == int(num) else num
         except (ValueError, OverflowError):
             pass
+    is_container = _is_container_type(ptype)
     try:
-        return json.loads(val, strict=False)
+        decoded = json.loads(val, strict=False)
     except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
         pass
+    else:
+        # Some models wrap the whole fragment list in a JSON string (#5336).
+        if is_container and isinstance(decoded, str):
+            decoded = _merge_json_fragments(decoded, spec) or decoded
+        return decoded
     try:
         literal = ast.literal_eval(val)
         if isinstance(literal, (dict, list, tuple)):
             return list(literal) if isinstance(literal, tuple) else literal
     except (ValueError, SyntaxError, TypeError, MemoryError, *_DEEP_NEST_ERRORS):
         pass
-    if ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list")):
+    if is_container:
         merged = _merge_json_fragments(val, spec)
         if merged is not None:
             logger.warning(
@@ -431,6 +444,8 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             )
             return merged
         repaired = _repair_json_value(val)
+        if isinstance(repaired, str):
+            repaired = _merge_json_fragments(repaired, spec) or repaired
         if repaired is not None:
             logger.warning(
                 "Repaired malformed JSON for parameter %r of tool %r "
@@ -2016,6 +2031,7 @@ def parse_tool_calls(
     text: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    parse_errors: Optional[List[str]] = None,
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse tool calls from model output.
@@ -2034,6 +2050,8 @@ def parse_tool_calls(
         text: Raw model output text
         tokenizer: mlx-lm's TokenizerWrapper (required)
         tools: Tool definitions for type conversion (optional)
+        parse_errors: Collects "malformed" when the native parser yields no
+            call from a span that calls a declared tool (optional)
 
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
@@ -2047,7 +2065,9 @@ def parse_tool_calls(
         ).strip()
         return cleaned_text, tool_calls or None
 
-    cleaned_text, tool_calls = _parse_tool_calls_impl(text, tokenizer, tools)
+    cleaned_text, tool_calls = _parse_tool_calls_impl(
+        text, tokenizer, tools, parse_errors
+    )
     if tool_calls and getattr(tokenizer, "tool_call_start", None) != "<｜DSML｜ calls>":
         _remap_tool_call_names(tool_calls, tools)
     return cleaned_text, tool_calls
@@ -2057,6 +2077,7 @@ def _parse_tool_calls_impl(
     text: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    parse_errors: Optional[List[str]] = None,
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """parse_tool_calls body, pre-remap. See the public wrapper's docstring."""
     cleaned_text = text
@@ -2162,7 +2183,14 @@ def _parse_tool_calls_impl(
                                 untyped_string = "type" not in spec and isinstance(
                                     value, str
                                 )
-                                if union_mismatch or untyped_string:
+                                container_mismatch = _is_container_type(
+                                    spec.get("type")
+                                ) and isinstance(value, str)
+                                if (
+                                    union_mismatch
+                                    or untyped_string
+                                    or container_mismatch
+                                ):
                                     arguments[key] = _coerce_param_value(
                                         val, key, props, name
                                     )
@@ -2248,6 +2276,14 @@ def _parse_tool_calls_impl(
                     if idx >= 0:
                         cleaned_text = cleaned_text[:idx].strip()
                 return cleaned_text, tool_calls
+
+            if (
+                parse_errors is not None
+                and matches
+                and text.rstrip().endswith(tool_call_end or matches[-1].rstrip())
+                and _opens_call(matches[-1], tools)
+            ):
+                parse_errors.append("malformed")
 
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if "<tool_call>" in cleaned_text:
@@ -2345,9 +2381,16 @@ def _extract_tool_names(tools: List) -> set:
             func = tool.get("function", {})
             if isinstance(func, dict):
                 name = func.get("name")
-                if name:
+                if isinstance(name, str) and name:
                     names.add(name)
     return names
+
+
+def _opens_call(payload: str, tools: Optional[List]) -> bool:
+    return bool(re.match(r"\s*(?:[<{\[]|call:)", payload)) or any(
+        re.match(rf"\s*{re.escape(name)}\s*[(\[{{<:]", payload)
+        for name in _extract_tool_names(tools or [])
+    )
 
 
 def parse_qwen_tool_calls(
@@ -2494,6 +2537,7 @@ def extract_tool_calls_with_thinking(
       of whether regular text was also produced.
     """
     parse_errors = ()
+    rejected: list[str] = []
     parser = getattr(tokenizer, "tool_parser", None)
     if (
         finish_reason is not None
@@ -2508,7 +2552,37 @@ def extract_tool_calls_with_thinking(
             regular_content, tokenizer, tools, finish_reason
         )
     else:
-        cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+        cleaned_text, tool_calls = parse_tool_calls(
+            regular_content, tokenizer, tools, rejected
+        )
+
+    dsml_start = getattr(tokenizer, "tool_call_start", None)
+    if (
+        tools
+        and not tool_calls
+        and dsml_start == "<｜DSML｜ calls>"
+        and dsml_start in regular_content
+    ):
+        # V4.1's output parser returns rejected envelopes as text.
+        errors = []
+        if any(
+            payload.lstrip().startswith("<｜DSML｜ invoke")
+            for payload in _marker_payloads(
+                regular_content, dsml_start, tokenizer.tool_call_end
+            )
+        ):
+            errors.append("malformed")
+        stream_filter = ToolCallStreamFilter(tokenizer, tools=tools)
+        visible = stream_filter.feed(regular_content) + stream_filter.finish()
+        if (
+            stream_filter.recovery_candidate_is_payload()
+            and stream_filter.take_recovery_candidate().startswith(dsml_start)
+        ):
+            cleaned_text = visible.strip()
+            errors.append("incomplete")
+        parse_errors = tuple(errors)
+        rejected = []
+
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer, tools=tools)
     tool_calls_from_thinking = False
 
@@ -2561,8 +2635,13 @@ def extract_tool_calls_with_thinking(
                     tool_calls = None
                     tool_calls_from_thinking = False
 
-    if tools and finish_reason == "tool_calls" and not tool_calls and not parse_errors:
+    if (
+        tools
+        and not tool_calls
+        and not parse_errors
         # A remote backend can consume the call span and still report this finish.
+        and (finish_reason == "tool_calls" or (finish_reason == "stop" and rejected))
+    ):
         parse_errors = ("malformed",)
 
     return ToolCallExtraction(
@@ -2720,6 +2799,16 @@ class ToolCallStreamFilter:
         )
         self._after_naked_function = False
         self._buffer = ""
+        # First character of every marker family, incl. custom pairs.
+        markers = [
+            "<",
+            *self._suppress_after_markers,
+            *self._orphan_close_markers,
+            *self._stray_close_markers,
+            *self._bracket_prefixes,
+            *(pair[0] for pair in self._marker_pairs),
+        ]
+        self._marker_trigger_chars = frozenset(m[0] for m in markers if m)
         self._suppressing_until: Optional[str] = None
         self._suppressing = False
         self._pending_envelope_parts: List[str] = []
@@ -3580,8 +3669,18 @@ class ToolCallStreamFilter:
         if not self.active:
             return text
 
-        self._buffer += text
         out: List[str] = []
+        # Prose fast path: no marker can begin, so skip the scan below.
+        if (
+            not self._buffer
+            and not self._after_naked_function
+            and self._suppressing_until is None
+            and self._marker_trigger_chars.isdisjoint(text)
+        ):
+            self._record_content(out, text)
+            return text
+
+        self._buffer += text
 
         while self._buffer:
             if self._after_naked_function:

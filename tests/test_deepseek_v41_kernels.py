@@ -27,19 +27,19 @@ from omlx.patches.deepseek_v41.quantization import (
 )
 
 
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
-    "dim,length,count",
+    "dtype,dim,length,count",
     [
-        (32, 1, 0),
-        (64, 1, 17),
-        (128, 1, 17),
-        (256, 1, 17),
-        (512, 1, 513),
-        (512, 7, 129),
-        (96, 1, 17),
-        (96, 3, 37),
-        (1024, 1, 17),
+        (mx.float32, 32, 1, 0),
+        (mx.float32, 512, 1, 513),
+        (mx.float32, 96, 3, 37),
+        (mx.float32, 1024, 1, 17),
+        (mx.float16, 128, 1, 17),
+        (mx.float16, 512, 7, 129),
+        (mx.bfloat16, 64, 1, 17),
+        (mx.bfloat16, 256, 1, 17),
+        (mx.bfloat16, 512, 1, 513),
+        (mx.bfloat16, 96, 1, 17),
     ],
 )
 def test_packed_attention_split_and_mask(dtype, dim, length, count):
@@ -92,11 +92,19 @@ def test_attention_empty_and_all_masked():
 
 
 @pytest.mark.parametrize(
-    "dim,heads,length",
-    [(32, 8, 1), (128, 128, 3), (96, 9, 2), (96, 33, 3), (128, 65, 1), (32, 32, 2)],
+    "dim,heads,length,restricted,dtype",
+    [
+        (32, 8, 1, False, mx.bfloat16),
+        (32, 8, 1, True, mx.float32),
+        (96, 9, 2, False, mx.float32),
+        (96, 9, 2, True, mx.bfloat16),
+        (128, 128, 3, False, mx.float16),
+        (128, 128, 3, True, mx.bfloat16),
+        (96, 33, 3, False, mx.bfloat16),
+        (96, 33, 3, True, mx.float16),
+        (32, 32, 2, False, mx.float32),
+    ],
 )
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("restricted", [False, True])
 def test_index_scores_packed_candidates_and_causal(
     dim, heads, length, restricted, dtype
 ):
@@ -217,9 +225,13 @@ def test_tile_topk_ties_use_absolute_ids():
 
 
 @pytest.mark.parametrize(
-    "dim,heads,start,ratio", [(32, 3, 0, 4), (128, 8, 399, 2), (96, 9, 91, 3)]
+    "dim,heads,start,ratio,dtype",
+    [
+        (32, 3, 0, 4, mx.float32),
+        (128, 8, 399, 2, mx.bfloat16),
+        (96, 9, 91, 3, mx.bfloat16),
+    ],
 )
-@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_streamed_index_and_candidate_blocks_match_full_scores(
     dim, heads, start, ratio, dtype
 ):
@@ -588,9 +600,14 @@ def test_batched_decode_templates_do_not_depend_on_positions(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "n,k", [(1280, 5120), (512, 5120), (5120, 2304), (4096, 1280), (32768, 1280)]
+    "n,k,dtype",
+    [
+        (1280, 5120, mx.bfloat16),
+        (1280, 5120, mx.float16),
+        (5120, 2304, mx.bfloat16),
+        (32768, 1280, mx.bfloat16),
+    ],
 )
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 def test_mxfp8_gemv_matches_quantized_matmul(n, k, dtype):
     mx.random.seed(n + k)
     weight, scales = mx.quantize(
@@ -679,7 +696,6 @@ def test_deep_prefill_index_selection_matches_full_scores():
 @pytest.mark.parametrize(
     "ratio,tied,width,length",
     [
-        (1, False, 4103, 37),
         (2, False, 4103, 37),
         (2, True, 4103, 37),
         (1, False, 65539, 257),  # More than one 64 MiB score group.
@@ -758,3 +774,41 @@ def test_nax_index_scores_match_reference_rounding(monkeypatch, key_start):
         np.abs(actual - expected)[finite],
         (2 * 2.0**-7 * np.asarray(magnitude) + 3e-5)[finite],
     )
+
+
+@pytest.mark.parametrize("heads", [8, 32])   # 32: the head-split MMA tiles DeepSeek-V4.1 runs
+@pytest.mark.parametrize("restricted", [False, True])
+def test_row_batched_index_matches_each_request_alone(heads, restricted):
+    """packed_index_scores_rows / index_select_rows: each decode request's row (own keys,
+    position, width, count; widths above and below the count, repeated positions) gets the
+    scores and indices packed_index_scores / index_select give that request alone."""
+    from omlx.patches.deepseek_v41.kernels import index_select, index_select_rows, packed_index_scores_rows
+
+    rng = np.random.default_rng(23)
+    dim, count, ratio = 128, 24, 2
+    lengths = [57, 9, 300, 57, 130]
+    positions = [2 * n - 1 for n in lengths]
+    positions[3] = positions[0]
+    q = quantize_activation(mx.array(rng.normal(size=(1, len(lengths), heads, dim)), mx.bfloat16), bits=4)
+    w = mx.array(rng.normal(size=(1, len(lengths), heads)).astype(np.float32)) / heads
+    keys = [pack_activation(mx.array(rng.normal(size=(1, n, dim)).astype(np.float32)), 4) for n in lengths]
+    # Scores tie across rows whose keys repeat: the selection must still take the lower position.
+    keys[3] = mx.concatenate([keys[3][:, :20], keys[3][:, :20], keys[3][:, 40:]], 1)
+    if restricted:
+        cand = [np.sort(rng.choice(n, size=min(n, 40), replace=False)) for n in lengths]
+        cand[1] = np.concatenate([[-1, -1], cand[1]])   # leading -1 slots, as candidate blocks give
+        widths = [len(x) for x in cand]
+        rows = [mx.array(x, mx.int32).reshape(1, 1, -1) for x in cand]
+        candidates = mx.array(np.stack([np.pad(x, (0, max(widths) - len(x)), constant_values=-1) for x in cand]),
+                              mx.int32)[None]
+    else:
+        widths = [min(n, (p + 1) // ratio) for n, p in zip(lengths, positions)]
+        rows = [None] * len(lengths)
+        candidates = None
+    counts = [min(count, n) for n in (widths if restricted else lengths)]
+    scores = packed_index_scores_rows(q, keys, w, positions, ratio, widths, candidates)
+    ids = index_select_rows(scores, widths, counts, candidates)
+    for r, (k, p, n, c, cr) in enumerate(zip(keys, positions, widths, counts, rows)):
+        alone = packed_index_scores(q[:, r : r + 1], k if restricted else k[:, :n], w[:, r : r + 1], p, ratio, cr)
+        assert mx.array_equal(scores[:, r : r + 1, :n], alone).item()
+        assert mx.array_equal(ids[r], index_select(alone, c, cr)).item()

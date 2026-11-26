@@ -406,7 +406,7 @@ def init_cluster_group(
 ) -> object:
     """Initialize a distributed group with the resilient JACCL bootstrap.
 
-    Ring/NCCL execution remains byte-for-byte on MLX's normal path.  For a
+    Ring execution remains byte-for-byte on MLX's normal path.  For a
     JACCL worker, only connection metadata travels through this small TCP
     control channel; collectives immediately thereafter remain RDMA/JACCL.
     """

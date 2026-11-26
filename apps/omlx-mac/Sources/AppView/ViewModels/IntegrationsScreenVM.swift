@@ -9,7 +9,8 @@ final class IntegrationsScreenVM {
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
         case hermesModel, copilotModel, dshModel, vibeModel
         case mcpConfig
-        case splashPath, splashLimits, splashKvFormat, splashAnePrefill
+        case splashPath, splashLimits, splashKvFormat, splashActivations
+        case splashAnePrefill, splashMaxConcurrentRequests
         case markitdownEnabled, markitdownExposeModel, markitdownMaxFileSize
         case markitdownMaxFiles, markitdownPdfProcessingEngine
     }
@@ -39,11 +40,13 @@ final class IntegrationsScreenVM {
     var splashPathDraft: String = ""
     var editingSplashPath = false
     var splashKvFormat: String = "int8"
+    var splashActivations: String = "bf16"
     var splashAnePrefill = true
     /// Whole GB as text; empty means automatic.
     var splashMaxMemoryGb: String = ""
     var splashSsdCacheGb: String = ""
     private var splashLimitsLoaded = ("", "")
+    var splashMaxConcurrentRequests: String = ""
 
     // MarkItDown
     var markitdownEnabled = true
@@ -57,6 +60,38 @@ final class IntegrationsScreenVM {
     )
     private(set) var savingMarkitdownFields: Set<Field> = []
     private(set) var markitdownOcrModels: [String] = []
+
+    // Web search values stay in the form even when their provider hides them.
+    enum WebSearchField: CaseIterable {
+        case provider, braveApiKey, searxngUrl, ddgsBackends, maxResults
+        case contentMode, contentTruncate, contentMaxChars
+    }
+
+    struct WebSearchForm: Equatable {
+        var provider = "ddgs"
+        var braveApiKey = ""
+        var searxngUrl = ""
+        var ddgsBackends = ""
+        var maxResults = "3"
+        var contentMode = "snippet"
+        var contentTruncate = true
+        var contentMaxChars = "20000"
+    }
+
+    static let ddgsBackends = ["brave", "duckduckgo", "grokipedia", "mojeek", "wikipedia", "yahoo", "yandex"]
+    var webSearch = WebSearchForm() {
+        didSet {
+            if webSearch != oldValue {
+                webSearchTestMessage = nil
+                webSearchTestOK = nil
+            }
+        }
+    }
+    private var webSearchLoaded = WebSearchForm()
+    private(set) var savingWebSearchFields: Set<WebSearchField> = []
+    private(set) var webSearchTesting = false
+    private(set) var webSearchTestMessage: String?
+    private(set) var webSearchTestOK: Bool?
 
     // MCP
     var mcpConfigPath: String = ""
@@ -74,7 +109,7 @@ final class IntegrationsScreenVM {
     // which can drift after a hot-reload).
     private(set) var serverHost: String = "127.0.0.1"
     private(set) var serverPort: Int = 8000
-    private(set) var serverApiKey: String = ""
+    private(set) var serverApiKeySet: Bool = false
     private(set) var cliPrefix: String = "omlx"
 
     /// Popup options: a leading "Select model…" placeholder + every model id.
@@ -141,10 +176,18 @@ final class IntegrationsScreenVM {
         "\(cliCommandPrefix) launch claude_desktop"
     }
 
-    /// Env-var recipe that runs the real `claude` binary directly. Mirrors
-    /// `claudeCodeCommand` in dashboard.js — cloud form unsets the Anthropic
-    /// vars, local form sets them to point at the oMLX server.
-    var claudeEnvRecipe: String {
+    func claudeEnvRecipeForCopy(client: OMLXClient) async throws -> String {
+        guard serverApiKeySet else { return claudeEnvRecipe(authToken: "") }
+        return try await claudeEnvRecipe(authToken: client.revealApiKey())
+    }
+
+    /// `claudeEnvRecipe` with the API key masked, for display only. Mirrors
+    /// `claudeCodeCommandDisplay` in dashboard.js.
+    var claudeEnvRecipeDisplay: String {
+        claudeEnvRecipe(authToken: serverApiKeySet ? "••••••••" : "")
+    }
+
+    private func claudeEnvRecipe(authToken: String) -> String {
         if claudeMode == "cloud" {
             return "env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN "
                  + "-u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL "
@@ -157,8 +200,8 @@ final class IntegrationsScreenVM {
         var parts: [String] = []
         parts.append(Self.shellEnvAssign("ANTHROPIC_BASE_URL",
                                          "http://\(formatDisplayHost(serverHost)):\(serverPort)"))
-        if !serverApiKey.isEmpty {
-            parts.append(Self.shellEnvAssign("ANTHROPIC_AUTH_TOKEN", serverApiKey))
+        if !authToken.isEmpty {
+            parts.append(Self.shellEnvAssign("ANTHROPIC_AUTH_TOKEN", authToken))
         }
         parts.append(Self.shellEnvAssign("ANTHROPIC_DEFAULT_OPUS_MODEL",   opus))
         parts.append(Self.shellEnvAssign("ANTHROPIC_DEFAULT_SONNET_MODEL", sonnet))
@@ -259,10 +302,12 @@ final class IntegrationsScreenVM {
                 self.dshModel             = it.dshModel ?? ""
                 self.splashPathSetting    = it.splashPath ?? ""
                 self.splashKvFormat       = it.splashKvFormat ?? "int8"
+                self.splashActivations    = it.splashActivations ?? "bf16"
                 self.splashAnePrefill     = it.splashAnePrefill ?? true
                 self.splashMaxMemoryGb    = Self.gigabytesText(it.splashMaxMemoryGb)
                 self.splashSsdCacheGb     = Self.gigabytesText(it.splashSsdCacheGb)
                 self.splashLimitsLoaded   = (self.splashMaxMemoryGb, self.splashSsdCacheGb)
+                self.splashMaxConcurrentRequests = it.splashMaxConcurrentRequests.map(String.init) ?? ""
             }
             self.markitdownEnabled = settings.integrations?.markitdownEnabled ?? true
             self.markitdownExposeModel = settings.integrations?.markitdownExposeModel ?? false
@@ -273,6 +318,17 @@ final class IntegrationsScreenVM {
             self.markitdownPdfProcessingEngine = settings.integrations?.markitdownPdfProcessingEngine ?? "markitdown"
             self.markitdownLoaded = (markitdownEnabled, markitdownExposeModel, maxFileSize,
                                     maxFiles, markitdownPdfProcessingEngine)
+            self.webSearch = WebSearchForm(
+                provider: settings.integrations?.webSearchProvider ?? "ddgs",
+                braveApiKey: settings.integrations?.webSearchBraveApiKey ?? "",
+                searxngUrl: settings.integrations?.webSearchSearxngUrl ?? "",
+                ddgsBackends: settings.integrations?.webSearchDdgsBackends ?? "",
+                maxResults: String(settings.integrations?.webSearchMaxResults ?? 3),
+                contentMode: settings.integrations?.webSearchContentMode ?? "snippet",
+                contentTruncate: settings.integrations?.webSearchContentTruncate ?? true,
+                contentMaxChars: String(settings.integrations?.webSearchContentMaxChars ?? 20000)
+            )
+            self.webSearchLoaded = webSearch
             self.splash = settings.externalEngines?.splash
             if let mcp = settings.mcp {
                 let path = mcp.configPath ?? ""
@@ -283,13 +339,12 @@ final class IntegrationsScreenVM {
             // Available models
             try await refreshModels(client: client)
 
-            // Stats — host/port/api_key/cli_prefix for the command builders.
             // Failure here is non-fatal: the screen still works against the
             // default `omlx` prefix and 127.0.0.1:8000.
             if let stats = try? await client.getStats() {
                 if let host = stats.host, !host.isEmpty { self.serverHost = host }
                 if let port = stats.port               { self.serverPort = port }
-                self.serverApiKey = stats.apiKey ?? ""
+                self.serverApiKeySet = stats.apiKeySet ?? false
                 if let prefix = stats.cliPrefix, !prefix.isEmpty {
                     self.cliPrefix = prefix
                 }
@@ -323,7 +378,10 @@ final class IntegrationsScreenVM {
         case .splashPath:
             patch.splashPath = Self.trimmed(splashPathDraft)
         case .splashKvFormat:       patch.splashKvFormat = splashKvFormat
+        case .splashActivations:    patch.splashActivations = splashActivations
         case .splashAnePrefill:     patch.splashAnePrefill = splashAnePrefill
+        case .splashMaxConcurrentRequests:
+            patch.splashMaxConcurrentRequests = Int(splashMaxConcurrentRequests).map(PatchOptionalInt.value) ?? PatchOptionalInt.null
         case .splashLimits:
             guard let memory = Self.gigabytesPatch(splashMaxMemoryGb, minimum: 1),
                   let ssd = Self.gigabytesPatch(splashSsdCacheGb, minimum: 0) else {
@@ -415,6 +473,132 @@ final class IntegrationsScreenVM {
             default: break
             }
             self.lastError = error.omlxDescription
+        }
+    }
+
+    func ddgsBackendChecked(_ name: String) -> Bool {
+        webSearch.ddgsBackends.split(separator: ",").contains { Self.trimmed(String($0)) == name }
+    }
+
+    func setDdgsBackend(_ name: String, selected: Bool) {
+        var backends = webSearch.ddgsBackends.split(separator: ",").map { Self.trimmed(String($0)) }
+        backends.removeAll { $0 == name || $0.isEmpty }
+        if selected { backends.append(name) }
+        webSearch.ddgsBackends = backends.joined(separator: ",")
+    }
+
+    func saveWebSearch(_ field: WebSearchField, client: OMLXClient) async {
+        guard !savingWebSearchFields.contains(field) else { return }
+        var submitted = webSearch
+        var patch = GlobalSettingsPatch()
+        switch field {
+        case .provider:
+            guard submitted.provider != webSearchLoaded.provider else { lastError = nil; return }
+            patch.webSearchProvider = submitted.provider
+        case .braveApiKey:
+            submitted.braveApiKey = Self.trimmed(submitted.braveApiKey)
+            guard submitted.braveApiKey != webSearchLoaded.braveApiKey else { lastError = nil; return }
+            patch.webSearchBraveApiKey = submitted.braveApiKey
+        case .searxngUrl:
+            submitted.searxngUrl = Self.trimmed(submitted.searxngUrl)
+            guard submitted.searxngUrl != webSearchLoaded.searxngUrl else { lastError = nil; return }
+            patch.webSearchSearxngUrl = submitted.searxngUrl
+        case .ddgsBackends:
+            guard submitted.ddgsBackends != webSearchLoaded.ddgsBackends else { lastError = nil; return }
+            patch.webSearchDdgsBackends = submitted.ddgsBackends
+        case .maxResults:
+            guard let value = Int(Self.trimmed(submitted.maxResults)), (1...10).contains(value) else {
+                lastError = String(localized: "integrations.websearch.max_results_invalid",
+                                   defaultValue: "Enter a whole number between 1 and 10.",
+                                   comment: "Invalid web search numeric setting")
+                return
+            }
+            submitted.maxResults = String(value)
+            guard submitted.maxResults != webSearchLoaded.maxResults else { lastError = nil; return }
+            patch.webSearchMaxResults = value
+        case .contentMode:
+            guard submitted.contentMode != webSearchLoaded.contentMode else { lastError = nil; return }
+            patch.webSearchContentMode = submitted.contentMode
+        case .contentTruncate:
+            guard submitted.contentTruncate != webSearchLoaded.contentTruncate else { lastError = nil; return }
+            patch.webSearchContentTruncate = submitted.contentTruncate
+        case .contentMaxChars:
+            guard let value = Int(Self.trimmed(submitted.contentMaxChars)), value > 0 else {
+                lastError = String(localized: "integrations.websearch.content_limit_invalid",
+                                   defaultValue: "Enter a whole number greater than zero.",
+                                   comment: "Invalid web search numeric setting")
+                return
+            }
+            submitted.contentMaxChars = String(value)
+            guard submitted.contentMaxChars != webSearchLoaded.contentMaxChars else { lastError = nil; return }
+            patch.webSearchContentMaxChars = value
+        }
+        savingWebSearchFields.insert(field)
+        defer { savingWebSearchFields.remove(field) }
+        do {
+            _ = try await client.updateGlobalSettings(patch)
+            Self.copy(field, from: submitted, to: &webSearchLoaded)
+            Self.copy(field, from: submitted, to: &webSearch)
+            lastError = nil
+        } catch {
+            switch field {
+            case .provider, .ddgsBackends, .contentMode, .contentTruncate:
+                Self.copy(field, from: webSearchLoaded, to: &webSearch)
+            case .braveApiKey, .searxngUrl, .maxResults, .contentMaxChars:
+                // Keep typed drafts available for correction or retry.
+                break
+            }
+            lastError = error.omlxDescription
+        }
+    }
+
+    private static func copy(_ field: WebSearchField, from source: WebSearchForm, to target: inout WebSearchForm) {
+        switch field {
+        case .provider: target.provider = source.provider
+        case .braveApiKey: target.braveApiKey = source.braveApiKey
+        case .searxngUrl: target.searxngUrl = source.searxngUrl
+        case .ddgsBackends: target.ddgsBackends = source.ddgsBackends
+        case .maxResults: target.maxResults = source.maxResults
+        case .contentMode: target.contentMode = source.contentMode
+        case .contentTruncate: target.contentTruncate = source.contentTruncate
+        case .contentMaxChars: target.contentMaxChars = source.contentMaxChars
+        }
+    }
+
+    func testWebSearch(client: OMLXClient) async {
+        guard !webSearchTesting else { return }
+        webSearchTestMessage = nil
+        webSearchTestOK = nil
+        guard let count = Int(Self.trimmed(webSearch.maxResults)), (1...10).contains(count) else {
+            webSearchTestOK = false
+            webSearchTestMessage = String(localized: "integrations.websearch.max_results_invalid",
+                                         defaultValue: "Enter a whole number between 1 and 10.",
+                                         comment: "Invalid web search numeric setting")
+            return
+        }
+        let request = WebSearchTestRequest(
+            provider: webSearch.provider, braveApiKey: Self.trimmed(webSearch.braveApiKey),
+            searxngUrl: Self.trimmed(webSearch.searxngUrl), ddgsBackends: webSearch.ddgsBackends,
+            maxResults: count
+        )
+        webSearchTesting = true
+        defer { webSearchTesting = false }
+        do {
+            let response = try await client.testWebSearch(request)
+            webSearchTestOK = response.ok
+            if response.ok {
+                webSearchTestMessage = String(localized: "integrations.websearch.test_success",
+                                             defaultValue: "Search OK: \(response.results?.count ?? 0) results",
+                                             comment: "Successful web search connectivity test; argument is result count")
+            } else {
+                webSearchTestMessage = response.error?.message
+                    ?? String(localized: "integrations.websearch.test_failed",
+                              defaultValue: "Search test failed",
+                              comment: "Fallback error for a web search connectivity test")
+            }
+        } catch {
+            webSearchTestOK = false
+            webSearchTestMessage = error.omlxDescription
         }
     }
 

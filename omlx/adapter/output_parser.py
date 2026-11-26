@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 from mlx_lm import tokenizer_utils
 
+from ..patches.hy_v4.tool_parser import is_hy_v4_template
 from ..utils.tokenizer import (
     create_streaming_detokenizer,
     is_gemma4_model,
@@ -351,14 +352,19 @@ class BailingHybridOutputParserSession:
 
 
 def correct_tool_parser_type(parser_type: str | None, template: Any) -> str | None:
-    """Return qwen3_coder for a template that MLX template matching misreads.
+    """Return the parser for templates that MLX template matching misreads.
 
     MiMo renders the qwen3_coder grammar with no newline after ``<tool_call>``
     (#4933). MLX-LM and MLX-VLM match only the newline form, so they select
     json_tools and every call fails the native parser.
+
+    Hy4 builds its ``:opensource`` tool tokens with ``str.format``, so the
+    generic matchers see no known marker (or GLM-4.7's ``<arg_key``).
     """
     if parser_type == "json_tools" and is_mimo_tool_template(template):
         return "qwen3_coder"
+    if is_hy_v4_template(template):
+        return "hy_v4"
     return parser_type
 
 
@@ -807,7 +813,7 @@ class MiniMaxM3OutputParserSession:
                     if isinstance(call, dict) and call.get("name")
                 ]
             except Exception as e:  # noqa: BLE001
-                logger.debug("MiniMax M3 tool-call parse failed: %s", e)
+                logger.warning("MiniMax M3 tool-call parse failed: %s", e)
 
         return OutputParserFinalizeResult(
             stream_text=stream_text,
@@ -817,7 +823,7 @@ class MiniMaxM3OutputParserSession:
         )
 
 
-_INKLING_MODEL_TYPES = {"inkling", "inkling_mm_model"}
+_INKLING_MODEL_TYPES = {"inkling", "inkling_mm_model", "inkling2", "inkling2_loop"}
 _INKLING_MESSAGE_MODEL = "<|message_model|>"
 _INKLING_CONTENT_THINKING = "<|content_thinking|>"
 _INKLING_CONTENT_TEXT = "<|content_text|>"

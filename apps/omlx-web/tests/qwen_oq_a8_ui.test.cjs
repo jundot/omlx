@@ -71,8 +71,10 @@ console.log('oQ A8 visibility and ANE conflict checks passed');
     };
     context.alert = message => { throw Error(message); };
     app.modelSettings = app.buildModelSettingsState(app.selectedModel, {mtp_enabled: true, mtp_fixed_depth: 2});
-    assert.equal(app.modelSettings.mtp_adaptive_max_depth, '3');
-    for (const depth of [3, 4, 5, 6]) {
+    assert.equal(app.modelSettings.mtp_adaptive_max_depth, '');
+    await app.saveModelSettings();
+    assert.equal(payload.mtp_adaptive_max_depth, null);
+    for (const depth of [3, 4, 5, 6, 7, 8]) {
         app.modelSettings.mtp_adaptive_max_depth = String(depth);
         await app.saveModelSettings();
         assert.equal(payload.mtp_adaptive_max_depth, depth);

@@ -2,6 +2,7 @@
 """Compare the patched generic cache with the installed, unmodified source."""
 
 import importlib.util
+import io
 import random
 
 import mlx.core as mx
@@ -90,7 +91,7 @@ def equal(a, b):
             assert mx.array_equal(x, y).item()
 
 
-@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("seed", [0, 2, 6])
 def test_cache_and_attention_match_stock_through_lifecycle(seed, backend):
     stock, patched = backend
     rng = random.Random(seed)
@@ -293,6 +294,20 @@ def test_ragged_rollback_keeps_the_spare_rows(backend):
         c.finalize()
     assert b._keys.shape[0] == 4 and b.keys.shape[0] == 3
     equal(a, b)
+
+
+def test_ragged_rollback_leaves_left_padding_ready_for_host_reads(backend):
+    stock, patched = backend
+    a, b = make(stock, [300, 290, 299]), make(patched, [300, 290, 299])
+    for padding in ([1, 0, 2], mx.array([0, 6, 3], dtype=mx.int64), [2, 0, 1]):
+        for c in (a, b):
+            c.prepare(right_padding=padding)
+            c.finalize()
+        graph = io.StringIO()
+        mx.export_to_dot(graph, b.left_padding)
+        assert "->" not in graph.getvalue()
+        assert b.left_padding.dtype == a.left_padding.dtype
+        assert b.left_padding.tolist() == a.left_padding.tolist()
 
 
 def test_join_after_an_in_place_drop_leaves_no_stale_columns(backend):

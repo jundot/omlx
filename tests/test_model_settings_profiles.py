@@ -343,17 +343,23 @@ class TestApplyProfile:
         mgr.apply_profile("m", "p")
         assert mgr.get_settings("m").turboquant_kv_enabled is True
 
-    def test_apply_with_mtp_toggle_owns_the_fixed_depth(self, mgr):
-        mgr.set_settings("m", ModelSettings(mtp_enabled=True, mtp_fixed_depth=4))
+    def test_apply_with_mtp_toggle_owns_the_depth(self, mgr):
+        mgr.set_settings(
+            "m",
+            ModelSettings(
+                mtp_enabled=True, mtp_adaptive_max_depth=6, mtp_fixed_depth=4
+            ),
+        )
         mgr.save_profile("m", "chip", "Chip", None, {"temperature": 0.5})
         mgr.apply_profile("m", "chip")
-        assert mgr.get_settings("m").mtp_fixed_depth == 4
+        s = mgr.get_settings("m")
+        assert (s.mtp_adaptive_max_depth, s.mtp_fixed_depth) == (6, 4)
 
         mgr.save_profile("m", "adaptive", "Adaptive", None, {"mtp_enabled": True})
         mgr.apply_profile("m", "adaptive")
         s = mgr.get_settings("m")
         assert s.mtp_enabled is True
-        assert s.mtp_fixed_depth is None
+        assert (s.mtp_adaptive_max_depth, s.mtp_fixed_depth) == (None, None)
 
     def test_apply_resolves_vlm_mtp_processor_conflict(self, tmp_path):
         manager = ModelSettingsManager(tmp_path)
@@ -964,8 +970,15 @@ def _write_legacy_profile_storage(tmp_path):
     return documents
 
 
-def test_startup_repairs_only_missing_references_with_exact_backups(tmp_path):
+@pytest.mark.parametrize("settings_version", [1, 2])
+def test_startup_repairs_only_missing_references_with_exact_backups(
+    tmp_path, settings_version
+):
     expected = _write_legacy_profile_storage(tmp_path)
+    expected["model_settings.json"]["version"] = settings_version
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps(expected["model_settings.json"])
+    )
     originals = {name: (tmp_path / name).read_bytes() for name in expected}
     mgr = ModelSettingsManager(tmp_path)
     expected["model_profiles.json"]["profiles"]["m"]["orphan"]["source_template"] = None

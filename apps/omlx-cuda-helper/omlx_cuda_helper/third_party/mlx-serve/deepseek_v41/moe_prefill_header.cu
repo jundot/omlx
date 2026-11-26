@@ -1,6 +1,6 @@
 // Adapted from mlx-serve src/kernels/moe/moe_prefill_cuda_header.cu (MIT,
 // Copyright (c) 2026 David Dalcu). Changed: the expert weights are affine
-// codes (3, 4 or 8 bits, 64 weights a group, bf16 scales and biases), where a
+// codes (2, 3, 4 or 8 bits, 64 weights a group, bf16 scales and biases), where a
 // weight is code * scale + bias in float rounded once, or with MX MLX mxfp4
 // codes (E2M1, one E8M0 scale per 32 weights), whose weights bf16 holds exactly.
 // Each tensor-core step starts from zero and its 16 products are added to
@@ -176,7 +176,19 @@ __device__ __forceinline__ void msv_expert_tile(uint8_t* smem, int mv, ARow arow
           const float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&sbits));
           const float bias = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bbits));
           uint32_t out[CV / 2];
-          if constexpr (BITS == 4) {
+          if constexpr (BITS == 2) {
+            // The 4 values a code of this group can take; a load is one group.
+            uint32_t tab[4];
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) tab[q] = msv_affine(q, scale, bias);
+            #pragma unroll
+            for (int w4 = 0; w4 < 4; ++w4)
+              #pragma unroll
+              for (int q = 0; q < 8; ++q) {
+                const uint32_t pair = (vw[w4] >> (4 * q)) & 15u;
+                out[8 * w4 + q] = tab[pair & 3] | (tab[pair >> 2] << 16);
+              }
+          } else if constexpr (BITS == 4) {
             if constexpr (MX) {
               const uint32_t e8 = bsc[j][i] & 0xffu;
               // 2**(e8 - 127); e8 = 0 is the subnormal 2**-127.
@@ -243,6 +255,163 @@ __device__ __forceinline__ void msv_expert_tile(uint8_t* smem, int mv, ARow arow
               if (wm * 32 + a * 16 < mv) {
                 #pragma unroll
                 for (int jj = 0; jj < 4; ++jj) msv_mma(acc[a][jj], af[a], bf[jj][0], bf[jj][1]);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+}
+// MX (sm_120a / sm_121a): the same tile on the block-scaled mma. A rows are
+// E4M3 codes with one E8M0 scale per 32, the activation's FP8 round trip kept
+// as codes; B rows are the mxfp4 codes, each widened to one byte with the
+// E2M1 code in bits 5:2 as the mma reads it. The products are exact as in the
+// bf16 tile, and each k32 step starts from zero and is added in order.
+__device__ __forceinline__ void msv_cp4(uint32_t dst, const void* src, bool valid) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"(dst), "l"(src), "r"(valid ? 4 : 0));
+}
+__device__ __forceinline__ void msv_mma_mx(float* c, const uint32_t* a, uint32_t b0, uint32_t b1, uint32_t sa, uint32_t sb) {
+// CUDA 13 names an sm_12xa target by __CUDA_ARCH_SPECIFIC__, CUDA 12 by the FEAT macros.
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL) || \
+    (defined(__CUDA_ARCH_SPECIFIC__) && __CUDA_ARCH_SPECIFIC__ / 100 == 12) || \
+    (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && __CUDA_ARCH_FAMILY_SPECIFIC__ / 100 == 12)
+  const float zero = 0.f;
+  const uint16_t z = 0;
+  float p[4];
+  asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10}, {%11}, {%12,%13}, {%14}, {%15,%16};\n"
+      : "=f"(p[0]), "=f"(p[1]), "=f"(p[2]), "=f"(p[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(zero),
+        "r"(sa), "h"(z), "h"(z), "r"(sb), "h"(z), "h"(z));
+  c[0] = __fadd_rn(c[0], p[0]);
+  c[1] = __fadd_rn(c[1], p[1]);
+  c[2] = __fadd_rn(c[2], p[2]);
+  c[3] = __fadd_rn(c[3], p[3]);
+#else
+  __trap();
+#endif
+}
+// The 8 E2M1 codes of w (code i in bits 4i..4i+3) as 8 bytes, code i in bits 5:2 of byte i.
+__device__ __forceinline__ uint2 msv_fp4_bytes(uint32_t w) {
+  const uint32_t h = w >> 16;
+  const uint32_t lo = (w & 0xFu) | ((w & 0xF0u) << 4) | ((w & 0xF00u) << 8) | ((w & 0xF000u) << 12);
+  const uint32_t hi = (h & 0xFu) | ((h & 0xF0u) << 4) | ((h & 0xF00u) << 8) | ((h & 0xF000u) << 12);
+  return make_uint2(lo << 2, hi << 2);
+}
+// msv_expert_tile with MX: A codes from `acode(row)` and scales from
+// `ascale(row)`, B mxfp4 codes from `wrow(r)` and scales from `srow(r)`. Smem
+// holds ST stages of A codes and scales, then the B bytes and scales of one stage.
+// One pass covers MT tiles of 64 rows, so each B stage is read once for all of them.
+template <int K, int BD, int ST, int MT, typename ACode, typename AScale, typename WRow, typename SRow>
+__device__ __forceinline__ void msv_expert_tile_mx(uint8_t* smem, int mv, ACode acode, AScale ascale, WRow wrow, SRow srow, float (&acc)[MT][2][4][4]) {
+  constexpr int BM = 64, BN = 128, KS = 128, G = KS / 32;
+  constexpr int KT = K / KS;
+  constexpr int A_ST = MT * BM * KS, AS_ST = MT * BM * G;
+  static_assert(MT * BM <= 256, "the A scales of a pass load one per thread");
+  constexpr int RB = KS / 2, CPR = RB / 16, NL = BN * CPR / 256;
+  uint8_t* sa = smem;
+  uint8_t* sas = sa + ST * A_ST;
+  uint8_t* sw = sas + ST * AS_ST;
+  uint8_t* sws = sw + BN * KS;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 2, wn = warp & 3;
+  const int cc = tid % CPR;
+  auto load_a = [&](int t) {
+    const int st = t % ST;
+    #pragma unroll
+    for (int i = 0; i < 2 * MT; ++i) {
+      const int q = tid + i * 256, row = q >> 3, c = q & 7;
+      const bool ok = row < mv;
+      msv_cp16(msv_smem(sa + st * A_ST + row * KS + ((c ^ (row & 7)) << 4)), acode(ok ? row : 0) + t * KS + c * 16, ok);
+    }
+    if (tid < MT * BM) {
+      const bool ok = tid < mv;
+      msv_cp4(msv_smem(sas + st * AS_ST + tid * G), ascale(ok ? tid : 0) + t * G, ok);
+    }
+  };
+  // Load i: B row (i * 256 + tid) / CPR, 32 codes (one scale group) at chunk cc.
+  uint4 braw[BD][NL];
+  uint32_t bsc[BD][NL];
+  auto load_b = [&](int t, uint4 (&dst)[NL], uint32_t (&sc)[NL]) {
+    #pragma unroll
+    for (int i = 0; i < NL; ++i) {
+      const int r = (i * 256 + tid) / CPR;
+      dst[i] = __ldcg(reinterpret_cast<const uint4*>(wrow(r) + (long)t * RB + cc * 16));
+      sc[i] = static_cast<uint32_t>(__ldcg(reinterpret_cast<const unsigned char*>(srow(r) + t * G + cc)));
+    }
+  };
+  #pragma unroll
+  for (int m = 0; m < MT; ++m)
+    #pragma unroll
+    for (int a = 0; a < 2; ++a)
+      #pragma unroll
+      for (int j = 0; j < 4; ++j)
+        #pragma unroll
+        for (int v = 0; v < 4; ++v) acc[m][a][j][v] = 0.f;
+  #pragma unroll
+  for (int i = 0; i < ST - 1; ++i) { if (i < KT) load_a(i); msv_commit(); }
+  #pragma unroll
+  for (int i = 0; i < BD; ++i) if (i < KT) load_b(i, braw[i], bsc[i]);
+  for (int t0 = 0; t0 < KT; t0 += BD) {
+    #pragma unroll
+    for (int j = 0; j < BD; ++j) {
+      const int t = t0 + j;
+      if (t < KT) {
+        msv_wait<ST - 2 < 0 ? 0 : ST - 2>();
+        __syncthreads();
+        if (t + ST - 1 < KT) load_a(t + ST - 1);
+        msv_commit();
+        #pragma unroll
+        for (int i = 0; i < NL; ++i) {
+          const int r = (i * 256 + tid) / CPR;
+          const uint4 v = braw[j][i];
+          const uint2 b0 = msv_fp4_bytes(v.x), b1 = msv_fp4_bytes(v.y);
+          const uint2 b2 = msv_fp4_bytes(v.z), b3 = msv_fp4_bytes(v.w);
+          const int c = 2 * cc;
+          *reinterpret_cast<uint4*>(sw + r * KS + ((c ^ (r & 7)) << 4)) = make_uint4(b0.x, b0.y, b1.x, b1.y);
+          *reinterpret_cast<uint4*>(sw + r * KS + (((c + 1) ^ (r & 7)) << 4)) = make_uint4(b2.x, b2.y, b3.x, b3.y);
+          sws[r * G + cc] = static_cast<uint8_t>(bsc[j][i]);
+        }
+        if (t + BD < KT) load_b(t + BD, braw[j], bsc[j]);
+        __syncthreads();
+        if (wm * 32 < mv) {
+          const uint8_t* at = sa + (t % ST) * A_ST;
+          const uint8_t* ast = sas + (t % ST) * AS_ST;
+          #pragma unroll
+          for (int kb = 0; kb < G; ++kb) {
+            uint32_t bf[4][2], sfb[4];
+            #pragma unroll
+            for (int p = 0; p < 2; ++p) {
+              const int idx = lane >> 3;
+              const int n = wn * 32 + p * 16 + (idx >> 1) * 8 + (lane & 7);
+              const int c = kb * 2 + (idx & 1);
+              msv_ldsm4(msv_smem(sw + n * KS + ((c ^ (n & 7)) << 4)), bf[2 * p][0], bf[2 * p][1], bf[2 * p + 1][0], bf[2 * p + 1][1]);
+            }
+            #pragma unroll
+            for (int jj = 0; jj < 4; ++jj) sfb[jj] = sws[(wn * 32 + jj * 8 + (lane >> 2)) * G + kb];
+            #pragma unroll
+            for (int m = 0; m < MT; ++m) {
+              const int r0 = m * BM + wm * 32;
+              if (r0 < mv) {
+                uint32_t af[2][4], sfa[2];
+                #pragma unroll
+                for (int a = 0; a < 2; ++a) {
+                  const int idx = lane >> 3;
+                  const int row = r0 + a * 16 + (idx & 1) * 8 + (lane & 7);
+                  const int c = kb * 2 + (idx >> 1);
+                  msv_ldsm4(msv_smem(at + row * KS + ((c ^ (row & 7)) << 4)), af[a][0], af[a][1], af[a][2], af[a][3]);
+                  // Lane l supplies the scale of row 8 * (l % 2) + l / 4 of the 16.
+                  sfa[a] = ast[(r0 + a * 16 + 8 * (lane & 1) + (lane >> 2)) * G + kb];
+                }
+                #pragma unroll
+                for (int a = 0; a < 2; ++a) {
+                  if (r0 + a * 16 < mv) {
+                    #pragma unroll
+                    for (int jj = 0; jj < 4; ++jj) msv_mma_mx(acc[m][a][jj], af[a], bf[jj][0], bf[jj][1], sfa[a], sfb[jj]);
+                  }
+                }
               }
             }
           }

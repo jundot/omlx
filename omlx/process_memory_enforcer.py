@@ -45,6 +45,7 @@ from .utils.image import clear_image_decode_cache
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.proc_memory import (
     get_graphics_footprint,
+    get_graphics_footprint_compressed,
     get_phys_footprint,
     release_free_malloc_memory,
 )
@@ -871,6 +872,8 @@ class ProcessMemoryEnforcer:
         graphics = get_graphics_footprint()
         if graphics <= 0:
             return 0
+        # Compressed Metal pages leave the graphics ledger but stay in phys.
+        graphics += get_graphics_footprint_compressed()
         return max(0, get_phys_footprint() - graphics)
 
     def get_final_ceiling(self) -> int:

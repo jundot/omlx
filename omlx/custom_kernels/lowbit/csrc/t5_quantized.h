@@ -213,7 +213,7 @@ METAL_FUNC void qmv_fast_t5_impl(
 // Amortises the weight stream across all M vectors (Identity I-C):
 // decode each t5 byte once, multiply with all M activations.
 // k_lanes threads stride over groups, results_per_simdgroup=SIMD_SIZE/k_lanes.
-template <typename T, int group_size, int vecs_per_tg, int k_lanes>
+template <typename T, int group_size, int vecs_per_tg, int k_lanes, bool use_lut>
 METAL_FUNC void qmv_wide_t5_impl(
     const device uint8_t* w,
     const device T* scales,
@@ -261,7 +261,7 @@ METAL_FUNC void qmv_wide_t5_impl(
     // Full bytes: T5_TO_B4 LUT replaces serial divmod chain; all 5 dq values
     // are independent (no v=q reassignment), hiding decode latency.
     for (int b = 0; b < full_bytes; b++) {
-      const uint p = T5_TO_B4[wg[b]];
+      const uint p = use_lut ? lut[wg[b]] : T5_TO_B4[wg[b]];
       const int base = k0 + b * 5;
       const U dq0 = s * (U(p & 0x003u)        - 1.0f);
       const U dq1 = s * (U((p >>  2u) & 0x3u) - 1.0f);
@@ -279,7 +279,7 @@ METAL_FUNC void qmv_wide_t5_impl(
     }
     // Last partial byte via T5_TO_B4 LUT.
     if constexpr (rem_trits > 0) {
-      const uint p = T5_TO_B4[wg[full_bytes]];
+      const uint p = use_lut ? lut[wg[full_bytes]] : T5_TO_B4[wg[full_bytes]];
       const int base = k0 + full_bytes * 5;
       U dq0 = U(0), dq1 = U(0), dq2 = U(0), dq3 = U(0);
       if constexpr (rem_trits >= 1) { dq0 = s * (U(p & 0x003u) - 1.0f); }

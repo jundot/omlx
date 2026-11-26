@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """DeepSeek V4.1 image geometry, packing and prompt encoding."""
 
+import json
 import math
 
 import mlx.core as mx
@@ -115,6 +116,14 @@ def image_patches(image, config):
     return mx.array(patches).astype(mx.bfloat16), height // p, width // p, types
 
 
+def _parse_mlx_lm_tool_call(text, tools=None):
+    # mlx-lm's server JSON-encodes the parsed arguments itself.
+    return [
+        {**call, "arguments": json.loads(call["arguments"])}
+        for call in parse_tool_call(text, tools)
+    ]
+
+
 def install_tokenizer_protocol(tokenizer, raw_config):
     """Serve V4.1 through an mlx-lm tokenizer: its encoder and DSML tool calls.
 
@@ -123,7 +132,7 @@ def install_tokenizer_protocol(tokenizer, raw_config):
     """
     Processor(tokenizer, ModelConfig.from_dict(raw_config))
     tokenizer.has_chat_template = True
-    tokenizer._tool_parser = parse_tool_call
+    tokenizer._tool_parser = _parse_mlx_lm_tool_call
     for name, marker in (("start", tool_call_start), ("end", tool_call_end)):
         setattr(tokenizer, f"_tool_call_{name}", marker)
         setattr(

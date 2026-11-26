@@ -41,6 +41,7 @@ enum AdminAPI {
     static let prefillLending = "\(prefillHelper)/lending"
     static let prefillLendingStop = "\(prefillHelper)/lending/stop"
     static func modelGenerationConfig(_ id: String) -> String { "\(models)/\(id)/generation_config" }
+    static func modelLoRAAdapters(_ id: String) -> String { "\(models)/\(id)/lora-adapters" }
     static let reloadModels    = "\(prefix)/reload"
 
     static func modelProfiles(_ id: String) -> String { "\(models)/\(id)/profiles" }
@@ -88,6 +89,7 @@ enum AdminAPI {
 
     // PR 9
     static let setupApiKey     = "\(prefix)/setup-api-key"
+    static let revealApiKey    = "\(prefix)/auth/api-key"
     static let subKeys         = "\(prefix)/sub-keys"
 
     // PR 12 — oQ Quantization
@@ -109,6 +111,8 @@ enum AdminAPI {
     // PR 13 — Throughput bench
     static let deviceInfo      = "\(prefix)/device-info"
     static let benchStart      = "\(prefix)/bench/start"
+    static let benchActive     = "\(prefix)/bench/active"
+    static func benchQueueRemove(_ queueId: String) -> String { "\(prefix)/bench/queue/\(queueId)" }
     static func benchResults(_ benchId: String) -> String { "\(prefix)/bench/\(benchId)/results" }
     static func benchCancel(_ benchId: String) -> String  { "\(prefix)/bench/\(benchId)/cancel" }
     static let aneTuneStart = "\(prefix)/bench/ane-tune/start"

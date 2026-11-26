@@ -640,3 +640,20 @@ def is_cache_corruption_error(error: Exception) -> bool:
     """
     error_str = str(error)
     return any(pattern in error_str for pattern in CACHE_CORRUPTION_PATTERNS)
+
+
+def is_metal_out_of_memory(exc: BaseException | None) -> bool:
+    """True when *exc* or an exception in its cause chain is a Metal OOM."""
+    # Track visited exceptions: a cause chain can loop (an exception raised
+    # ``from`` itself), and this runs on the event loop during a failed load.
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        text = str(exc)
+        if (
+            "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
+            or "Insufficient Memory" in text
+        ):
+            return True
+        exc = exc.__cause__
+    return False

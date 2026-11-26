@@ -429,10 +429,10 @@ def test_openjev_shared_prefix_matches_independent_readouts(tiny_backbone, monke
             },
         },
     }
-    shared = _drain(model.run(model.encode(request), lambda: 16))
+    shared = _drain(model.run(model.encode(request), lambda: 64))
 
     monkeypatch.setattr(model, "_prefill_shared_prefix", lambda *a: (yield from ()))
-    independent = _drain(model.run(model.encode(request), lambda: 16))
+    independent = _drain(model.run(model.encode(request), lambda: 64))
 
     assert shared["input_tokens"] == independent["input_tokens"]
     team = shared["answers"]["team"]

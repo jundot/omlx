@@ -2,6 +2,8 @@
 """Tests for the admin benchmark module."""
 
 import asyncio
+import contextvars
+import heapq
 import json
 import logging
 import time
@@ -861,16 +863,22 @@ class TestBenchmarkEngineSelection:
         assert run.status == "completed"
 
     @pytest.mark.asyncio
-    async def test_run_benchmark_pins_speed_priority_and_restores(self):
+    async def test_run_benchmark_pins_throughput_modes_and_restores(self):
         """Throughput runs force prefill speed priority (no throttle
-        shrinking mid-measurement) and restore the previous mode after."""
+        shrinking mid-measurement) and Prefill First (no staggered batch
+        prefills), and restore the previous modes after."""
         pool = _FakeBenchEnginePool()
-        pool._scheduler_config = SimpleNamespace(prefill_speed_priority=False)
+        pool._scheduler_config = SimpleNamespace(
+            prefill_speed_priority=False, decode_fairness=True
+        )
         seen = []
 
         class _Recorder(_FakeBenchEngine):
             async def stream_generate(self, **kwargs):
-                seen.append(pool._scheduler_config.prefill_speed_priority)
+                config = pool._scheduler_config
+                seen.append(
+                    config.prefill_speed_priority and not config.decode_fairness
+                )
                 yield SimpleNamespace(
                     completion_tokens=1,
                     prompt_tokens=1024,
@@ -891,8 +899,9 @@ class TestBenchmarkEngineSelection:
             await run_benchmark(run, pool)
 
         assert run.status == "completed"
-        assert seen and all(seen), "speed priority must be pinned during the run"
+        assert seen and all(seen), "both modes must be pinned during the run"
         assert pool._scheduler_config.prefill_speed_priority is False
+        assert pool._scheduler_config.decode_fairness is True
 
     @pytest.mark.asyncio
     async def test_batch_request_skips_engine_with_none_scheduler_core(self):
@@ -2429,3 +2438,257 @@ class TestAneBenchmarkTrace:
         assert "configured_layers=64" in mlp_line
         assert "compiled_layers=unknown" in mlp_line
         assert "expected_operations=64" in mlp_line
+
+
+# =============================================================================
+# Batch tests wider than the concurrent-request cap (#5311)
+# =============================================================================
+
+
+# The virtual time of the token the current stream last received.
+_STREAM_NOW = contextvars.ContextVar("stream_now", default=None)
+
+
+class _CappedCore:
+    """Engine core that admits `cap` requests at a time, like the scheduler.
+
+    Each admitted request prefills for `prefill_s`, then emits one token per
+    `step_s`. Requests beyond the cap wait in the queue. `perf_counter` is a
+    virtual clock on that schedule, so timings do not depend on the runner.
+    """
+
+    def __init__(self, cap, prefill_s=0.05, step_s=0.005):
+        self.cap = cap
+        self.prefill_s = prefill_s
+        self.step_s = step_s
+        self._sem = None
+        self._requests = {}
+        self.running = 0
+        self.peak_running = 0
+        self.latest = 0.0
+        self._free_slots = []
+
+    def perf_counter(self):
+        """A stream reads its own token times; any other caller the latest one."""
+        now = _STREAM_NOW.get()
+        return self.latest if now is None else now
+
+    async def add_request(self, prompt, sampling_params, skip_cache_store=False):
+        request_id = f"request-{len(self._requests)}"
+        self._requests[request_id] = (
+            len(prompt),
+            sampling_params.max_tokens,
+            self.latest,
+        )
+        return request_id
+
+    async def stream_outputs(self, request_id):
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self.cap)
+        prompt_len, max_tokens, submitted = self._requests[request_id]
+        async with self._sem:
+            self.running += 1
+            self.peak_running = max(self.peak_running, self.running)
+            # A slot frees when the request holding it ends, whichever that is.
+            freed = heapq.heappop(self._free_slots) if self._free_slots else 0.0
+            decode_start = max(submitted, freed) + self.prefill_s
+            try:
+                await asyncio.sleep(self.prefill_s)
+                for count in range(1, max_tokens + 1):
+                    await asyncio.sleep(self.step_s)
+                    now = decode_start + count * self.step_s
+                    self.latest = max(self.latest, now)
+                    _STREAM_NOW.set(now)
+                    yield SimpleNamespace(
+                        completion_tokens=count,
+                        prompt_tokens=prompt_len,
+                        finished=count == max_tokens,
+                    )
+            finally:
+                heapq.heappush(
+                    self._free_slots, decode_start + max_tokens * self.step_s
+                )
+                self.running -= 1
+
+
+class TestBatchWiderThanConcurrencyCap:
+    @pytest.mark.asyncio
+    async def test_queued_batch_does_not_inflate_tg_tps(self):
+        """8 requests on a cap of 2 run in 4 waves. The tokens of all waves
+        must not be divided by the decode time of the last wave only: that
+        reported about 4x the real throughput."""
+        core = _CappedCore(cap=2)
+        engine = SimpleNamespace(_engine=core)
+
+        async def run(batch_size):
+            return await _run_batch_test(
+                engine=engine,
+                prompts=[[0] * 1024] * batch_size,
+                prompt_tokens=1024,
+                max_tokens=20,
+                batch_size=batch_size,
+            )
+
+        with patch("omlx.admin.benchmark.time.perf_counter", core.perf_counter):
+            two = await run(2)
+            eight = await run(8)
+
+        assert core.peak_running == 2
+        assert eight["total_gen_tokens"] == 160
+        # Same cap, same real throughput: two rows at one token per step each,
+        # where dividing every wave's tokens by the last wave reported ~4x.
+        assert two["tg_tps"] == pytest.approx(2 / core.step_s, rel=0.01)
+        assert eight["tg_tps"] == pytest.approx(two["tg_tps"], rel=0.01)
+
+    def test_tokens_after_counts_only_later_tokens(self):
+        from omlx.admin.benchmark import _tokens_after
+
+        timeline = [(1.0, 1), (2.0, 2), (3.0, 3), (4.0, 4)]
+        assert _tokens_after(timeline, 0.5) == 4
+        assert _tokens_after(timeline, 2.0) == 2
+        assert _tokens_after(timeline, 5.0) == 0
+        assert _tokens_after([], 1.0) == 0
+
+    @pytest.mark.asyncio
+    async def test_external_queued_stream_outside_window_is_not_counted(self):
+        """A remote server that queued one stream behind the other: the
+        first stream finished before the second started, so it decoded
+        nothing inside the generation window."""
+        from omlx.admin.benchmark import _run_external_batch_test
+        from omlx.admin.external_api import StreamStats
+
+        first = StreamStats(
+            prompt_tokens=1000,
+            completion_tokens=100,
+            cached_tokens=0,
+            start_time=0.0,
+            first_content_time=0.5,
+            last_content_time=1.5,
+            end_time=1.5,
+            text="x" * 16,
+            content_observed=True,
+        )
+        second = StreamStats(
+            prompt_tokens=1000,
+            completion_tokens=100,
+            cached_tokens=0,
+            start_time=0.0,
+            first_content_time=2.0,
+            last_content_time=3.0,
+            end_time=3.0,
+            text="x" * 16,
+            content_observed=True,
+        )
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(side_effect=[first, second])
+
+        clock = iter([0.0, 3.0])  # wall_start, wall_end
+        with patch(
+            "omlx.admin.benchmark.time.perf_counter",
+            side_effect=lambda: next(clock, 3.0),
+        ):
+            result = await _run_external_batch_test(
+                client=client,
+                prompts=["p1", "p2"],
+                max_tokens=100,
+                batch_size=2,
+            )
+
+        # Window 2.0..3.0 holds only the second stream's 100 tokens.
+        assert result["tg_tps"] == pytest.approx(100.0, abs=0.1)
+
+
+class _CapPool(_FakeBenchEnginePool):
+    """Bench pool with a live concurrent-request cap, like EnginePool."""
+
+    def __init__(self, cap, engine):
+        super().__init__(engine=engine)
+        self._scheduler_config = SimpleNamespace(
+            prefill_speed_priority=False, max_num_seqs=cap
+        )
+        self.applied = []
+
+    async def apply_max_concurrent_requests(self, value):
+        self.applied.append(value)
+        self._scheduler_config.max_num_seqs = value
+        self._engine._engine.cap = value
+
+
+class _CapEngine(_FakeBenchEngine):
+    def __init__(self, cap):
+        self._engine = _CappedCore(cap=cap, prefill_s=0.001, step_s=0.001)
+
+
+def _batch_run(batch_sizes):
+    return BenchmarkRun(
+        bench_id="bench-cap",
+        request=BenchmarkRequest(
+            model_id="m",
+            prompt_lengths=[1024],
+            generation_length=4,
+            batch_sizes=batch_sizes,
+        ),
+    )
+
+
+class TestBenchmarkConcurrencyLift:
+    @pytest.mark.asyncio
+    async def test_batch_phase_raises_cap_and_restores_it(self):
+        pool = _CapPool(cap=2, engine=_CapEngine(cap=2))
+        run = _batch_run([2, 4, 8])
+
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert pool._engine._engine.peak_running == 8
+        assert pool.applied == [8, 2]
+        assert pool._scheduler_config.max_num_seqs == 2
+
+    @pytest.mark.asyncio
+    async def test_wide_enough_cap_is_left_alone(self):
+        pool = _CapPool(cap=16, engine=_CapEngine(cap=16))
+        run = _batch_run([2, 8])
+
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert pool.applied == []
+        assert pool._scheduler_config.max_num_seqs == 16
+
+    @pytest.mark.asyncio
+    async def test_cap_changed_during_run_is_kept(self):
+        pool = _CapPool(cap=2, engine=_CapEngine(cap=2))
+        run = _batch_run([8])
+        real_apply = pool.apply_max_concurrent_requests
+
+        async def user_changes_cap(value):
+            await real_apply(value)
+            pool._scheduler_config.max_num_seqs = 12  # settings page, mid-run
+
+        pool.apply_max_concurrent_requests = user_changes_cap
+
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert pool.applied == [8]
+        assert pool._scheduler_config.max_num_seqs == 12
+
+    @pytest.mark.asyncio
+    async def test_cap_restored_when_batch_phase_fails(self):
+        pool = _CapPool(cap=2, engine=_CapEngine(cap=2))
+        run = _batch_run([8])
+
+        with (
+            patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()),
+            patch(
+                "omlx.admin.benchmark._run_batch_test",
+                AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+        ):
+            await run_benchmark(run, pool)
+
+        assert run.status == "error"
+        assert pool.applied == [8, 2]
+        assert pool._scheduler_config.max_num_seqs == 2

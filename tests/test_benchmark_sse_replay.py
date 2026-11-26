@@ -22,12 +22,15 @@ from typing import Optional
 import pytest
 
 from omlx.admin import accuracy_benchmark
+from omlx.admin import benchmark as bench_module
 from omlx.admin.benchmark import (
     BenchmarkRequest,
     BenchmarkRun,
     _benchmark_runs,
     _send_event as bench_send_event,
+    clear_queue,
     get_active_run,
+    get_queue,
 )
 from omlx.admin.accuracy_benchmark import (
     AccuracyBenchmarkRequest,
@@ -325,7 +328,7 @@ class TestAccuracyBenchmarkSSEReplay:
         }
 
 
-# --- Route-level: /api/bench/active + 409 on concurrent start ---------------
+# --- Route-level: /api/bench/active + queueing on concurrent start ----------
 
 
 class _FakeEntry:
@@ -355,6 +358,7 @@ def bench_client(monkeypatch):
     from omlx.admin import routes as admin_routes
 
     _benchmark_runs.clear()
+    clear_queue()
     monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: _FakePool())
 
     async def _fake_require_admin():
@@ -365,6 +369,7 @@ def bench_client(monkeypatch):
     app.dependency_overrides[admin_routes.require_admin] = _fake_require_admin
     yield TestClient(app)
     _benchmark_runs.clear()
+    clear_queue()
 
 
 class TestActiveBenchEndpoint:
@@ -376,6 +381,7 @@ class TestActiveBenchEndpoint:
             "bench_id": None,
             "model_id": None,
             "context_profile": None,
+            "queue": [],
         }
 
     def test_returns_running_run_payload(self, bench_client):
@@ -390,20 +396,18 @@ class TestActiveBenchEndpoint:
         assert r.status_code == 200
         assert r.json() == {
             "running": True,
+            "queue": [],
             "bench_id": "bench-abc",
             "model_id": "model-x",
             "context_profile": "code_python",
             "force_lm_engine": False,
             "external": False,
+            "queue_id": None,
         }
 
 
-class TestConcurrentStartRejection:
-    """Server refuses to start a second throughput bench while one is
-    running — two concurrent runs on the same engine produce mutually-
-    corrupted measurements, and there's no way to recover the data."""
-
-    def test_start_409_when_already_running(self, bench_client):
+class TestConcurrentStartQueueing:
+    def test_start_queues_when_already_running(self, bench_client):
         # Seed a running run in the registry.
         existing = BenchmarkRun(
             bench_id="bench-existing",
@@ -419,13 +423,183 @@ class TestConcurrentStartRejection:
                 "prompt_lengths": [1024],
             },
         )
-        assert r.status_code == 409
+        assert r.status_code == 200, r.text
         body = r.json()
-        assert "already running" in body["detail"].lower()
-        assert "bench-existing" in body["detail"]
-        # Confirm the registry still has only the original run — no
-        # second one was spuriously created and abandoned.
+        assert body["status"] == "queued"
+        assert body["queue_id"].startswith("q-")
+        assert body["queue"] == [
+            {"queue_id": body["queue_id"], "model_id": "model-x", "external": False}
+        ]
         assert len(_benchmark_runs) == 1
+        assert get_queue() == body["queue"]
+
+    def test_start_queues_while_finished_run_uploads(self, bench_client):
+        class _Pending:
+            def done(self):
+                return False
+
+        uploading = BenchmarkRun(
+            bench_id="bench-uploading",
+            request=BenchmarkRequest(model_id="model-x", prompt_lengths=[1024]),
+        )
+        uploading.status = "completed"
+        uploading.task = _Pending()
+        _benchmark_runs[uploading.bench_id] = uploading
+
+        r = bench_client.post(
+            "/admin/api/bench/start",
+            json={"model_id": "model-x", "prompt_lengths": [1024]},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "queued"
+        assert len(_benchmark_runs) == 1
+
+        r = bench_client.post("/admin/api/bench/bench-uploading/cancel")
+        assert r.status_code == 200, r.text
+        assert get_queue() == []
+        assert uploading.status == "completed"
+
+    def test_other_benchmarks_refuse_while_runs_are_queued(self, bench_client):
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-x", prompt_lengths=[1024])
+        )
+        for path in ("/admin/api/bench/context/start", "/admin/api/bench/ane-tune/start"):
+            r = bench_client.post(path, json={"model_id": "model-x"})
+            assert r.status_code == 409, r.text
+
+    @pytest.mark.asyncio
+    async def test_queue_runs_after_the_current_run(self, bench_client, monkeypatch):
+        ran = []
+
+        async def _fake_run(run, pool):
+            ran.append(run.request.model_id)
+            run.status = "completed"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        await bench_module.run_queue(first, None)
+        assert ran == ["model-a", "model-b"]
+        assert get_queue() == []
+
+    @pytest.mark.asyncio
+    async def test_queue_drains_when_a_run_raises(self, bench_client, monkeypatch):
+        ran = []
+
+        async def _fake_run(run, pool):
+            ran.append(run.request.model_id)
+            if run.request.model_id == "model-a":
+                raise RuntimeError("engine exploded")
+            run.status = "completed"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        await bench_module.run_queue(first, None)
+        assert ran == ["model-a", "model-b"]
+        assert first.error_message == "engine exploded"
+        assert first.terminal is True
+        assert [e["message"] for e in first.events if e["type"] == "error"] == [
+            "engine exploded"
+        ]
+        assert get_queue() == []
+
+    @pytest.mark.asyncio
+    async def test_queue_drops_idle_power_cap_per_promoted_run(
+        self, bench_client, monkeypatch
+    ):
+        drops = []
+
+        async def _fake_run(run, pool):
+            run.status = "completed"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-c", prompt_lengths=[1024])
+        )
+        await bench_module.run_queue(first, None, on_start=lambda: drops.append(1))
+        assert drops == [1, 1]
+        assert get_queue() == []
+
+    @pytest.mark.asyncio
+    async def test_queue_still_runs_what_arrived_after_a_cancel(
+        self, bench_client, monkeypatch
+    ):
+        ran = []
+
+        async def _fake_run(run, pool):
+            ran.append(run.request.model_id)
+            if run.request.model_id == "model-a":
+                run.status = "cancelled"
+                bench_module.clear_queue()
+                bench_module.add_to_queue(
+                    BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+                )
+                return
+            run.status = "completed"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        await bench_module.run_queue(first, None)
+        assert ran == ["model-a", "model-b"]
+        assert get_queue() == []
+
+    @pytest.mark.asyncio
+    async def test_queue_stops_when_the_pool_shuts_down(
+        self, bench_client, monkeypatch
+    ):
+        ran = []
+        pool = _FakePool()
+
+        async def _fake_run(run, engine_pool):
+            ran.append(run.request.model_id)
+            engine_pool._shutting_down = True
+            run.status = "cancelled"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        await bench_module.run_queue(first, pool)
+        assert ran == ["model-a"]
+        assert get_queue() == []
+
+    @pytest.mark.asyncio
+    async def test_queue_is_not_left_waiting_without_a_task(
+        self, bench_client, monkeypatch
+    ):
+        async def _never_finishes(run, pool):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _never_finishes)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await bench_module.run_queue(first, None)
+        assert get_queue() == []
 
     def test_start_allowed_when_previous_completed(self, bench_client, monkeypatch):
         # A completed prior run must not block a fresh start.
@@ -453,3 +627,32 @@ class TestConcurrentStartRejection:
             },
         )
         assert r.status_code == 200, r.text
+
+
+class TestQueueDelete:
+    def test_remove_by_queue_id(self, bench_client):
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-x", prompt_lengths=[1024])
+        )
+        queue_id = bench_module.get_queue()[0]["queue_id"]
+
+        r = bench_client.delete(f"/admin/api/bench/queue/{queue_id}")
+        assert r.status_code == 200, r.text
+        assert r.json() == {"queue": []}
+
+        r = bench_client.delete(f"/admin/api/bench/queue/{queue_id}")
+        assert r.status_code == 404
+        assert "not found" in r.json()["detail"]
+
+    def test_remove_keeps_the_other_entries(self, bench_client):
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-x", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-y", prompt_lengths=[1024])
+        )
+        first, second = bench_module.get_queue()
+
+        r = bench_client.delete(f"/admin/api/bench/queue/{second['queue_id']}")
+        assert r.status_code == 200, r.text
+        assert r.json()["queue"] == [first]

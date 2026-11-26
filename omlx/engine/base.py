@@ -575,6 +575,10 @@ class BaseEngine(ABC):
         """
         return False
 
+    def active_request_count(self) -> int:
+        """Return the number of in-flight requests (0/1 unless overridden)."""
+        return 1 if self.has_active_requests() else 0
+
     @abstractmethod
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics.
@@ -660,6 +664,11 @@ class ActivityTrackingMixin:
         """Check if the engine has active in-flight requests."""
         with self._active_lock:
             return self._active_count > 0
+
+    def active_request_count(self) -> int:
+        """Return the number of tracked in-flight operations."""
+        with self._active_lock:
+            return self._active_count
 
     def _reset_activity_tracking(self) -> None:
         """Clear the in-flight activity counter + records on engine teardown.

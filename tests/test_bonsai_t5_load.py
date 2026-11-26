@@ -450,6 +450,21 @@ class TestT5QuantizedMatmulNativeRouting:
         _t5_quantized_matmul(x, w, scales, biases, transpose=True, bits=2)
         assert called.get("fired") is True
 
+    def test_t5_fp16_batch4_decode_routes_to_qmv_wide(self, monkeypatch):
+        monkeypatch.setattr(bonsai_t5_load, "has_native", lambda: True)
+        called = {}
+
+        def fake_wide(x, w, scales):
+            called["fired"] = True
+            return mx.zeros((4, 1, 4), dtype=mx.float16)
+
+        monkeypatch.setattr(bonsai_t5_load, "t5_qmv_wide", fake_wide)
+        x = mx.zeros((4, 1, 128), dtype=mx.float16)
+        w = mx.zeros((4, 26), dtype=mx.uint8)
+        scales = mx.ones((4, 1), dtype=mx.float16)
+        _t5_quantized_matmul(x, w, scales, None, transpose=True, bits=2)
+        assert called.get("fired") is True
+
     def test_t5_above_threshold_routes_to_qmm(self, monkeypatch):
         monkeypatch.setattr(bonsai_t5_load, "has_native", lambda: True)
         called = {}
@@ -687,3 +702,26 @@ def test_vlm_one_bit_modules_match_stock_mlx():
     for x, ref in zip(xs, expected, strict=True):
         assert mx.allclose(model.linear(x), ref, atol=1e-2, rtol=1e-2).item()
     assert mx.array_equal(model.embedding(ids), expected_rows).item()
+
+
+@pytest.mark.parametrize("output_rows", [17, 4097])
+def test_t5_batch4_native_matches_dense(output_rows):
+    if not bonsai_t5_load.has_native():
+        pytest.skip("native t5 kernels unavailable")
+
+    rng = np.random.default_rng(382)
+    x_np = rng.integers(-2, 3, size=(4, 1, 256)).astype(np.float16)
+    codes = rng.integers(0, 3, size=(output_rows, 256), dtype=np.uint8)
+    scales_np = rng.choice([0.5, 1.0, 2.0], size=(output_rows, 2)).astype(np.float16)
+
+    apply_bonsai_t5_load_patch()
+    result = mx.quantized_matmul(
+        mx.array(x_np),
+        mx.array(pack_t5(codes, group_size=128)),
+        mx.array(scales_np),
+        group_size=128,
+        bits=2,
+    )
+    dense = (codes.astype(np.float64) - 1) * np.repeat(scales_np, 128, axis=1)
+    expected = (x_np.astype(np.float64) @ dense.T).astype(np.float16)
+    np.testing.assert_array_equal(np.asarray(result), expected)

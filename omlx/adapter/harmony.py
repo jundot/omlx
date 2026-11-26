@@ -34,6 +34,7 @@ from typing import Any
 
 from openai_harmony import (
     HarmonyEncoding,
+    HarmonyError,
     Role,
     StreamableParser,
     load_harmony_encoding,
@@ -466,11 +467,16 @@ def parse_tool_calls_from_tokens(
             f"parse_tool_calls input ({len(full_token_ids)} tokens): {decoded_text[:300]!r}..."
         )
 
-        messages = encoding.parse_messages_from_completion_tokens(
-            full_token_ids,
-            role=Role.ASSISTANT,
-            strict=False,
-        )
+        # Same parse as parse_messages_from_completion_tokens, but a malformed
+        # or cut-off last message keeps the messages completed before it.
+        parser = StreamableParser(encoding, Role.ASSISTANT, strict=False)
+        try:
+            for token_id in full_token_ids:
+                parser.process(token_id)
+            parser.process_eos()
+        except HarmonyError as e:
+            logger.warning(f"Dropping incomplete Harmony message: {e}")
+        messages = parser.messages
 
         logger.info(f"Parsed {len(messages)} messages")
         for i, msg in enumerate(messages):

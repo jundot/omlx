@@ -16,7 +16,7 @@ import mlx.core as mx
 import numpy as np
 
 from ... import checkpoint
-from ...tensors import from_host, load, to_host, unpack
+from ...tensors import from_host, load, peak_bytes, to_host, unpack
 from ...wire import HostArray
 from . import check_layout, kernels, linear_layers, resident
 from . import text_config as read_text_config
@@ -48,21 +48,24 @@ class Stage:
                 else first == 0
             )
         ]
-        weights = Weights(load(model_dir, names), config, root)
         linear = linear_layers(text)
-        self.layers = []
-        for i in range(first, last):
+
+        def load_layer(i: int) -> Layer:
+            wanted = [n for n in names if n.startswith(f"{root}layers.{i}.")]
+            weights = Weights(load(model_dir, wanted), config, root)
             layer = Layer(weights.at(f"layers.{i}"), text, linear[i])
             mx.eval(layer.parameters())
-            self.layers.append(layer)
-            # The dense weights replace the packed tensors: free those now,
-            # or a full GPU holds both until the last layer is loaded.
-            prefix = f"{root}layers.{i}."
-            for name in [n for n in weights.arrays if n.startswith(prefix)]:
-                del weights.arrays[name]
+            # The packed tensors of the unpacked linears are no longer needed.
+            del weights
             mx.clear_cache()
+            return layer
+
+        self._load_layer = load_layer
+        self.layers = [load_layer(i) for i in range(first, last)]
         self.embedding = None
         if first == 0:
+            wanted = [n for n in names if checkpoint.layer_of(n) is None]
+            weights = Weights(load(model_dir, wanted), config, root)
             self.embedding = [
                 weights.arrays[f"{root}embed_tokens.{part}"]
                 for part in ("weight", "scales", "biases")
@@ -85,8 +88,28 @@ class Stage:
     def memory_bytes(self) -> int:
         return mx.get_active_memory()
 
+    def peak_bytes(self) -> int:
+        return peak_bytes()
+
+    def drop_layer(self) -> None:
+        """Free the weights of the last layer held."""
+        self.layers.pop()
+        self.last -= 1
+        mx.clear_cache()
+
+    def add_layer(self) -> None:
+        """Load the layer after the last one held, as the stage loaded it."""
+        layer = self._load_layer(self.last)
+        if kernels.available():
+            layer.enable_kernels()
+        self.layers.append(layer)
+        self.last += 1
+
     def new_job(self, layers: int) -> list:
         return [layer.new_cache() for layer in self.layers[:layers]]
+
+    def trim(self, job: list, layers: int) -> None:
+        del job[layers:]
 
     def load_prefix(self, job: list, state: Arrays) -> None:
         for j, cache in enumerate(job):

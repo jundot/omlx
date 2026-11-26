@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from ... import checkpoint
 
 CONTRACT = 1
 FIRST_STAGE_MIN = 1
+PACKS_WEIGHTS = True
 
 
 def resident(tensor: str) -> bool:
@@ -45,21 +47,35 @@ def check_layout(tensors: dict[str, Any]) -> None:
         raise ValueError("Only checkpoints converted to the MLX layout are supported")
 
 
-def plan(model_dir: str | Path) -> tuple[int, list[int]]:
-    """(bytes outside the layers, bytes per layer) a helper holds."""
+def plan(model_dir: str | Path, packed_weights: bool = False) -> tuple[int, list[int]]:
+    """(bytes outside the layers, bytes per layer) a helper holds, keeping
+    affine weights packed with ``packed_weights``."""
     config = checkpoint.load_config(model_dir)
     check_layout(checkpoint.tensors(model_dir))
     shared, layers = checkpoint.memory_plan(model_dir, resident)
-    # A stage unpacks every linear of a layer to a dense 16-bit weight, which
-    # takes more than its packed tensors. The embedding stays packed.
+    # An unpacked linear takes its dense 16-bit size. The embedding stays packed.
     index = checkpoint.tensors(model_dir)
     for name, weight in index.items():
         base = name.removesuffix(".weight")
         layer = checkpoint.layer_of(name)
-        packed = [index.get(f"{base}.{part}") for part in ("scales", "biases")]
-        if base == name or layer is None or None in packed or not resident(name):
+        if base == name or layer is None or not resident(name):
             continue
-        bits = checkpoint.quantization(config, base)["bits"]
-        dense = weight.shape[0] * (weight.shape[1] * 32 // bits) * 2
+        signs = index.get(f"{base}.{checkpoint.OQH_SIGNS}")
+        if signs is not None:
+            # oQh: dense weight [N, K]; only the signs stay next to it.
+            parts = ("rscale", "oqh_scales", "oqh_biases")
+            packed = [t for p in parts if (t := index.get(f"{base}.{p}")) is not None]
+            dense = weight.shape[0] * math.prod(signs.shape) * 2
+            layers[layer] += dense - weight.nbytes - sum(t.nbytes for t in packed)
+            continue
+        if f"{base}.scales" not in index:
+            continue
+        # The floating point modes have no biases.
+        stored = ("scales", "biases")
+        packed = [t for p in stored if (t := index.get(f"{base}.{p}")) is not None]
+        quant = checkpoint.quantization(config, base)
+        if packed_weights and checkpoint.packable(quant):
+            continue
+        dense = weight.shape[0] * (weight.shape[1] * 32 // quant["bits"]) * 2
         layers[layer] += dense - weight.nbytes - sum(t.nbytes for t in packed)
     return shared, layers

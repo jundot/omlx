@@ -17,6 +17,7 @@ from omlx.utils.image import (
     compute_per_image_hashes,
     extract_images_from_messages,
     extract_media_from_messages,
+    image_hash_prefixes,
     load_image,
 )
 
@@ -543,6 +544,12 @@ class TestComputeImageHash:
         result = compute_image_hash(images)
         assert isinstance(result, str)
         assert len(result) == 64
+
+    def test_prefixes_match_compute_image_hash(self):
+        images = [_make_test_image(4, 4, c) for c in ("red", "green", "blue")]
+        assert image_hash_prefixes(images) == [
+            compute_image_hash(images[:i]) for i in range(1, len(images) + 1)
+        ]
 
 
 class TestComputePerImageHashes:

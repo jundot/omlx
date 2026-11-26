@@ -13,7 +13,11 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
+import re
+import shutil
+import subprocess
 import threading
+import unicodedata
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -118,6 +122,30 @@ def _normalize_result_language(raw_lang: Any) -> Any:
     return raw_lang
 
 
+def _audio_duration(audio_path: str) -> float | None:
+    """Return the audio length in seconds from file metadata."""
+    import miniaudio
+
+    try:
+        return miniaudio.get_file_info(audio_path).duration
+    except miniaudio.DecodeError:
+        pass
+    # mlx-audio decodes the formats miniaudio cannot read (M4A, Opus) with ffmpeg.
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+    probe = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries", "format=duration"]
+        + ["-of", "csv=p=0", audio_path],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        return float(probe.stdout)
+    except ValueError:
+        return None
+
+
 def _map_stt_prompt_kwargs(model: Any, prompt: str | None) -> dict[str, str]:
     """Map the OpenAI ``prompt`` field onto the backend's biasing hook.
 
@@ -147,6 +175,73 @@ def _map_stt_prompt_kwargs(model: Any, prompt: str | None) -> dict[str, str]:
         type(model).__name__,
     )
     return {}
+
+
+_NEMOTRON_TRANSCRIBE_MODULE = "mlx_audio.stt.models.nemotron_transcribe."
+_VIBEVOICE_ASR_MODULE = "mlx_audio.stt.models.vibevoice_asr."
+_SPEAKER_TAG = re.compile(r"<spk:(\d+)>\s*", re.IGNORECASE)
+
+
+def _nemotron_turns(text: str, words: list[dict]) -> list[dict]:
+    """Group Nemotron word timestamps into the transcript's speaker turns.
+
+    Each speaker's words arrive in transcript order, so a turn takes the next
+    words of its speaker that occur in its text.
+    """
+    # The aligner matches NFC characters for Chinese and Japanese.
+    parts = _SPEAKER_TAG.split(unicodedata.normalize("NFC", text))
+    # Text before the first tag has no speaker unless there are no tags.
+    tags = [0 if len(parts) == 1 else None, *map(int, parts[1::2])]
+    pending: dict[Any, list[dict]] = {}
+    for word in words:
+        pending.setdefault(word["speaker"], []).append(word)
+    used = dict.fromkeys(pending, 0)
+    turns = []
+    for tag, turn_text in zip(tags, parts[::2]):
+        queue, pos, taken = pending.get(tag, []), 0, []
+        while used.get(tag, 0) < len(queue):
+            word = queue[used[tag]]
+            found = turn_text.find(word["text"], pos)
+            if found < 0:
+                break
+            pos = found + len(word["text"])
+            used[tag] += 1
+            taken.append(word)
+        if taken and tag is not None:
+            turns.append(
+                {
+                    "speaker": tag,
+                    "start": min(w["start"] for w in taken),
+                    "end": max(w["end"] for w in taken),
+                    "text": turn_text.strip(),
+                }
+            )
+    if any(used[tag] < len(queue) for tag, queue in pending.items()):
+        raise ValueError("Nemotron word timestamps do not match the transcript")
+    return turns
+
+
+def _speaker_turns(
+    model: Any, text: str, segments: list[dict]
+) -> tuple[str, list[dict]]:
+    """Return plain text and speaker turns from a diarizing backend."""
+    turns = [
+        {
+            "speaker": s.get("speaker", s.get("speaker_id")),
+            "start": s.get("start"),
+            "end": s.get("end"),
+            "text": s.get("text"),
+        }
+        for s in segments
+    ]
+    if type(model).__module__.startswith(_NEMOTRON_TRANSCRIBE_MODULE):
+        return _SPEAKER_TAG.sub("", text).strip(), _nemotron_turns(text, turns)
+    if turns:
+        # VibeVoice text is the raw JSON transcript, and its non-speech
+        # segments such as [Silence] carry no speaker.
+        turns = [t for t in turns if t["speaker"] is not None]
+        text = " ".join(t["text"] for t in turns if isinstance(t["text"], str))
+    return text, turns
 
 
 def _wrap_stt_load_error(model_name: str, exc: Exception) -> Exception:
@@ -701,6 +796,7 @@ class STTEngine(BaseNonStreamingEngine):
         audio_path: str,
         language: str | None = None,
         prompt: str | None = None,
+        diarize: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
         """
@@ -713,6 +809,9 @@ class STTEngine(BaseNonStreamingEngine):
                 ``prompt`` field), mapped onto the backend's biasing hook
                 (Qwen3-ASR ``system_prompt``, Whisper ``initial_prompt``);
                 ignored by backends without one
+            diarize: Return speaker turns (``speaker``, ``start``, ``end``,
+                ``text``) and the decoded audio length as ``duration``.
+                Requires ``supports_diarization()``.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -759,7 +858,16 @@ class STTEngine(BaseNonStreamingEngine):
                 gen_kwargs["language"] = generate_language
             gen_kwargs.update(_map_stt_prompt_kwargs(model, prompt))
 
-            result = model.generate(audio_path, **gen_kwargs)
+            audio = audio_path
+            if diarize:
+                from mlx_audio.stt.utils import load_audio
+
+                # Decode once so the reported duration matches the model input.
+                audio = load_audio(audio_path, sr=model.sample_rate)
+                if type(model).__module__.startswith(_NEMOTRON_TRANSCRIBE_MODULE):
+                    gen_kwargs.update(task="saa", word_timestamps=True)
+
+            result = model.generate(audio, **gen_kwargs)
 
             # result is typically an STTOutput dataclass with:
             # text, segments, language, total_time, etc.
@@ -775,20 +883,27 @@ class STTEngine(BaseNonStreamingEngine):
                     _normalize_segment(s) for s in raw_segs
                 ] if raw_segs else []
 
-                return {
+                output = {
                     "text": result.text or "",
                     "language": raw_lang,
                     "segments": segments,
-                    "duration": getattr(
-                        result, "total_time", 0.0
+                    "duration": (
+                        audio.shape[-1] / model.sample_rate
+                        if diarize
+                        else _audio_duration(audio_path)
                     ),
                 }
+                if diarize:
+                    output["text"], output["segments"] = _speaker_turns(
+                        model, output["text"], segments
+                    )
+                return output
             # Fallback for unexpected return types
             return {
                 "text": str(result),
                 "language": language,
                 "segments": [],
-                "duration": 0.0,
+                "duration": _audio_duration(audio_path),
             }
 
         activity_id = self._begin_activity(
@@ -828,6 +943,17 @@ class STTEngine(BaseNonStreamingEngine):
         except (TypeError, ValueError):
             return False
         return "stream" in params
+
+    def supports_diarization(self) -> bool:
+        """True when the loaded backend returns timed speaker labels."""
+        module = type(self._model).__module__
+        if module.startswith(_NEMOTRON_TRANSCRIBE_MODULE):
+            # Word timing needs the CTC head and its alignment tokenizer.
+            return (
+                self._model.ctc_timestamp is not None
+                and self._model._alignment_tokenizer is not None
+            )
+        return module.startswith(_VIBEVOICE_ASR_MODULE)
 
     async def transcribe_stream(
         self,

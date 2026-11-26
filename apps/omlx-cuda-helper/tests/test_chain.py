@@ -10,19 +10,25 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from pathlib import Path
 
+import mlx.core as mx
 import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fake_family.stage import FakeStage  # noqa: E402
-from omlx_cuda_helper import families, gpus, wire, worker  # noqa: E402
+from omlx_cuda_helper import families, gpus, tensors, wire, worker  # noqa: E402
 from omlx_cuda_helper.control import ControlServer  # noqa: E402
 from omlx_cuda_helper.files import ModelStore  # noqa: E402
 from omlx_cuda_helper.state import State  # noqa: E402
-from omlx_cuda_helper.supervisor import Supervisor, plan_stages  # noqa: E402
+from omlx_cuda_helper.supervisor import (  # noqa: E402
+    RESERVE_BYTES,
+    Supervisor,
+    plan_stages,
+)
 from omlx_cuda_helper.worker import (  # noqa: E402
     WINDOW,
     StageError,
@@ -45,13 +51,13 @@ def tmp_path():
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _serve(stage, tmp_path, name, upstream=None):
+def _serve(stage, tmp_path, name, upstream=None, limit=0):
     """A stage server on a Unix socket; returns a host connection to it."""
     path = str(tmp_path / name)
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(path)
     listener.listen(1)
-    server = StageServer(stage, TOKEN, INFO, upstream)
+    server = StageServer(stage, TOKEN, INFO, upstream, limit)
     threading.Thread(target=server.serve, args=(listener,), daemon=True).start()
     sock = socket.socket(socket.AF_UNIX)
     sock.connect(path)
@@ -68,11 +74,23 @@ def _chain(cut, layers, tmp_path):
 
 
 def _run(
-    host, job_id="job", *, layers=None, prefix=None, feed=False, capture=None, late=0.0
+    host,
+    job_id="job",
+    *,
+    layers=None,
+    prefix=None,
+    feed=False,
+    capture=None,
+    late=0.0,
+    ran=None,
 ):
+    """The arrays of each chunk. With a ``ran`` list the job lets the stages
+    drop layers, and the list gets the layers each chunk ran."""
     meta = {"op": "job", "job_id": job_id, "chunks": CHUNKS}
     if layers is not None:
         meta["layers"] = layers
+    if ran is not None:
+        meta["fewer_layers"] = True
     if feed:
         meta["feed"] = True
     if capture:
@@ -91,6 +109,8 @@ def _run(
                 {"rows": (rows, "float32")},
             )
         meta, arrays = host.take(job_id, index)
+        if ran is not None:
+            ran.append(meta["layers"])
         out.append({name: data for name, (data, _) in arrays.items()})
     return out
 
@@ -130,7 +150,7 @@ def _same(a, b):
         # the first stage, or the second stage runs only part of its layers.
         {"layers": 2},
         {"layers": 5, "feed": True},
-        {"feed": True, "late": 0.1},
+        {"feed": True, "late": 0.03},
     ],
     ids=[
         "capture",
@@ -172,6 +192,22 @@ class _FailsFirst(FakeStage):
         return super().run(job, **chunk)
 
 
+class _Caches(FakeStage):
+    """Sends a view of an MLX buffer each chunk, as real stages do."""
+
+    def run(self, job, **chunk):
+        boundary, state = super().run(job, **chunk)
+        return boundary, {
+            **state,
+            f"{self.first}.mlx": tensors.to_host(mx.zeros(1 << 20)),
+        }
+
+
+def test_a_job_gives_the_mlx_cache_back(tmp_path):
+    _run(_serve(_Caches(0, 6), tmp_path, "s0"))
+    _until(lambda: mx.get_cache_memory() == 0)
+
+
 def test_a_job_that_ends_early_frees_both_stages(tmp_path, monkeypatch):
     # A stage that stays in an ended job shows here as a timeout.
     monkeypatch.setattr(worker, "_UPSTREAM_TIMEOUT_S", 10.0)
@@ -188,6 +224,61 @@ def test_a_job_that_ends_early_frees_both_stages(tmp_path, monkeypatch):
     with pytest.raises(StageError, match="out of memory"):
         _run(host, "failed")
     _same(_run(host, "next"), _run(_whole(6, tmp_path)))
+
+
+class _Tight(FakeStage):
+    """Holds 1 GiB per layer and 64 MiB per token and layer of a running job."""
+
+    _job = staticmethod(lambda: None)
+
+    def new_job(self, layers):
+        job = super().new_job(layers)
+        job.tokens = 0
+        self._job = weakref.ref(job)
+        return job
+
+    def memory_bytes(self):
+        job = self._job()
+        state = len(job.acc) * job.tokens << 26 if job is not None else 0
+        return super().memory_bytes() + state
+
+    def run(self, job, **chunk):
+        job.tokens += len(chunk["tokens"])
+        return super().run(job, **chunk)
+
+
+@pytest.mark.parametrize("chain", [False, True], ids=["one-stage", "chain"])
+def test_a_long_prompt_drops_layers_from_the_end_and_loads_them_again(tmp_path, chain):
+    if chain:
+        # The first stage runs out of room; the second cannot follow it.
+        tight, want = _Tight(0, 3), [6, 2, 2, 2, 1]
+        first = _serve(tight, tmp_path, "s0", limit=4 << 30)
+        host = _serve(FakeStage(3, 6), tmp_path, "s1", upstream=first)
+    else:
+        tight, want = _Tight(0, 6), [6, 5, 4, 4, 3]
+        host = _serve(tight, tmp_path, "s0", limit=8 << 30)
+    top, ran = tight.last, []
+    got = _run(host, ran=ran)
+    assert ran == want
+    # The layers a chunk ran give what they give in the whole model; the host
+    # runs the others.
+    for k, mine, whole in zip(ran, got, _run(_whole(6, tmp_path))):
+        names = [n for n in whole if not n.startswith("s:") or _layer(n) < k]
+        assert sorted(mine) == sorted(names)
+        for name, data in mine.items():
+            if name == "b:h":
+                np.testing.assert_array_equal(data[..., :1], whole[f"s:{k - 1}.rows"])
+            else:
+                np.testing.assert_array_equal(data, whole[name])
+    _until(lambda: tight.last == top)
+    if not chain:
+        # A host that runs a fixed split gets the prompt back instead.
+        with pytest.raises(StageError, match="no GPU memory left"):
+            _run(host, "fixed")
+
+
+def _layer(name):
+    return int(name[2:].split(".")[0])
 
 
 def test_a_silent_peer_does_not_hold_the_data_port(monkeypatch):
@@ -248,6 +339,7 @@ def test_supervisor_runs_stage_processes_and_frees_them(tmp_path, monkeypatch):
     assert ready["hello"]["layers"] == 6 and ready["hello"]["contract"] == 7
     # The endpoint adds up what both stages hold.
     assert ready["hello"]["active_gib"] == 6.0
+    assert "--packed-weights" not in supervisor._session.procs[0].args
 
     sock = socket.create_connection(("127.0.0.1", ready["port"]), timeout=10)
     host = Upstream(sock, TOKEN)
@@ -259,6 +351,36 @@ def test_supervisor_runs_stage_processes_and_frees_them(tmp_path, monkeypatch):
     supervisor.stop(owner)
     assert supervisor.status() is None
     assert all(proc.poll() is not None for proc in procs)
+
+
+def test_supervisor_keeps_weights_packed_to_hold_more_layers(tmp_path, monkeypatch):
+    # 1 MiB shared, 1 MiB an unpacked layer, 512 KiB a packed one.
+    gpu = {
+        "index": 0,
+        "name": "GPU",
+        "total": 24 << 30,
+        "free": RESERVE_BYTES + (5 << 20),
+    }
+    monkeypatch.setattr(gpus, "gpus", lambda only=None: [gpu])
+    monkeypatch.setitem(
+        families.FAMILIES, "fake", families.Family(contract=7, module="fake_family")
+    )
+    worker = [sys.executable, str(Path(__file__).parent / "fake_worker.py")]
+    supervisor = Supervisor(None, tmp_path / "run", worker=worker)
+    owner = object()
+    ready = supervisor.start(
+        owner,
+        model_dir=str(tmp_path / "Model"),
+        model_type="fake",
+        layers=8,
+        warm_tokens=8,
+        host={"node_id": "studio", "name": "Studio"},
+        token=TOKEN,
+        bind="127.0.0.1",
+    )
+    assert ready["hello"]["layers"] == 8
+    assert "--packed-weights" in supervisor._session.procs[0].args
+    supervisor.stop(owner)
 
 
 def test_a_loading_session_ends_with_a_stop_or_with_its_host(tmp_path, monkeypatch):

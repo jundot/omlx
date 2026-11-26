@@ -16,7 +16,7 @@ import mlx.core as mx
 import numpy as np
 
 from ... import checkpoint
-from ...tensors import from_host, load, to_host, unpack
+from ...tensors import from_host, load, peak_bytes, to_host, unpack
 from ...wire import HostArray
 from . import (
     FIRST_STAGE_MIN,
@@ -65,8 +65,8 @@ class Stage:
             )
         ]
         kinds, ple = layer_kinds(text), ple_layers(text)
-        self.layers = []
-        for i in range(first, last):
+
+        def load_layer(i: int) -> Layer:
             wanted = [n for n in names if n.startswith(f"{root}layers.{i}.")]
             weights = Weights(load(model_dir, wanted), config, root)
             layer = Layer(weights.at(f"layers.{i}"), text, kinds[i], i in ple)
@@ -74,7 +74,10 @@ class Stage:
             # The packed tensors of the unpacked linears are no longer needed.
             del weights
             mx.clear_cache()
-            self.layers.append(layer)
+            return layer
+
+        self._load_layer = load_layer
+        self.layers = [load_layer(i) for i in range(first, last)]
         self.embedding = None
         if first == 0:
             wanted = [n for n in names if checkpoint.layer_of(n) is None]
@@ -99,15 +102,39 @@ class Stage:
     def memory_bytes(self) -> int:
         return mx.get_active_memory()
 
+    def peak_bytes(self) -> int:
+        return peak_bytes()
+
+    def drop_layer(self) -> None:
+        """Free the weights of the last layer held."""
+        self.layers.pop()
+        self.last -= 1
+        mx.clear_cache()
+
+    def add_layer(self) -> None:
+        """Load the layer after the last one held, as the stage loaded it."""
+        layer = self._load_layer(self.last)
+        if kernels.available():
+            layer.enable_kernels()
+        self.layers.append(layer)
+        self.last += 1
+
     def new_job(self, layers: int) -> list:
         return [layer.new_cache() for layer in self.layers[:layers]]
+
+    def trim(self, job: list, layers: int) -> None:
+        del job[layers:]
 
     def load_prefix(self, job: list, state: Arrays) -> None:
         for j, cache in enumerate(job):
             name = f"{self.first + j}."
             if isinstance(cache, QSACache):
                 if name + "k" in state:
-                    cache.append(*(from_host(state[name + s]) for s in _QSA_SLOTS))
+                    *rows, positions = (from_host(state[name + s]) for s in _QSA_SLOTS)
+                    # Older hosts send a decoded cache's MRoPE ids [3, 1, n]; take the text plane.
+                    if positions.ndim == 3:
+                        positions = positions[0]
+                    cache.append(*rows, positions)
             else:
                 for slot in range(len(cache)):
                     if f"{name}{slot}" in state:
