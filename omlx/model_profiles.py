@@ -48,6 +48,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_scheme",
     "turboquant_kv_bits",
     "turboquant_skip_last",
+    "inkling2_fp8_kv",
     "qwen35_ane_prefill_enabled",
     "qwen35_ane_prefill_sequence_length",
     "qwen35_ane_prefill_tail_padding_min_tokens",

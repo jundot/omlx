@@ -81,6 +81,7 @@ from .model_settings import (
     ced_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
+    inkling2_fp8_kv_mode,
     specprefill_draft,
     validate_ane_prefill,
 )
@@ -1360,6 +1361,9 @@ class EnginePool:
                 "deepseek_v41_ced_prefill_enabled",
                 ced_prefill_on(settings),
             )
+            # The KV cache format is fixed when the model is loaded.
+            if entry.config_model_type in INKLING2_MODEL_TYPES:
+                add("inkling2_fp8_kv", inkling2_fp8_kv_mode(data))
             factor = yarn_factor(
                 entry.config_model_type,
                 entry.model_context_length,

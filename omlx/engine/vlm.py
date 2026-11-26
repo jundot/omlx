@@ -2836,6 +2836,7 @@ class VLMBatchedEngine(BaseEngine):
             apply_qwen35_padded_row_attention_patch()
         except Exception:
             logger.debug("qwen3_5 padded-row attention patch not applied", exc_info=True)
+        scheduler.apply_inkling2_fp8_kv_setting(self._model_settings)
         scheduler.refresh_ssd_layer_signature()
 
         draft_path = specprefill_draft(self._model_settings)

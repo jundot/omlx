@@ -2077,6 +2077,48 @@ def _inkling2_state(cache):
     return [np.asarray(a) for a in out]
 
 
+@pytest.mark.parametrize("prefix", [0, 1])
+def test_inkling2_split_keeps_an_fp8_kv_cache_in_codes(prefix):
+    """The helper works on dense keys and values; this Mac's FP8 KV cache
+    takes its rows as codes and hands a prefix back dense."""
+    ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 30)))
+    host, helper, k = _inkling2(), _inkling2(), 7
+    host.set_fp8_kv("all")
+    INKLING2.keep_first(helper, k)
+    chunks = _chunks(ids, [12, 10, 8])
+    reference = host.make_cache()
+    for chunk in chunks:
+        host(chunk, cache=reference)
+    cache, helper_cache = host.make_cache(), helper.make_cache()
+    for chunk in chunks[:prefix]:
+        host(chunk, cache=cache)
+    if prefix:
+        state = INKLING2.prefix_state(cache, k)
+        assert all(a.dtype != mx.uint8 for a in state.values())
+        INKLING2.load_prefix(helper_cache, state)
+    for chunk in chunks[prefix:]:
+        boundary, state = INKLING2.run_first(helper, helper_cache, chunk, 0, {})
+        INKLING2.run_rest(None, host, cache, chunk, k, boundary, state)
+        INKLING2.apply_state(cache, k, state)
+    mx.eval([c.state for c in cache])
+    for a, b in zip(cache, reference):
+        if hasattr(a, "offset") or len(a.cache) > 4:
+            held, want = (
+                (c.keys, c.values) if hasattr(c, "offset") else c.cache[:2]
+                for c in (a, b)
+            )
+            assert [x.dtype for x in held] == [mx.uint8] * 2
+            assert [x.shape for x in held] == [x.shape for x in want]
+    # Layer 0 sees the same inputs on both Macs: its codes are the same.
+    np.testing.assert_array_equal(
+        np.asarray(cache[0].cache[0]), np.asarray(reference[0].cache[0])
+    )
+    last = ids[:, -1:]
+    got, want = _logits(host, cache, last)[0], _logits(host, reference, last)[0]
+    finite = np.isfinite(want)
+    assert np.corrcoef(got[finite], want[finite])[0, 1] > 0.9
+
+
 @pytest.mark.parametrize("k,prefix", [(3, 0), (4, 0), (5, 0), (5, 1)])
 def test_inkling2_split_matches_whole_model(k, prefix):
     ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 30)))

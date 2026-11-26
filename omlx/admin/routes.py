@@ -77,6 +77,7 @@ from ..model_profiles import (
     filter_universal_fields,
 )
 from ..model_settings import (
+    INKLING2_FP8_KV_MODES,
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
     ModelSettings,
     ane_prefill_backend,
@@ -474,6 +475,8 @@ class ModelSettingsRequest(BaseModel):
     turboquant_kv_scheme: str | None = None
     turboquant_kv_bits: float | None = None
     turboquant_skip_last: bool | None = None
+    # Inkling 2 FP8 KV cache: "off" | "full" | "all"
+    inkling2_fp8_kv: str | None = None
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
     qwen35_ane_prefill_enabled: bool | None = None
     qwen35_ane_prefill_sequence_length: int | None = None
@@ -554,6 +557,16 @@ class ModelSettingsRequest(BaseModel):
             raise ValueError(
                 f"gpu_power_limit_w must be between {gpu_power.MIN_WATTS} and "
                 f"{gpu_power.MAX_WATTS} W, or 0 to turn it off"
+            )
+        return value
+
+    @field_validator("inkling2_fp8_kv")
+    @classmethod
+    def validate_inkling2_fp8_kv(cls, value: str | None) -> str | None:
+        # Profiles reuse this model, so a bad mode is refused there too.
+        if value is not None and value not in INKLING2_FP8_KV_MODES:
+            raise ValueError(
+                "inkling2_fp8_kv must be one of " + ", ".join(INKLING2_FP8_KV_MODES)
             )
         return value
 
@@ -3338,6 +3351,9 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     current_settings.turboquant_kv_scheme = kv_scheme
     current_settings.turboquant_kv_bits = kv_bits
+    if "inkling2_fp8_kv" in sent:
+        # null = clear to the default ("off")
+        current_settings.inkling2_fp8_kv = request.inkling2_fp8_kv or "off"
     if "turboquant_skip_last" in sent:
         # null = clear to the model default (True); bool(None) would flip it
         # to False and silently disable the skip-last corruption guard.

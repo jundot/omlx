@@ -32,6 +32,7 @@ from mlx_lm.models.cache import ArraysCache, KVCache
 
 from .. import row_exact_gemv
 from ..moe_verify_gather import pair_order
+from ...model_settings import INKLING2_FP8_KV_MODES
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
 from . import expert_mma, fused, kernels, loopcd, verify_experts
@@ -692,6 +693,8 @@ class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
         self.sliding = args.is_sliding(layer_idx)
+        # Cache this layer's keys and values as FP8 codes (Model.set_fp8_kv).
+        self.fp8_kv = False
         self.head_dim = args.swa_head_dim if self.sliding else args.head_dim
         self.n_heads = (
             args.swa_num_attention_heads if self.sliding else args.num_attention_heads
@@ -853,6 +856,9 @@ class Inkling2Attention(nn.Module):
 
     def attend(self, q, k, v, rel, sink, kv, state=None):
         left_padding = None
+        if state is not None and windows.stores_fp8(kv, state):
+            k = kernels.fp8_quantize(k)
+            v = kernels.fp8_quantize(v)
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
             left_padding = getattr(kv, "left_padding", None)
@@ -1264,12 +1270,17 @@ class Inkling2TextModel(nn.Module):
                 f"{len(layout)} layer visits, got {len(cache)}"
             )
         window = self.args.sliding_window_size
-        return [
+        visits = [
             (None, windows.ArraysCache.adopt(cache[state], window))
             if kv is None
             else (cache[kv], cache[state])
             for kv, state in layout
         ]
+        dense = self.embed_norm.weight.dtype
+        for (idx, _), (_, state) in zip(self._schedule, visits):
+            # Read by windows.stores_fp8 for a visit that holds no keys yet.
+            state._omlx_fp8_kv = dense if self.layers[idx].attn.fp8_kv else None
+        return visits
 
     def __call__(self, inputs, cache, input_embeddings, capture):
         """``capture`` maps draft feature ids to fill: ``i`` < num visits is
@@ -1575,7 +1586,24 @@ class Model(nn.Module):
                 cache += [KVCache(), ArraysCache(4)]
         if self.model._caches_thinking_flags:
             cache.append(ArraysCache(1))
+        self.model.visit_caches(cache)
         return cache
+
+    # Keys and values are L2-clipped and unit-RMS, so they fit unit-scale FP8
+    # E4M3 codes with no scale: half the bytes of a BF16 cache, lossy.
+    fp8_kv = "off"
+
+    def set_fp8_kv(self, mode: str) -> None:
+        """Which layer visits cache keys and values as FP8 codes: "off",
+        "full" (the full-attention visits, whose cache grows with the
+        context) or "all" (the sliding windows too). Applies to caches made
+        afterwards; a cache that holds keys keeps their format."""
+        if mode not in INKLING2_FP8_KV_MODES:
+            raise ValueError(f"Unsupported Inkling 2 FP8 KV mode: {mode!r}")
+        self.fp8_kv = mode
+        for layer in self.model.layers:
+            attn = layer.attn
+            attn.fp8_kv = mode == "all" or (mode == "full" and not attn.sliding)
 
     def restore_cache(self, cache: list) -> list:
         """Prefix-cache hook: restored sliding states become joinable again."""

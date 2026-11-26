@@ -283,6 +283,17 @@ def oq_a8_model_supported(config_type: str | None) -> bool:
     )
 
 
+# Inkling 2 FP8 KV cache: which layer visits store keys and values as
+# unit-scale FP8 E4M3 codes instead of the activation dtype.
+INKLING2_FP8_KV_MODES = ("off", "full", "all")
+
+
+def inkling2_fp8_kv_mode(settings: Any) -> str:
+    """The saved Inkling 2 FP8 KV mode; "off" when unset or not a known mode."""
+    mode = _setting(settings, "inkling2_fp8_kv")
+    return mode if mode in INKLING2_FP8_KV_MODES else "off"
+
+
 def ced_prefill_on(settings: Any) -> bool:
     """DeepSeek V4.1 CED prefill unless it was saved off."""
     return _setting(settings, "deepseek_v41_ced_prefill_enabled") is not False
@@ -365,6 +376,12 @@ class ModelSettings:
         turboquant_kv_scheme: Cache format: "turboquant", "affine4", or "affine8".
         turboquant_kv_bits: Cache bit depth (2/2.5/3/3.5/4/6/8); affine formats require their named depth.
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
+        inkling2_fp8_kv: Inkling 2 only: cache keys and values as unit-scale
+            FP8 E4M3 codes, one byte per element instead of two. "off"
+            (default) keeps the exact cache; "full" converts the
+            full-attention layer visits, whose cache grows with the context;
+            "all" also converts the sliding windows. Changes numerics (lossy).
+            Requires reload.
         qwen35_ane_prefill_enabled: Enable ANE/GPU prompt processing for a
             supported model. Model metadata selects the implementation.
         qwen35_ane_prefill_sequence_length: Compiled ANE prompt block size.
@@ -533,6 +550,9 @@ class ModelSettings:
     turboquant_skip_last: bool = (
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
+    # Inkling 2 only. Off by default because it is an accuracy decision: the
+    # cached keys and values keep three mantissa bits.
+    inkling2_fp8_kv: str = "off"  # "off" | "full" | "all"
 
     # Shared ANE/GPU prefill controls retain the original Qwen setting names.
     # Backend-specific controls apply only to models that support them.
@@ -668,6 +688,11 @@ class ModelSettings:
         # The ddtree verify mode was removed; stored settings run as adaptive.
         if self.dflash_verify_mode == "ddtree":
             self.dflash_verify_mode = "adaptive"
+        if self.inkling2_fp8_kv not in INKLING2_FP8_KV_MODES:
+            raise ValueError(
+                "inkling2_fp8_kv must be one of "
+                + ", ".join(INKLING2_FP8_KV_MODES)
+            )
         if a8_prefill_on(self) and self.a8_prefill_min_tokens < 1:
             raise ValueError("a8_prefill_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
