@@ -914,6 +914,43 @@ def test_inkling2_rows_with_different_windows_decode_together():
     assert diff[..., :300].max().item() < 1e-3
 
 
+def test_inkling2_batch_verify_rolls_each_row_back_to_its_own_count():
+    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOPCD)
+    ids = mx.random.randint(0, 300, (2, 70))
+    lengths, rounds, block = (41, 9), ([1, 5], [6, 0]), 7
+    ends = list(lengths)
+    for accepted in rounds:
+        ends = [end + a + 1 for end, a in zip(ends, accepted)]
+    alone, expected = [], []
+    for row, (n, end) in enumerate(zip(lengths, ends)):
+        cache = model.make_cache()
+        model(ids[row : row + 1, :n], cache=cache)
+        alone.append(cache)
+        reference = model.make_cache()
+        model(ids[row : row + 1, :end], cache=reference)
+        expected.append(model(ids[row : row + 1, end : end + 1], cache=reference))
+    joined = []
+    for a, b in zip(*alone):
+        if hasattr(a, "offset"):
+            joined.append(type(a).merge([a, b]))
+        else:
+            a.extend(b)
+            joined.append(a)
+    starts = list(lengths)
+    for accepted in rounds:
+        tokens = mx.stack([ids[row, s : s + block] for row, s in enumerate(starts)])
+        out = model(tokens, cache=joined, return_hidden=True, capture_layer_ids=[5])
+        assert out.gdn_states == []
+        model.rollback_speculative_cache(joined, out.gdn_states, accepted, block)
+        starts = [s + a + 1 for s, a in zip(starts, accepted)]
+    nxt = mx.stack([ids[row, end : end + 1] for row, end in enumerate(ends)])
+    short = [c.extract(1) for c in joined]
+    got = mx.concatenate([model(nxt, cache=joined), model(nxt[1:], cache=short)])
+    for row, want in enumerate([*expected, expected[1]]):
+        diff = mx.abs(got[row, :, :300] - want[0, :, :300]).max().item()
+        assert diff < 1e-3
+
+
 def test_inkling2_restored_state_decodes_and_joins_like_the_live_one():
     # The prefix cache rebuilds a sliding state as a plain ArraysCache inside
     # oMLX's size wrapper, without the growth buffers.
