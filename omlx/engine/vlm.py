@@ -2515,6 +2515,15 @@ class VLMBatchedEngine(BaseEngine):
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
 
+        if self.model_type == "gemma3":
+            from ..patches.gemma3_prefill_linear import (
+                apply_gemma3_prefill_linear_patch,
+            )
+
+            patched = apply_gemma3_prefill_linear_patch(self._vlm_model)
+            if patched:
+                logger.info("Gemma 3 dense prefill enabled for %d projections", patched)
+
         # Create scheduler config
         scheduler_config = (
             copy.copy(self._scheduler_config)
