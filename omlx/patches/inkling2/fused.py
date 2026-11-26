@@ -72,7 +72,7 @@ _ATTN_SOURCE = """
                 const int g = r / RG, t = t0 + r % RG;
                 const int d = S - L + t - j;
                 float s = (d < 0 || t >= L) ? -INFINITY : kd[r];
-                if (d >= 0 && d < R) s += float(rel[(t * HQ + hk * GROUP + g) * R + d]) * LOG2E;
+                if (t < L && d >= 0 && d < R) s += float(rel[(t * HQ + hk * GROUP + g) * R + d]) * LOG2E;
                 sc[r] = s;
             }
         } else {
