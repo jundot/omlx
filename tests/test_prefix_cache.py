@@ -5447,3 +5447,110 @@ def test_restore_pool_flush_raises_failed_command_buffer(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="GPU Hang"):
         BlockAwarePrefixCache._flush_restore_pool_if_over(1)
+
+
+def test_hot_ram_fast_reconstruct_matches_standard_and_fallback(tmp_path, monkeypatch):
+    """Hot-RAM fast path matches standard restore, tracks hits, and falls back on placeholders."""
+    layer_types = ["KVCache", "ArraysCache", "ArraysCache"]
+    cache, ssd = _make_cache(tmp_path / "ssd", num_layers=len(layer_types))
+    try:
+        total = NUM_BLOCKS * BLOCK_SIZE
+        tokens = list(range(total + 5))
+
+        def _hybrid_state(seq_len: int) -> list[dict]:
+            k, v = _position_kv(seq_len)
+            k = k.astype(mx.bfloat16)
+            v = v.astype(mx.bfloat16)
+            c0, r0 = _arrays_state(seq_len, 0.5)
+            s0 = mx.full((1, 2, 4, 8), seq_len + 1.0, dtype=mx.bfloat16)
+            s1 = mx.full((1, 2, 4, 8), seq_len + 2.0, dtype=mx.bfloat16)
+            s2 = mx.array([seq_len], dtype=mx.int32)
+            mx.eval(k, v, c0, r0, s0, s1, s2)
+            return [
+                {
+                    "state": (k, v),
+                    "meta_state": (seq_len,),
+                    "class_name": "KVCache",
+                    "cache_type": "KVCache",
+                },
+                {
+                    "state": (c0, r0),
+                    "meta_state": (),
+                    "class_name": "ArraysCache",
+                    "cache_type": "ArraysCache",
+                },
+                {
+                    "state": [s0, s1, s2],
+                    "meta_state": (),
+                    "class_name": "ArraysCache",
+                    "cache_type": "ArraysCache",
+                },
+            ]
+
+        snapshots = {
+            BLOCK_SIZE * i: _hybrid_state(BLOCK_SIZE * i)
+            for i in range(1, NUM_BLOCKS + 1)
+        }
+        snapshots[total + 3] = _hybrid_state(total + 3)
+        stored = cache.store_cache(
+            "store-hybrid",
+            tokens[: total + 3],
+            _hybrid_state(total + 3),
+            model_cache_config=ModelCacheConfig.from_type_list(
+                layer_types, model_name="test-model"
+            ),
+            boundary_snapshots=snapshots,
+            _store_tail_terminal=True,
+        )
+        assert stored is not None and len(stored.block_ids) == NUM_BLOCKS + 1
+
+        # Verify both block-aligned and tail-terminal restores match standard path bit-for-bit.
+        for label, match_len, expected_blocks in (
+            ("aligned", total, NUM_BLOCKS),
+            ("tail", total + 3, NUM_BLOCKS + 1),
+        ):
+            query = tokens[:match_len] + [99999]
+            before_hits = ssd.get_stats().hot_cache_hits
+            bt_fast, _ = cache.fetch_cache(f"fast-{label}", query)
+            assert bt_fast is not None and bt_fast.num_tokens == match_len
+            restored_fast = cache.reconstruct_cache(bt_fast)
+            assert restored_fast is not None
+            assert ssd.get_stats().hot_cache_hits == before_hits + expected_blocks
+            assert restored_fast[0].offset == match_len
+            assert restored_fast[0].keys.shape[2] == match_len
+
+            with monkeypatch.context() as mp:
+                mp.setattr(
+                    cache,
+                    "_reconstruct_cache_from_hot_ram",
+                    lambda *a, **kw: prefix_cache_module._HOT_RAM_FALLBACK,
+                )
+                bt_std, _ = cache.fetch_cache(f"std-{label}", query)
+                restored_std = cache.reconstruct_cache(bt_std)
+            assert restored_std is not None
+            _assert_same(restored_fast, restored_std)
+
+        # Placeholder on the final block falls back to walk-back truncation without double-counting.
+        ph_tokens = list(range(10000, 10000 + total + 2))
+        ph_snaps = {
+            BLOCK_SIZE * i: _hybrid_state(BLOCK_SIZE * i) for i in range(1, NUM_BLOCKS)
+        }
+        ph_table = cache.store_cache(
+            "store-walkback",
+            ph_tokens,
+            _hybrid_state(total + 2),
+            model_cache_config=ModelCacheConfig.from_type_list(
+                layer_types, model_name="test-model"
+            ),
+            boundary_snapshots=ph_snaps,
+        )
+        assert ph_table is not None and len(ph_table.block_ids) == NUM_BLOCKS
+        before_wb_hits = ssd.get_stats().hot_cache_hits
+        bt_wb, _ = cache.fetch_cache("walkback-req", ph_tokens[:total] + [77777])
+        restored_wb = cache.reconstruct_cache(bt_wb)
+        assert restored_wb is not None
+        assert bt_wb.num_tokens == total - BLOCK_SIZE
+        assert restored_wb[0].offset == total - BLOCK_SIZE
+        assert ssd.get_stats().hot_cache_hits == before_wb_hits + NUM_BLOCKS
+    finally:
+        ssd.close()

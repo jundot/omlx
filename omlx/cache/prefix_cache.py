@@ -15,6 +15,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 from ..utils.fatal import is_command_buffer_error
 from ..utils.metal_sync import _sync_and_clear_cache
 
@@ -24,6 +26,11 @@ try:
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
+
+try:
+    from mlx_lm.models.cache import KVCache
+except ImportError:
+    KVCache = None
 
 from .deepseek_v41_delta import DELTA_CLASS as V41_DELTA_CLASS
 from .deepseek_v41_delta import compact_state as compact_v41_state
@@ -43,10 +50,13 @@ from .paged_ssd_cache import (
     _AFFINE4_CACHE_TYPES,
     _AFFINE8_CACHE_TYPES,
     _AFFINE_CACHE_TYPES,
+    _KV_COPY_PARALLEL_MIN_BYTES,
     _PACKED_CACHE_TYPES,
     _PM_BOUNDARY_SUB_CLASSES,
     _PM_SLICEABLE_SUB_CLASSES,
+    _ST_DTYPE_TO_NP,
     PagedSSDCacheManager,
+    _get_kv_copy_executor,
     _validate_affine_meta,
 )
 from .pooling_delta import POOLING_CACHE_DELTA_CLASS
@@ -239,6 +249,12 @@ class BlockCacheEntry:
 
     block_table: BlockTable
     last_access: float
+
+
+_HOT_RAM_FALLBACK = object()
+_DIRECT_NON_SLICEABLE_TYPES = frozenset(
+    {"ArraysCache", "SizedArraysCache", "MambaCache", "RotatingKVCache"}
+)
 
 
 class BlockAwarePrefixCache(CacheManager):
@@ -3286,6 +3302,304 @@ class BlockAwarePrefixCache(CacheManager):
 
         return self.paged_ssd_cache.preload_matched_blocks(block_hashes)
 
+    def _reconstruct_cache_from_hot_ram(self, block_table: BlockTable) -> Any:
+        ssd_cache = self.paged_ssd_cache
+        if (
+            KVCache is None
+            or not isinstance(ssd_cache, PagedSSDCacheManager)
+            or "_hot_cache" not in ssd_cache.__dict__
+            or "load_block_with_metadata" in ssd_cache.__dict__
+        ):
+            return _HOT_RAM_FALLBACK
+
+        manager_expected = ssd_cache._expected_layer_cache_types
+        layer_cache_types = list(manager_expected) if manager_expected else None
+        current_model_name = self.paged_cache.model_name
+
+        entries: list[dict[str, Any]] = []
+        block_hashes: list[bytes] = []
+        block_token_counts: list[int] = []
+        last_block_meta_states = None
+
+        for block_id in block_table.block_ids:
+            block = self.paged_cache.allocated_blocks.get(block_id)
+            if block is None or block.block_hash is None:
+                return _HOT_RAM_FALLBACK
+            entry, block_metadata = self.paged_ssd_cache.peek_hot_block(
+                block.block_hash
+            )
+            if entry is None or not block_metadata:
+                return _HOT_RAM_FALLBACK
+            if entry.get("arrays") or not entry.get("tensors_raw"):
+                return _HOT_RAM_FALLBACK
+
+            if current_model_name:
+                bm = block_metadata.get("model_name", "")
+                if not bm or bm != current_model_name:
+                    return _HOT_RAM_FALLBACK
+            block_num_layers = block_metadata.get("num_layers", 0)
+            if (
+                self.expected_num_layers > 0
+                and block_num_layers > 0
+                and block_num_layers != self.expected_num_layers
+            ):
+                return _HOT_RAM_FALLBACK
+            if "block_size" in block_metadata:
+                bs = block_metadata.get("block_size", 0)
+                if (bs and bs != self.block_size) or (not bs and self.block_size):
+                    return _HOT_RAM_FALLBACK
+            block_layer_types = block_metadata.get("layer_cache_types")
+            if layer_cache_types is None:
+                layer_cache_types = block_layer_types
+            elif block_layer_types is not None and self._canonical_layer_cache_types(
+                block_layer_types
+            ) != self._canonical_layer_cache_types(layer_cache_types):
+                return _HOT_RAM_FALLBACK
+            if not self.paged_ssd_cache.is_signature_compatible(
+                block_metadata.get("cache_signature", "")
+            ):
+                return _HOT_RAM_FALLBACK
+
+            entries.append(entry)
+            block_hashes.append(block.block_hash)
+            block_token_counts.append(int(block.token_count))
+            last_block_meta_states = block_metadata.get("layer_meta_states")
+
+        if not entries or not layer_cache_types:
+            return _HOT_RAM_FALLBACK
+        if self._gdn_split_layout_supported(layer_cache_types):
+            return _HOT_RAM_FALLBACK
+
+        num_layers = len(layer_cache_types)
+        valid_token_count = sum(block_token_counts)
+        if valid_token_count <= 0:
+            return _HOT_RAM_FALLBACK
+
+        kv_layers: list[int] = []
+        non_sliceable_layers: list[int] = []
+        for i, ctype in enumerate(layer_cache_types):
+            if ctype == "KVCache":
+                kv_layers.append(i)
+            elif ctype in _DIRECT_NON_SLICEABLE_TYPES:
+                non_sliceable_layers.append(i)
+            else:
+                return _HOT_RAM_FALLBACK
+
+        if not kv_layers and not non_sliceable_layers:
+            return _HOT_RAM_FALLBACK
+
+        kv_specs: list[tuple[int, str, str, str, tuple[int, int, int]]] = []
+        for i in kv_layers:
+            k_key_0 = f"layer_{i}_state_0"
+            v_key_0 = f"layer_{i}_state_1"
+            k_key_v2 = f"layer_{i}_keys"
+            v_key_v2 = f"layer_{i}_values"
+            spec_dtype: str | None = None
+            spec_bhd: tuple[int, int, int] | None = None
+            k_keys_per_block: list[str] = []
+            v_keys_per_block: list[str] = []
+            total_t = 0
+            for entry in entries:
+                fmeta = entry.get("file_metadata") or {}
+                if (
+                    f"layer_{i}_turboquant_v2" in fmeta
+                    or f"layer_{i}_affine4" in fmeta
+                    or f"layer_{i}_affine8" in fmeta
+                ):
+                    return _HOT_RAM_FALLBACK
+                traw = entry["tensors_raw"]
+                if k_key_0 in traw and v_key_0 in traw:
+                    if (
+                        fmeta.get(f"layer_{i}_state_count") not in (None, "2")
+                        or f"{k_key_0}_none" in fmeta
+                        or f"{v_key_0}_none" in fmeta
+                        or f"{k_key_0}_zero_dim" in fmeta
+                        or f"{v_key_0}_zero_dim" in fmeta
+                        or f"{k_key_0}_nested" in fmeta
+                        or f"{v_key_0}_nested" in fmeta
+                    ):
+                        return _HOT_RAM_FALLBACK
+                    kk, vk = k_key_0, v_key_0
+                elif k_key_v2 in traw and v_key_v2 in traw:
+                    if (
+                        f"{k_key_v2}_zero_dim" in fmeta
+                        or f"{v_key_v2}_zero_dim" in fmeta
+                    ):
+                        return _HOT_RAM_FALLBACK
+                    kk, vk = k_key_v2, v_key_v2
+                else:
+                    return _HOT_RAM_FALLBACK
+
+                _, k_dt, k_sh = traw[kk]
+                _, v_dt, v_sh = traw[vk]
+                if (
+                    len(k_sh) != 4
+                    or len(v_sh) != 4
+                    or k_dt != v_dt
+                    or k_dt not in _ST_DTYPE_TO_NP
+                    or k_sh != v_sh
+                    or any(d <= 0 for d in k_sh)
+                ):
+                    return _HOT_RAM_FALLBACK
+                bhd = (int(k_sh[0]), int(k_sh[1]), int(k_sh[3]))
+                if spec_dtype is None:
+                    spec_dtype = k_dt
+                    spec_bhd = bhd
+                elif spec_dtype != k_dt or spec_bhd != bhd:
+                    return _HOT_RAM_FALLBACK
+                total_t += int(k_sh[2])
+                k_keys_per_block.append(kk)
+                v_keys_per_block.append(vk)
+
+            if total_t != valid_token_count or spec_dtype is None or spec_bhd is None:
+                return _HOT_RAM_FALLBACK
+            if len(set(k_keys_per_block)) != 1 or len(set(v_keys_per_block)) != 1:
+                return _HOT_RAM_FALLBACK
+            kv_specs.append(
+                (i, k_keys_per_block[0], v_keys_per_block[0], spec_dtype, spec_bhd)
+            )
+
+        # Superseded non-sliceable snapshots on blocks 0..N-2 are never consumed;
+        # only decode non-sliceable layers from the final block.
+        last_entry = entries[-1]
+        kv_layer_set = set(kv_layers)
+        last_non_slice_data: list[Any] = []
+        if non_sliceable_layers:
+            last_arrays = self.paged_ssd_cache._arrays_from_tensors_raw(
+                last_entry["tensors_raw"],
+                skip_layer_indices=kv_layer_set,
+            )
+            last_non_slice_data = self.paged_ssd_cache._reconstruct_cache_data(
+                last_arrays,
+                last_entry["file_metadata"],
+                num_layers,
+                layer_cache_types,
+                skip_layer_indices=kv_layer_set,
+            )
+            if last_non_slice_data is None:
+                return _HOT_RAM_FALLBACK
+            for i in non_sliceable_layers:
+                if self._is_placeholder_state(last_non_slice_data[i]):
+                    return _HOT_RAM_FALLBACK
+
+        scatter_jobs: list[tuple[int, int, str, str, tuple[int, int, int]]] = []
+        for i, kk, vk, dt_str, bhd in kv_specs:
+            scatter_jobs.append((i, 0, kk, dt_str, bhd))
+            scatter_jobs.append((i, 1, vk, dt_str, bhd))
+
+        def _scatter_one(
+            job: tuple[int, int, str, str, tuple[int, int, int]],
+        ) -> tuple[int, int, np.ndarray, str]:
+            layer_idx, kv_idx, tkey, dt_str, (b_dim, h_dim, d_dim) = job
+            np_dtype = _ST_DTYPE_TO_NP[dt_str]
+            buf = np.empty((b_dim, h_dim, valid_token_count, d_dim), dtype=np_dtype)
+            off = 0
+            for entry in entries:
+                raw, _, sh = entry["tensors_raw"][tkey]
+                blen = int(sh[2])
+                buf[:, :, off : off + blen, :] = np.frombuffer(
+                    raw, dtype=np_dtype
+                ).reshape(sh)
+                off += blen
+            return layer_idx, kv_idx, buf, dt_str
+
+        kv_buffers: dict[tuple[int, int], tuple[np.ndarray, str]] = {}
+        if scatter_jobs:
+            total_kv_bytes = sum(
+                b_dim
+                * h_dim
+                * valid_token_count
+                * d_dim
+                * np.dtype(_ST_DTYPE_TO_NP[dt]).itemsize
+                * 2
+                for _, _, _, dt, (b_dim, h_dim, d_dim) in kv_specs
+            )
+            if total_kv_bytes >= _KV_COPY_PARALLEL_MIN_BYTES and len(scatter_jobs) > 1:
+                executor = _get_kv_copy_executor()
+                for l_idx, kv_idx, buf, dt_str in executor.map(
+                    _scatter_one, scatter_jobs
+                ):
+                    kv_buffers[(l_idx, kv_idx)] = (buf, dt_str)
+            else:
+                for job in scatter_jobs:
+                    l_idx, kv_idx, buf, dt_str = _scatter_one(job)
+                    kv_buffers[(l_idx, kv_idx)] = (buf, dt_str)
+
+        reconstructed_caches: list[Any] = [None] * num_layers
+        for i in kv_layers:
+            k_buf, k_dt = kv_buffers.pop((i, 0))
+            v_buf, v_dt = kv_buffers.pop((i, 1))
+            k_arr = mx.array(k_buf)
+            v_arr = mx.array(v_buf)
+            del k_buf, v_buf
+            if k_dt == "BF16":
+                k_arr = k_arr.view(mx.bfloat16)
+                v_arr = v_arr.view(mx.bfloat16)
+            cache = KVCache()
+            cache.keys = k_arr
+            cache.values = v_arr
+            cache.offset = valid_token_count
+            reconstructed_caches[i] = cache
+
+        for i in non_sliceable_layers:
+            cache_type_name = layer_cache_types[i]
+            layer_data = last_non_slice_data[i]
+            meta_state = (
+                last_block_meta_states[i]
+                if last_block_meta_states and i < len(last_block_meta_states)
+                else None
+            )
+            if (
+                isinstance(layer_data, tuple)
+                and len(layer_data) >= 3
+                and layer_data[0] == "__nstate__"
+            ):
+                marker_class = layer_data[1] or cache_type_name
+                elements = layer_data[2]
+                marker_handler = CacheTypeRegistry.get_handler_by_class_name(
+                    marker_class
+                )
+                if marker_handler.is_variable_length_state():
+                    cache = marker_handler.reconstruct_cache(
+                        {"states": list(elements)},
+                        meta_state,
+                        token_count=valid_token_count,
+                    )
+                else:
+                    cache = marker_handler.deserialize_state(
+                        tuple(elements), meta_state
+                    )
+            else:
+                latest_keys, latest_values = layer_data
+                handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
+                if CacheTypeRegistry.is_rotating_family(cache_type_name):
+                    cache = handler.reconstruct_cache(
+                        {
+                            "keys": latest_keys,
+                            "values": latest_values,
+                            "meta_state": meta_state,
+                        },
+                        meta_state,
+                    )
+                else:
+                    cache = handler.reconstruct_cache(
+                        {"states": [latest_keys, latest_values]},
+                        meta_state,
+                        token_count=valid_token_count,
+                    )
+            if cache is None:
+                return _HOT_RAM_FALLBACK
+            reconstructed_caches[i] = cache
+
+        for block_hash in block_hashes:
+            self.paged_ssd_cache.record_direct_hot_block_load(block_hash)
+
+        logger.debug(
+            f"Reconstructed cache from hot RAM fast path: {len(reconstructed_caches)} layers, "
+            f"{valid_token_count} tokens from {len(entries)} blocks"
+        )
+        return reconstructed_caches
+
     def reconstruct_cache(
         self,
         block_table: BlockTable,
@@ -3330,6 +3644,15 @@ class BlockAwarePrefixCache(CacheManager):
             return None
 
         try:
+            flush_bytes = _RESTORE_POOL_FLUSH_BYTES
+            bound_transient = (
+                flush_bytes > 0 and block_table.num_tokens >= _RESTORE_BOUND_MIN_TOKENS
+            )
+            if not bound_transient:
+                fast_result = self._reconstruct_cache_from_hot_ram(block_table)
+                if fast_result is not _HOT_RAM_FALLBACK:
+                    return fast_result
+
             # Collect cache data from valid blocks (stop at first invalid)
             all_block_data = []
             valid_block_count = 0
@@ -3365,10 +3688,6 @@ class BlockAwarePrefixCache(CacheManager):
 
             # Blocks are held as private list copies: dropping a consumed
             # tensor never mutates a list the SSD manager handed out.
-            flush_bytes = _RESTORE_POOL_FLUSH_BYTES
-            bound_transient = (
-                flush_bytes > 0 and block_table.num_tokens >= _RESTORE_BOUND_MIN_TOKENS
-            )
             snapshot_drop_state: dict[str, Any] = {}
 
             for idx, block_id in enumerate(block_table.block_ids):
