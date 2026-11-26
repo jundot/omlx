@@ -554,10 +554,12 @@ def _patch_model(dsv4: Any) -> None:
         mx.eval(logits)
         return logits
 
-    def mtp_take_primed(self, cache, main_token):
+    def mtp_take_primed(self, cache, main_token, cache_offset=None):
         if not getattr(self, "_omlx_dspark_decode_enabled", False):
             return None
-        return deepseek_v4_dspark.take_primed(self, cache, main_token)
+        return deepseek_v4_dspark.take_primed(
+            self, cache, main_token, target_offset=cache_offset
+        )
 
     def mtp_forward(
         self,

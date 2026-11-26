@@ -1257,7 +1257,12 @@ def _take_primed(
     for host in _host_candidates(model):
         hook = getattr(host, "mtp_take_primed", None)
         if callable(hook):
-            primed = hook(cache, main_tok)
+            # A batch activation shares one target cache; it names the row's offset.
+            primed = (
+                hook(cache, main_tok)
+                if cache_offset is None
+                else hook(cache, main_tok, cache_offset=cache_offset)
+            )
             if primed is not None:
                 return primed
             # None means the hook declined ownership, not "no priming": the

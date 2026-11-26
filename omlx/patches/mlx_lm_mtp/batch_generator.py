@@ -1285,26 +1285,40 @@ def _replace_cache_rows(
 
 
 def _initial_batch_forward(gen_batch):
-    """Advance fresh Qwen rows together without extracting target caches.
+    """Advance fresh rows together instead of extracting each row's target cache.
 
     The per-row fallback extracts every row and merges the batch again, which
-    copies the whole KV bank at each activation, join, finish and unpark.
-    Rows still sample in order from their own logits, as on that fallback.
+    copies the whole KV bank at each activation, join, finish and unpark, and
+    reads the weights once per row. Rows still sample in order from their own
+    logits, as on that fallback. Hosts whose caches roll a batch back in place
+    qualify, and so do DSpark hosts whose batched decode returns the draft
+    inputs of every row (``mtp_batch_activation_ok``).
     """
     from .fused_batch import _supports_batch_rollback
 
     host = getattr(gen_batch.model, "_language_model", None)
+    activation_ok = getattr(
+        _dspark_host(gen_batch.model), "mtp_batch_activation_ok", None
+    )
     chain, _, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
     if not (
         len(gen_batch.uids) > 1
         and chain
         and not head_clone
-        and getattr(host, "_omlx_mtp_batch_rollback", False)
         and gen_batch._next_tokens is not None
-        and all(_supports_batch_rollback(c) for c in gen_batch.prompt_cache)
         and not any(
             _row_value(gen_batch.logits_processors, i)
             for i in range(len(gen_batch.uids))
+        )
+        and (
+            (
+                getattr(host, "_omlx_mtp_batch_rollback", False)
+                and all(_supports_batch_rollback(c) for c in gen_batch.prompt_cache)
+            )
+            or (
+                callable(activation_ok)
+                and activation_ok(gen_batch.prompt_cache, len(gen_batch.uids))
+            )
         )
     ):
         return None

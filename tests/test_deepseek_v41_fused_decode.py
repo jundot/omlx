@@ -775,16 +775,7 @@ def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, 
     batch_generator.apply()
     # Affine projections run on matrix tiles alone and in a batch, so each request's greedy
     # tokens are its single-request ones (batched MXFP8 rows round like batched decode).
-    model = build(
-        fmt="affine",
-        vocab_size=4096,
-        preserve_mtp=True,
-        n_mtp_layers=1,
-        dspark_block_size=3,
-        dspark_noise_token_id=2,
-        dspark_target_layer_ids=(2, 3, 4),
-        dspark_markov_rank=32,
-    )
+    model = _dspark_build()
     prompts = [[3 + r + j for j in range(9)] for r in range(0, 9 * count, 9)]
     model.configure_mtp(True, 3)
     # A fixed depth keeps the batch policy from timing-based parking.
@@ -826,6 +817,120 @@ def test_mtp_generation_of_several_requests_verifies_them_together(monkeypatch, 
     assert together and max(shape[0] for shape in together) == count, "the requests must verify in one forward"
     for uid, want in zip(uids, expected):
         assert result[uid][:8] == want
+
+
+def _dspark_build(fmt="affine"):
+    return build(
+        fmt=fmt,
+        vocab_size=4096,
+        preserve_mtp=True,
+        n_mtp_layers=1,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_markov_rank=32,
+    )
+
+
+@pytest.mark.parametrize("fmt", ["affine", "mxfp"])
+@pytest.mark.parametrize("batch", [3, 8, 17])
+def test_batched_decode_returns_each_requests_draft_inputs(fmt, batch):
+    """A batched decode that asks for the DSpark target hidden runs the plain batched decode
+    kernels, so one forward can activate a batch's drafting. With affine projections every
+    request gets bit for bit the logits and hidden it gets decoding alone; MXFP8 projections
+    switch to matrix tiles from decode_moe.MMA_MIN_BATCH requests, as any batched decode does."""
+    from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
+
+    model = verify_exact(_dspark_build(fmt))
+    rng = np.random.default_rng(5)
+    prompts = [rng.integers(3, 60, 13 + r).tolist() for r in range(batch)]
+    singles, rows, plain_rows = [], [], []
+    for p in prompts:
+        for target in (singles, rows, plain_rows):
+            cache = model.make_cache()
+            mx.eval(model(mx.array([p[:-1]]), cache=cache))
+            target.append(cache)
+
+    def merged(caches):
+        return [DeepseekV41Cache.merge([caches[r][i] for r in range(batch)]) for i in range(len(caches[0]))]
+
+    batched, plain = merged(rows), merged(plain_rows)
+    tokens = mx.array([[p[-1]] for p in prompts])
+    logits, hidden = model(tokens, cache=batched, return_hidden=True)
+    assert mx.array_equal(logits, model(tokens, cache=plain))
+    for r, (p, cache) in enumerate(zip(prompts, singles)):
+        want_logits, want_hidden = model(mx.array([[p[-1]]]), cache=cache, return_hidden=True)
+        if fmt == "affine":
+            assert mx.array_equal(logits[r], want_logits[0])
+            assert mx.array_equal(hidden[r], want_hidden[0])
+        else:
+            for got, want in ((logits[r], want_logits[0]), (hidden[r], want_hidden[0])):
+                got, want = np.asarray(got.astype(mx.float32)), np.asarray(want.astype(mx.float32))
+                np.testing.assert_allclose(got, want, rtol=0, atol=1e-6 * np.abs(want).max())
+        assert batched[0].extract(r).size() == cache[0].size()
+
+
+@pytest.mark.parametrize("count", [2, 8])
+def test_requests_activate_drafting_in_one_forward(monkeypatch, count):
+    """Every (re)activation of a batch's drafting advances all requests with one batched
+    forward, and each request still reproduces its own greedy decoding."""
+    from mlx_lm.generate import BatchGenerator
+
+    from omlx.patches.mlx_lm_mtp import batch_generator, batch_policy
+
+    batch_generator.apply()
+    model = _dspark_build()
+    prompts = [[3 + r + j for j in range(9)] for r in range(0, 9 * count, 9)]
+    model.configure_mtp(True, 3)
+    model._omlx_mtp_depth_fixed = True
+    expected = []
+    for prompt in prompts:
+        tokens, cache = [], model.make_cache()
+        for s in range(0, len(prompt) - 1, 4):
+            model(mx.array([prompt[s : min(s + 4, len(prompt) - 1)]]), cache=cache)
+        ids = mx.array([prompt[-1:]])
+        for _ in range(16):
+            token = int(mx.argmax(model(ids, cache=cache)[0, -1]).item())
+            tokens.append(token)
+            ids = mx.array([[token]])
+        expected.append(tokens)
+    activations = []
+    real = batch_generator._initial_batch_forward
+
+    def counted(gen_batch):
+        shared = real(gen_batch)
+        activations.append((len(gen_batch.uids), shared is not None))
+        return shared
+
+    monkeypatch.setattr(batch_generator, "_initial_batch_forward", counted)
+    # An ordinary step every few batch steps drops the drafting state, so the
+    # batch re-activates the way it does after a park.
+    steps = []
+
+    def needs_standard(self):
+        steps.append(1)
+        return len(steps) % 4 == 0
+
+    monkeypatch.setattr(batch_policy.BatchPolicy, "needs_standard", needs_standard)
+    generator = BatchGenerator(
+        model, max_tokens=16, prefill_step_size=4, prefill_batch_size=count,
+        sampler=lambda logits: mx.argmax(logits, -1),
+    )
+    result = {}
+    try:
+        uids = generator.insert(prompts)
+        for _ in range(96):
+            _, responses = generator.next()
+            for response in responses:
+                result.setdefault(response.uid, []).append(response.token)
+            if all(len(result.get(uid, [])) >= 16 for uid in uids):
+                break
+    finally:
+        generator.close()
+    full = [shared for rows, shared in activations if rows == count]
+    assert len(full) >= 2 and all(full), activations
+    for uid, want in zip(uids, expected):
+        assert result[uid][:16] == want
 
 
 # Two pipeline ranks run batched Lightning MTP for two requests (rank 0 holds the head and

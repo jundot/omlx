@@ -1205,21 +1205,30 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             x = _gather_stage(x)
         return x if skip_logits else project_logits(x, self.head.weight)
 
-    def _batched_decode_ok(self, input_ids, cache, masks, inputs_embeds, capture, kwargs):
+    def _batched_decode_ok(self, shape, cache, masks, inputs_embeds, capture, kwargs):
         """One token per request at a valid position, through supported fused layers.
 
-        Batches wider than the fused kernels are split into MAX_BATCH-row chunks.
+        Batches wider than the fused kernels are split into MAX_BATCH-row chunks. A DSpark
+        target capture also needs every target layer on this rank, so the hidden is complete
+        before any cache advances.
         """
-        b_n = input_ids.shape[0]
+        b_n, width = shape
         if not (
-            input_ids.shape[1] == 1
+            width == 1
             and b_n >= 2
             and inputs_embeds is None
-            and not capture
             and kwargs.get("mtp_verify_states") is None
             and not kwargs.get("_ced_prefill", False)
         ):
             return False
+        if capture:
+            targets = set(self._config.dspark_target_layer_ids)
+            if (
+                not targets
+                or self.pipeline_size > 1
+                or not targets <= {i for i, _ in self._stage()}
+            ):
+                return False
         if masks is not None and not bool(np.all(np.asarray(masks))):
             return False
         # A pending decoder replay runs on its row in the per-row path.
@@ -1270,32 +1279,38 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             self._fused_stages = agreed
         return agreed
 
-    def _forward_decode_batched(self, input_ids, cache, skip_logits=False):
+    def _forward_decode_batched(self, input_ids, cache, skip_logits=False, capture=False):
         """_forward for B single-token requests with weights shared within each chunk.
 
         Same per-request semantics as the row loop below (positions, caches, Engram history,
         cache bookkeeping). decode_fused.decode_block_nb, Engram (each request's row projected
         on its own) and project_logits give each request its single-request result: bit for
         bit below decode_moe.MMA_MIN_BATCH requests, and within the fp32 summation rounding of
-        the simdgroup-matrix GEMVs from there on.
+        the simdgroup-matrix GEMVs from there on. With ``capture`` it also returns each request's
+        DSpark target hidden, as the per-row path does.
         """
         c = self._config
         b_n = input_ids.shape[0]
         if b_n > decode_fused.MAX_BATCH:
-            results, rows = [], [[] for _ in cache]
+            results, hiddens, rows = [], [], [[] for _ in cache]
             for start in range(0, b_n, decode_fused.MAX_BATCH):
                 end = min(start + decode_fused.MAX_BATCH, b_n)
                 chunk = [
                     DeepseekV41Cache.merge([item.extract(r) for r in range(start, end)])
                     for item in cache
                 ]
-                results.append(self._forward_decode_batched(input_ids[start:end], chunk, skip_logits))
+                out = self._forward_decode_batched(input_ids[start:end], chunk, skip_logits, capture)
+                if capture:
+                    out, hidden = out
+                    hiddens.append(hidden)
+                results.append(out)
                 for i, item in enumerate(chunk):
                     rows[i].extend(item.extract(r) for r in range(end - start))
             for item, updated in zip(cache, rows):
                 item.adopt_rows(updated)
                 item.advance(1)
-            return mx.concatenate(results, axis=0)
+            logits = mx.concatenate(results, axis=0)
+            return (logits, mx.concatenate(hiddens, axis=0)) if capture else logits
         rcs = [[item.extract(row) for item in cache] for row in range(b_n)]
         starts = []
         for rc in rcs:
@@ -1314,6 +1329,7 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         if self.pipeline_rank < self.pipeline_size - 1:
             h, pre = _receive_stage(h, pre, self.pipeline_rank + 1)
         shareds = [{} for _ in range(b_n)]
+        captured = {}
         engram_ids = list(c.engram_layer_ids)
         stage = self._stage()
         shared_rows = getattr(self, "mtp_shared_verify_rows", None)
@@ -1337,6 +1353,8 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                             self.layers[following].engram.embed,
                             hashes[:, :, engram_ids.index(following)],
                         )
+                if capture and i in c.dspark_target_layer_ids:
+                    captured[i] = mx.mean(h, axis=2)
                 h, pre = decode_fused.decode_block_nb(
                     layer, h, pre, [rcs[r][j] for r in range(b_n)], shareds, starts, c, together
                 )
@@ -1362,6 +1380,8 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         for i, item in enumerate(cache):
             item.adopt_rows([rcs[r][i] for r in range(b_n)])
             item.advance(1)
+        if capture:
+            return logits, mx.concatenate([captured[i] for i in c.dspark_target_layer_ids], axis=-1)
         return logits
 
     def _batched_verify_ok(self, input_ids, cache, masks, inputs_embeds, kwargs):
@@ -1487,8 +1507,8 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             )
         masks = cache[0].make_mask(input_ids.shape[1])
         capture = bool(kwargs.get("return_dspark_hidden", False))
-        if self._batched_decode_ok(input_ids, cache, masks, inputs_embeds, capture, kwargs):
-            return self._forward_decode_batched(input_ids, cache, skip_logits)
+        if self._batched_decode_ok(input_ids.shape, cache, masks, inputs_embeds, capture, kwargs):
+            return self._forward_decode_batched(input_ids, cache, skip_logits, capture)
         verify_rows = kwargs.get("mtp_verify_states")
         if verify_rows is not None and input_ids.shape[0] > 1:
             if not self._batched_verify_ok(input_ids, cache, masks, inputs_embeds, kwargs):

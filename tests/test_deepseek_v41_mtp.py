@@ -343,3 +343,54 @@ def test_interleaved_prefills_keep_their_dspark_contexts():
         2,
     ]
 
+
+def test_batch_activation_primes_each_row_from_its_offset():
+    """A batch activation hands take_primed the whole batch cache and each row's own
+    offset: every request still adopts the draft context of its prompt."""
+    from types import SimpleNamespace
+
+    from omlx.models.vlm import VLMModelAdapter
+    from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    model = LanguageModel(mtp_config())
+    load_reference_weights(model)
+    model.configure_mtp(True, 3)
+    adapter = VLMModelAdapter(
+        SimpleNamespace(
+            config=SimpleNamespace(model_type="deepseek_v41"), language_model=model
+        )
+    )
+    caches = {name: model.make_cache() for name in "ab"}
+    for name in "ab":
+        prompt_priming.prepare_prefix_context(
+            adapter,
+            request_id=name,
+            prompt_tokens=[1, 2, 3, 4],
+            cached_tokens=0,
+            prefix_cache=None,
+        )
+    for name, chunk in (("a", [3, 4, 5]), ("b", [7, 8, 9, 10, 11])):
+        prompt_priming.activate_request(adapter, name)
+        model(mx.array([chunk]), cache=caches[name])
+    for uid, (name, token) in enumerate((("a", 6), ("b", 12))):
+        prompt_priming.bind_uid(adapter, name, uid)
+        with prompt_priming.decode_scope(adapter, [uid]):
+            model(mx.array([[token]]), cache=caches[name])
+    # The activation forward advanced each row by its next token.
+    for name, token in (("a", 13), ("b", 14)):
+        model(mx.array([[token]]), cache=caches[name], return_hidden=True)
+    offsets = [caches[name][0].size() for name in "ab"]
+    batch = [
+        DeepseekV41Cache.merge([caches["a"][i], caches["b"][i]])
+        for i in range(len(caches["a"]))
+    ]
+    primed = [
+        prompt_priming.take_primed(
+            adapter, batch, mx.array([token]), uid=uid, cache_offset=offset
+        )
+        for uid, (token, offset) in enumerate(zip((13, 14), offsets))
+    ]
+    # Each history ends one token before its activation forward: prompt tokens 3..6 for
+    # "a" (offset 4) and 7..12 for "b" (offset 6).
+    assert [p is not None and p[1] for p in primed] == [4, 6]

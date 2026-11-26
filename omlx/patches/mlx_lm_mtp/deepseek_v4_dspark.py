@@ -204,13 +204,19 @@ def take_primed(
     host: Any,
     target_cache: Optional[list[Any]],
     _main_token: Any,
+    target_offset: Optional[int] = None,
 ) -> Optional[tuple[list[DSparkContextCache], int]]:
-    """Finish the prompt-to-decode seam for the native MTP batch loop."""
+    """Finish the prompt-to-decode seam for the native MTP batch loop.
+
+    ``target_offset`` is the row's target cache offset when ``target_cache``
+    holds a whole batch.
+    """
     ctx = getattr(host, _PRIME_CTX_ATTR, None)
     drop_primed(host)
     if not isinstance(ctx, _DSparkPrimeContext):
         return None
-    target_offset = _target_cache_offset(target_cache)
+    if target_offset is None:
+        target_offset = _target_cache_offset(target_cache)
     # Activation has already forwarded one target token with capture disabled.
     if target_offset is None or ctx.expected_target_offset != target_offset - 1:
         return None
