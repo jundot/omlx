@@ -399,30 +399,37 @@ class Inkling2Experts(nn.Module):
         """The routed expert outputs [N, K, H] and their FP32 weights [N, K]
         (NVFP4 tensor scale included), before ``moe_sum``."""
         z = self.routes(x, inds)
-        # z carries w2's activation dtype (gather_qmm keeps its input dtype).
         s2 = self.w2.post_scale(inds, z.dtype)
         if s2 is not None:
             weights = weights * s2
         return z, weights
 
-    def routes(self, x: mx.array, inds: mx.array) -> mx.array:
-        """Unweighted per-route outputs ``[..., k, H]`` (before the w2 post-scale)."""
+    def routes(
+        self, x: mx.array, inds: mx.array, call: tuple[int, int, int] | None = None
+    ) -> mx.array:
+        """Unweighted per-route outputs ``[..., k, H]`` (before the w2 post-scale).
+
+        The kernel is picked for ``call`` = (routes, rows, experts), by default
+        ``inds`` and this stack's expert count. Expert offload passes its whole
+        routing's, as its ``inds`` are slots or a part of that routing.
+        """
         xe = mx.expand_dims(x, (-2, -3))
         armed = is_row_exact_armed()
         # The expert-order kernel repeats gather_qmm's one-pair arithmetic, so
         # it takes every block gather_qmm runs pair by pair: a decode row, a
         # row-exact verify block, and any block below gather_qmm's batched
         # sorted kernel (four pairs per expert). Shared experts are read once.
-        experts = self.w13.weight.shape[0]
-        per_pair = inds.size < verify_experts.PAIRS_PER_EXPERT * experts
+        call = call or (inds.size, inds.shape[0], self.w13.weight.shape[0])
+        size, rows, experts = call
+        per_pair = size < verify_experts.PAIRS_PER_EXPERT * experts
         fused = (
-            (per_pair or (armed and inds.shape[0] <= verify_experts.MAX_ROWS))
+            (per_pair or (armed and rows <= verify_experts.MAX_ROWS))
             and verify_experts.supported(self.w13, x.dtype)
             and verify_experts.supported(self.w2, x.dtype)
         )
         # Sorting regroups the pairs by expert and changes their arithmetic;
         # row-exact verify rows keep the per-pair gather of a decode step.
-        do_sort = not fused and inds.size >= 64 and not armed
+        do_sort = not fused and size >= 64 and not armed
         idx = inds
         inv = None
         if do_sort:
@@ -611,12 +618,9 @@ def _row_matmul(x: mx.array, w: mx.array) -> mx.array:
     does: a multi-row matmul switches kernels with the row count."""
     rows = x.shape[-2]
     if rows > 1 and is_row_exact_armed():
-        # One single-row product per row in a batch: with a stride-0 weight
-        # batch MLX keeps the one-row kernel instead of folding the rows into
-        # a multi-row matmul.
-        batch = mx.broadcast_shapes(x.shape[:-2], w.shape[:-2])
-        wb = mx.broadcast_to(w[..., None, :, :], (*batch, rows, *w.shape[-2:]))
-        return (x[..., :, None, :] @ wb).squeeze(-2)
+        return mx.concatenate(
+            [x[..., row : row + 1, :] @ w for row in range(rows)], axis=-2
+        )
     return x @ w
 
 
@@ -996,11 +1000,6 @@ class Inkling2Layer(nn.Module):
         return h, s2, s3
 
     def _post_attn(self, out, gate, h, mlp_blocks, s2, messages=None):
-        """``_post`` up to the MoE: the residual, the MoE input (and its FP32
-        copy, or None), the conv state.
-
-        Expert offload compiles this and :meth:`_post_mlp` around an eager MoE.
-        """
         a = self.attn.output(out, gate)
         # The conv kernels also do the FP32 residual adds: the attention
         # output joins h (off a block boundary), the MLP output the residual.
@@ -1062,8 +1061,6 @@ class Inkling2Layer(nn.Module):
         return residual, x, x32, s2
 
     def _post_mlp(self, residual, z, zw, s3, h):
-        """``_post`` after the MoE: ``z``/``zw`` are ``mlp.unreduced``'s
-        outputs; ``h`` gives the output dtype."""
         conv = kernels.moe_short_conv(
             z, zw, self.mlp_conv, s3, self._conv_scale, residual, h.dtype
         )

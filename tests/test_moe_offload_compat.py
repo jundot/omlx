@@ -90,7 +90,6 @@ def test_supported_layouts_use_headers_only(tmp_path, monkeypatch, kind, per_exp
 
 
 def test_inkling2_nvfp4_and_affine_experts(tmp_path):
-    """Inkling 2: fused w13/w2, NVFP4 layers need their per-expert global_scale."""
     text = dict(
         num_hidden_layers=2,
         n_routed_experts=16,

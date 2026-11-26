@@ -1145,7 +1145,7 @@ def apply_moe_expert_offload(
         from .inkling2.moe_offload import apply_inkling2_moe_expert_offload
 
         wrapped += apply_inkling2_moe_expert_offload(
-            model, model_dir, resident_fraction, mtp_resident=mtp_resident
+            model, model_dir, resident_fraction
         )
     total_bytes = resident_bytes = 0
     staging_sizes = {}
@@ -1261,7 +1261,6 @@ def estimate_offload_admission_bytes(
                 # V4.1 admission is owned by its own adapter's estimator.
                 return full_size
             if kind == "inkling2_loop":
-                # Fused gate/up; the Inkling adapter slots NVFP4 experts.
                 projs, nvfp4_ok = ("w13", "w2"), True
             if kind in ("qwen3_5_moe", "inkling2_loop"):
                 from .moe_offload_compat import moe_offload_compatibility

@@ -122,7 +122,6 @@ def _inspect(path, signature):
             prefix = parent + ".switch_glu"
         if kind in ("qwen3_5_moe", "minicpmv4_7"):
             prefix = _qwen35_checkpoint_prefix(store, prefix)
-        # Inkling 2 fuses gate/up into one interleaved ``w13``.
         projs = (
             (("w13", 2 * intermediate, hidden), ("w2", hidden, intermediate))
             if kind == "inkling2_loop"
@@ -152,8 +151,6 @@ def _inspect(path, signature):
             bits = spec.get("bits", 4)
             group = spec.get("group_size", 64)
             mode = spec.get("mode", "affine")
-            # NVFP4 needs a per-expert global_scale, which only the
-            # Inkling 2 adapter slots.
             modes = ("affine", "mxfp4", "mxfp8") + (
                 ("nvfp4",) if kind == "inkling2_loop" else ()
             )

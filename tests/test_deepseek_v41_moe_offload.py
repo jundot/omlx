@@ -154,6 +154,7 @@ def test_lightning_mtp_offload_conflict_is_family_aware():
     validate_moe_expert_offload(settings, model_type="glm5_next")
     validate_moe_expert_offload(settings, model_type="glm5-next")
     validate_moe_expert_offload(settings, model_type="qwen4_exp")
+    validate_moe_expert_offload(settings, model_type="inkling2_loop")
     validate_moe_expert_offload(settings, model_type=None)
     with pytest.raises(ValueError, match="MoE expert offload cannot"):
         validate_moe_expert_offload(settings, model_type="qwen3_5")

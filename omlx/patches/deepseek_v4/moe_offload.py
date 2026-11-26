@@ -102,8 +102,7 @@ def resolve_view(glu, store: CheckpointExpertStore, path: str):
 
 
 class OffloadedSwitchGLU(nn.Module):
-    """DeepSeek V4 SwitchGLU whose experts live in a
-    :class:`~omlx.patches.moe_slot_cache.SlotCache`."""
+    """DeepSeek V4 SwitchGLU whose experts live in a :class:`SlotCache`."""
 
     def __init__(self, glu, capacity: int, view: _GLUStoreView):
         super().__init__()
