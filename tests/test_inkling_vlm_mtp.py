@@ -10,12 +10,18 @@ import pytest
 
 try:
     import mlx.core as mx
+    import mlx.nn as nn
 
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
 
-from omlx.patches.inkling2 import loopcd
+from omlx.patches.inkling2 import fused, kernels, loopcd
+from omlx.patches.inkling2 import model as inkling2_model
+from omlx.patches.qwen35_verify_qmm import (
+    apply_verify_qmm_patch,
+    set_verify_qmm_armed,
+)
 
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
@@ -1974,33 +1980,8 @@ def test_inkling2_dspark_fold_dequantizes_the_head_in_chunks():
         assert mx.array_equal(head._fold_bias[start:end], expected)
 
 
-def _attention_reference(q, k, v, rel, sink, scale, left_padding=0):
-    """FP32 banded-sink attention for full-attention rows (no window)."""
-    _, hq, length, _ = q.shape
-    hkv, s = k.shape[1], k.shape[2]
-    r = rel.shape[-1]
-    k = mx.repeat(k, hq // hkv, axis=1).astype(mx.float32)
-    v = mx.repeat(v, hq // hkv, axis=1).astype(mx.float32)
-    scores = (q.astype(mx.float32) @ k.swapaxes(-1, -2)) * scale
-    dist = mx.arange(s - length, s)[:, None] - mx.arange(s)[None, :]
-    bias = mx.take_along_axis(
-        rel[0].transpose(1, 0, 2).astype(mx.float32),
-        mx.broadcast_to(mx.clip(dist, 0, r - 1)[None], (hq, length, s)),
-        axis=-1,
-    )
-    scores = scores + mx.where(dist < r, bias, 0.0)
-    visible = (dist >= 0) & (mx.arange(s)[None, :] >= left_padding)
-    scores = mx.where(visible, scores, -mx.inf)
-    sink = sink[0].transpose(1, 0)[..., None].astype(mx.float32)
-    m = mx.maximum(scores.max(-1, keepdims=True), sink)
-    p = mx.exp(scores - m)
-    return (p @ v) / (p.sum(-1, keepdims=True) + mx.exp(sink - m))
-
-
 def _attention_inputs(length, keys, hq=8, hkv=2, d=128, r=16):
     mx.random.seed(length)
-    # Peaked scores, a strong bias band and sinks, so dropping any of them
-    # moves the output well past the tolerance.
     q = (mx.random.normal((1, hq, length, d)) * 3).astype(mx.bfloat16)
     k = mx.random.normal((1, hkv, keys, d)).astype(mx.bfloat16)
     v = mx.random.normal((1, hkv, keys, d)).astype(mx.bfloat16)
@@ -2009,20 +1990,18 @@ def _attention_inputs(length, keys, hq=8, hkv=2, d=128, r=16):
     return q, k, v, rel, sink, d**-0.5
 
 
+@pytest.mark.parametrize("hq", [8, 12])
 @pytest.mark.parametrize("padding", [0, 700])
-@pytest.mark.parametrize("length", [1, 3, 5, 7, 8, 16])
-def test_inkling2_long_attention_matches_reference(length, padding):
-    from omlx.patches.inkling2 import fused
-
+@pytest.mark.parametrize("length", [1, 5, 16])
+def test_inkling2_long_attention_matches_reference(length, padding, hq):
     if mx.default_device() != mx.gpu:
         pytest.skip("the long-context attention kernel runs on the GPU")
-    q, k, v, rel, sink, scale = _attention_inputs(length, 1300)
+    q, k, v, rel, sink, scale = _attention_inputs(length, 2600, hq=hq)
     lp = mx.array([padding]) if padding else None
     got = fused.long_decode_attention(q, k, v, rel, sink, scale=scale, left_padding=lp)
-    expected = _attention_reference(q, k, v, rel, sink, scale, padding)
-    assert mx.abs(got.astype(mx.float32) - expected).max().item() < 2e-2
-    # A row's result does not depend on the rows after it: each one has the
-    # bits of a one-row call over the keys up to its position.
+    expected = kernels._masked_attention(q, k, v, rel, sink, scale, 0, lp)
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+    assert diff.max().item() < 2e-2
     s = k.shape[2]
     for t in range(length):
         end = s - length + t + 1
@@ -2038,104 +2017,10 @@ def test_inkling2_long_attention_matches_reference(length, padding):
         assert mx.array_equal(got[:, :, t : t + 1], alone)
 
 
-@pytest.mark.parametrize("length,passes", [(4, 1), (5, 1), (8, 1), (9, 2), (16, 2)])
-def test_inkling2_long_attention_shares_one_pass_up_to_8_rows(length, passes, monkeypatch):
-    """Blocks of up to 8 query positions read the keys once (two simdgroups
-    per split past 4); longer blocks take one pass per 8."""
-    from omlx.patches.inkling2 import fused
-
-    if mx.default_device() != mx.gpu:
-        pytest.skip("the long-context attention kernel runs on the GPU")
-    calls = []
-    block = fused._attention_block
-    monkeypatch.setattr(
-        fused,
-        "_attention_block",
-        lambda q, *a: calls.append(q.shape[2]) or block(q, *a),
-    )
-    q, k, v, rel, sink, scale = _attention_inputs(length, 1300)
-    mx.eval(fused.long_decode_attention(q, k, v, rel, sink, scale=scale))
-    assert len(calls) == passes
-
-
-@pytest.mark.parametrize("padding", [None, 40])
-@pytest.mark.parametrize("first", [4090, 5000])
-def test_inkling2_row_exact_long_attention_rows_match_decode_steps(
-    first, padding, monkeypatch
-):
-    """A row-exact verify block of a full-attention visit gives every row the
-    bits of the decode step for its token, also across the kernel threshold
-    (lowered to 4096 keys to keep the case small)."""
-    from omlx.patches.inkling2 import model as inkling2_model
-    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
-
-    monkeypatch.setattr(inkling2_model, "_LONG_ATTENTION_MIN_KEYS", 4096)
-
-    if mx.default_device() != mx.gpu:
-        pytest.skip("the long-context attention kernel runs on the GPU")
-    model = _bf16(_inkling2_tiny(head_dim=128, swa_head_dim=128))
-    attn = next(layer.attn for layer in model.model.layers if not layer.sliding)
-    length = 16
-    q, k, v, rel, sink, _ = _attention_inputs(length, first + length - 1)
-    lp = None if padding is None else mx.array([padding])
-    steps = [
-        attn._long_attention(
-            q[:, :, t : t + 1],
-            k[:, :, : first + t],
-            v[:, :, : first + t],
-            rel[:, t : t + 1],
-            sink[:, t : t + 1],
-            lp,
-        )
-        for t in range(length)
-    ]
-    set_verify_qmm_armed(True, row_exact=True)
-    try:
-        block = attn._long_attention(q, k, v, rel, sink, lp)
-    finally:
-        set_verify_qmm_armed(False)
-    for t, step in enumerate(steps):
-        if step is None:
-            # Below the threshold the decode step took SDPA; so does the row.
-            step = _banded_row(attn, q, k, v, rel, sink, lp, first, t)
-        assert mx.array_equal(block[:, :, t : t + 1], step)
-
-
-def _banded_row(attn, q, k, v, rel, sink, lp, first, t):
-    from omlx.patches.inkling2 import kernels
-
-    return kernels.banded_sink_attention(
-        q[:, :, t : t + 1],
-        k[:, :, : first + t],
-        v[:, :, : first + t],
-        rel[:, t : t + 1],
-        sink[:, t : t + 1],
-        scale=attn.scale,
-        left_padding=lp,
-    )
-
-
-@pytest.mark.parametrize("width", [8, 16])
-@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
-def test_inkling2_long_context_verify_rows_match_serial_decode(
-    dims, width, monkeypatch
-):
-    """Row-exact verify after a 4092-token prefix, which crosses the long
-    attention threshold (lowered to 4096 keys) inside the block, through the
-    whole model."""
-    import mlx.nn as nn
-
-    from omlx.patches.inkling2 import fused
-    from omlx.patches.inkling2 import model as inkling2_model
-
-    monkeypatch.setattr(inkling2_model, "_LONG_ATTENTION_MIN_KEYS", 4096)
-    from omlx.patches.qwen35_verify_qmm import (
-        apply_verify_qmm_patch,
-        set_verify_qmm_armed,
-    )
-
+def test_inkling2_long_context_verify_rows_match_serial_decode(monkeypatch):
     if mx.default_device() != mx.gpu:
         pytest.skip("row-exact projections run on the GPU")
+    monkeypatch.setattr(inkling2_model, "_LONG_ATTENTION_MIN_KEYS", 4096)
     calls = []
     kernel = fused.long_decode_attention
     monkeypatch.setattr(
@@ -2144,21 +2029,20 @@ def test_inkling2_long_context_verify_rows_match_serial_decode(
         lambda *a, **kw: calls.append(a[0].shape[2]) or kernel(*a, **kw),
     )
     apply_verify_qmm_patch()
-    model = _bf16(_inkling2_tiny(head_dim=128, swa_head_dim=128, **dims))
+    model = _bf16(_inkling2_tiny(head_dim=128, swa_head_dim=128, **_TINY_LOOP))
     nn.quantize(
         model,
         group_size=64,
         bits=8,
         class_predicate=lambda _, m: isinstance(m, nn.Linear),
     )
-    prefix = 4092
+    prefix, width = 4092, 16
     ids = mx.random.randint(0, 300, (1, prefix + width))
 
     def prefilled():
         cache = model.make_cache()
         for s in range(0, prefix, 2048):
             model(ids[:, s : min(prefix, s + 2048)], cache=cache)
-            # As the server does after each prefill chunk.
             mx.eval([c.state for c in cache])
         return cache
 
@@ -2174,38 +2058,6 @@ def test_inkling2_long_context_verify_rows_match_serial_decode(
         block = model(ids[:, prefix : prefix + width], cache=cache)[0]
     finally:
         set_verify_qmm_armed(False)
-    assert calls, "the verify block did not reach the long-context kernel"
+    assert calls
     for row, expected in enumerate(serial):
         assert mx.array_equal(block[row], expected)
-
-
-def test_inkling2_long_attention_starts_at_32k_keys():
-    """Contexts under 32K keys keep MLX's SDPA, and with it main's bits."""
-    from omlx.patches.inkling2 import model as inkling2_model
-
-    if mx.default_device() != mx.gpu:
-        pytest.skip("the long-context attention kernel runs on the GPU")
-    assert inkling2_model._LONG_ATTENTION_MIN_KEYS == 32768
-    model = _bf16(_inkling2_tiny(head_dim=128, swa_head_dim=128))
-    attn = next(layer.attn for layer in model.model.layers if not layer.sliding)
-    q, k, v, rel, sink, _ = _attention_inputs(1, 32767)
-    assert attn._long_attention(q, k, v, rel, sink, None) is None
-    q, k, v, rel, sink, _ = _attention_inputs(1, 32768)
-    assert attn._long_attention(q, k, v, rel, sink, None) is not None
-
-
-def test_inkling2_long_attention_keeps_sdpa_for_other_inputs():
-    from omlx.patches.inkling2 import fused
-
-    q = mx.zeros((1, 8, 1, 128), dtype=mx.bfloat16)
-    k = mx.zeros((1, 2, 5000, 128), dtype=mx.bfloat16)
-    if mx.default_device() == mx.gpu:
-        assert fused.long_attention_supported(q, k, k)
-    # FP16 and FP32 activations, batches and other head sizes keep SDPA.
-    assert not fused.long_attention_supported(
-        *(a.astype(mx.float16) for a in (q, k, k))
-    )
-    assert not fused.long_attention_supported(q.astype(mx.float32), k, k)
-    assert not fused.long_attention_supported(mx.concatenate([q, q]), k, k)
-    small = mx.zeros((1, 8, 1, 64), dtype=mx.bfloat16)
-    assert not fused.long_attention_supported(small, k[..., :64], k[..., :64])

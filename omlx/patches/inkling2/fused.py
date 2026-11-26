@@ -1,53 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused Metal kernels for Inkling 2.
-
-``long_decode_attention``: full-attention decode and verify over long
-contexts. Each full-attention visit reads every cached key and value per
-token, and MLX's vector SDPA streams them well below the memory bandwidth.
-
-Keys are cut into fixed 256-key splits counted from the first key, so a
-query's splits, tiles and merge order do not depend on how many keys follow
-it. A verify row therefore has the bits of the decode step for its token
-while sharing one pass over the keys with the other rows of its block.
-"""
+"""Long-context full-attention decode and verify kernel for Inkling 2."""
 
 from __future__ import annotations
 
 import mlx.core as mx
 
-# Keys per split; split boundaries sit at multiples of this from key 0.
 KEYS_PER_SPLIT = 256
-# Simdgroups per threadgroup (one split each).
 _NSG = 8
-# Query positions one simdgroup holds; more spill registers.
 _ROWS = 4
-# Blocks of up to _HALVES_MAX * _ROWS positions share one pass over the keys:
-# two simdgroups take each split, one per half of the positions.
-_HALVES_MAX = 2
-# Lanes x dims per lane of the V sum.
+_MERGE_NSG = 8
 HEAD_DIM = 128
+# Metal: a threadgroup holds at most 32 KB of threadgroup memory.
+_THREADGROUP_BYTES = 32768
 
-# Stage 1. grid: (32 * NSG, ceil(nsplit / (NSG / HALVES)), HKV). Each
-# simdgroup owns one key split (with HALVES == 2, one half of the query
-# positions of it) and writes one partial (acc, m, l) per query row of its kv
-# head. Lanes own keys for the scores (q of the GROUP heads sharing the kv head
-# sits in threadgroup memory), then 4 dims each for the V sum, with one
-# online-softmax update per 32-key tile; the tile's weights reach the V sum
-# through threadgroup memory. Query t of L sits at key S - L + t
-# and sees keys j in [lp, S - L + t], with the relative bias rel[t, h, d] for
-# the distance d < R. Masked keys give exactly zero weight, so a tile or split
-# with no visible key leaves the partial unchanged.
+# Invariant: splits are fixed KEYS_PER_SPLIT ranges counted from key 0.
+# - query t of L sits at key S - L + t and sees keys [lp, S - L + t].
+# - a masked key has weight 0, so a split without a visible key leaves its partial unchanged.
+# - the merge folds split g in simdgroup g % _MERGE_NSG in ascending g, so a row has the same bits in any block.
 _ATTN_SOURCE = """
     constexpr float LOG2E = 1.4426950408889634f;
-    // HALVES == 2: the simdgroup pair of a split holds positions [0, RG) and
-    // [RG, L); each row's arithmetic is the same as in a one-row block.
     constexpr int RG = HALVES == 1 ? L : (L + 1) / 2;
     constexpr int ROWS = GROUP * RG;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint tid = thread_position_in_threadgroup.x;
     const int nsplit = dims[0];
-    const int lp = dims[1];   // left padding: keys before it are not real
+    const int lp = dims[1];
     const int hh = HALVES == 1 ? 0 : int(sg % 2);
     const int split = int(threadgroup_position_in_grid.y) * (NSG / HALVES) + int(sg / HALVES);
     const int t0 = hh * RG;
@@ -55,7 +33,6 @@ _ATTN_SOURCE = """
     const int S = k_shape[2];
     const float qscale = scale[0] * LOG2E;
     threadgroup float4 qs[GROUP * L][D / 4];
-    // Each simdgroup's tile weights for the V sum (cheaper than shuffling them).
     threadgroup float ps[NSG][ROWS][32];
     for (uint i = tid; i < GROUP * L * D / 4; i += 32 * NSG) {
         const uint row = i / (D / 4), c = i % (D / 4);
@@ -129,41 +106,55 @@ _ATTN_SOURCE = """
     for (int r = 0; r < ROWS; ++r) {
         const int g = r / RG, t = t0 + r % RG;
         if (t >= L) continue;
-        // partial layout: [1, HQ, L, nsplit, D + 2]
         device float* pp = part + (((size_t)(hk * GROUP + g) * L + t) * nsplit + split) * (D + 2);
         for (int i = 0; i < 4; ++i) pp[lane * 4 + i] = acc[r][i];
         if (lane == 0) { pp[D] = m[r]; pp[D + 1] = l[r]; }
     }
 """
 
-# Stage 2: one simdgroup per (h, t) merges the splits in order and adds the
-# zero-value sink. Splits without a visible key (m = -inf) are skipped.
 _MERGE_SOURCE = """
     constexpr int DPL = D / 32;
     constexpr float LOG2E = 1.4426950408889634f;
     const uint lane = thread_index_in_simdgroup;
-    const uint row = threadgroup_position_in_grid.x;   // h * L + t
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint row = threadgroup_position_in_grid.x;
     const int L = part_shape[2];
     const int nsplit = part_shape[3];
     const int t = row % L;
     const int h = row / L;
     const device float* pp = part + (size_t)row * nsplit * (D + 2);
     const float sk = float(sink[t * sink_strides[1] + h * sink_strides[2]]) * LOG2E;
+    threadgroup float tm[NSG];
+    threadgroup float to[NSG][D + 1];
     float mt = sk;
-    for (int g = 0; g < nsplit; ++g) mt = max(mt, pp[g * (D + 2) + D]);
-    float lt = fast::exp2(sk - mt);
+    for (int g = int(sg * 32 + lane); g < nsplit; g += NSG * 32) mt = max(mt, pp[g * (D + 2) + D]);
+    mt = simd_max(mt);
+    if (lane == 0) tm[sg] = mt;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < NSG; ++i) mt = max(mt, tm[i]);
+    float lt = 0.0f;
     float o[DPL];
     for (int i = 0; i < DPL; ++i) o[i] = 0.0f;
-    for (int g = 0; g < nsplit; ++g) {
+    for (int g = int(sg); g < nsplit; g += NSG) {
         const float mg = pp[g * (D + 2) + D];
         if (mg == -INFINITY) continue;
         const float f = fast::exp2(mg - mt);
         lt += pp[g * (D + 2) + D + 1] * f;
         for (int i = 0; i < DPL; ++i) o[i] += pp[g * (D + 2) + lane + 32 * i] * f;
     }
+    for (int i = 0; i < DPL; ++i) to[sg][lane + 32 * i] = o[i];
+    if (lane == 0) to[sg][D] = lt;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0) return;
+    lt = fast::exp2(sk - mt);
+    for (int i = 0; i < NSG; ++i) lt += to[i][D];
     const float inv = 1.0f / lt;
     device T* op = out + (size_t)row * D;
-    for (int i = 0; i < DPL; ++i) op[lane + 32 * i] = T(o[i] * inv);
+    for (int i = 0; i < DPL; ++i) {
+        float o_sum = 0.0f;
+        for (int j = 0; j < NSG; ++j) o_sum += to[j][lane + 32 * i];
+        op[lane + 32 * i] = T(o_sum * inv);
+    }
 """
 
 _kernels: dict = {}
@@ -182,17 +173,27 @@ def _kernel(name: str, source: str, inputs: list, outputs: list):
     return kern
 
 
+def _threadgroup_bytes(group: int, length: int) -> int:
+    rows = length if length <= _ROWS else -(-length // 2)
+    return 4 * group * (length * HEAD_DIM + _NSG * rows * 32)
+
+
+def _rows_per_pass(group: int) -> int:
+    return max(
+        n
+        for n in range(1, 2 * _ROWS + 1)
+        if _threadgroup_bytes(group, n) <= _THREADGROUP_BYTES
+    )
+
+
 def long_attention_supported(q: mx.array, k: mx.array, v: mx.array) -> bool:
     """Shapes and dtypes ``long_decode_attention`` covers: one sequence,
-    128-wide heads with contiguous rows, BF16 q, k and v on the GPU."""
+    128-wide heads with contiguous rows, BF16 activations on the GPU."""
     return (
         mx.default_device() == mx.gpu
         and q.shape[0] == 1
         and q.shape[-1] == HEAD_DIM
-        and q.shape[1] % k.shape[1] == 0
         and q.dtype == mx.bfloat16
-        and k.dtype == q.dtype
-        and v.dtype == q.dtype
     )
 
 
@@ -204,13 +205,10 @@ def long_decode_attention(q, k, v, rel, sink, *, scale, left_padding=None):
     array or None. Query t sits at key S - L + t. Returns [1, Hq, L, D].
     """
     length, s = q.shape[2], k.shape[2]
-    if length <= _ROWS * _HALVES_MAX:
-        return _attention_block(q, k, v, rel, sink, scale, left_padding)
+    step = _rows_per_pass(q.shape[1] // k.shape[1])
     outs = []
-    step = _ROWS * _HALVES_MAX
     for t0 in range(0, length, step):
         t1 = min(length, t0 + step)
-        # Later keys are causally masked for these queries.
         end = s - length + t1
         outs.append(
             _attention_block(
@@ -233,7 +231,7 @@ def _attention_block(q, k, v, rel, sink, scale, left_padding):
     nsplit = -(-s // KEYS_PER_SPLIT)
     halves = 1 if length <= _ROWS else 2
     lp = (
-        left_padding.reshape(1).astype(mx.int32)
+        left_padding.astype(mx.int32)
         if left_padding is not None
         else mx.zeros((1,), dtype=mx.int32)
     )
@@ -247,7 +245,7 @@ def _attention_block(q, k, v, rel, sink, scale, left_padding):
             q,
             k,
             v,
-            mx.contiguous(rel.reshape(length, hq, r)),
+            mx.contiguous(rel),
             mx.concatenate([mx.array([nsplit], dtype=mx.int32), lp]),
             mx.array([scale], dtype=mx.float32),
         ],
@@ -261,8 +259,6 @@ def _attention_block(q, k, v, rel, sink, scale, left_padding):
             ("L", length),
             ("HALVES", halves),
             ("HQ", hq),
-            # Part of the kernel name, so another rel dtype gets its own build.
-            ("RT", rel.dtype),
         ],
         grid=(32 * _NSG, -(-nsplit // (_NSG // halves)), hkv),
         threadgroup=(32 * _NSG, 1, 1),
@@ -273,9 +269,9 @@ def _attention_block(q, k, v, rel, sink, scale, left_padding):
     ]
     return _kernel("long_attention_merge", _MERGE_SOURCE, ["part", "sink"], ["out"])(
         inputs=[part, sink],
-        template=[("T", q.dtype), ("D", d), ("ST", sink.dtype)],
-        grid=(32 * hq * length, 1, 1),
-        threadgroup=(32, 1, 1),
+        template=[("T", q.dtype), ("D", d), ("NSG", _MERGE_NSG)],
+        grid=(32 * _MERGE_NSG * hq * length, 1, 1),
+        threadgroup=(32 * _MERGE_NSG, 1, 1),
         output_shapes=[(1, hq, length, d)],
         output_dtypes=[q.dtype],
     )[0]
