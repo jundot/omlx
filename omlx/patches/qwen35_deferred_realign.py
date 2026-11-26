@@ -25,11 +25,8 @@ from mlx_vlm.models.cache import BatchKVCache
 from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from mlx_vlm.speculative import cache_state
 
-from .vlm_batch_kv_capacity import (
-    _early_growth,
-    _roll_logical_prefix,
-    apply_batch_kv_capacity_patch,
-)
+from .kv_roll import _roll_logical_prefix
+from .vlm_batch_kv_capacity import _early_growth, apply_batch_kv_capacity_patch
 
 logger = logging.getLogger(__name__)
 

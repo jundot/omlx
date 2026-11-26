@@ -17,51 +17,9 @@ import mlx.core as mx
 from mlx_lm.generate import GenerationBatch
 from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
 from mlx_lm.models.cache import KVCache as LMKVCache
-from mlx_vlm.models.cache import BatchKVCache, KVCache, dynamic_roll
+from mlx_vlm.models.cache import BatchKVCache, KVCache
 
-from omlx.custom_kernels.attention import fast as _attention_fast
-
-# Larger shifts keep the MLX gather.
-# The native roll stages this many columns per block; an MTP rollback shifts at most one verify window.
-_NATIVE_ROLL_MAX_SHIFT = 16
-
-
-def _native_roll(x, shifts, length: int, axis: int, max_shift: int):
-    """Roll the rows of ``x`` in place when the kernel applies, else ``None``."""
-    if (
-        not 0 < max_shift < length
-        or max_shift > _NATIVE_ROLL_MAX_SHIFT
-        or x.itemsize not in (1, 2, 4)
-        or mx.default_device() != mx.gpu
-        or not _attention_fast.has_symbol("roll_rows")
-    ):
-        return None
-    rows = mx.broadcast_to(shifts, x.shape[:axis]).reshape(-1).astype(mx.int32)
-    return _attention_fast.roll_rows(x, rows, axis % x.ndim, length, max_shift)
-
-
-def _roll_logical_prefix(x, shifts, length: int, axis: int, max_shift=None):
-    """``dynamic_roll`` of the first ``length`` columns; later columns stay put.
-
-    ``max_shift`` is the largest shift when the caller knows it on the host.
-    """
-    if max_shift == 0:
-        return x
-    if max_shift is not None:
-        rolled = _native_roll(x, shifts, length, axis, max_shift)
-        if rolled is not None:
-            return rolled
-    n = x.shape[axis]
-    if n == length:
-        return dynamic_roll(x, shifts, axis=axis)
-    if length <= 0:
-        return x
-    expand_shifts = (...,) + (None,) * (x.ndim - axis)
-    expand_indices = expand_shifts[:-1]
-    positions = mx.arange(n)[expand_indices]
-    rolled = (positions - shifts[expand_shifts]) % length
-    idx = mx.where(positions < length, rolled, positions)
-    return mx.take_along_axis(x, idx, axis=axis)
+from .kv_roll import _roll_logical_prefix
 
 
 def _ladder_capacity(needed: int, step: int, fraction: int = 16) -> int:

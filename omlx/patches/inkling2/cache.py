@@ -24,7 +24,7 @@ from __future__ import annotations
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache as _ArraysCache
 
-from ..vlm_batch_kv_capacity import _roll_logical_prefix
+from ..kv_roll import _roll_logical_prefix
 
 KEYS, VALUES, CONV, PADDING = 0, 1, 2, 6
 SLOTS = 7
