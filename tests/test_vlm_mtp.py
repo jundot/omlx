@@ -9,13 +9,48 @@ weights.
 
 from __future__ import annotations
 
+import json
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import numpy as np
 import pytest
+from mlx_lm.models.cache import KVCache
+from safetensors.numpy import save_file
 
+from omlx.engine.vlm import VLMModelAdapter
+from omlx.patches.bonsai_t5_load import free_t5_biases
+from omlx.patches.mlx_lm_mtp import (
+    batched_head,
+    get_mtp_depth,
+    is_mtp_active,
+    is_mtp_depth_fixed,
+    set_mtp_active,
+    set_mtp_depth,
+)
+from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
+from omlx.patches.mlx_vlm_mtp.bonsai_v2_sidecar import (
+    BONSAI_V2_SIDECAR_REL_PATH,
+    bind_bonsai_v2_mtp_sidecar,
+    validate_bonsai_v2_sidecar,
+)
 from omlx.speculative import vlm_mtp
+from tests.test_model_loading import (
+    _bonsai_v2_sidecar_spec,
+    _build_prism_hadamard_checkpoint,
+)
+
+try:
+    from mlx_vlm.models.qwen3_5 import config as q35_config
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+    from mlx_vlm.utils import load_model as vlm_load_model
+except ImportError:
+    q35_config = None
+    q35_lang = None
+    vlm_load_model = None
 
 
 def test_mtp_rounds_share_the_wrapper_generation_stream():
@@ -1141,3 +1176,343 @@ def test_buffered_rotating_cache_rolls_back_by_trimming(kept):
     ring_transaction = start_speculative_cache([ring], 4)
     assert ring_transaction._rotating
     ring_transaction.abort()
+
+
+def _build_bonsai_v2_checkpoint(
+    root: Path,
+    *,
+    with_sidecar: bool = True,
+    metadata: dict[str, str] | None = None,
+) -> dict[str, float]:
+    _build_prism_hadamard_checkpoint(root)
+    norm_values = {
+        "nextn.enorm": 0.5965,
+        "nextn.hnorm": 0.8298,
+        "nextn.shared_head_norm": 2.1236,
+        "attn_norm": 1.0903,
+        "post_attention_norm": 0.9500,
+        "attn_q_norm": 1.5575,
+        "attn_k_norm": 1.5575,
+    }
+    if with_sidecar:
+        rng = np.random.default_rng(11)
+        linear_dims, norm_dims = _bonsai_v2_sidecar_spec(512, 1024, 4, 2, 128)
+        sidecar_tensors: dict[str, np.ndarray] = {}
+        for stem, (rows, width) in linear_dims.items():
+            w_fp = mx.array(
+                rng.standard_normal((rows, width)).astype(np.float16) * 0.02
+            )
+            qw, qs, qb = mx.quantize(w_fp, group_size=32, bits=4)
+            mx.eval(qw, qs, qb)
+            sidecar_tensors[f"{stem}.weight"] = np.array(qw)
+            sidecar_tensors[f"{stem}.scales"] = np.array(qs)
+            sidecar_tensors[f"{stem}.biases"] = np.array(qb)
+        for stem, size in norm_dims.items():
+            sidecar_tensors[f"{stem}.weight"] = np.full(
+                (size,), norm_values[stem], dtype=np.float32
+            )
+        sidecar_path = root / BONSAI_V2_SIDECAR_REL_PATH
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        save_file(sidecar_tensors, str(sidecar_path), metadata=metadata)
+    return norm_values
+
+
+def test_bonsai_v2_disabled_matches_stock_trunk_logits(tmp_path):
+    assert vlm_load_model is not None
+    _build_bonsai_v2_checkpoint(tmp_path, with_sidecar=True)
+    stock = vlm_load_model(tmp_path, lazy=False)
+    qwen35_vlm_runtime.apply()
+    disabled = vlm_load_model(tmp_path, lazy=False)
+
+    assert hasattr(disabled.language_model, "mtp") is False
+    tokens = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    stock_logits = stock.language_model(tokens).logits
+    disabled_logits = disabled.language_model(tokens).logits
+    mx.eval(stock_logits, disabled_logits)
+    assert float(mx.max(mx.abs(stock_logits - disabled_logits)).item()) == 0.0
+
+
+def test_bonsai_v2_bind_float16_boundary_symlink_batched_head_and_t5_safety(tmp_path):
+    assert vlm_load_model is not None
+    snapshot_dir = tmp_path / "snapshots" / "abc123"
+    blobs_dir = tmp_path / "blobs"
+    snapshot_dir.mkdir(parents=True)
+    blobs_dir.mkdir(parents=True)
+    norm_values = _build_bonsai_v2_checkpoint(
+        snapshot_dir,
+        with_sidecar=True,
+        metadata={"bits": "4", "group_size": "32"},
+    )
+    sidecar_file = snapshot_dir / BONSAI_V2_SIDECAR_REL_PATH
+    blob_file = blobs_dir / "deadbeef"
+    shutil.move(str(sidecar_file), str(blob_file))
+    sidecar_file.symlink_to("../../../blobs/deadbeef")
+
+    prev_active = is_mtp_active()
+    prev_depth = get_mtp_depth()
+    prev_fixed = is_mtp_depth_fixed()
+    set_mtp_active(False)
+    set_mtp_depth(8, fixed=True)
+    try:
+        model = vlm_load_model(snapshot_dir, lazy=False)
+        assert bind_bonsai_v2_mtp_sidecar(model, snapshot_dir) is True
+    finally:
+        set_mtp_active(prev_active)
+        set_mtp_depth(prev_depth, fixed=prev_fixed)
+
+    lm = model.language_model
+    assert model.config.quantization == {"bits": 2, "group_size": 128, "mode": "affine"}
+    assert lm.args.mtp_num_hidden_layers == 0
+    assert lm._omlx_mtp_decode_enabled is True
+    assert lm._omlx_mtp_depth == 3
+    assert lm._omlx_mtp_depth_fixed is False
+    assert lm.model._omlx_mtp_prime_host() is lm
+    assert lm.mtp.norm.weight.dtype == mx.float16
+    assert (
+        abs(float(mx.mean(lm.mtp.norm.weight).item()) - norm_values["nextn.shared_head_norm"])
+        < 1e-2
+    )
+    assert (
+        abs(
+            float(mx.mean(lm.mtp.layers[0].self_attn.q_norm.weight).item())
+            - norm_values["attn_q_norm"]
+        )
+        < 1e-2
+    )
+
+    tokens = mx.array([[5, 6, 7]], dtype=mx.int32)
+    out = lm(tokens, return_hidden=True)
+    trunk_hidden = out.hidden_states[-1]
+    mx.eval(trunk_hidden)
+    assert trunk_hidden.dtype == mx.float16
+    mtp_cache = lm.make_mtp_cache()
+    logits_1, hidden_1 = lm.mtp_forward(
+        trunk_hidden,
+        mx.array([[6, 7, 8]], dtype=mx.int32),
+        mtp_cache,
+        return_hidden=True,
+    )
+    logits_2, _ = lm.mtp_forward(
+        hidden_1[:, -1:, :],
+        mx.array([[9]], dtype=mx.int32),
+        mtp_cache,
+        return_hidden=True,
+    )
+    mx.eval(logits_1, logits_2, mtp_cache[0].keys)
+    assert logits_1.dtype == mx.float16
+    assert logits_2.dtype == mx.float16
+    assert mtp_cache[0].keys.dtype == mx.float16
+
+    adapter = VLMModelAdapter(model)
+    batch_state = SimpleNamespace(head=None)
+    batch = SimpleNamespace(model=adapter, _omlx_mtp_batch_state=batch_state)
+    states = [
+        SimpleNamespace(
+            depth=2,
+            head_clone=False,
+            hist_offset=0,
+            mtp_cache=[KVCache()],
+            draft_sampler=None,
+            drafts=None,
+            draft_lps=None,
+            draft_accept_lps=None,
+            stats=SimpleNamespace(mtp_head_ms=0.0),
+        )
+        for _ in range(2)
+    ]
+    row = SimpleNamespace(
+        samplers=[None], fallback_sampler=None, logits_processors=None
+    )
+    jobs = [
+        (
+            row,
+            states[0],
+            trunk_hidden[:, :2, :],
+            mx.array([1, 2], dtype=mx.int32),
+        ),
+        (
+            row,
+            states[1],
+            trunk_hidden[:, :1, :],
+            mx.array([3], dtype=mx.int32),
+        ),
+    ]
+    batched_head.draft(batch, jobs)
+    batched_head.flush(batch_state)
+    for state in states:
+        mx.eval(*state.draft_lps, state.mtp_cache[0].keys)
+        assert all(lp.dtype == mx.float16 for lp in state.draft_lps)
+        assert state.mtp_cache[0].keys.dtype == mx.float16
+
+    biases_shape = lm.mtp.fc.biases.shape
+    assert free_t5_biases(model) == 0
+    assert lm.mtp.fc.biases.shape == biases_shape
+
+
+def test_bonsai_v2_preserves_coresident_bfloat16_qwen35_mtp():
+    assert q35_config is not None and q35_lang is not None
+    qwen35_vlm_runtime.apply()
+    args = q35_config.TextConfig.from_dict(
+        {
+            "model_type": "qwen3_5_text",
+            "vocab_size": 128,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 1024,
+            "mtp_num_hidden_layers": 1,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 32,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_value_head_dim": 32,
+        }
+    )
+    mtp = q35_lang.MTPModule(args)
+    mtp.set_dtype(mx.bfloat16)
+
+    def _embed(ids):
+        return mx.zeros((*ids.shape, 128), dtype=mx.bfloat16)
+
+    cache = [KVCache()]
+    out = mtp(
+        mx.zeros((1, 2, 128), dtype=mx.bfloat16),
+        mx.array([[1, 2]], dtype=mx.int32),
+        _embed,
+        cache,
+    )
+    mx.eval(out, cache[0].keys)
+    assert out.dtype == mx.bfloat16
+    assert cache[0].keys.dtype == mx.bfloat16
+
+
+def test_bonsai_v2_validator_handles_absent_omitted_metadata_and_corrupt_sidecars(
+    tmp_path,
+):
+    absent_dir = tmp_path / "absent"
+    absent_dir.mkdir()
+    _build_bonsai_v2_checkpoint(absent_dir, with_sidecar=False)
+    path, reason = validate_bonsai_v2_sidecar(absent_dir)
+    assert path is None
+    assert "mtp/mtp-v2-head.safetensors" in reason
+    assert bind_bonsai_v2_mtp_sidecar(MagicMock(), absent_dir) is False
+
+    no_meta_dir = tmp_path / "no_meta"
+    no_meta_dir.mkdir()
+    _build_bonsai_v2_checkpoint(no_meta_dir, with_sidecar=True, metadata=None)
+    valid_path, valid_reason = validate_bonsai_v2_sidecar(no_meta_dir)
+    assert valid_path == no_meta_dir / BONSAI_V2_SIDECAR_REL_PATH
+    assert valid_reason == ""
+
+    broken_link_dir = tmp_path / "broken_link"
+    broken_link_dir.mkdir()
+    _build_bonsai_v2_checkpoint(broken_link_dir, with_sidecar=False)
+    broken_sidecar = broken_link_dir / BONSAI_V2_SIDECAR_REL_PATH
+    broken_sidecar.parent.mkdir(parents=True)
+    broken_sidecar.symlink_to("../../../blobs/missing")
+    path, reason = validate_bonsai_v2_sidecar(broken_link_dir)
+    assert path is None
+    assert "readable regular file" in reason
+    with pytest.raises(ValueError, match="mtp/mtp-v2-head.safetensors"):
+        bind_bonsai_v2_mtp_sidecar(MagicMock(), broken_link_dir)
+
+    lfs_dir = tmp_path / "lfs"
+    lfs_dir.mkdir()
+    _build_bonsai_v2_checkpoint(lfs_dir, with_sidecar=False)
+    lfs_sidecar = lfs_dir / BONSAI_V2_SIDECAR_REL_PATH
+    lfs_sidecar.parent.mkdir(parents=True)
+    lfs_sidecar.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:0\n")
+    path, reason = validate_bonsai_v2_sidecar(lfs_dir)
+    assert path is None
+    assert "Git LFS pointer" in reason
+
+    corrupt_dir = tmp_path / "corrupt"
+    corrupt_dir.mkdir()
+    _build_bonsai_v2_checkpoint(corrupt_dir, with_sidecar=False)
+    corrupt_sidecar = corrupt_dir / BONSAI_V2_SIDECAR_REL_PATH
+    corrupt_sidecar.parent.mkdir(parents=True)
+    corrupt_sidecar.write_bytes(b"not-a-safetensors-header")
+    path, reason = validate_bonsai_v2_sidecar(corrupt_dir)
+    assert path is None
+    assert "Invalid mtp/mtp-v2-head.safetensors header" in reason
+
+    bad_meta_dir = tmp_path / "bad_meta"
+    bad_meta_dir.mkdir()
+    _build_bonsai_v2_checkpoint(
+        bad_meta_dir, with_sidecar=True, metadata={"bits": "8", "group_size": "32"}
+    )
+    path, reason = validate_bonsai_v2_sidecar(bad_meta_dir)
+    assert path is None
+    assert "Invalid mtp/mtp-v2-head.safetensors schema" in reason
+
+    missing_stem_dir = tmp_path / "missing_stem"
+    missing_stem_dir.mkdir()
+    _build_bonsai_v2_checkpoint(missing_stem_dir, with_sidecar=False)
+    partial_sidecar = missing_stem_dir / BONSAI_V2_SIDECAR_REL_PATH
+    partial_sidecar.parent.mkdir(parents=True)
+    save_file({"nextn.enorm.weight": np.ones(512, dtype=np.float32)}, str(partial_sidecar))
+    path, reason = validate_bonsai_v2_sidecar(missing_stem_dir)
+    assert path is None
+    assert "tensor key mismatch" in reason
+
+    bad_cfg_dir = tmp_path / "bad_cfg"
+    bad_cfg_dir.mkdir()
+    _build_bonsai_v2_checkpoint(bad_cfg_dir, with_sidecar=True)
+    cfg_path = bad_cfg_dir / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["text_config"]["hidden_size"] = 256
+    cfg_path.write_text(json.dumps(cfg))
+    path, reason = validate_bonsai_v2_sidecar(bad_cfg_dir)
+    assert path is None
+    assert "Invalid mtp/mtp-v2-head.safetensors schema" in reason
+
+    bool_cfg_dir = tmp_path / "bool_cfg"
+    bool_cfg_dir.mkdir()
+    _build_bonsai_v2_checkpoint(bool_cfg_dir, with_sidecar=True)
+    bool_cfg_path = bool_cfg_dir / "config.json"
+    bool_cfg = json.loads(bool_cfg_path.read_text())
+    bool_cfg["text_config"]["head_dim"] = True
+    bool_cfg_path.write_text(json.dumps(bool_cfg))
+    path, reason = validate_bonsai_v2_sidecar(bool_cfg_dir)
+    assert path is None
+    assert "Invalid mtp/mtp-v2-head.safetensors config" in reason
+
+    missing_key_dir = tmp_path / "missing_key"
+    missing_key_dir.mkdir()
+    _build_bonsai_v2_checkpoint(missing_key_dir, with_sidecar=True)
+    missing_cfg_path = missing_key_dir / "config.json"
+    missing_cfg = json.loads(missing_cfg_path.read_text())
+    del missing_cfg["text_config"]["head_dim"]
+    missing_cfg_path.write_text(json.dumps(missing_cfg))
+    path, reason = validate_bonsai_v2_sidecar(missing_key_dir)
+    assert path is None
+    assert "Invalid mtp/mtp-v2-head.safetensors config" in reason
+
+    wrong_type_dir = tmp_path / "wrong_type"
+    wrong_type_dir.mkdir()
+    _build_bonsai_v2_checkpoint(wrong_type_dir, with_sidecar=True)
+    wrong_cfg_path = wrong_type_dir / "config.json"
+    wrong_cfg = json.loads(wrong_cfg_path.read_text())
+    wrong_cfg["model_type"] = "qwen3_5"
+    wrong_cfg_path.write_text(json.dumps(wrong_cfg))
+    path, reason = validate_bonsai_v2_sidecar(wrong_type_dir)
+    assert path is None
+    assert "Invalid mtp/mtp-v2-head.safetensors config" in reason
+
+    assert vlm_load_model is not None
+    overflow_dir = tmp_path / "overflow_norm"
+    overflow_dir.mkdir()
+    _build_bonsai_v2_checkpoint(overflow_dir, with_sidecar=True)
+    overflow_sidecar = overflow_dir / BONSAI_V2_SIDECAR_REL_PATH
+    loaded = dict(mx.load(str(overflow_sidecar)))
+    loaded_np = {k: np.array(v) for k, v in loaded.items()}
+    loaded_np["nextn.shared_head_norm.weight"] = np.full((512,), 1e5, dtype=np.float32)
+    save_file(loaded_np, str(overflow_sidecar), metadata={"bits": "4", "group_size": "32"})
+    overflow_model = vlm_load_model(overflow_dir, lazy=False)
+    with pytest.raises(ValueError, match="exceeds float16 range"):
+        bind_bonsai_v2_mtp_sidecar(overflow_model, overflow_dir)
+

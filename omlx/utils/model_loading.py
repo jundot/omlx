@@ -19,6 +19,10 @@ from ..patches.inkling2.loader import is_mlx_vlm_quantization, mlx_vlm_quantizat
 from ..patches.inkling2.loopcd import apply_loopcd
 from ..patches.inkling2.model import TextArgs
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
+from ..patches.mlx_vlm_mtp.bonsai_v2_sidecar import (
+    bonsai_v2_sidecar_entry_exists,
+    validate_bonsai_v2_sidecar,
+)
 from ..patches.prism_hadamard_verify import (
     PRISM_HADAMARD_MODEL_TYPE,
     apply_prism_hadamard_patch,
@@ -706,6 +710,19 @@ def maybe_apply_pre_load_patches(
 
     set_mtp_active(False)
 
+    config: dict | None = None
+    config_path = Path(model_name) / "config.json"
+    if config_path.exists():
+        try:
+            loaded_config = json.loads(config_path.read_text())
+        except (OSError, ValueError) as e:
+            logger.debug(
+                "Could not read %s for pre-load patch dispatch: %s", config_path, e
+            )
+        else:
+            if isinstance(loaded_config, dict):
+                config = loaded_config
+
     # Same for the mlx-vlm attach flag: the patched Qwen3.5 classes read it, also
     # in VLMs outside the MTP branch below (minicpmv4_7). Exports that declare
     # MTP heads without mtp.* weights (issue #1426) fail strict load if attached.
@@ -716,7 +733,14 @@ def maybe_apply_pre_load_patches(
         except Exception:
             pass
         else:
-            has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+            has_mtp_weights = (
+                False
+                if (
+                    isinstance(config, dict)
+                    and config.get("model_type") == PRISM_HADAMARD_MODEL_TYPE
+                )
+                else _checkpoint_has_mtp_weights(model_name)
+            )
             set_mtp_attach_enabled(has_mtp_weights)
 
     _patch_mlx_lm_load_config()
@@ -750,15 +774,7 @@ def maybe_apply_pre_load_patches(
     apply_qwen35_yarn_patch()
     set_context_window(model_name, getattr(model_settings, "max_context_window", None))
 
-    config_path = Path(model_name) / "config.json"
-    if not config_path.exists():
-        return
-    try:
-        config = json.loads(config_path.read_text())
-    except Exception as e:
-        logger.debug(
-            "Could not read %s for pre-load patch dispatch: %s", config_path, e
-        )
+    if not isinstance(config, dict):
         return
 
     normalize_qwen35_text_config(config)
@@ -1083,7 +1099,29 @@ def maybe_apply_pre_load_patches(
 
         # Inkling 2 bundles its DSpark draft as mtp.safetensors.
         minimax_dspark = bundled_inkling2_dspark_path(model_name)
-    if _is_mtp_compatible(config, model_type) or dflash_batched or minimax_dspark:
+    bonsai_v2_mtp = None
+    if (
+        for_vlm
+        and model_type == PRISM_HADAMARD_MODEL_TYPE
+        and model_settings is not None
+        and getattr(model_settings, "mtp_enabled", False)
+    ):
+        bonsai_v2_mtp, reason = validate_bonsai_v2_sidecar(model_name)
+        if bonsai_v2_mtp is None:
+            if bonsai_v2_sidecar_entry_exists(model_name):
+                raise ValueError(reason)
+            logger.warning(
+                "Lightning MTP is inactive for %s (model_type=%s): %s",
+                model_name,
+                model_type,
+                reason,
+            )
+    if (
+        _is_mtp_compatible(config, model_type)
+        or dflash_batched
+        or minimax_dspark
+        or bonsai_v2_mtp is not None
+    ):
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
@@ -1108,7 +1146,7 @@ def maybe_apply_pre_load_patches(
             if fixed:
                 set_mtp_depth(int(fixed), fixed=True)
             elif (
-                model_type == "qwen3_5"
+                model_type in ("qwen3_5", PRISM_HADAMARD_MODEL_TYPE)
                 and (text_config or config).get("hidden_size") == 5120
                 and (text_config or config).get("num_hidden_layers") == 64
             ):
@@ -1153,8 +1191,10 @@ def maybe_apply_pre_load_patches(
                 else:
                     backend = "Lightning MTP"
                 # DSpark is declared in config only, so only Lightning MTP is probed.
-                if backend == "Lightning MTP" and not _checkpoint_has_mtp_weights(
-                    model_name
+                if (
+                    backend == "Lightning MTP"
+                    and bonsai_v2_mtp is None
+                    and not _checkpoint_has_mtp_weights(model_name)
                 ):
                     logger.warning(
                         "Lightning MTP is inactive for %s (model_type=%s): the "
@@ -1245,6 +1285,7 @@ def maybe_apply_pre_load_patches(
                         )
     elif (
         model_type != "qwen4_exp"
+        and not (for_vlm and model_type == PRISM_HADAMARD_MODEL_TYPE)
         and model_settings is not None
         and getattr(model_settings, "mtp_enabled", False)
     ):
@@ -1603,6 +1644,8 @@ def lightning_mtp_supported(model_path: str | Path) -> bool:
         from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
 
         return bundled_inkling2_dspark_path(model_path) is not None
+    if model_type == PRISM_HADAMARD_MODEL_TYPE:
+        return validate_bonsai_v2_sidecar(model_path)[0] is not None
     if model_type == "qwen4_exp":
         if not _has_mtp_heads(config):
             return False

@@ -33,8 +33,10 @@ from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
+from omlx.patches.prism_hadamard_verify import PRISM_HADAMARD_MODEL_TYPE
 from omlx.scheduler import PrefillEvictionRequest, SchedulerConfig
 from tests.test_cluster_engine_pool import _deployment
+from tests.test_model_loading import _write_bonsai_v2_sidecar_checkpoint
 
 
 def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
@@ -1227,6 +1229,55 @@ class TestApplySettingsOverrides:
         assert not manager.get_settings("stripped").mtp_enabled
         # Saved settings are the user's; discovery does not touch them.
         assert not manager.get_settings("saved").mtp_enabled
+
+    def test_new_bonsai_v2_mtp_checkpoints_start_with_mtp_on(self, tmp_path):
+        models = tmp_path / "models"
+        for name, with_sidecar in (("with-sidecar", True), ("without-sidecar", False)):
+            path = models / name
+            path.mkdir(parents=True)
+            _write_bonsai_v2_sidecar_checkpoint(path, write_sidecar=with_sidecar)
+            (path / "model.safetensors").write_bytes(b"0" * 1024)
+
+        manager = ModelSettingsManager(tmp_path / "settings")
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(models))
+
+        pool.apply_settings_overrides(manager)
+
+        assert manager.get_settings("with-sidecar").mtp_enabled is True
+        assert manager.get_settings("without-sidecar").mtp_enabled is False
+
+    def test_bonsai_v2_mtp_sidecar_adds_resident_size_for_vlm_only(self, tmp_path):
+        sidecar = tmp_path / "mtp-v2-head.safetensors"
+        sidecar.write_bytes(b"0" * 1000)
+        pool = _make_pool(ceiling=10 * 1024**3)
+        entry = EngineEntry(
+            model_id="bonsai",
+            model_path=str(tmp_path),
+            model_type="vlm",
+            engine_type="vlm",
+            estimated_size=10_000,
+            config_model_type=PRISM_HADAMARD_MODEL_TYPE,
+        )
+
+        with patch(
+            "omlx.engine_pool.validate_bonsai_v2_sidecar",
+            return_value=(sidecar, ""),
+        ):
+            vlm_delta = pool._entry_runtime_resident_size(
+                entry, ModelSettings(mtp_enabled=True), base_size=entry.estimated_size
+            ) - pool._entry_runtime_resident_size(
+                entry, ModelSettings(mtp_enabled=False), base_size=entry.estimated_size
+            )
+            entry.engine_type = "batched"
+            batched_delta = pool._entry_runtime_resident_size(
+                entry, ModelSettings(mtp_enabled=True), base_size=entry.estimated_size
+            ) - pool._entry_runtime_resident_size(
+                entry, ModelSettings(mtp_enabled=False), base_size=entry.estimated_size
+            )
+
+        assert vlm_delta == 1050
+        assert batched_delta == 0
 
     def test_recommended_sampling_keeps_ocr_defaults(self, tmp_path):
         (tmp_path / "generation_config.json").write_text(

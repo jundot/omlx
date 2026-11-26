@@ -1172,6 +1172,8 @@ def estimate_model_size(model_path: Path) -> int:
     # Also check in subdirectories (some models store weights in subfolders)
     if total_size == 0:
         for f in model_path.glob("**/*.safetensors"):
+            if f.relative_to(model_path).parts[0] == "mtp":
+                continue
             total_size += f.stat().st_size
 
     if total_size == 0:

@@ -65,10 +65,12 @@ from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
 from ..patches.inkling2.loopcd import apply_loopcd
-from ..patches.mlx_lm_mtp import drafter_target
+from ..patches.mlx_lm_mtp import drafter_target, is_mtp_active
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
+from ..patches.mlx_vlm_mtp.bonsai_v2_sidecar import bind_bonsai_v2_mtp_sidecar
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
+from ..patches.prism_hadamard_verify import PRISM_HADAMARD_MODEL_TYPE
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
@@ -2125,6 +2127,15 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         **load_kwargs,
                     )
+                    if (
+                        model_type == PRISM_HADAMARD_MODEL_TYPE
+                        and is_mtp_active()
+                        and bind_bonsai_v2_mtp_sidecar(loaded[0], self._model_name)
+                    ):
+                        logger.info(
+                            "Bound Ternary Bonsai Lightning MTP sidecar for %s",
+                            self._model_name,
+                        )
                     return loaded
 
         loop = asyncio.get_running_loop()

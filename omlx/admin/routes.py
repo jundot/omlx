@@ -69,6 +69,7 @@ from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
     _resolve_hf_cache_entry,
+    detect_model_type,
 )
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
@@ -98,7 +99,9 @@ from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.k2_horizon import REASONING_EFFORTS
+from ..patches.mlx_vlm_mtp.bonsai_v2_sidecar import validate_bonsai_v2_sidecar
 from ..patches.moe_offload_compat import moe_offload_compatibility
+from ..patches.prism_hadamard_verify import PRISM_HADAMARD_MODEL_TYPE
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.routes import helper_status as prefill_helper_status
 from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
@@ -1271,6 +1274,10 @@ def _sanitize_diffusion_model_settings(settings) -> None:
 _MTP_EXTERNAL_ENGINE_REASON = (
     "MTP is not used when an external engine serves this model"
 )
+_BONSAI_MTP_VLM_ENGINE_REASON = (
+    "Lightning MTP for Ternary Bonsai requires the VLM serving engine; "
+    "set Serving Engine to VLM or Auto."
+)
 
 
 def _mtp_compat_for_model(
@@ -1335,6 +1342,13 @@ def _mtp_compat_for_model(
         if bundled_inkling2_dspark_path(model_path) is not None:
             return True, ""
         return False, "Inkling 2 checkpoint has no bundled mtp.safetensors draft"
+    if model_type == PRISM_HADAMARD_MODEL_TYPE:
+        if model_info.get("engine_type") not in (None, "vlm"):
+            return False, _BONSAI_MTP_VLM_ENGINE_REASON
+        sidecar_path, reason = validate_bonsai_v2_sidecar(model_path)
+        if sidecar_path is not None:
+            return True, ""
+        return False, reason
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
@@ -3166,6 +3180,8 @@ async def update_model_settings(
                 engine_pool=engine_pool,
             )
         current_settings.model_alias = alias_value
+    candidate_entry = entry
+    override_value = current_settings.model_type_override
     if "model_type_override" in sent:
         valid_types = {
             "llm",
@@ -3189,8 +3205,6 @@ async def update_model_settings(
                 status_code=400,
                 detail=f"Invalid model_type_override: {request.model_type_override}",
             )
-        current_settings.model_type_override = override_value
-        # Update engine pool entry type immediately
         type_to_engine = {
             "llm": "batched",
             "vlm": "vlm",
@@ -3202,17 +3216,14 @@ async def update_model_settings(
             "decision": "decision",
         }
         if override_value:
-            entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+            candidate_model_type = override_value
         else:
-            # Reset to auto-detected type
-            from pathlib import Path
-
-            from ..model_discovery import detect_model_type
-
-            detected_type = detect_model_type(Path(entry.model_path))
-            entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+            candidate_model_type = detect_model_type(Path(entry.model_path))
+        candidate_entry = copy.copy(entry)
+        candidate_entry.model_type = candidate_model_type
+        candidate_entry.engine_type = type_to_engine.get(
+            candidate_model_type, "batched"
+        )
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
     if "max_tokens" in sent:
@@ -3248,7 +3259,7 @@ async def update_model_settings(
         )
     if "prefill_helper_node_id" in sent:
         supported = stage_adapter_for(
-            entry.config_model_type, entry.engine_type, entry.model_path
+            entry.config_model_type, candidate_entry.engine_type, entry.model_path
         )
         current_settings.prefill_helper_node_id = (
             (request.prefill_helper_node_id or None) if supported else None
@@ -3522,7 +3533,7 @@ async def update_model_settings(
                 {
                     "model_path": entry.model_path,
                     "config_model_type": entry.config_model_type,
-                    "engine_type": entry.engine_type,
+                    "engine_type": candidate_entry.engine_type,
                 }
             )
             if not compat_ok:
@@ -3563,8 +3574,16 @@ async def update_model_settings(
         current_settings.dflash_verify_mode = request.dflash_verify_mode
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
-    if "mtp_enabled" in sent:
-        new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
+    if "mtp_enabled" in sent or "model_type_override" in sent:
+        new_mtp_enabled = (
+            False
+            if is_diffusion_model
+            else (
+                bool(request.mtp_enabled)
+                if "mtp_enabled" in sent
+                else current_settings.mtp_enabled
+            )
+        )
         if new_mtp_enabled:
             # Same gate as the toggle status in the model list, which also
             # accepts MiniMax M3.1 through its bundled dspark/ draft.
@@ -3572,24 +3591,29 @@ async def update_model_settings(
                 {
                     "model_path": entry.model_path,
                     "config_model_type": entry.config_model_type,
-                    "engine_type": entry.engine_type,
-                }
+                    "engine_type": candidate_entry.engine_type,
+                },
+                external_engine=current_settings.external_engine,
             )
             if not compat_ok:
                 raise HTTPException(status_code=400, detail=compat_reason)
-            # Mutual exclusion with DFlash — ModelSettings.__post_init__
-            # also enforces this, but we surface a clearer error here.
-            dflash_after = (
-                bool(request.dflash_enabled)
-                if "dflash_enabled" in sent
-                else current_settings.dflash_enabled
-            )
-            if dflash_after:
-                raise HTTPException(
-                    status_code=400,
-                    detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
+            if "mtp_enabled" in sent:
+                # Mutual exclusion with DFlash — ModelSettings.__post_init__
+                # also enforces this, but we surface a clearer error here.
+                dflash_after = (
+                    bool(request.dflash_enabled)
+                    if "dflash_enabled" in sent
+                    else current_settings.dflash_enabled
                 )
-        current_settings.mtp_enabled = new_mtp_enabled
+                if dflash_after:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
+                    )
+        if "mtp_enabled" in sent:
+            current_settings.mtp_enabled = new_mtp_enabled
+    if "model_type_override" in sent:
+        current_settings.model_type_override = override_value
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
@@ -3656,7 +3680,7 @@ async def update_model_settings(
     # settled for DFlash. The profile routes apply the same rule through
     # _draft_usability_problem.
     draft_problem = _draft_usability_problem(
-        current_settings.to_dict(), touched, entry
+        current_settings.to_dict(), touched, candidate_entry
     )
     if draft_problem:
         raise HTTPException(status_code=422, detail=draft_problem)
@@ -3670,7 +3694,7 @@ async def update_model_settings(
     if "guided_grammar" in sent:
         grammar = request.guided_grammar.strip() if request.guided_grammar else None
         current_settings.guided_grammar = grammar or None
-    _validate_model_settings(entry, current_settings.to_dict())
+    _validate_model_settings(candidate_entry, current_settings.to_dict())
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -3748,6 +3772,9 @@ async def update_model_settings(
                         settings=profile_settings,
                     )
 
+    if "model_type_override" in sent:
+        entry.model_type = candidate_entry.model_type
+        entry.engine_type = candidate_entry.engine_type
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
     helper_fields = {"prefill_helper_node_id", "prefill_helper_layers"}

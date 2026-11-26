@@ -16,16 +16,26 @@ import mlx_lm.utils as mlx_lm_utils
 import mlx_vlm.utils as mlx_vlm_utils
 import numpy as np
 import pytest
+import safetensors
 from mlx.utils import tree_flatten
 from safetensors.numpy import save_file
 
 from omlx.cache.paged_ssd_cache import numerics_revision_for_model
 from omlx.oqh import modules as oqh_modules
 from omlx.patches import prism_hadamard_verify, qwen35_verify_qmm
+from omlx.patches.mlx_lm_mtp import (
+    get_mtp_depth,
+    is_mtp_active,
+    is_mtp_depth_fixed,
+    set_mtp_active,
+    set_mtp_depth,
+)
+from omlx.patches.mlx_vlm_mtp.bonsai_v2_sidecar import BONSAI_V2_SIDECAR_REL_PATH
 from omlx.utils import model_loading
 from omlx.utils.model_loading import (
     dflash_draft_for,
     ensure_model_code_trusted,
+    lightning_mtp_supported,
     maybe_apply_pre_load_patches,
     maybe_load_custom_quantization,
     preflight_text_remote_code,
@@ -388,7 +398,10 @@ class TestVlmMtpPreLoadDispatch:
         )
         return calls, sanitize_mock, runtime_mock, attach_mock
 
-    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe", "qwen4_exp"])
+    @pytest.mark.parametrize(
+        "model_type",
+        ["qwen3_5", "qwen3_5_moe", "qwen4_exp", "prism_hadamard_qwen35"],
+    )
     @pytest.mark.parametrize("for_vlm", [False, True])
     def test_qwen_ssm_mask_patch_runs_without_speculation(
         self, tmp_path, monkeypatch, model_type, for_vlm
@@ -1758,4 +1771,193 @@ def test_prism_hadamard_verify_recasts_trunk_memoizes_siblings_and_routes_verify
     assert gdn.in_proj_qkv._hadamard_key is None
     assert gdn.in_proj_z._hadamard_key is None
 
+
+def _bonsai_v2_sidecar_spec(
+    hidden_size: int,
+    intermediate_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[dict[str, tuple[int, int]], dict[str, int]]:
+    linear_dims = {
+        "nextn.eh_proj": (hidden_size, 2 * hidden_size),
+        "attn_q": (num_heads * head_dim * 2, hidden_size),
+        "attn_k": (num_kv_heads * head_dim, hidden_size),
+        "attn_v": (num_kv_heads * head_dim, hidden_size),
+        "attn_output": (hidden_size, num_heads * head_dim),
+        "ffn_gate": (intermediate_size, hidden_size),
+        "ffn_up": (intermediate_size, hidden_size),
+        "ffn_down": (hidden_size, intermediate_size),
+    }
+    norm_dims = {
+        "nextn.enorm": hidden_size,
+        "nextn.hnorm": hidden_size,
+        "nextn.shared_head_norm": hidden_size,
+        "attn_norm": hidden_size,
+        "post_attention_norm": hidden_size,
+        "attn_q_norm": head_dim,
+        "attn_k_norm": head_dim,
+    }
+    return linear_dims, norm_dims
+
+
+def _write_bonsai_v2_sidecar_checkpoint(
+    root: Path,
+    *,
+    hidden_size: int = 64,
+    intermediate_size: int = 128,
+    num_attention_heads: int = 2,
+    num_key_value_heads: int = 1,
+    head_dim: int = 32,
+    num_hidden_layers: int = 4,
+    sidecar_hidden_size: int | None = None,
+    write_sidecar: bool = True,
+) -> str:
+    config = {
+        "model_type": prism_hadamard_verify.PRISM_HADAMARD_MODEL_TYPE,
+        "vision_config": {},
+        "text_config": {
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "num_attention_heads": num_attention_heads,
+            "num_key_value_heads": num_key_value_heads,
+            "head_dim": head_dim,
+            "num_hidden_layers": num_hidden_layers,
+            "mtp_num_hidden_layers": 0,
+        },
+    }
+    _write_config(root, json.dumps(config))
+    if not write_sidecar:
+        return str(root)
+
+    h = hidden_size if sidecar_hidden_size is None else sidecar_hidden_size
+    linear_dims, norm_dims = _bonsai_v2_sidecar_spec(
+        h, intermediate_size, num_attention_heads, num_key_value_heads, head_dim
+    )
+    tensors: dict[str, np.ndarray] = {}
+    for stem, (rows, width) in linear_dims.items():
+        tensors[f"{stem}.weight"] = np.zeros((rows, width // 8), dtype=np.uint32)
+        tensors[f"{stem}.scales"] = np.ones((rows, width // 32), dtype=np.float16)
+        tensors[f"{stem}.biases"] = np.zeros((rows, width // 32), dtype=np.float16)
+    for stem, size in norm_dims.items():
+        tensors[f"{stem}.weight"] = np.ones((size,), dtype=np.float32)
+
+    sidecar_path = root / BONSAI_V2_SIDECAR_REL_PATH
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    save_file(
+        tensors,
+        str(sidecar_path),
+        metadata={"bits": "4", "group_size": "32"},
+    )
+    return str(root)
+
+
+class TestBonsaiV2MtpPreLoad:
+    @pytest.fixture(autouse=True)
+    def _restore_mtp_globals(self):
+        prev_active = is_mtp_active()
+        prev_depth = get_mtp_depth()
+        prev_fixed = is_mtp_depth_fixed()
+        try:
+            yield
+        finally:
+            set_mtp_active(prev_active)
+            set_mtp_depth(prev_depth, fixed=prev_fixed)
+
+    def test_lightning_mtp_supported_validates_sidecar_states(self, tmp_path):
+        valid_dir = tmp_path / "valid"
+        valid_dir.mkdir()
+        _write_bonsai_v2_sidecar_checkpoint(valid_dir)
+        assert lightning_mtp_supported(valid_dir) is True
+
+        missing_dir = tmp_path / "missing"
+        missing_dir.mkdir()
+        _write_bonsai_v2_sidecar_checkpoint(missing_dir, write_sidecar=False)
+        assert lightning_mtp_supported(missing_dir) is False
+
+        corrupt_dir = tmp_path / "corrupt"
+        corrupt_dir.mkdir()
+        _write_bonsai_v2_sidecar_checkpoint(corrupt_dir, write_sidecar=False)
+        corrupt_sidecar = corrupt_dir / BONSAI_V2_SIDECAR_REL_PATH
+        corrupt_sidecar.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_sidecar.write_bytes(b"corrupt-safetensors-header")
+        assert lightning_mtp_supported(corrupt_dir) is False
+
+        mismatch_dir = tmp_path / "mismatch"
+        mismatch_dir.mkdir()
+        _write_bonsai_v2_sidecar_checkpoint(
+            mismatch_dir, hidden_size=64, sidecar_hidden_size=96
+        )
+        assert lightning_mtp_supported(mismatch_dir) is False
+
+    def test_27b_geometry_sets_depth_four(self, tmp_path):
+        path = _write_bonsai_v2_sidecar_checkpoint(
+            tmp_path,
+            hidden_size=5120,
+            intermediate_size=32,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=32,
+            num_hidden_layers=64,
+        )
+        maybe_apply_pre_load_patches(
+            path,
+            model_settings=types.SimpleNamespace(mtp_enabled=True),
+            for_vlm=True,
+        )
+        assert is_mtp_active() is True
+        assert get_mtp_depth() == 4
+        assert is_mtp_depth_fixed() is False
+
+    def test_mtp_disabled_skips_sidecar_opens_and_stays_inactive(
+        self, tmp_path, monkeypatch
+    ):
+        path = _write_bonsai_v2_sidecar_checkpoint(tmp_path)
+        opened_sidecars: list[str] = []
+        original_safe_open = safetensors.safe_open
+
+        def tracking_safe_open(filename, *args, **kwargs):
+            if str(filename).endswith(str(BONSAI_V2_SIDECAR_REL_PATH)):
+                opened_sidecars.append(str(filename))
+            return original_safe_open(filename, *args, **kwargs)
+
+        monkeypatch.setattr(safetensors, "safe_open", tracking_safe_open)
+
+        maybe_apply_pre_load_patches(
+            path,
+            model_settings=types.SimpleNamespace(mtp_enabled=False),
+            for_vlm=True,
+        )
+
+        assert opened_sidecars == []
+        assert is_mtp_active() is False
+
+    def test_mtp_enabled_missing_sidecar_warns_without_incompatible_message(
+        self, tmp_path, caplog
+    ):
+        path = _write_bonsai_v2_sidecar_checkpoint(tmp_path, write_sidecar=False)
+        with caplog.at_level(logging.WARNING):
+            maybe_apply_pre_load_patches(
+                path,
+                model_settings=types.SimpleNamespace(mtp_enabled=True),
+                for_vlm=True,
+            )
+
+        assert "mtp/mtp-v2-head.safetensors" in caplog.text
+        assert "model is incompatible" not in caplog.text
+        assert is_mtp_active() is False
+
+    def test_mtp_enabled_corrupt_sidecar_raises_value_error(self, tmp_path):
+        path = _write_bonsai_v2_sidecar_checkpoint(tmp_path, write_sidecar=False)
+        corrupt_sidecar = tmp_path / BONSAI_V2_SIDECAR_REL_PATH
+        corrupt_sidecar.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_sidecar.write_bytes(b"corrupt-safetensors-header")
+
+        with pytest.raises(ValueError, match="mtp/mtp-v2-head.safetensors"):
+            maybe_apply_pre_load_patches(
+                path,
+                model_settings=types.SimpleNamespace(mtp_enabled=True),
+                for_vlm=True,
+            )
+        assert is_mtp_active() is False
 

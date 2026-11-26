@@ -98,6 +98,7 @@ _RUNTIME_PATCHES: tuple[str, ...] = (
 # historical apply-everything behaviour.
 _RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
     "qwen3_5": ("qwen35_vlm_runtime",),
+    "prism_hadamard_qwen35": ("qwen35_vlm_runtime",),
     "qwen3_5_moe": ("qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"),
     "minicpmv4_7": ("qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"),
     "gemma4": ("gemma4_vlm_runtime",),

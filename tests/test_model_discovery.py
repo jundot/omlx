@@ -1037,6 +1037,18 @@ class TestEstimateModelSize:
         # Should use safetensors size only
         assert size == int(1000 * 1.05)
 
+    def test_estimate_excludes_mtp_sidecar_subdir(self, tmp_path):
+        mtp_dir = tmp_path / "mtp"
+        mtp_dir.mkdir()
+        (mtp_dir / "mtp-v2-head.safetensors").write_bytes(b"0" * 2000)
+        with pytest.raises(ValueError, match="No model weights found"):
+            estimate_model_size(tmp_path)
+
+        weights_dir = tmp_path / "weights"
+        weights_dir.mkdir()
+        (weights_dir / "model.safetensors").write_bytes(b"0" * 1000)
+        assert estimate_model_size(tmp_path) == 1050
+
 
 class TestDiscoverModels:
     """Tests for discover_models function."""
