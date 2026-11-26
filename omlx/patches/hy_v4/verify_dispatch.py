@@ -22,11 +22,7 @@ def armed() -> bool:
 
 @cache
 def _supported_gpu() -> bool:
-    # The fast paths reproduce the reduction layout in this MLX version.
-    return (
-        mx.__version__ == "0.32.4"
-        and mx.device_info().get("architecture") == "applegpu_g17s"
-    )
+    return mx.device_info().get("architecture") == "applegpu_g17s"
 
 
 def short_gpu_verify(rows: int) -> bool:

@@ -28,6 +28,7 @@ from .config import TextConfig
 from .flash import CompressedIndexer
 from .rope import TrailingRoPE, rotate
 from .verify_moe import routed_experts
+from .verify_sparse import attend as attend_sparse_verify
 
 _ROW_CHUNK = 256
 # Up to this many query rows, attention gathers each row's own keys instead of
@@ -787,9 +788,6 @@ class Attention(nn.Module):
             == sinks.dtype
             and latent.dtype in (mx.bfloat16, mx.float16)
         ):
-            # The Metal implementation is only needed on the supported path.
-            from .verify_sparse import attend as attend_sparse_verify
-
             return self.unembed_out(
                 attend_sparse_verify(
                     q_latent, q_pe, latent, k_pe, topk, mask, sinks, self.scale
