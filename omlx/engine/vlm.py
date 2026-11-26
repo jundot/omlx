@@ -2085,7 +2085,12 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
                 if model_type in INKLING2_MODEL_TYPES:
-                    loaded = inkling2_vlm.load(self._model_name)
+                    loaded = inkling2_vlm.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
+                    )
                     apply_loopcd(loaded[0], self._model_settings)
                     return loaded
                 if model_type == "muse_spark":

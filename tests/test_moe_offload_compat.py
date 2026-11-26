@@ -89,6 +89,36 @@ def test_supported_layouts_use_headers_only(tmp_path, monkeypatch, kind, per_exp
     assert moe_offload_compatibility(tmp_path) == (True, "")
 
 
+def test_inkling2_nvfp4_and_affine_experts(tmp_path):
+    text = dict(
+        num_hidden_layers=2,
+        n_routed_experts=16,
+        num_experts_per_tok=2,
+        hidden_size=64,
+        intermediate_size=64,
+    )
+    nvfp4 = {"bits": 4, "group_size": 16, "mode": "nvfp4"}
+    quant = {"bits": 4, "group_size": 32, "mode": "affine"}
+    quant.update({f"model.layers.0.mlp.experts.{p}": nvfp4 for p in ("w13", "w2")})
+    raw = {"model_type": "inkling2_loop", "text_config": text, "quantization": quant}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    tensors = {}
+    for layer, mode, group in ((0, "nvfp4", 16), (1, "affine", 32)):
+        for proj, out in (("w13", 128), ("w2", 64)):
+            key = f"model.layers.{layer}.mlp.experts.{proj}"
+            fields = ("weight", "scales") + (("biases",) if mode == "affine" else ())
+            packed = mx.quantize(mx.ones((16, out, 64)), group_size=group, mode=mode)
+            tensors.update({f"{key}.{f}": v for f, v in zip(fields, packed)})
+            if mode == "nvfp4":
+                tensors[f"{key}.global_scale"] = mx.ones((16,))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+
+    del tensors["model.layers.0.mlp.experts.w2.global_scale"]
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    assert moe_offload_compatibility(tmp_path)[0] is False
+
+
 @pytest.mark.parametrize(
     "change", ["missing_expert", "wrong_shape", "wrong_dtype", "bias"]
 )

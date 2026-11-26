@@ -7,6 +7,7 @@ import json
 
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 
 try:
     import mlx.core as mx
@@ -18,6 +19,11 @@ except ImportError:
 
 from omlx.patches.inkling2 import fused, kernels, loopcd
 from omlx.patches.inkling2 import model as inkling2_model
+from omlx.patches.moe_expert_offload import (
+    apply_moe_expert_offload,
+    materialize_offload_state,
+    moe_offload_stats,
+)
 from omlx.patches.qwen35_verify_qmm import (
     apply_verify_qmm_patch,
     set_verify_qmm_armed,
@@ -1316,6 +1322,71 @@ def test_inkling2_nvfp4_experts_stay_finite_in_float16():
     assert mx.isfinite(got).all().item()
     rel = mx.abs(got.astype(mx.float32) - expected).max() / mx.abs(expected).max()
     assert rel.item() < 1e-2
+
+
+_OFFLOAD_DIMS = dict(n_routed_experts=32, num_experts_per_tok=8)
+
+
+def _inkling2_offloaded(tmp_path, dims):
+    reference, model = (_inkling2_tiny(**dims, **_OFFLOAD_DIMS) for _ in range(2))
+    for m in (reference, model):
+        for layer in m.model.layers:
+            for proj in (layer.mlp.experts.w13, layer.mlp.experts.w2):
+                if "global_scale" in proj:
+                    proj.global_scale = proj.global_scale * mx.linspace(0.5, 2, 32)
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(reference.parameters()))
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "inkling2_loop", "text_config": _OFFLOAD_DIMS})
+    )
+    assert apply_moe_expert_offload(model, tmp_path, 0.25) == len(model.model.layers)
+    materialize_offload_state(model)
+    return reference, model
+
+
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["mxfp8+nvfp4", "looped"])
+def test_inkling2_offloaded_logits_match_resident(tmp_path, dims):
+    reference, model = _inkling2_offloaded(tmp_path, dims)
+    ids = mx.random.randint(0, 300, (1, 24))
+    outs = []
+    for m in (reference, model):
+        cache = m.make_cache()
+        logits = [m(ids[:, :16], cache=cache)]
+        for t in range(16, 24):
+            logits.append(m(ids[:, t : t + 1], cache=cache))
+        outs.append(mx.concatenate(logits, axis=1))
+    mx.eval(outs)
+    assert mx.abs(outs[0][..., :300] - outs[1][..., :300]).max().item() < 1e-4
+    assert moe_offload_stats(model)["misses"] > 8 * len(model.model.layers)
+
+
+def test_inkling2_offload_over_capacity_reads_only_missing_experts(tmp_path):
+    _, model = _inkling2_offloaded(tmp_path, {})
+    experts = model.model.layers[0].mlp.experts
+    x = mx.random.normal((64, 128)).astype(mx.bfloat16)
+    inds = mx.arange(64 * 8).reshape(64, 8) % 32
+    w = mx.ones((64, 8))
+    mx.eval(experts.unreduced(x, inds, w))
+    before = experts.cache.misses
+    mx.eval(experts.unreduced(x, inds, w))
+    assert experts.cache.misses - before == 32 - experts.cache.capacity
+
+
+def test_inkling2_offloaded_row_exact_verify_matches_resident(tmp_path):
+    reference, model = _inkling2_offloaded(tmp_path, {})
+    ids = mx.random.randint(0, 300, (1, 19))
+    blocks = []
+    for m in (reference, model):
+        cache = m.make_cache()
+        m(ids[:, :16], cache=cache)
+        set_verify_qmm_armed(True, row_exact=True)
+        try:
+            blocks.append(m(ids[:, 16:], cache=cache))
+        finally:
+            set_verify_qmm_armed(False)
+    mx.eval(blocks)
+    assert mx.abs(blocks[0][..., :300] - blocks[1][..., :300]).max().item() < 1e-4
 
 
 @pytest.mark.parametrize(

@@ -399,35 +399,51 @@ class Inkling2Experts(nn.Module):
     def unreduced(self, x: mx.array, inds: mx.array, weights: mx.array):
         """The routed expert outputs [N, K, H] and their FP32 weights [N, K]
         (NVFP4 tensor scale included), before ``moe_sum``."""
+        z = self.routes(x, inds)
+        s2 = self.w2.post_scale(inds, z.dtype)
+        if s2 is not None:
+            weights = weights * s2
+        return z, weights
+
+    def routes(
+        self, x: mx.array, inds: mx.array, call: tuple[int, int, int] | None = None
+    ) -> mx.array:
+        """Unweighted per-route outputs ``[..., k, H]`` (before the w2 post-scale).
+
+        The kernel is picked for ``call`` = (routes, rows, experts), by default
+        ``inds`` and this stack's expert count. Expert offload passes its whole
+        routing's, as its ``inds`` are slots or a part of that routing.
+        """
         xe = mx.expand_dims(x, (-2, -3))
         armed = is_row_exact_armed()
         # The expert-order kernel repeats gather_qmm's one-pair arithmetic, so
         # it takes every block gather_qmm runs pair by pair: a decode row, a
         # row-exact verify block, and any block below gather_qmm's batched
         # sorted kernel (four pairs per expert). Shared experts are read once.
-        experts = self.w13.weight.shape[0]
-        per_pair = inds.size < verify_experts.PAIRS_PER_EXPERT * experts
+        call = call or (inds.size, inds.shape[0], self.w13.weight.shape[0])
+        size, rows, experts = call
+        per_pair = size < verify_experts.PAIRS_PER_EXPERT * experts
         fused = (
-            (per_pair or (armed and inds.shape[0] <= verify_experts.MAX_ROWS))
+            (per_pair or (armed and rows <= verify_experts.MAX_ROWS))
             and verify_experts.supported(self.w13, x.dtype)
             and verify_experts.supported(self.w2, x.dtype)
         )
         # Sorting regroups the pairs by expert and changes their arithmetic;
         # row-exact verify rows keep the per-pair gather of a decode step.
-        do_sort = not fused and inds.size >= 64 and not armed
+        do_sort = not fused and size >= 64 and not armed
         if (
             do_sort
             and not per_pair
-            and inds.size <= expert_mma.MAX_PAIRS
+            and size <= expert_mma.MAX_PAIRS
             and expert_mma.supported(self.w13, x.dtype)
             and expert_mma.supported(self.w2, x.dtype)
         ):
             pairs = inds.reshape(-1)
-            routing = expert_mma.plan(pairs, experts)
+            routing = expert_mma.plan(pairs, self.w13.weight.shape[0])
             y = expert_mma.gather(self.w13, x, inds.shape[-1], routing)
             act = _softcapped_swiglu(y[:, 0::2], y[:, 1::2], self._gcap, self._ucap)
             z = expert_mma.gather(self.w2, act, 1, routing)
-            return z.reshape(*inds.shape, -1), weights
+            return z.reshape(*inds.shape, -1)
         idx = inds
         inv = None
         if do_sort:
@@ -454,11 +470,7 @@ class Inkling2Experts(nn.Module):
             z = self.w2(act, idx, do_sort)
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
-        z = z.squeeze(-2)
-        s2 = self.w2.post_scale(inds, act.dtype)
-        if s2 is not None:
-            weights = weights * s2
-        return z, weights
+        return z.squeeze(-2)
 
 
 def moe_sum(z: mx.array, weights: mx.array) -> mx.array:
@@ -1039,6 +1051,12 @@ class Inkling2Layer(nn.Module):
         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
+        residual, x, x32, s2 = self._post_attn(out, gate, h, mlp_blocks, s2, messages)
+        z, zw = self.mlp.unreduced(x, x32)
+        h, s3 = self._post_mlp(residual, z, zw, s3, h)
+        return h, s2, s3
+
+    def _post_attn(self, out, gate, h, mlp_blocks, s2, messages=None):
         a = self.attn.output(out, gate)
         # The conv kernels also do the FP32 residual adds: the attention
         # output joins h (off a block boundary), the MLP output the residual.
@@ -1097,7 +1115,9 @@ class Inkling2Layer(nn.Module):
                         self.loop_gain_forget[3:],
                     ).squeeze(0)
                 x, x32 = _norm(self.mlp_norm, y).astype(h.dtype), None
-        z, zw = self.mlp.unreduced(x, x32)
+        return residual, x, x32, s2
+
+    def _post_mlp(self, residual, z, zw, s3, h):
         conv = kernels.moe_short_conv(
             z, zw, self.mlp_conv, s3, self._conv_scale, residual, h.dtype
         )
@@ -1110,8 +1130,7 @@ class Inkling2Layer(nn.Module):
                 residual=residual,
                 dtype=h.dtype,
             )
-        h, s3 = conv
-        return h, s2, s3
+        return conv
 
     def __call__(self, h, blocks, cache=None, bank=None, tau=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS

@@ -42,7 +42,12 @@ MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 # qwen4_exp (Qwen3.8-Flash-Next) drafts from its embedded native head, whose
 # experts the generic SwitchGLU adapter leaves resident (see
 # apply_moe_expert_offload's mtp_resident).
-MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next", "qwen4_exp")
+MOE_OFFLOAD_MTP_MODEL_TYPES = (
+    "deepseek_v41",
+    "glm5_next",
+    "qwen4_exp",
+    "inkling2_loop",
+)
 
 
 # Paths that run the targeted projections from the checkpoint weights, or
