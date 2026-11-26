@@ -62,7 +62,6 @@ def _inspect(path, signature):
 
     text = raw.get("text_config", raw)
     if kind == "bailing_hybrid":
-        # Ling: flat text config with num_experts and leading dense layers.
         count = int(text.get("num_experts") or 0)
         first_moe = int(text.get("first_k_dense_replace") or 0)
         moe_freq = int(text.get("moe_layer_freq") or 1)
