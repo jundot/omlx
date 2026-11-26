@@ -921,6 +921,19 @@ class Inkling2Attention(nn.Module):
         return _linear(self.o_proj, out)
 
 
+def _row_picks(starts: list[int], width: int) -> mx.array | int:
+    if len(set(starts)) == 1:
+        return starts[0]
+    return mx.array(starts, dtype=mx.int32)[:, None] + mx.arange(width)
+
+
+def _rows_from(x: mx.array, picks: mx.array | int, width: int) -> mx.array:
+    if isinstance(picks, int):
+        return x[:, picks : picks + width]
+    index = picks.reshape(*picks.shape, *([1] * (x.ndim - 2)))
+    return mx.take_along_axis(x, index, axis=1)
+
+
 def _cumsum(xs):
     total = 0
     for x in xs:
@@ -1498,20 +1511,26 @@ class Model(nn.Module):
             return logits
         if return_hidden:
             return SimpleNamespace(
-                logits=logits, hidden_states=captures + [h], gdn_states=None
+                logits=logits,
+                hidden_states=captures + [h],
+                gdn_states=[] if h.shape[0] > 1 else None,
             )
         return SimpleNamespace(logits=logits, hidden_states=captures)
 
-    # Rows that accept different counts would need a ragged conv rollback.
-    _omlx_drafter_single_row = True
+    def mtp_partial_rollback(self, cache, accepted, num_drafts: int) -> bool:
+        """Drop the rejected drafts of a ``num_drafts + 1``-token verify.
 
-    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
-        """Drop the rejected drafts of a ``num_drafts + 1``-token verify."""
-        rejected = int(num_drafts) - int(accepted)
-        if rejected <= 0:
+        ``accepted`` is one count for every row, or a list with one per row.
+        """
+        counts = accepted if isinstance(accepted, (list, tuple)) else [accepted]
+        rejected = [int(num_drafts) - int(count) for count in counts]
+        if max(rejected) <= 0:
             return True
-        keep = int(accepted) + 1
+        keep = [int(count) + 1 for count in counts]
+        common = min(rejected)
+        extra = [count - common for count in rejected]
         width = self.args.text.sconv_kernel_size - 1
+        picks = _row_picks(keep, width)
         for kv, conv in self.model.visit_caches(cache):
             padded = getattr(conv, "_omlx_verify_xp", None)
             if padded is None:
@@ -1519,19 +1538,22 @@ class Model(nn.Module):
             if kv is None:
                 if not windows.trim(conv, rejected):
                     return False
-            elif kv.trim(rejected) != rejected:
+            elif kv.trim(common) != common:
                 return False
+            elif any(extra):
+                kv.prepare(right_padding=extra)
+                kv.finalize()
             base = windows.CONV if kv is None else 0
             for slot, xp in padded.items():
-                # A verify window is a few rows, so the state may stay a view.
-                conv[base + slot] = xp[:, keep : keep + width]
+                conv[base + slot] = _rows_from(xp, picks, width)
             conv._omlx_verify_xp = None
         if self.model._caches_thinking_flags:
-            cache[-1][0] = cache[-1]._omlx_verify_xp[:, keep - 1 : keep]
+            flags = cache[-1]._omlx_verify_xp
+            last = _row_picks([start - 1 for start in keep], 1)
+            cache[-1][0] = _rows_from(flags, last, 1)
         return True
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
-        accepted = int(accepted)
         if not self.mtp_partial_rollback(caches, accepted, int(block_size) - 1):
             raise RuntimeError("Inkling 2 verify rollback found no conv windows")
         return accepted
