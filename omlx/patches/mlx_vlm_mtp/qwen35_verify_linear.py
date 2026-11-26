@@ -4,6 +4,7 @@
 import sys
 from functools import wraps
 
+import mlx.core as mx
 import mlx.nn as nn
 from mlx_vlm.speculative.ops import linear as verify_linear
 
@@ -13,6 +14,17 @@ from .. import qwen35_packed_linear, qwen35_verify_qmm, row_exact_qmv
 def _routes_quantized_linear() -> bool:
     """True while an armed MTP forward owns QuantizedLinear verify routing."""
     return qwen35_verify_qmm._is_armed() or qwen35_verify_qmm.is_row_exact_armed()
+
+
+def _dense_falls_back_to_singletons(linear: nn.Linear, x: mx.array) -> bool:
+    outputs = int(linear.weight.shape[0])
+    return (
+        "bias" in linear
+        or outputs < 4
+        or outputs % 4 != 0
+        or int(x.shape[-1]) >= 16 * outputs
+        or linear.weight.dtype != x.dtype
+    )
 
 
 def apply():
@@ -25,6 +37,11 @@ def apply():
         if x.ndim == 3 and (
             x.shape[0] > 1
             or (_routes_quantized_linear() and isinstance(linear, nn.QuantizedLinear))
+            or (
+                qwen35_verify_qmm._is_armed()
+                and isinstance(linear, nn.Linear)
+                and _dense_falls_back_to_singletons(linear, x)
+            )
         ):
             return False
         return original(linear, x)

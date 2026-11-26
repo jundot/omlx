@@ -77,11 +77,15 @@ from __future__ import annotations
 import logging
 import threading
 from functools import wraps
+from typing import Literal
+
+import mlx.core as mx
+import mlx.nn as nn
 
 from omlx.custom_kernels import nax_skinny_qmm
 from omlx.custom_kernels.nax import is_nax_available
 
-from . import m1_verify_mma, m1_verify_qmv
+from . import m1_verify_mma, m1_verify_qmv, q2_verify_qmv
 
 logger = logging.getLogger(__name__)
 
@@ -136,9 +140,9 @@ def is_row_exact_armed() -> bool:
 
 
 def _fma_block(m: int, bits: int) -> str:
-    per = 8 if bits == 4 else 4
-    mask = "0xFu" if bits == 4 else "0xFFu"
-    shift = 4 if bits == 4 else 8
+    per = 8 if bits in (2, 4) else 4
+    mask = "0x3u" if bits == 2 else ("0xFu" if bits == 4 else "0xFFu")
+    shift = 2 if bits == 2 else (4 if bits == 4 else 8)
     lines = [f"for (int ki = 0; ki < {per}; ++ki) {{"]
     for j in range(4):
         lines.append(
@@ -148,7 +152,7 @@ def _fma_block(m: int, bits: int) -> str:
         for r in range(m):
             lines.append(
                 f"    acc[{j} * {m} + {r}] += "
-                f"float(v{r}[ki{'' if bits == 4 else ' + koff'}]) * w{j};"
+                f"float(v{r}[ki{'' if bits in (2, 4) else ' + koff'}]) * w{j};"
             )
     lines.append("}")
     return "\n            ".join(lines)
@@ -164,14 +168,19 @@ def _build_msg_kernel(m: int, bits: int, group_size: int, dtype, nsg: int):
     xloads = "\n            ".join(
         f"Vec8 v{r} = xv[({r} * K + k_base) / 8];" for r in range(m)
     )
-    if bits == 4:
-        pack_setup = """
+    if bits in (2, 4):
+        word_expr = (
+            "uint32_t(((const device ushort*)w_q)[(n0 + {j}) * K_by_p + pack])"
+            if bits == 2
+            else "w_q[(n0 + {j}) * K_by_p + pack]"
+        )
+        loads = "\n            ".join(
+            f"uint32_t p{j} = {word_expr.format(j=j)};" for j in range(4)
+        )
+        pack_setup = f"""
             int k_base = pack * 8;
             int gi = k_base / GS;
-            uint32_t p0 = w_q[(n0 + 0) * K_by_p + pack];
-            uint32_t p1 = w_q[(n0 + 1) * K_by_p + pack];
-            uint32_t p2 = w_q[(n0 + 2) * K_by_p + pack];
-            uint32_t p3 = w_q[(n0 + 3) * K_by_p + pack];
+            {loads}
         """
         body = f"""
         for (int pack = int(lane); pack < K_by_p; pack += 32) {{
@@ -186,7 +195,7 @@ def _build_msg_kernel(m: int, bits: int, group_size: int, dtype, nsg: int):
             float b2 = float(biases[(n0 + 2) * K_by_gs + gi]);
             float b3 = float(biases[(n0 + 3) * K_by_gs + gi]);
             _Pragma("unroll")
-            {_fma_block(m, 4)}
+            {_fma_block(m, bits)}
         }}
         """
     else:
@@ -229,7 +238,7 @@ def _build_msg_kernel(m: int, bits: int, group_size: int, dtype, nsg: int):
 
         int K = int(K_size);
         int N = int(N_size);
-        int K_by_p = {"K / 8" if bits == 4 else "K / 8"};
+        int K_by_p = K / 8;
         int K_by_gs = K / GS;
         int n0 = (int(tg_n) * NSG + int(sg)) * 4;
         if (n0 + 3 >= N) {{ return; }}
@@ -278,9 +287,16 @@ def _pack_block(m: int, bits: int, sfx: str) -> str:
     lines = [f"int k_base{sfx} = {p} * 8;", f"int gi{sfx} = k_base{sfx} / GS;"]
     for r in range(m):
         lines.append(f"Vec8 v{sfx}_{r} = xv[({r} * K + k_base{sfx}) / 8];")
-    if bits == 4:
+    if bits in (2, 4):
+        mask = "0x3u" if bits == 2 else "0xFu"
+        shift = 2 if bits == 2 else 4
         for j in range(4):
-            lines.append(f"uint32_t p{sfx}_{j} = w_q[(n0 + {j}) * K_by_p + {p}];")
+            if bits == 2:
+                lines.append(
+                    f"uint32_t p{sfx}_{j} = uint32_t(((const device ushort*)w_q)[(n0 + {j}) * K_by_p + {p}]);"
+                )
+            else:
+                lines.append(f"uint32_t p{sfx}_{j} = w_q[(n0 + {j}) * K_by_p + {p}];")
         for j in range(4):
             lines.append(
                 f"float s{sfx}_{j} = float(scales[(n0 + {j}) * K_by_gs + gi{sfx}]);"
@@ -293,7 +309,7 @@ def _pack_block(m: int, bits: int, sfx: str) -> str:
                 f"    float s = s{sfx}_{j};",
                 f"    float b = b{sfx}_{j};",
                 "    for (int ki = 0; ki < 8; ++ki) {",
-                "        float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;",
+                f"        float wv = float((packed >> (ki * {shift})) & {mask}) * s + b;",
             ]
             for r in range(m):
                 block.append(
@@ -810,16 +826,19 @@ def sg8_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> b
 
     # On M1-class GPUs the M1 kernels beat sg8 inside their row windows; the
     # fused swiglu path keys off this check, so it falls back per-linear.
-    if _m1_route(M, K, N, bits, group_size, dtype):
+    if _m1_route(M, K, N, bits, group_size, dtype) or q2_verify_qmv.eligible(
+        M, K, N, bits, group_size, dtype
+    ):
         return False
     nsg, ct = _sg8_geometry(int(K), int(N))
+    min_rows = 2 if int(bits) == 2 else _SG8_MIN_ROWS
     return (
         # The operand holds 128 + q exactly only up to 7-bit codes.
         int(bits) in (2, 3, 4, 5, 6)
         and int(group_size) in (32, 64, 128)
         and dtype in (mx.bfloat16, mx.float16)
         # Two or three rows stay on split-K, which is faster there in context.
-        and _SG8_MIN_ROWS <= int(M) <= 8
+        and min_rows <= int(M) <= 8
         and int(K) % (int(group_size) * nsg) == 0
         and int(N) % (8 * ct) == 0
         and int(N) >= _MIN_SG8_ROUTE_N
@@ -1057,11 +1076,12 @@ def vk_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bo
     # M >= 3: at M=2 (depth-1 verify) the dispatch overhead eats the GPU win
     # AND skipping it keeps depth-1 greedy output bit-identical to the
     # unrouted path. Depth >= 2 verifies at M >= 3 where the kernels pay.
+    min_rows = 2 if int(bits) == 2 else 3
     return (
-        int(bits) in (4, 8)
+        int(bits) in (2, 4, 8)
         and int(group_size) in (32, 64, 128)
         and dtype in (mx.bfloat16, mx.float16)
-        and 3 <= int(M) <= 6
+        and min_rows <= int(M) <= 6
         and int(K) % 64 == 0
         and int(N) % 4 == 0
         and int(N) >= _MIN_ROUTE_N
@@ -1081,6 +1101,9 @@ def _sg8_group_source(ns: tuple, bits: tuple, half: bool = False) -> str:
     Matrices may mix 4- and 5-bit storage; the branch is uniform per
     threadgroup.
     """
+    pair2 = _operand_bits(
+        "((w0 >> (2 * j)) & 0x3u) | (((w1 >> (2 * j)) & 0x3u) << 16)", half
+    )
     pair4 = _operand_bits("((w0 >> (4 * j)) & 0x000F000Fu)", half)
     pair5 = _operand_bits(
         "((w0 >> (5 * j)) & 0x1Fu) | (((w1 >> (5 * j)) & 0x1Fu) << 16)", half
@@ -1139,6 +1162,10 @@ def _sg8_group_source(ns: tuple, bits: tuple, half: bool = False) -> str:
             uint w0, w1 = 0;
             if (wbits == 4) {{
                 w0 = ((const device uint*)(wg + qd * 16))[fn >> 1];
+            }} else if (wbits == 2) {{
+                uint packed16 = uint(((const device ushort*)(wg + qd * 8))[fn >> 1]);
+                w0 = packed16;
+                w1 = packed16 >> 8;
             }} else {{
                 const device uint* wp = (const device uint*)(wg + qd * 20);
                 uint at = (fn >> 1) * 5;
@@ -1155,7 +1182,7 @@ def _sg8_group_source(ns: tuple, bits: tuple, half: bool = False) -> str:
                 xsum += float2(float(xa), float(xb));
                 uint pair = wbits == 4
                     ? {pair4}
-                    : {pair5};
+                    : (wbits == 2 ? {pair2} : {pair5});
                 simdgroup_matrix<T, 8, 8> a, b;
                 a.thread_elements()[0] = as_type<T>(ushort(pair));
                 a.thread_elements()[1] = as_type<T>(ushort(pair >> 16));
@@ -1202,7 +1229,7 @@ def sg8_group_eligible(linears, x) -> bool:
     rows = x.shape[0] * x.shape[1]
     K = x.shape[2]
     first = linears[0]
-    if any(
+    if q2_verify_qmv.group_eligible(linears, x) or any(
         isinstance(linear, nn.QuantizedLinear)
         and _m1_route(
             rows, K, linear.scales.shape[0], linear.bits, linear.group_size, x.dtype
@@ -1216,7 +1243,7 @@ def sg8_group_eligible(linears, x) -> bool:
             isinstance(linear, nn.QuantizedLinear)
             and getattr(linear, "mode", "affine") == "affine"
             and "bias" not in linear
-            and int(linear.bits) in (4, 5)
+            and int(linear.bits) in (2, 4, 5)
             and linear.group_size == first.group_size
             and linear.weight.shape[1] * 32 // linear.bits == K
             and linear.scales.shape[0] % 8 == 0
@@ -1225,8 +1252,11 @@ def sg8_group_eligible(linears, x) -> bool:
             and linear.biases.dtype == x.dtype
         ):
             return False
+    min_rows = (
+        2 if all(int(linear.bits) == 2 for linear in linears) else _SG8_MIN_ROWS
+    )
     return (
-        _SG8_MIN_ROWS <= rows <= 8
+        min_rows <= rows <= 8
         and int(first.group_size) in (32, 64, 128)
         and K % (int(first.group_size) * _SG8_GROUP_NSG) == 0
         and max(linear.scales.shape[0] for linear in linears) >= _MIN_MMA_ROUTE_N
@@ -1284,6 +1314,29 @@ def vk_group_sg8(x2, linears, sums=None):
     )
 
 
+def verify_swiglu(gate: object, up: object, x: mx.array) -> mx.array | None:
+    """Fuse ``silu(x @ gate^T) * (x @ up^T)`` for an armed verify MLP, or return None."""
+    if (
+        not _is_armed()
+        or not q2_verify_qmv.metal_ready()
+        or not isinstance(gate, nn.QuantizedLinear)
+        or not isinstance(up, nn.QuantizedLinear)
+    ):
+        return None
+    if q2_verify_qmv.swiglu_eligible(gate, up, x):
+        batch, length, width = x.shape
+        return q2_verify_qmv.q2_swiglu(
+            x.reshape(batch * length, width), gate, up
+        ).reshape(batch, length, -1)
+    if sg8_swiglu_eligible(gate, up, x):
+        batch, length, width = x.shape
+        out: mx.array = vk_swiglu_sg8(
+            x.reshape(batch * length, width), gate, up, group_sums_for(x)
+        ).reshape(batch, length, -1)
+        return out
+    return None
+
+
 def _patch_verify_grouped_linears() -> None:
     """Serve the verifier's same-input projection tuples in one sg8 launch."""
     try:
@@ -1298,12 +1351,19 @@ def _patch_verify_grouped_linears() -> None:
 
     def _linears(self, linears, x):
         linears = tuple(linears)
-        if sg8_group_eligible(linears, x):
-            batch, length, K = x.shape
-            outs = vk_group_sg8(
-                x.reshape(batch * length, K), linears, group_sums_for(x)
-            )
-            return tuple(out.reshape(batch, length, -1) for out in outs)
+        if q2_verify_qmv.metal_ready():
+            if _is_armed() and q2_verify_qmv.group_eligible(linears, x):
+                batch, length, width = x.shape
+                outs = q2_verify_qmv.q2_group_qmv(
+                    x.reshape(batch * length, width), linears
+                )
+                return tuple(out.reshape(batch, length, -1) for out in outs)
+            if sg8_group_eligible(linears, x):
+                batch, length, width = x.shape
+                outs = vk_group_sg8(
+                    x.reshape(batch * length, width), linears, group_sums_for(x)
+                )
+                return tuple(out.reshape(batch, length, -1) for out in outs)
         return original(self, linears, x)
 
     _linears._omlx_sg8_group = True
@@ -1329,26 +1389,19 @@ def _patch_verify_swiglu() -> None:
         gate = getattr(feed_forward, "gate_proj", None)
         up = getattr(feed_forward, "up_proj", None)
         down = getattr(feed_forward, "down_proj", None)
-        if (
-            down is not None
-            and not hasattr(feed_forward, "switch_mlp")
-            and sg8_swiglu_eligible(gate, up, x)
-        ):
-            batch, length, K = x.shape
-            hidden = vk_swiglu_sg8(
-                x.reshape(batch * length, K), gate, up, group_sums_for(x)
-            )
-            hidden = hidden.reshape(batch, length, -1)
-            if down.group_size == _SUM_GROUP and sg8_eligible(
-                batch * length,
-                hidden.shape[-1],
-                down.scales.shape[0],
-                down.bits,
-                down.group_size,
-                hidden.dtype,
-            ):
-                register_group_sums(hidden, group_sums(hidden))
-            return self._linear(down, hidden)
+        if down is not None and not hasattr(feed_forward, "switch_mlp"):
+            hidden = verify_swiglu(gate, up, x)
+            if hidden is not None:
+                if down.group_size == _SUM_GROUP and sg8_eligible(
+                    x.shape[0] * x.shape[1],
+                    hidden.shape[-1],
+                    down.scales.shape[0],
+                    down.bits,
+                    down.group_size,
+                    hidden.dtype,
+                ):
+                    register_group_sums(hidden, group_sums(hidden))
+                return self._linear(down, hidden)
         return original(self, feed_forward, x)
 
     _feed_forward._omlx_sg8_swiglu = True
@@ -1496,8 +1549,13 @@ def _patch_verify_layer_flush() -> None:
 
     def _mixed(self, layer, hidden, mask, cache, position_ids, position_embeddings):
         pending = getattr(_ROUTE_ARMED, "normed", None)
+        _ROUTE_ARMED.normed = None
         if pending is not None and pending[0] is hidden:
             normed = pending[1]
+        elif (in_seam := getattr(layer.input_layernorm, "_omlx_seam_norm", None)) is not None and (
+            fused_in := in_seam(hidden, None)
+        ) is not None:
+            _, normed = fused_in
         else:
             normed = layer.input_layernorm(hidden)
         if layer.is_linear:
@@ -1512,13 +1570,22 @@ def _patch_verify_layer_flush() -> None:
                 position_embeddings,
             )
         post = layer.post_attention_layernorm
-        if not _add_rms_eligible(hidden, residual, post):
+        post_seam = getattr(post, "_omlx_seam_norm", None)
+        if post_seam is not None and (fused_post := post_seam(hidden, residual)) is not None:
+            hidden, normed = fused_post
+        elif _add_rms_eligible(hidden, residual, post):
+            hidden, normed, sums = add_rms_norm(hidden, residual, post)
+            register_group_sums(normed, sums)
+        else:
             hidden = hidden + residual
             return hidden + self._feed_forward(layer.mlp, post(hidden))
-        hidden, normed, sums = add_rms_norm(hidden, residual, post)
-        register_group_sums(normed, sums)
         out = self._feed_forward(layer.mlp, normed)
         nxt = (getattr(_ROUTE_ARMED, "next_norm", None) or {}).get(id(layer))
+        nxt_seam = getattr(nxt, "_omlx_seam_norm", None) if nxt is not None else None
+        if nxt_seam is not None and (fused_nxt := nxt_seam(hidden, out)) is not None:
+            hidden, normed = fused_nxt
+            _ROUTE_ARMED.normed = (hidden, normed)
+            return hidden
         if nxt is None or not _add_rms_eligible(hidden, out, nxt):
             return hidden + out
         hidden, normed, sums = add_rms_norm(hidden, out, nxt)
@@ -1527,7 +1594,7 @@ def _patch_verify_layer_flush() -> None:
         return hidden
 
     def _layer(self, layer, hidden, *args, **kwargs):
-        if not _is_armed():
+        if not _is_armed() or not q2_verify_qmv.metal_ready():
             return original(self, layer, hidden, *args, **kwargs)
         hidden = _mixed(self, layer, hidden, *args, **kwargs)
         count = getattr(_ROUTE_ARMED, "layers", 0) + 1
@@ -1576,21 +1643,25 @@ def skinny_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -
     return int(M) > _NAX_MMA_MAX_ROWS or mma_eligible(M, K, N, bits, group_size, dtype)
 
 
-def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
-    """Kernel an armed verify projection runs ("m1", "m1_mma", "sg8", "skinny",
-    "mma" or "vk"), or None for the stock qmm."""
-    m1 = _m1_route(rows, K, N, bits, group_size, dtype)
+def _verify_route(
+    rows: int, width: int, cols: int, bits: int, group_size: int, dtype
+) -> Literal["m1", "m1_mma", "q2", "sg8", "skinny", "mma", "vk"] | None:
+    """Kernel an armed verify projection runs ("m1", "m1_mma", "q2", "sg8",
+    "skinny", "mma" or "vk"), or None for the stock qmm."""
+    m1 = _m1_route(rows, width, cols, bits, group_size, dtype)
     if m1:
         return m1
-    if sg8_eligible(rows, K, N, bits, group_size, dtype):
-        if rows < _SG8_SINGLE_MIN_ROWS_NAX and is_nax_available():
+    if q2_verify_qmv.eligible(rows, width, cols, bits, group_size, dtype):
+        return "q2"
+    if sg8_eligible(rows, width, cols, bits, group_size, dtype):
+        if int(bits) != 2 and rows < _SG8_SINGLE_MIN_ROWS_NAX and is_nax_available():
             return None
         return "sg8"
-    if skinny_eligible(rows, K, N, bits, group_size, dtype):
+    if skinny_eligible(rows, width, cols, bits, group_size, dtype):
         return "skinny"
-    if mma_eligible(rows, K, N, bits, group_size, dtype):
+    if mma_eligible(rows, width, cols, bits, group_size, dtype):
         return "mma"
-    if rows <= 6 and vk_eligible(rows, K, N, bits, group_size, dtype):
+    if rows <= 6 and vk_eligible(rows, width, cols, bits, group_size, dtype):
         return "vk"
     return None
 
@@ -1600,7 +1671,13 @@ def run_route(layer, x2, route: str, *, sums=None):
 
     Returns None when the route cannot read the layer's scales dtype.
     """
-    if route in ("m1", "m1_mma", "skinny") and layer.scales.dtype != x2.dtype:
+    if route in ("m1", "m1_mma", "q2", "skinny") and layer.scales.dtype != x2.dtype:
+        return None
+    if route == "q2" and (
+        layer.biases is None
+        or layer.biases.dtype != x2.dtype
+        or not q2_verify_qmv.metal_ready()
+    ):
         return None
     args = (x2, layer.weight, layer.scales, layer.biases)
     if route == "m1":
@@ -1608,6 +1685,12 @@ def run_route(layer, x2, route: str, *, sums=None):
     if route == "m1_mma":
         return m1_verify_mma.m1_mma_qmm(
             *args, bits=layer.bits, group_size=layer.group_size
+        )
+    if route == "q2":
+        return q2_verify_qmv.q2_qmm(
+            *args,
+            group_size=layer.group_size,
+            neg_scale=q2_verify_qmv.is_ternary_linear(layer),
         )
     if route == "sg8":
         return vk_qmm_sg8(
@@ -1663,25 +1746,34 @@ def apply_verify_qmm_patch() -> bool:
             return row_exact_linear(self, x)
         if (
             not _is_armed()
+            or not q2_verify_qmv.metal_ready()
             or x.ndim != 3
             or getattr(self, "mode", "affine") != "affine"
             or (x.shape[0] == 1 and x.shape[1] < 2)
         ):
             return orig_call(self, x)
-        batch, length, K = x.shape
+        batch, length, width = x.shape
         rows = batch * length
-        N = self.scales.shape[0]
-        route = _verify_route(rows, K, N, self.bits, self.group_size, x.dtype)
+        cols = self.scales.shape[0]
+        if (
+            self.weight.shape[-1] * 32 != width * self.bits
+            or width % self.group_size != 0
+            or self.scales.shape != (cols, width // self.group_size)
+            or self.biases is None
+            or self.biases.shape != self.scales.shape
+        ):
+            return orig_call(self, x)
+        route = _verify_route(rows, width, cols, self.bits, self.group_size, x.dtype)
         if route is None:
             return orig_call(self, x)
         try:
             # Batched verify rows (requests x block) share one weight pass.
-            y = run_route(self, x.reshape(rows, K), route, sums=group_sums_for(x))
+            y = run_route(self, x.reshape(rows, width), route, sums=group_sums_for(x))
             if y is None:
                 return orig_call(self, x)
             if hasattr(self, "bias"):
                 y = y + self.bias
-            return y.reshape(batch, length, N)
+            return y.reshape(batch, length, cols)
         except Exception:
             logger.debug("verify qmm route failed; stock fallback", exc_info=True)
             return orig_call(self, x)
