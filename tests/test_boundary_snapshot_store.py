@@ -1050,14 +1050,17 @@ class TestBoundarySnapshotSSDStore:
         ]
         for t in threads:
             t.start()
-        _time.sleep(1.5)
+        _time.sleep(0.5)
         stop.set()
         for t in threads:
             t.join(timeout=10.0)
         assert not errors, errors
 
         # Let writer drain.
-        _time.sleep(0.5)
+        deadline = _time.monotonic() + 5.0
+        while not self.store._write_queue.empty() and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        self.store.shutdown()
 
         # Orphan check: every .safetensors on disk must have a matching
         # registry entry. The reverse direction is fine to drift (the

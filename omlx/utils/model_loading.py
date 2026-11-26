@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,18 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
+from ..patches.inkling2.loader import is_mlx_vlm_quantization, mlx_vlm_quantization
+from ..patches.inkling2.loopcd import apply_loopcd
+from ..patches.inkling2.model import TextArgs
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
+
+try:
+    import mlx_vlm.utils as mlx_vlm_utils
+except ImportError:
+    # mlx-vlm: absent from a CUDA cluster worker's venv (#4739).
+    mlx_vlm_utils = None
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +39,7 @@ _RUNTIME_TEXT_PREFIX = "language_model.model."
 _MATERIALIZE_EVAL_CHUNK = 8
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
+_vlm_trust_remote_code = ContextVar("omlx_vlm_trust_remote_code", default=False)
 
 _REMOTE_CODE_METADATA_PATTERNS = [
     "*.json",
@@ -56,6 +67,36 @@ def ensure_model_code_trusted(
             f"module ({model_file!r}) to build its architecture. This is disabled "
             "by default. Enable Trust Remote Code for this model if you trust it."
         )
+
+
+def _patch_mlx_vlm_model_file_trust() -> None:
+    get_model_and_args = mlx_vlm_utils.get_model_and_args
+    load_model = mlx_vlm_utils.load_model
+
+    def checked_get_model_and_args(config, model_path=None):
+        if model_path is not None:
+            ensure_model_code_trusted(
+                config,
+                model_path=model_path,
+                trust_remote_code=_vlm_trust_remote_code.get(),
+            )
+        return get_model_and_args(config, model_path=model_path)
+
+    def load_model_with_trust(model_path, *args, trust_remote_code=False, **kwargs):
+        token = _vlm_trust_remote_code.set(trust_remote_code)
+        try:
+            return load_model(
+                model_path, *args, trust_remote_code=trust_remote_code, **kwargs
+            )
+        finally:
+            _vlm_trust_remote_code.reset(token)
+
+    mlx_vlm_utils.get_model_and_args = checked_get_model_and_args
+    mlx_vlm_utils.load_model = load_model_with_trust
+
+
+if mlx_vlm_utils is not None:
+    _patch_mlx_vlm_model_file_trust()
 
 
 def preflight_text_remote_code(
@@ -463,6 +504,43 @@ def normalize_inkling2_modelopt_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_inkling2_mlx_vlm_quant(cfg: dict) -> dict:
+    """Move an mlx-vlm-layout Inkling 2 quantization onto runtime paths.
+
+    Checkpoints quantized through mlx-vlm key ``quantization`` by mlx-vlm's
+    module names (``language_model.model.layers.N.self_attn.q_proj``). The
+    runtime fuses some of those modules, and mlx-lm applies the per-path specs
+    to the runtime module tree, so the keys are rewritten before it does.
+    """
+    if cfg.get("model_type") not in INKLING2_MODEL_TYPES:
+        return cfg
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict) or not is_mlx_vlm_quantization(quant):
+        return cfg
+    text = TextArgs.from_dict(cfg.get("text_config") or {})
+    cfg["quantization"] = mlx_vlm_quantization(quant, text)
+    return cfg
+
+
+def normalize_inkling2_expert_quant(cfg: dict) -> dict:
+    """Keep mlx-lm from quantizing the Inkling 2 expert carriers.
+
+    The Inkling 2 model builds its expert carriers from the checkpoint. mlx-lm
+    infers a spec for a quantized module the config does not name, and that
+    fails on the native NVFP4 and MXFP8 experts that mlx-lm conversions keep.
+    """
+    if cfg.get("model_type") not in INKLING2_MODEL_TYPES:
+        return cfg
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict):
+        return cfg
+    layers = TextArgs.from_dict(cfg.get("text_config") or {}).num_hidden_layers
+    for idx in range(layers):
+        for which in ("w13", "w2"):
+            quant.setdefault(f"model.layers.{idx}.mlp.experts.{which}", False)
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -482,6 +560,8 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_hy_v3_rope_config(cfg)
         # Cluster ranks load MiniMax through mlx-lm, not the patched mlx-vlm.
         adopt_expert_global_scales(cfg)
+        normalize_inkling2_mlx_vlm_quant(cfg)
+        normalize_inkling2_expert_quant(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
@@ -1756,6 +1836,7 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
         if applied:
             logger.info(f"IndexCache applied: freq={index_cache_freq}")
 
+    apply_loopcd(model, model_settings)
     return model
 
 

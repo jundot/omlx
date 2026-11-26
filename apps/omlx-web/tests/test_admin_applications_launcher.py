@@ -21,8 +21,7 @@ TOOL_COMMANDS = {
     "vibe": ["vibeCommand"],
     "copilot": ["copilotCommand"],
 }
-# Claude's bar shows the masked command and copies the real one.
-DISPLAY_COPIES = {"claudeCodeCommandDisplay": "claudeCodeCommand"}
+DISPLAY_COPIES = {"claudeCodeCommandDisplay": "await claudeCodeCommand()"}
 
 
 class _Card(HTMLParser):

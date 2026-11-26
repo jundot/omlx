@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,8 +12,11 @@ import mlx.nn as nn
 from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
 from mlx_vlm.models.base import LanguageModelOutput, create_attention_mask
 
+from ..deepseek_v4.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from ..deepseek_v41.mtp import AcceptanceDepthController
-from . import exact
+from ..mlx_lm_mtp.cache_rollback import _is_decode_consistent_armed, _is_undo_armed
+from . import exact, verify_dispatch
+from . import kernels as hc_kernels
 from .config import TextConfig
 from .flash import Engram
 from .layers import (
@@ -24,6 +28,7 @@ from .layers import (
     hc_expand,
 )
 from .rope import Positions
+from .verify_layers import LayerStack, layer_output
 
 
 class DecoderLayer(nn.Module):
@@ -40,8 +45,71 @@ class DecoderLayer(nn.Module):
         )
         self.hc_attn_layer = HyperConnection(args)
         self.hc_mlp_layer = HyperConnection(args)
+        self._verify_moe_graph = None
+        self._verify_tail_graph = None
         if args.engram_layer_ids and layer + 1 in args.engram_layer_ids:
             self.engram_layer = Engram(args, layer + 1)
+
+    def _can_compile_moe(self, x):
+        mlp = self.mlp
+        if not (
+            x.ndim == 3
+            and x.shape[0] == 1
+            and x.dtype == mx.bfloat16
+            and type(mlp) is MoE
+            and not mlp.training
+            and verify_dispatch.eligible(x.shape[1])
+        ):
+            return False
+        switch = mlp.switch_mlp
+        return (
+            type(switch) is SwitchGLU
+            and "gate_up_proj" not in switch
+            and all(
+                type(proj) is QuantizedSwitchLinear
+                and proj.mode == "affine"
+                and proj.bits == 4
+                and proj.group_size == 64
+                for proj in switch.projections()
+            )
+        )
+
+    def _mlp_forward(self, x):
+        mlp = self.mlp
+        if self._can_compile_moe(x):
+            graph = self._verify_moe_graph
+            if graph is None or graph[0] is not mlp:
+                graph = (mlp, mx.compile(mlp.__call__, inputs=mlp.state))
+                # Capture the MLP, leaving ownership with the decoder layer.
+                object.__setattr__(self, "_verify_moe_graph", graph)
+            return graph[1](x)
+        return mlp(x)
+
+    def _verify_tail(self, values, gate, streams, post):
+        attention = self.self_attn
+        pre = self.hc_mlp_layer.hc_pre
+        norm = self.post_attention_layernorm
+        mlp = self.mlp
+        modules = (attention.o_proj, pre, norm, mlp)
+        if "post_proj_norm" in attention:
+            modules += (attention.post_proj_norm,)
+        owners = (attention, *modules)
+        graph = self._verify_tail_graph
+        if (
+            graph is None
+            or len(graph[0]) != len(owners)
+            or any(current is not saved for current, saved in zip(owners, graph[0]))
+        ):
+
+            def tail(values, gate, streams, post, transposed):
+                return layer_output(
+                    attention, pre, norm, mlp, values, gate, streams, post, transposed
+                )
+
+            graph = (owners, mx.compile(tail, inputs=[m.state for m in modules]))
+            object.__setattr__(self, "_verify_tail_graph", graph)
+        transposed = pre._fused.get(pre.hc_fn)
+        return graph[1](values, gate, streams, post, transposed)
 
     def __call__(
         self,
@@ -55,12 +123,22 @@ class DecoderLayer(nn.Module):
         if "engram_layer" in self and engram_inputs is not None:
             streams = streams + self.engram_layer(streams, *engram_inputs)
         x, post = self.hc_attn_layer(streams)
-        x, topk = self.self_attn(
-            self.input_layernorm(x), mask, cache, prev_topk, positions
-        )
+        x = self.input_layernorm(x)
+        if (
+            cache is not None
+            and x.shape[1] > 1
+            and self._can_compile_moe(x)
+            and hc_kernels.available()
+        ):
+            (values, gate), topk = self.self_attn(
+                x, mask, cache, prev_topk, positions, return_values=True
+            )
+            return self._verify_tail(values, gate, streams, post), topk
+
+        x, topk = self.self_attn(x, mask, cache, prev_topk, positions)
         streams = hc_expand(x, streams, post)
         x, post = self.hc_mlp_layer(streams)
-        x = self.mlp(self.post_attention_layernorm(x))
+        x = self._mlp_forward(self.post_attention_layernorm(x))
         return hc_expand(x, streams, post), topk
 
 
@@ -72,6 +150,7 @@ class TextModel(nn.Module):
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.hc_head = HyperHead(args)
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self._verify_stack = None
         kinds = args.attention_kinds
         self._first = {k: kinds.index(k) for k in ("sparse", "sliding") if k in kinds}
 
@@ -106,6 +185,24 @@ class TextModel(nn.Module):
         streams = mx.contiguous(
             mx.broadcast_to(h[:, :, None, :], (b, length, self.args.hc_mult, d))
         )
+        if (
+            b == 1
+            and h.dtype == mx.bfloat16
+            and not self.training
+            and verify_dispatch.eligible(length)
+            and hc_kernels.available()
+            and _is_undo_armed()
+            and not _is_decode_consistent_armed()
+            and len(cache) == len(self.layers)
+            and all(c is not None for c in cache)
+        ):
+            stack = self._verify_stack
+            if stack is None or not stack.matches(self.layers):
+                stack = LayerStack(self.layers, h)
+                object.__setattr__(self, "_verify_stack", stack)
+            if any(stack.ready):
+                streams = stack(streams, cache, masks, engram_inputs, positions)
+                return self.norm(self.hc_head(streams))
         prev_topk = None
         kinds = self.args.attention_kinds
         for layer, c, kind in zip(self.layers, cache, kinds):
@@ -222,6 +319,7 @@ EXACT_VERIFY = False
 def set_dspark_verify_armed(flag: bool) -> None:
     """The MTP generator arms this around draft verify forwards."""
     exact.set_armed(flag and EXACT_VERIFY)
+    verify_dispatch.set_armed(flag)
 
 
 class LanguageModel(nn.Module):
@@ -280,6 +378,69 @@ class LanguageModel(nn.Module):
 
     def dspark_append_context(self, hidden_rows, cache, **_):
         """DFly2 reads the target's caches directly; there is nothing to append."""
+
+    def dspark_prepare_block(self, cache, hidden, row, anchor, num_drafts, depth):
+        """Prepare the inputs for a DFly2 block before the target cache rolls back."""
+        width = num_drafts + 1
+        if (
+            cache is None
+            or cache is not self._dfly_cache
+            or hidden is None
+            or hidden.shape[:2] != (1, width)
+            or hidden.dtype != mx.bfloat16
+            or not 2 <= width <= 6
+            or not 1 <= depth <= 5
+            or self.training
+            or mx.default_device() != mx.gpu
+            or not verify_dispatch._supported_gpu()
+        ):
+            return None
+
+        extent = _latent_cache(cache[0])
+        padded_end = getattr(extent, "_idx", None)
+        left = getattr(extent, "left_padding", None)
+        if padded_end is None:
+            padded_end, left = extent.offset, None
+        if not isinstance(padded_end, int) or padded_end - num_drafts <= 2048:
+            return None
+        # The accepted row leaves the cache at the same extent as a trim of
+        # num_drafts - row. The retained keys themselves are unchanged.
+        first = left.reshape(1) if left is not None else mx.zeros((1,), dtype=mx.int32)
+        end = padded_end - num_drafts + row
+        dfly = self.dfly
+        histories = []
+        for kv_layer, index_layer in zip(dfly.cfg.kv_layers, dfly.cfg.index_layers):
+            kv = _latent_cache(cache[kv_layer])
+            if kv.keys is None or kv.values is None or kv.keys.shape[2] < padded_end:
+                return None
+            topk = self.layers[index_layer].self_attn._captured_topk
+            if isinstance(topk, list):
+                if len(topk) != width or any(entry is None for entry in topk):
+                    return None
+                topk = mx.stack([entry[0, 0, 0] for entry in topk])
+            elif topk is not None and topk.shape[:3] == (1, 1, width):
+                topk = topk[0, 0]
+            else:
+                return None
+            if topk.shape[-1] != 2048:
+                return None
+            index = mx.take(topk, row, axis=0).reshape(2048)
+            valid = (index >= first) & (index < end)
+            safe = mx.maximum(mx.minimum(index, end - 1), first)
+            histories.append((kv.keys[:, :, safe], kv.values[:, :, safe], valid))
+
+        start = end - first
+        if self._position_delta.value is not None:
+            start = start + self._position_delta.value
+        return partial(
+            dfly.block_hidden,
+            self.model.embed_tokens,
+            mx.take(hidden, row, axis=1),
+            anchor,
+            start,
+            histories,
+            depth + 1,
+        )
 
     def dspark_forward(self, hidden_rows, anchor, cache=None, *, draft_length=None):
         """Final-normed hidden of one draft block.

@@ -90,14 +90,11 @@ class Model(_LoadedModel):
         skip_logits: bool = False,
         **kwargs: Any,
     ) -> Any:
-        # Lightning MTP verify forwards add return_hidden and n_confirmed.
         if (
             getattr(_prompt_pass, "active", False)
             and not kwargs
-            and inputs.shape[0] == 1
+            and self.language_model._config.ced_prefill
         ):
-            # A prompt chunk only fills the cache, like the single-Mac
-            # scheduler's _omlx_prefill chunks.
             kwargs["_ced_prefill"] = True
         return self.language_model(
             inputs, cache=cache, skip_logits=skip_logits, **kwargs
@@ -113,11 +110,6 @@ class Model(_LoadedModel):
             yield
         finally:
             _prompt_pass.active = previous
-
-    @property
-    def _omlx_one_prompt_prefill(self) -> bool:
-        # CED runs on one request row; batching prompts would drop it.
-        return bool(self.language_model._config.ced_prefill)
 
     def mtp_forward(
         self,

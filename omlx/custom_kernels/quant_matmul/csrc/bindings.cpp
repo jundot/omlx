@@ -2,13 +2,11 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
-#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include "affine_qmm.h"
 #include "ane/ane_hybrid.h"
-#include "command_buffer_caps.h"
 #include "command_queue.h"
 #include "gather_qmm.h"
 #include "grouped_expert.h"
@@ -128,11 +126,6 @@ NB_MODULE(_ext, m) {
 
   omlx::moe_staging::register_bindings(m);
 
-  m.def(
-      "set_command_buffer_caps",
-      &omlx::quant_matmul::set_command_buffer_caps,
-      "ops"_a,
-      "mb"_a);
   m.def(
       "share_command_queue",
       &omlx::quant_matmul::share_command_queue,

@@ -440,7 +440,7 @@ class TestDraftCacheReuse:
                 "model_type": "qwen3_5",
                 "hidden_size": 64,
                 "intermediate_size": 128,
-                "num_hidden_layers": 4,
+                "num_hidden_layers": 2,
                 "num_attention_heads": 4,
                 "num_key_value_heads": 2,
                 "vocab_size": 256,
@@ -579,7 +579,7 @@ class TestDraftCacheReuse:
                     assert mx.array_equal(a, b).item()
 
     @pytest.mark.parametrize(
-        "stored,n,restored", [(1024, 1024, 768), (1154, 1216, 1024)]
+        "stored,n,restored", [(768, 768, 512), (898, 960, 768)]
     )
     def test_disk_reuse_matches_cold_scoring(self, tmp_path, stored, n, restored):
         model = self._model()

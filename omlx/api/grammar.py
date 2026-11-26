@@ -127,6 +127,11 @@ class GrammarConstraintProcessor:
         self._pending = True
         self._bitmask.fill(-1)
         self._matcher.fill_next_token_bitmask(self._bitmask)
+        # xgrammar: since 0.2.9 a stop token can match as text and end the grammar.
+        if not self._matcher.is_completed():
+            words = self._bitmask.view(np.uint32)
+            for token_id in self._matcher.stop_token_ids:
+                words[0, token_id // 32] &= ~np.uint32(1 << token_id % 32)
 
         mx_bitmask = mx.array(self._bitmask)
         return self._apply_mask(mx_bitmask, logits, self._vocab_size)

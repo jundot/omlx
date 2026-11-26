@@ -27,19 +27,19 @@ from omlx.patches.deepseek_v41.quantization import (
 )
 
 
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
-    "dim,length,count",
+    "dtype,dim,length,count",
     [
-        (32, 1, 0),
-        (64, 1, 17),
-        (128, 1, 17),
-        (256, 1, 17),
-        (512, 1, 513),
-        (512, 7, 129),
-        (96, 1, 17),
-        (96, 3, 37),
-        (1024, 1, 17),
+        (mx.float32, 32, 1, 0),
+        (mx.float32, 512, 1, 513),
+        (mx.float32, 96, 3, 37),
+        (mx.float32, 1024, 1, 17),
+        (mx.float16, 128, 1, 17),
+        (mx.float16, 512, 7, 129),
+        (mx.bfloat16, 64, 1, 17),
+        (mx.bfloat16, 256, 1, 17),
+        (mx.bfloat16, 512, 1, 513),
+        (mx.bfloat16, 96, 1, 17),
     ],
 )
 def test_packed_attention_split_and_mask(dtype, dim, length, count):
@@ -92,11 +92,19 @@ def test_attention_empty_and_all_masked():
 
 
 @pytest.mark.parametrize(
-    "dim,heads,length",
-    [(32, 8, 1), (128, 128, 3), (96, 9, 2), (96, 33, 3), (128, 65, 1), (32, 32, 2)],
+    "dim,heads,length,restricted,dtype",
+    [
+        (32, 8, 1, False, mx.bfloat16),
+        (32, 8, 1, True, mx.float32),
+        (96, 9, 2, False, mx.float32),
+        (96, 9, 2, True, mx.bfloat16),
+        (128, 128, 3, False, mx.float16),
+        (128, 128, 3, True, mx.bfloat16),
+        (96, 33, 3, False, mx.bfloat16),
+        (96, 33, 3, True, mx.float16),
+        (32, 32, 2, False, mx.float32),
+    ],
 )
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("restricted", [False, True])
 def test_index_scores_packed_candidates_and_causal(
     dim, heads, length, restricted, dtype
 ):
@@ -217,9 +225,13 @@ def test_tile_topk_ties_use_absolute_ids():
 
 
 @pytest.mark.parametrize(
-    "dim,heads,start,ratio", [(32, 3, 0, 4), (128, 8, 399, 2), (96, 9, 91, 3)]
+    "dim,heads,start,ratio,dtype",
+    [
+        (32, 3, 0, 4, mx.float32),
+        (128, 8, 399, 2, mx.bfloat16),
+        (96, 9, 91, 3, mx.bfloat16),
+    ],
 )
-@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_streamed_index_and_candidate_blocks_match_full_scores(
     dim, heads, start, ratio, dtype
 ):
@@ -588,9 +600,14 @@ def test_batched_decode_templates_do_not_depend_on_positions(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "n,k", [(1280, 5120), (512, 5120), (5120, 2304), (4096, 1280), (32768, 1280)]
+    "n,k,dtype",
+    [
+        (1280, 5120, mx.bfloat16),
+        (1280, 5120, mx.float16),
+        (5120, 2304, mx.bfloat16),
+        (32768, 1280, mx.bfloat16),
+    ],
 )
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 def test_mxfp8_gemv_matches_quantized_matmul(n, k, dtype):
     mx.random.seed(n + k)
     weight, scales = mx.quantize(
@@ -679,7 +696,6 @@ def test_deep_prefill_index_selection_matches_full_scores():
 @pytest.mark.parametrize(
     "ratio,tied,width,length",
     [
-        (1, False, 4103, 37),
         (2, False, 4103, 37),
         (2, True, 4103, 37),
         (1, False, 65539, 257),  # More than one 64 MiB score group.

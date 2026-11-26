@@ -119,7 +119,7 @@ brew services restart omlx  # 重启
 brew services info omlx     # 查看状态
 ```
 
-服务使用默认配置运行 `omlx serve`（`~/.omlx/models`，端口 8000）。要自定义，可以设置环境变量（`OMLX_MODEL_DIR`、`OMLX_PORT` 等），或运行一次 `omlx serve --model-dir /your/path` 将设置保存到 `~/.omlx/settings.json`。
+服务使用默认配置运行 `omlx serve`（`~/.omlx/models`，端口 8000）。要自定义，可以运行一次 `omlx serve --model-dir /your/path` 将设置保存到 `~/.omlx/settings.json`。
 
 日志写入两个位置：
 - **服务日志**: `$(brew --prefix)/var/log/omlx.log`（stdout/stderr）
@@ -240,6 +240,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | `POST /v1/rerank` | 文档重排序 |
 | `POST /v1/systemone` | 决策模型或聊天模型的类型化判断 (TypeSafe System One) |
 | `GET /v1/models` | 列出可用模型 |
+| `GET /v1/models/{model_id}` | 获取单个模型 |
 | `POST /tokenize`, `POST /detokenize` | 兼容 vLLM 的分词器 API（也可通过 `/v1` 访问） |
 
 用于设置、模型、下载、量化和基准测试的管理 API 接受主 API 密钥作为 Bearer 令牌，在 headless 模式下同样可用。详见 [Admin API](docs/admin-api.md)。

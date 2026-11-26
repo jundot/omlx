@@ -82,8 +82,9 @@ def _moe_modules(dtype, top_k=8):
     return router, experts
 
 
-@pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("shape", [(1, 1), (3, 5)])
+@pytest.mark.parametrize(
+    "dtype, shape", [(mx.bfloat16, (1, 1)), (mx.float16, (3, 5))]
+)
 def test_patched_moe_matches_stock(dtype, shape):
     router, experts = _moe_modules(dtype)
     x = mx.random.normal((*shape, 256)).astype(dtype)

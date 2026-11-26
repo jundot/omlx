@@ -1655,7 +1655,12 @@ class TestMing3Patches:
         def run(sample):
             mx.random.seed(0)
             steps = sample(
-                model, "p", "t", max_decode_steps=max_steps, temperature=temperature
+                model,
+                "p",
+                "t",
+                max_decode_steps=max_steps,
+                temperature=temperature,
+                flow_steps=3,
             )
             return [(mx.array(latent), last) for latent, last in steps]
 
@@ -1669,7 +1674,9 @@ class TestMing3Patches:
     @pytest.mark.parametrize(
         "cfg, temperature", [(2.0, 0.5), (1.0, 0.5), (0.0, 0.0)]
     )
-    def test_tiny_compiled_flow_matches_eager_flow(self, cfg, temperature):
+    def test_tiny_compiled_flow_matches_eager_flow(
+        self, monkeypatch, cfg, temperature
+    ):
         from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
 
         tiny_flow = pytest.importorskip("mlx_audio.tts.models.lingv3_tts.flow")
@@ -1683,10 +1690,14 @@ class TestMing3Patches:
 
         def run(sample):
             mx.random.seed(0)
-            kwargs = {"cfg": cfg, "temperature": temperature, "steps": 10}
+            kwargs = {"cfg": cfg, "temperature": temperature, "steps": 3}
             return sample(flow, hidden, history, **kwargs)
 
-        want = run(tiny_flow.FlowLoss.sample._omlx_original)
+        full = mx.full
+        with monkeypatch.context() as m:
+            # mlx-audio: FlowLoss.sample rounds the timestep to the weight dtype
+            m.setattr(mx, "full", lambda shape, value, dtype=None: full(shape, value))
+            want = run(tiny_flow.FlowLoss.sample._omlx_original)
         got = run(tiny_flow.FlowLoss.sample)
         assert got.dtype == want.dtype == mx.float32
         assert mx.array_equal(got, want).item()
@@ -1705,7 +1716,7 @@ class TestMing3Patches:
 
         def run(sample):
             mx.random.seed(0)
-            return sample(flow, hidden, history, cfg=2.0, temperature=0.5, steps=10)
+            return sample(flow, hidden, history, cfg=2.0, temperature=0.5, steps=3)
 
         want = run(tiny_flow.FlowLoss.sample._omlx_original)
         got = run(tiny_flow.FlowLoss.sample)

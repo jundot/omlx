@@ -24,7 +24,9 @@ def health_harness(tmp_path_factory):
     directory = tmp_path_factory.mktemp("server-process-health")
     source = directory / "ServerProcessHealth.swift"
     source.write_text(
-        (APP / "Sources/Server/ServerProcess.swift").read_text()
+        (APP / "Sources/Server/ServerProcess.swift")
+        .read_text()
+        .replace("import AppKit\n", "")
         + "\n"
         + (APP / "Tests/Fixtures/ServerProcessHealthHarness.swift").read_text()
     )

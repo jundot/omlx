@@ -52,6 +52,9 @@ final class ThroughputBenchScreenVM {
     private(set) var singleResults: [BenchResultDTO] = []
     private(set) var batchResults: [BenchResultDTO] = []
     private(set) var currentBenchId: String?
+    /// Position of this app's queued run in the server queue, nil when it
+    /// is not waiting. The run starts automatically when it reaches zero.
+    private(set) var queuedAhead: Int?
     /// Server-side upload-to-leaderboard state, populated after the
     /// bench completes. Phases: "idle" (not yet started) → "uploading" →
     /// "done" | "skipped". Only external-endpoint runs skip now;
@@ -67,13 +70,18 @@ final class ThroughputBenchScreenVM {
     private weak var client: OMLXClient?
     @ObservationIgnored
     private var pollTask: Task<Void, Never>?
+    /// Queue id returned by a queued start, watched until that run is active.
+    @ObservationIgnored
+    private var pendingQueueId: String?
+    @ObservationIgnored
+    private var queuePollTask: Task<Void, Never>?
     /// Export header of the last run, fixed at start since the form can change afterwards.
     private var runHeader: [String] = []
 
     // MARK: Derived
 
     var canRun: Bool {
-        !running && startRequest != nil
+        !running && queuedAhead == nil && startRequest != nil
     }
 
     var startRequest: BenchStartRequest? {
@@ -258,13 +266,25 @@ final class ThroughputBenchScreenVM {
         uploadState = nil
         lastError = nil
         running = true
+        queuedAhead = nil
+        pendingQueueId = nil
+        queuePollTask?.cancel()
 
         Task { [weak self] in
             do {
                 let resp = try await client.startThroughputBench(body)
                 guard let self else { return }
-                self.currentBenchId = resp.benchId
-                self.pollResults(client: client)
+                if let benchId = resp.benchId, resp.status != "queued" {
+                    self.currentBenchId = benchId
+                    self.pollResults(client: client)
+                } else {
+                    self.running = false
+                    self.pendingQueueId = resp.queueId
+                    self.queuedAhead = Self.position(
+                        of: resp.queueId, in: resp.queue
+                    ) ?? 0
+                    self.pollQueue(client: client)
+                }
             } catch {
                 self?.running = false
                 self?.lastError = error.omlxDescription
@@ -273,7 +293,16 @@ final class ThroughputBenchScreenVM {
     }
 
     func cancelBenchmark(client: OMLXClient) {
-        // No server run to cancel until the start response arrives.
+        if let queueId = pendingQueueId {
+            queuedAhead = nil
+            pendingQueueId = nil
+            queuePollTask?.cancel()
+            Task { [weak self] in
+                _ = try? await client.removeThroughputQueue(queueId: queueId)
+                await MainActor.run { self?.running = false }
+            }
+            return
+        }
         guard running, let benchId = currentBenchId else { return }
         Task { [weak self] in
             do {
@@ -284,6 +313,51 @@ final class ThroughputBenchScreenVM {
             } catch {
                 // The poll still owns the run and ends it on a terminal status or 404.
                 self?.lastError = error.omlxDescription
+            }
+        }
+    }
+
+    // MARK: Queue
+
+    private static func position(
+        of queueId: String?, in queue: [BenchQueueItem]?
+    ) -> Int? {
+        guard let queueId, let queue else { return nil }
+        return queue.firstIndex { $0.queueId == queueId }
+    }
+
+    /// Watch `/bench/active` until the server reaches this request, then
+    /// attach to the bench id it was given.
+    private func pollQueue(client: OMLXClient) {
+        queuePollTask?.cancel()
+        queuePollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if Task.isCancelled { return }
+                guard let self, let queueId = self.pendingQueueId else { return }
+                guard let active = try? await client.getActiveThroughputBench() else {
+                    continue
+                }
+                if active.running, active.queueId == queueId, let benchId = active.benchId {
+                    self.pendingQueueId = nil
+                    self.queuedAhead = nil
+                    self.currentBenchId = benchId
+                    self.running = true
+                    self.pollResults(client: client)
+                    return
+                }
+                guard let ahead = Self.position(of: queueId, in: active.queue) else {
+                    self.pendingQueueId = nil
+                    self.queuedAhead = nil
+                    self.running = false
+                    self.lastError = String(
+                        localized: "bench.throughput.error.queue_removed",
+                        defaultValue: "The queued run is no longer in the server queue.",
+                        comment: "Throughput Bench error when a queued run disappears from the server queue"
+                    )
+                    return
+                }
+                self.queuedAhead = ahead
             }
         }
     }

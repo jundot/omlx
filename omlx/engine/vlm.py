@@ -64,6 +64,7 @@ from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
+from ..patches.inkling2.loopcd import apply_loopcd
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
@@ -79,6 +80,7 @@ from ..utils.image import (
     extract_media_from_messages,
     image_hash_prefixes,
 )
+from ..utils.sampling import seed_request_stream
 from ..utils.video import (
     NATIVE_VIDEO_MODEL_TYPES,
     attach_native_video_processor,
@@ -2083,7 +2085,14 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
                 if model_type in INKLING2_MODEL_TYPES:
-                    return inkling2_vlm.load(self._model_name)
+                    loaded = inkling2_vlm.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
+                    )
+                    apply_loopcd(loaded[0], self._model_settings)
+                    return loaded
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
                         self._model_name,
@@ -5896,8 +5905,7 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             limit_ctx = contextlib.nullcontext()
 
-        if seed is not None:
-            mx.random.seed(seed)
+        seed_request_stream(seed)
 
         tokenizer = self._tokenizer
         if hasattr(tokenizer, "stopping_criteria"):

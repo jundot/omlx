@@ -365,17 +365,7 @@ def _register_snapshot_classes() -> None:
 
 def _wrap_for_save(
     cache: list[Any], *, boundary: int = 0, segment_start: int = 0
-) -> list[Any]:
-    """Swap serialisation-hostile entries for their wire stand-ins.
-
-    Returns a parallel list; the live cache is never touched. When ``boundary``
-    is set, plain ``KVCache`` members that are in step with the token stream
-    (offset equals the boundary) are stored as segments holding only the
-    tokens past ``segment_start``; everything else keeps its full state, so a
-    member with any unusual offset stays whole rather than risking a slab
-    that does not compose.
-    """
-
+) -> tuple[list[Any], bool]:
     from mlx_lm.models.cache import CacheList, KVCache
 
     try:
@@ -384,8 +374,10 @@ def _wrap_for_save(
         pooling_class: Any = None
     else:
         pooling_class = PoolingCache
+    segmented = False
 
     def wrap(entry: Any) -> Any:
+        nonlocal segmented
         if pooling_class is not None and isinstance(entry, pooling_class):
             return PoolingCacheSnapshot(entry)
         if isinstance(entry, CacheList):
@@ -399,12 +391,14 @@ def _wrap_for_save(
             and isinstance(entry, KVCache)
             and getattr(entry, "offset", 0) == boundary
         ):
+            segmented = True
             return KVCacheSegment(entry, segment_start)
         if _has_unserialisable_leaves(entry):
             return EmptyLeafSnapshot(entry)
         return entry
 
-    return [wrap(entry) for entry in cache]
+    wrapped = [wrap(entry) for entry in cache]
+    return wrapped, not segmented
 
 
 @dataclass
@@ -413,6 +407,7 @@ class _Entry:
     filename: str
     nbytes: int
     boundary: int
+    standalone: bool
 
 
 def candidate_boundaries(prompt_len: int, step: int) -> tuple[int, ...]:
@@ -457,15 +452,17 @@ class SSDPromptSnapshotStore:
     contribute only their new (b - step, b] slab, while non-sliceable members
     (rotating windows, recurrent slots, pooling state) contribute their full
     state at b, which is the only representation they have. Restoring boundary
-    B therefore needs every chain file at step, 2*step, ..., B; a chain with a
-    hole simply does not offer the boundaries past the hole. Files are keyed by
+    B therefore needs every chain file at step, 2*step, ..., B when the files
+    hold KV slabs; a chain with a hole does not offer those boundaries past the
+    hole. A file without KV slabs restores its boundary alone. Files are keyed by
     the token prefix they end at, so two prompts sharing a prefix share the
     early files, exactly like the local paged SSD cache shares blocks.
 
     Eviction is a deterministic bounded LRU (entry count, optionally bytes)
     keyed on the sequence of operations rather than a wall clock. Evicting an
-    early file orphans the deeper files of its chain; they stop being offered,
-    are never touched again, age to the LRU front and fall out on their own.
+    early file orphans the deeper KV-slab files of its chain; they stop being
+    offered, are never touched again, age to the LRU front and fall out on
+    their own.
     """
 
     def __init__(
@@ -588,7 +585,9 @@ class SSDPromptSnapshotStore:
                     raise ValueError("snapshot manifest contains a duplicate key")
                 if not path.is_file() or path.stat().st_size != nbytes:
                     raise ValueError("snapshot manifest file is missing or changed")
-                self._index[key] = _Entry((), filename, nbytes, boundary)
+                self._index[key] = _Entry(
+                    (), filename, nbytes, boundary, row.get("standalone") is True
+                )
                 self._nbytes += nbytes
                 indexed_files.add(filename)
             for stale in self.directory.iterdir():
@@ -614,6 +613,7 @@ class SSDPromptSnapshotStore:
                     "filename": entry.filename,
                     "nbytes": entry.nbytes,
                     "boundary": entry.boundary,
+                    "standalone": entry.standalone,
                 }
                 for key, entry in self._index.items()
             ],
@@ -664,18 +664,19 @@ class SSDPromptSnapshotStore:
         if boundary == 0 or boundary % self.step != 0:
             return False
         key = self._chain_keys(model, token_tuple)[-1]
+        wrapped, standalone = _wrap_for_save(
+            cache, boundary=boundary, segment_start=boundary - self.step
+        )
         with self._lock:
             entry = self._index.get(key)
             if entry is not None and (
                 entry.tokens == token_tuple
                 or (not entry.tokens and entry.boundary == boundary)
             ):
+                entry.standalone = standalone
                 self._index.move_to_end(key)
                 self._persist_index_locked()
                 return True
-        wrapped = _wrap_for_save(
-            cache, boundary=boundary, segment_start=boundary - self.step
-        )
         target = self._path(key)
         temporary = None
         try:
@@ -711,7 +712,9 @@ class SSDPromptSnapshotStore:
             previous = self._index.pop(key, None)
             if previous is not None:
                 self._nbytes -= previous.nbytes
-            self._index[key] = _Entry(token_tuple, target.name, size, boundary)
+            self._index[key] = _Entry(
+                token_tuple, target.name, size, boundary, standalone
+            )
             self._nbytes += size
             self._index.move_to_end(key)
             self._evict_locked()
@@ -719,14 +722,16 @@ class SSDPromptSnapshotStore:
         return True
 
     def present_boundaries(self, model: Any, tokens: list[int]) -> tuple[int, ...]:
-        """Boundaries whose whole chain is on disk, longest first.
+        """Boundaries this rank can restore, longest first.
 
         A missing or evicted interior file ends the chain there, so a failed
-        write simply removes the deeper boundaries from this rank's vote.
+        write removes the deeper boundaries that hold KV slabs from this
+        rank's vote. A file without KV slabs restores its boundary alone.
         """
 
         token_tuple = tuple(int(t) for t in tokens)
         found: list[int] = []
+        chained = True
         with self._lock:
             for position, key in enumerate(self._chain_keys(model, token_tuple)):
                 boundary = (position + 1) * self.step
@@ -739,8 +744,10 @@ class SSDPromptSnapshotStore:
                     )
                     or not self._path(key).is_file()
                 ):
-                    break
-                found.append(boundary)
+                    chained = False
+                    continue
+                if chained or entry.standalone:
+                    found.append(boundary)
         return tuple(reversed(found))
 
     def load(self, model: Any, tokens: list[int], boundary: int) -> list[Any] | None:
@@ -751,7 +758,10 @@ class SSDPromptSnapshotStore:
             return None
         chain = self._chain_keys(model, token_tuple[:boundary])
         with self._lock:
+            deepest = self._index.get(chain[-1])
+            standalone = deepest is not None and deepest.standalone
             for position, key in enumerate(chain):
+                required = not standalone or position == len(chain) - 1
                 entry = self._index.get(key)
                 prefix = token_tuple[: (position + 1) * self.step]
                 expected_boundary = (position + 1) * self.step
@@ -759,14 +769,18 @@ class SSDPromptSnapshotStore:
                     entry.tokens != prefix
                     and not (not entry.tokens and entry.boundary == expected_boundary)
                 ):
-                    return None
+                    if required:
+                        return None
+                    continue
                 if not self._path(key).is_file():
                     self._index.pop(key, None)
                     self._nbytes -= entry.nbytes
                     self._persist_index_locked()
-                    return None
+                    if required:
+                        return None
+        needed = chain[-1:] if standalone else chain
         try:
-            files = [_load_prompt_snapshot(str(self._path(key))) for key in chain]
+            files = [_load_prompt_snapshot(str(self._path(key))) for key in needed]
             assembled = _assemble_chain(files, boundary)
         except Exception:
             return None

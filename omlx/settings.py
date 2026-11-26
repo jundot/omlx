@@ -1109,6 +1109,28 @@ class IntegrationSettings:
         )
 
 
+_CREDENTIAL_SECTIONS = frozenset({"auth", "network", "huggingface", "modelscope"})
+
+
+def _describe_setting_changes(
+    before: dict[str, Any], after: dict[str, Any]
+) -> list[str]:
+    changes: list[str] = []
+    for section, values in after.items():
+        if not isinstance(values, dict):
+            continue
+        previous = before[section]
+        for key, value in values.items():
+            old = previous.get(key)
+            if old == value:
+                continue
+            if section in _CREDENTIAL_SECTIONS:
+                changes.append(f"{section}.{key}: (value hidden)")
+            else:
+                changes.append(f"{section}.{key}: {old!r} -> {value!r}")
+    return changes
+
+
 @dataclass
 class GlobalSettings:
     """
@@ -1658,14 +1680,17 @@ class GlobalSettings:
             temp_file.unlink(missing_ok=True)
             raise
 
-    def save_cli_overrides(self, args: Any) -> None:
+    def save_cli_overrides(self, args: Any) -> list[str]:
         """Persist explicit non-secret CLI configuration without freezing env state."""
         persisted = type(self)(base_path=self.base_path)
         settings_file = self.base_path / "settings.json"
         if settings_file.exists():
             persisted._load_from_file(settings_file)
+        before = persisted.to_dict()
         persisted._apply_cli_overrides(args, include_api_key=False)
+        changes = _describe_setting_changes(before, persisted.to_dict())
         persisted.save()
+        return changes
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""

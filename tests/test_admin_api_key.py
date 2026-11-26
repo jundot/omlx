@@ -885,8 +885,7 @@ class TestLoginEndpoint:
 class TestStatsSecurity:
     """Tests for /admin/api/stats response hardening."""
 
-    def test_stats_response_includes_api_key_for_admin(self):
-        """The stats payload includes api_key for admin CLI snippet generation."""
+    def test_stats_response_reports_api_key_set_without_secret(self):
         mock_settings = MagicMock()
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 9981
@@ -911,8 +910,15 @@ class TestStatsSecurity:
         ):
             result = asyncio.run(admin_routes.get_server_stats(is_admin=True))
 
-        # api_key is included for admin-only CLI snippet generation in the dashboard
-        assert result["api_key"] == "super-secret-key"
+        assert result["api_key_set"] is True
+        assert "api_key" not in result
+
+    def test_reveal_api_key_returns_stored_secret(self):
+        mock_settings = MagicMock()
+        mock_settings.auth.api_key = "super-secret-key"
+        with patch.object(admin_routes, "_get_global_settings", return_value=mock_settings):
+            result = asyncio.run(admin_routes.reveal_api_key(is_admin=True))
+        assert result == {"api_key": "super-secret-key"}
 
     def test_activity_response_does_not_build_runtime_cache_observability(self):
         active_models = {"models": [{"id": "model-a"}]}

@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from omlx.api.thinking import normalize_think_tags
+
 logger = logging.getLogger(__name__)
 
 # Token budget for thinking/reasoning models (industry reference: OpenCompass 8K~32K)
@@ -204,6 +206,7 @@ class BaseBenchmark(ABC):
     @staticmethod
     def _strip_think_tags(text: str) -> str:
         """Remove completed thinking spans from model output."""
+        text = normalize_think_tags(text)
         # Some chat templates open <think> in the prompt, so non-streaming
         # generation contains only ``reasoning</think>answer``.  Handle that
         # shape before the complete-block regex so reasoning drafts cannot

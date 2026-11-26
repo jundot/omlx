@@ -313,13 +313,7 @@ def _verify_rows_together(batch, batch_state, host, indices, replacements):
     started = time.perf_counter()
     logits, hidden, caches = host.mtp_verify_rows(inputs, caches)
     verify_ms = (time.perf_counter() - started) * 1000 / len(rows)
-    # Greedy requests draft together (one vocabulary head read for all of them).
-    jobs = (
-        []
-        if bg._dspark_host(batch.model) is not None
-        and all(bg._is_greedy(row) and bg._proc_list(row) is None for _, row in rows)
-        else None
-    )
+    jobs = [] if bg._dspark_host(batch.model) is not None else None
     for i, ((index, row), state, cache) in enumerate(zip(rows, states, caches)):
         row.prompt_cache = cache
         bg._set_singleton_mrope_delta(row)

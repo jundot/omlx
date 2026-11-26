@@ -252,6 +252,55 @@ final class BenchDTODecodeTests: XCTestCase {
         XCTAssertNil(response.currentModel)
         XCTAssertNil(response.currentBenchId)
     }
+
+    // MARK: Throughput queue
+
+    /// A queued start has no bench id yet: `benchId`/`totalTests` are absent
+    /// and the app follows `queueId` until the server reaches it.
+    func testDecodeQueuedStartResponse() throws {
+        let json = """
+        {
+            "status": "queued",
+            "queue_id": "q-1234abcd",
+            "queue": [
+                {"queue_id": "q-1234abcd", "model_id": "model-x", "external": false}
+            ]
+        }
+        """.data(using: .utf8)!
+
+        let response = try decoder.decode(BenchStartResponse.self, from: json)
+        XCTAssertEqual(response.status, "queued")
+        XCTAssertEqual(response.queueId, "q-1234abcd")
+        XCTAssertNil(response.benchId)
+        XCTAssertNil(response.totalTests)
+        XCTAssertEqual(response.queue?.map(\.modelId), ["model-x"])
+    }
+
+    /// `/bench/active` carries the running run plus the waiting queue; the
+    /// app compares `queueId` against its own to know when to attach.
+    func testDecodeActiveThroughputBenchWithQueue() throws {
+        let json = """
+        {
+            "running": true,
+            "bench_id": "bench-abc",
+            "model_id": "model-x",
+            "context_profile": "code_python",
+            "force_lm_engine": false,
+            "external": false,
+            "queue_id": "q-1234abcd",
+            "queue": [
+                {"queue_id": "q-5678efgh", "model_id": "model-y", "external": true}
+            ]
+        }
+        """.data(using: .utf8)!
+
+        let response = try decoder.decode(BenchActiveResponse.self, from: json)
+        XCTAssertTrue(response.running)
+        XCTAssertEqual(response.benchId, "bench-abc")
+        XCTAssertEqual(response.queueId, "q-1234abcd")
+        XCTAssertEqual(response.queue.count, 1)
+        XCTAssertEqual(response.queue.first?.external, true)
+    }
 }
 
 private final class BenchStubProtocol: URLProtocol, @unchecked Sendable {
