@@ -324,6 +324,28 @@ def test_batch_uid_cancellation_closes_request_on_every_rank():
     assert snapshot["last_request"]["status"] == "cancelled"
 
 
+def test_a_waiting_prompt_gets_a_keepalive(monkeypatch):
+    class FakeBatchGenerator:
+        def __init__(self, *args, **kwargs):
+            self._unprocessed_sequences = [(7, [[1, 2, 3], [4]], 16)]
+
+        def next(self):
+            return [], []
+
+    monkeypatch.setattr(mlx_server, "BatchGenerator", FakeBatchGenerator)
+    queue = _Queue()
+    with install_server_telemetry(_Marker()) as telemetry:
+        request_id = telemetry.begin_request()
+        telemetry.register_response_queue(request_id, queue)
+        telemetry.mark_pending_uid(request_id)
+        telemetry.bind_pending_uid((7,))
+        generator = mlx_server.BatchGenerator(SimpleNamespace())
+        assert generator.next() == ([], [])
+        generator.next()
+
+    assert [item for item, _, _ in queue.items] == [(0, 4)]
+
+
 def test_a_one_prompt_model_prefills_prompts_one_at_a_time(monkeypatch):
     class FakeBatchGenerator:
         def __init__(self, model, **kwargs):
