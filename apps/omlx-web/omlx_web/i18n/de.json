@@ -1376,7 +1376,7 @@
   "modal.model_settings.qwen4_gdn_decode_wide_proj": "Erweiterte fusionierte Qwen4-Decodierung",
   "modal.model_settings.qwen4_gdn_decode_wide_proj_hint": "Beschleunigt die Decodierung bei Qwen4 oQ2.5e, oQ2.7e, oQ6e, oQ8e und 8-Bit-Community-Modellen (etwa 3–6% bei einem 8-Bit-Modell, bis zu 1,5 GiB mehr Speicher). Keine Wirkung bei oQ3e bis oQ4e oder fp16-Varianten; geringe Wirkung bei aktiviertem Lightning MTP.",
   "modal.model_settings.activation_fp16": "Float16-Aktivierungen",
-  "modal.model_settings.activation_fp16_hint": "Wandelt beim Laden die bfloat16-Skalierungen, -Normen und -Embeddings dieses Modells in float16 um. M1- und M2-GPUs emulieren bfloat16, daher laufen Prefill und Decodierung schneller. Die Ausgabe kann leicht von bfloat16 abweichen. Nicht mit MoE-Expertenauslagerung verfügbar.",
+  "modal.model_settings.activation_fp16_hint": "Wandelt beim Laden die bfloat16-Skalierungen, -Normen und -Embeddings dieses Modells in float16 um. M1- und M2-GPUs emulieren bfloat16, daher laufen Prefill und Decodierung schneller. Die Ausgabe kann leicht von bfloat16 abweichen.",
   "modal.model_settings.thinking_budget": "Thinking-Budget",
   "modal.model_settings.thinking_budget_hint": "Begrenzt die Thinking-Tokens für Reasoning-Modelle. Erzwingt das Ende des Thinking, wenn der Wert überschritten wird.",
   "modal.model_settings.thinking_budget_placeholder": "z. B. 4096",

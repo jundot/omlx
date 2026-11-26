@@ -1474,20 +1474,7 @@ final class ModelSettingsScreenVM {
     /// Streamed experts cannot back a speculative decoder, except the
     /// Lightning MTP head of families that keep it resident. Mirrors
     /// `validate_moe_expert_offload` on the server.
-    /// The server rejects the recast together with MoE expert offload.
-    var activationFp16ConflictReason: String? {
-        guard moeExpertOffloadEnabled else { return nil }
-        return String(localized: "settings.advanced.activation_fp16.conflict.moe_offload",
-                      defaultValue: "Disable MoE Expert Offload before enabling Float16 Activations.",
-                      comment: "Sublabel shown when the float16 activation recast can't be enabled because MoE expert offload is on")
-    }
-
     var moeExpertOffloadConflictReason: String? {
-        if activationFp16Enabled {
-            return String(localized: "settings.moe_offload.conflict.activation_fp16",
-                          defaultValue: "Disable Float16 Activations before enabling MoE Expert Offload.",
-                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because the float16 activation recast is on")
-        }
         if mtpEnabled && model?.moeOffloadAllowsMtp != true {
             return String(localized: "settings.moe_offload.conflict.mtp",
                           defaultValue: "Disable Lightning MTP before enabling MoE Expert Offload.",

@@ -1376,7 +1376,7 @@
   "modal.model_settings.qwen4_gdn_decode_wide_proj": "Decodifica fusa estesa Qwen4",
   "modal.model_settings.qwen4_gdn_decode_wide_proj_hint": "Accelera la decodifica su Qwen4 oQ8e e altri layout GDN, come alcuni vecchi download oQ e modelli della community (fino a 1,5 GiB di memoria in più). Nessun effetto sulle build attuali da oQ2.5e a oQ6e o fp16, e poco effetto con Lightning MTP attivo.",
   "modal.model_settings.activation_fp16": "Attivazioni Float16",
-  "modal.model_settings.activation_fp16_hint": "Converte in float16 al caricamento le scale, le norme e gli embedding bfloat16 di questo modello. Le GPU M1 e M2 emulano bfloat16, quindi prefill e decodifica risultano più veloci. L'output può differire leggermente da bfloat16. Non disponibile con MoE expert offload.",
+  "modal.model_settings.activation_fp16_hint": "Converte in float16 al caricamento le scale, le norme e gli embedding bfloat16 di questo modello. Le GPU M1 e M2 emulano bfloat16, quindi prefill e decodifica risultano più veloci. L'output può differire leggermente da bfloat16.",
   "modal.model_settings.thinking_budget": "Budget di ragionamento",
   "modal.model_settings.thinking_budget_hint": "Limita i token di ragionamento per i modelli che ragionano. Al superamento, forza la fine del ragionamento.",
   "modal.model_settings.thinking_budget_placeholder": "es. 4096",
