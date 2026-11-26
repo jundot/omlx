@@ -606,12 +606,9 @@ def _row_matmul(x: mx.array, w: mx.array) -> mx.array:
     does: a multi-row matmul switches kernels with the row count."""
     rows = x.shape[-2]
     if rows > 1 and is_row_exact_armed():
-        # One single-row product per row in a batch: with a stride-0 weight
-        # batch MLX keeps the one-row kernel instead of folding the rows into
-        # a multi-row matmul.
-        batch = mx.broadcast_shapes(x.shape[:-2], w.shape[:-2])
-        wb = mx.broadcast_to(w[..., None, :, :], (*batch, rows, *w.shape[-2:]))
-        return (x[..., :, None, :] @ wb).squeeze(-2)
+        return mx.concatenate(
+            [x[..., row : row + 1, :] @ w for row in range(rows)], axis=-2
+        )
     return x @ w
 
 

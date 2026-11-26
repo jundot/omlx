@@ -568,7 +568,9 @@ def exact_verify_gemv(module, inputs: mx.array) -> mx.array:
     rows = int(inputs.size) // input_dims
     output_dims = int(module.weight.shape[0])
     flat = inputs.reshape(rows, input_dims)
-    (output,) = _dense_kernel()(
+    has_bias = "bias" in module
+    kernel = _dense_fp32_kernel() if has_bias else _dense_kernel()
+    (output,) = kernel(
         inputs=[flat, module.weight],
         template=[
             ("T", inputs.dtype),
@@ -579,11 +581,11 @@ def exact_verify_gemv(module, inputs: mx.array) -> mx.array:
         grid=((output_dims // 32) * 256, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(rows, output_dims)],
-        output_dtypes=[inputs.dtype],
+        output_dtypes=[mx.float32 if has_bias else inputs.dtype],
     )
     output = output.reshape((*inputs.shape[:-1], output_dims))
-    if "bias" in module:
-        output = output + module.bias
+    if has_bias:
+        output = (output + module.bias).astype(inputs.dtype)
     return output
 
 

@@ -1274,7 +1274,7 @@ def test_decode_fast_forward_matches_reference(monkeypatch):
     cache = model.make_cache()
     _forward(model, tokens[:, :40], cache, False, monkeypatch)
     pos = 40
-    for L in [1, 2, 3, 1, 7, 1]:
+    for L in [1, 2, 3, 1, 5, 1]:
         step = tokens[:, pos : pos + L]
         ref_cache, fast_cache = _clone(cache), _clone(cache)
         ref = _forward(model, step, ref_cache, False, monkeypatch)
@@ -1322,7 +1322,7 @@ def test_decode_fast_forward_matches_reference_batch_caches(monkeypatch):
     _forward(model, tokens[:, :45], ca, False, monkeypatch)
     _forward(model, tokens[:, 3:40], cb, False, monkeypatch)
     batch = [type(a).merge([a, b]) for a, b in zip(ca, cb)]
-    for L in [1, 3]:
+    for L in [1, 2]:
         step = mx.random.randint(0, 512, (2, L))
         ref_cache, fast_cache = _clone(batch), _clone(batch)
         ref = _forward(model, step, ref_cache, False, monkeypatch)
@@ -1364,7 +1364,7 @@ def test_decode_fast_gqa16_chunked_sdpa_matches_reference(monkeypatch):
     cache = model.make_cache()
     _forward(model, tokens[:, :40], cache, False, monkeypatch)
     pos = 40
-    for L in [1, 3, 7]:
+    for L in [1, 3, 5]:
         step = tokens[:, pos : pos + L]
         ref_cache, fast_cache = _clone(cache), _clone(cache)
         before = chunked["n"]

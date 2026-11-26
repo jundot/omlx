@@ -1534,6 +1534,8 @@ def test_fused_verify_cycles_are_bitwise_reference_with_nax_tf32():
         "import sys; sys.path[:0] = [%r, %r]\n"
         "import test_glm5_next_mtp as t\n"
         "t.dk.moe_router = t._stock_verify_router(t.dk.moe_router)\n"
+        "import conftest, pytest\n"
+        "conftest.use_qmv_wide_reference(pytest.MonkeyPatch())\n"
         "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
         "used = []\n"
         "for seed, ctx in ((5, 300), (11, 2101)):\n"

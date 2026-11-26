@@ -13,11 +13,9 @@ Auto depth and parking use the measured cost of the whole active batch.
 from __future__ import annotations
 
 import contextlib
-import functools
 import inspect
 import logging
 import math
-import threading
 import time
 import weakref
 from collections import deque
@@ -184,8 +182,7 @@ def apply() -> bool:
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        with _spec_command_buffers(model):
-                            return _mtp_batch_next(self, batch_state)
+                        return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
                     if not _reconcile_mtp_batch_to_standard(self):
@@ -221,8 +218,7 @@ def apply() -> bool:
                                 state.queue.popleft()
                                 _bump_emit_stat(state, "init")
                                 first_sent = False
-                            with _spec_command_buffers(model):
-                                return _mtp_next(self, state)
+                            return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
                         active = getattr(self, "_omlx_mtp_state", None)
@@ -447,78 +443,6 @@ def _cluster_shared_token(gen_batch: Any, tok: Any) -> Tuple[Any, Optional[int]]
     mx.eval(tok)
     ids, seed = sync.share_tokens(tok.tolist() if sync.is_leader else None)
     return mx.array(ids, dtype=mx.uint32), seed
-
-
-# MLX commits a command buffer every ~50 ops or 50 MB of inputs, weights
-# included, and blocks eval at ten in flight, so a cycle could not queue the
-# next draft behind a running verify. Prefill keeps MLX's caps: larger ones
-# raise its peak memory.
-_SPEC_BUFFER_CAPS = (200, 512)
-
-# Target model types supported by the Qwen Lightning MTP/DFlash paths.
-_SPEC_CAPS_TARGET_TYPES = frozenset(
-    {
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_5_vl",
-        "qwen3_6",
-        "qwen3_6_moe",
-        "qwen4_exp",
-        "qwen4_exp_text",
-    }
-)
-
-
-def _spec_caps_target(model: Any) -> bool:
-    """Whether the loaded target belongs to the selected Qwen family."""
-    return getattr(model, "model_type", None) in _SPEC_CAPS_TARGET_TYPES
-
-
-@functools.lru_cache(maxsize=1)
-def _raises_spec_buffer_caps() -> bool:
-    """True on GPUs where the raised caps were measured: M5 and the M3 family."""
-    import mlx.core as mx
-
-    from omlx.custom_kernels.nax import is_nax_available
-
-    if is_nax_available():
-        return True
-    try:
-        architecture = str(mx.device_info().get("architecture", ""))
-    except Exception:
-        return False
-    return architecture.startswith("applegpu_g15")
-
-
-# The caps live on the MLX device, so engines running cycles at the same time
-# share one raise and the last one out restores MLX's values.
-_spec_caps_lock = threading.Lock()
-_spec_caps_holders = 0
-_spec_caps_previous: Optional[Tuple[int, int]] = None
-
-
-@contextlib.contextmanager
-def _spec_command_buffers(model: Any = None):
-    """Raise caps for supported Qwen targets and GPUs, then restore them."""
-    global _spec_caps_holders, _spec_caps_previous
-    if not _spec_caps_target(model) or not _raises_spec_buffer_caps():
-        yield
-        return
-
-    from omlx.custom_kernels.quant_matmul.fast import set_command_buffer_caps
-
-    with _spec_caps_lock:
-        if _spec_caps_holders == 0:
-            _spec_caps_previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
-        _spec_caps_holders += 1
-    try:
-        yield
-    finally:
-        with _spec_caps_lock:
-            _spec_caps_holders -= 1
-            if _spec_caps_holders == 0 and _spec_caps_previous is not None:
-                set_command_buffer_caps(*_spec_caps_previous)
-                _spec_caps_previous = None
 
 
 def _drafter_for(model: Any) -> Optional[Any]:
@@ -3181,6 +3105,39 @@ def _dspark_host(model: Any) -> Optional[Any]:
     return None
 
 
+def _dspark_draft_depth(host, state, depth=None):
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
+    return min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+
+
+def _queue_dspark_block(host, prepare, gen_batch, state, hidden, packet, k, *, greedy):
+    """Queue only the deterministic block. Sampling follows the actual commit."""
+    import mlx.core as mx
+
+    depth = _dspark_draft_depth(host, state)
+    if depth <= 0:
+        return None
+    m = packet[:1]
+    if greedy:
+        anchor = mx.take(packet[1 : k + 2], m)
+    else:
+        residual = packet[k + 1 : 2 * k + 1]
+        anchor = mx.where(
+            m < k,
+            mx.take(residual, mx.minimum(m, k - 1)),
+            packet[2 * k + 1 : 2 * k + 2],
+        )
+    build = prepare(gen_batch.prompt_cache, hidden, m, anchor, k, depth)
+    if build is None:
+        return None
+    # The host reads the acceptance packet without waiting for the new block.
+    mx.async_eval(packet)
+    block = build()
+    mx.async_eval(block)
+    return depth, block
+
+
 def _dspark_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -3189,6 +3146,8 @@ def _dspark_next_drafts(
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
     logits: Optional[Any] = None,
+    *,
+    prepared_block=None,
 ) -> None:
     """Append committed target taps and sample one DSpark block.
 
@@ -3202,9 +3161,7 @@ def _dspark_next_drafts(
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
-    if depth is None:
-        depth = state.controller.cur if state.controller is not None else state.depth
-    depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+    depth = _dspark_draft_depth(host, state, depth)
     n = int(committed.shape[0])
     if depth <= 0:
         host.dspark_append_context(hidden_rows, state.mtp_cache)
@@ -3216,12 +3173,15 @@ def _dspark_next_drafts(
 
     anchor = committed[-1:].reshape(1, 1)
     if logits is None:
-        logits, _ = host.dspark_forward(
-            hidden_rows,
-            anchor,
-            state.mtp_cache,
-            draft_length=depth,
-        )
+        if prepared_block is not None and prepared_block[0] == depth:
+            logits = prepared_block[1]
+        else:
+            logits, _ = host.dspark_forward(
+                hidden_rows,
+                anchor,
+                state.mtp_cache,
+                draft_length=depth,
+            )
         state.hist_offset += n
 
     sampler = _resolve_sampler(gen_batch)
@@ -3344,6 +3304,8 @@ def _chain_next_drafts(
     committed: Any,
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
+    *,
+    prepared_block=None,
 ) -> None:
     """Rebuild committed MTP-head history and draft the next chain.
 
@@ -3375,6 +3337,7 @@ def _chain_next_drafts(
             committed,
             prev_buf,
             depth,
+            prepared_block=prepared_block,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
@@ -4729,6 +4692,20 @@ def _run_verify_cycle_chain(
         and not defer_commit
     )
     predrafted = False
+    prepared_block = None
+    dspark = None
+    prepare_block = None
+    if (
+        k > 0
+        and drafter is None
+        and sync is None
+        and not defer_commit
+        and draft_jobs is None
+        and commit_cache is None
+        and gdn_states is None
+    ):
+        dspark = _dspark_host(gen_batch.model)
+        prepare_block = getattr(dspark, "dspark_prepare_block", None)
 
     if k == 0:
         # Depth-0 cycle (controller escape hatch): the forward above was a
@@ -4760,6 +4737,17 @@ def _run_verify_cycle_chain(
                     host_arr,
                     m_arr,
                     mx.take(targets, m_arr),
+                )
+            elif prepare_block is not None:
+                prepared_block = _queue_dspark_block(
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    host_arr,
+                    k,
+                    greedy=True,
                 )
             host = host_arr.tolist()
         else:
@@ -4799,8 +4787,23 @@ def _run_verify_cycle_chain(
                 predrafted = _predraft(
                     gen_batch, state, drafter, captured, result, m_arr, anchor
                 )
+            elif prepare_block is not None:
+                prepared_block = _queue_dspark_block(
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    result,
+                    k,
+                    greedy=False,
+                )
+            verify_packet = result.tolist()
+            if not verify_packet[-1]:
+                # The dense redraw can choose a different row or correction.
+                prepared_block = None
             host = _settled_verify(
-                result.tolist(),
+                verify_packet,
                 sampler,
                 combined_lp,
                 state.drafts,
@@ -4888,6 +4891,8 @@ def _run_verify_cycle_chain(
     # backbone cache yet, so materialize it before the queue reaches it.
     materialize_boundary_emit = align > 0 and to_boundary > 0 and to_boundary == m + 1
     state.boundary_emit_pending = materialize_boundary_emit
+    if materialize_boundary_emit:
+        draft_jobs = None
 
     # --- stats ---
     state.stats.cycles += 1
@@ -4966,6 +4971,7 @@ def _run_verify_cycle_chain(
                 committed,
                 prev_buf,
                 depth=0 if copied else None,
+                prepared_block=prepared_block if m == m_gpu and not copied else None,
             )
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
