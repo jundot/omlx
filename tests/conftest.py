@@ -405,23 +405,16 @@ def _gguf_value(value) -> bytes:
 
 @pytest.fixture
 def write_gguf():
-    """Write a GGUF file of a header with ``metadata`` and ``size`` bytes in all.
-
-    ``tensors`` lists (name, ggml type, shape) of F32 (0) or F16 (1) tensors,
-    laid out 32-byte aligned after the header.
-    """
-
     def write(path: Path, metadata: dict, size: int = 0, tensors=()) -> Path:
         header = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(metadata))
         for key, value in metadata.items():
             header += struct.pack("<Q", len(key)) + key.encode() + _gguf_value(value)
         data = b""
-        for name, kind, shape in tensors:
+        for name, shape in tensors:
             header += struct.pack("<Q", len(name)) + name.encode()
-            header += struct.pack(f"<I{len(shape)}QI", len(shape), *shape, kind)
+            header += struct.pack(f"<I{len(shape)}QI", len(shape), *shape, 0)
             header += struct.pack("<Q", len(data))
-            data += b"\0" * ({0: 4, 1: 2}[kind] * math.prod(shape))
-            data += b"\0" * (-len(data) % 32)
+            data += b"\0" * (4 * math.prod(shape))
         if tensors:
             header += b"\0" * (-len(header) % 32)
         header += data

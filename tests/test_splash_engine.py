@@ -2425,23 +2425,17 @@ class TestMemoryEstimate:
             "qwen4exp.attention.head_count": 24,
             "qwen4exp.attention.head_count_kv": 2,
             "qwen4exp.attention.key_length": 256,
-            "qwen4exp.full_attention_interval": 4,
-            "qwen4exp.expert_count": 512,
             "qwen4exp.expert_used_count": 10,
             "tokenizer.ggml.tokens": vocab,
         }
         source = tmp_path / "models" / "Flash-Next"
-        write_gguf(
-            source / "Flash-Next-00001-of-00002.gguf",
-            metadata,
-            tensors=[("blk.0.ffn_down.weight", 0, (256,))],
-        )
+        write_gguf(source / "Flash-Next-00001-of-00002.gguf", metadata)
         write_gguf(
             source / "Flash-Next-00002-of-00002.gguf",
             {},
             tensors=[
-                ("per_layer_token_embd.weight", 0, (1024, 64)),
-                ("output_norm.weight", 0, (8,)),
+                ("output_norm.weight", (8,)),
+                ("per_layer_token_embd.weight", (1024, 64)),
             ],
         )
         models = discover_models(tmp_path / "models", tmp_path / "gguf")
@@ -2452,12 +2446,26 @@ class TestMemoryEstimate:
         monkeypatch.setattr(splash_mod, "PLE_ROW_CACHE_BYTES", 64 * 1024)
         draft = _write_draft(tmp_path / "draft", FLASH_NEXT_TEXT)
 
-        full = splash_memory_estimate(folder, draft, 1024, "int8")
-        assert splash_memory_estimate(folder, draft, 1024, "int8", "1.6.0") == full
+        full = splash_memory_estimate(folder, draft, 1024, "int8", "1.6.0")
+        streamed = 64 * 1024 - 1024 * 64 * 4
         assert (
             splash_memory_estimate(folder, draft, 1024, "int8", "1.6.1")
-            == full - 1024 * 64 * 4 + 64 * 1024
+            == full + streamed
         )
+
+        engine = SplashEngine(
+            model_name=str(folder),
+            model_id="Flash-Next",
+            target=SplashTarget(_binary("1.6.1"), "Qwen3.8-Flash-Next", draft),
+            hub_dir=tmp_path / "hub",
+            log_dir=tmp_path / "logs",
+            options=SplashOptions(),
+        )
+        engine._process = MagicMock(pid=4200, **{"poll.return_value": None})
+        monkeypatch.setattr(splash_mod, "list_process_group_pids", lambda pgid: [4200])
+        monkeypatch.setattr(splash_mod, "get_phys_footprint", lambda pid: 0)
+        parts = sum(path.stat().st_size for path in source.iterdir())
+        assert engine.process_memory_bytes() == parts + streamed
 
 
 class TestProcessMemory:
