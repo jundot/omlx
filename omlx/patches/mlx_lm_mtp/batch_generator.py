@@ -3105,6 +3105,39 @@ def _dspark_host(model: Any) -> Optional[Any]:
     return None
 
 
+def _dspark_draft_depth(host, state, depth=None):
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
+    return min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+
+
+def _queue_dspark_block(host, prepare, gen_batch, state, hidden, packet, k, *, greedy):
+    """Queue only the deterministic block. Sampling follows the actual commit."""
+    import mlx.core as mx
+
+    depth = _dspark_draft_depth(host, state)
+    if depth <= 0:
+        return None
+    m = packet[:1]
+    if greedy:
+        anchor = mx.take(packet[1 : k + 2], m)
+    else:
+        residual = packet[k + 1 : 2 * k + 1]
+        anchor = mx.where(
+            m < k,
+            mx.take(residual, mx.minimum(m, k - 1)),
+            packet[2 * k + 1 : 2 * k + 2],
+        )
+    build = prepare(gen_batch.prompt_cache, hidden, m, anchor, k, depth)
+    if build is None:
+        return None
+    # The host reads the acceptance packet without waiting for the new block.
+    mx.async_eval(packet)
+    block = build()
+    mx.async_eval(block)
+    return depth, block
+
+
 def _dspark_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -3112,6 +3145,8 @@ def _dspark_next_drafts(
     committed: Any,
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
+    *,
+    prepared_block=None,
 ) -> None:
     """Append committed target taps and sample one DSpark block.
 
@@ -3125,9 +3160,7 @@ def _dspark_next_drafts(
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
-    if depth is None:
-        depth = state.controller.cur if state.controller is not None else state.depth
-    depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+    depth = _dspark_draft_depth(host, state, depth)
     n = int(committed.shape[0])
     if depth <= 0:
         host.dspark_append_context(hidden_rows, state.mtp_cache)
@@ -3138,12 +3171,15 @@ def _dspark_next_drafts(
         return
 
     anchor = committed[-1:].reshape(1, 1)
-    logits, _ = host.dspark_forward(
-        hidden_rows,
-        anchor,
-        state.mtp_cache,
-        draft_length=depth,
-    )
+    if prepared_block is not None and prepared_block[0] == depth:
+        logits = prepared_block[1]
+    else:
+        logits, _ = host.dspark_forward(
+            hidden_rows,
+            anchor,
+            state.mtp_cache,
+            draft_length=depth,
+        )
     state.hist_offset += n
 
     sampler = _resolve_sampler(gen_batch)
@@ -3259,6 +3295,8 @@ def _chain_next_drafts(
     committed: Any,
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
+    *,
+    prepared_block=None,
 ) -> None:
     """Rebuild committed MTP-head history and draft the next chain.
 
@@ -3290,6 +3328,7 @@ def _chain_next_drafts(
             committed,
             prev_buf,
             depth,
+            prepared_block=prepared_block,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
@@ -4644,6 +4683,20 @@ def _run_verify_cycle_chain(
         and not defer_commit
     )
     predrafted = False
+    prepared_block = None
+    dspark = None
+    prepare_block = None
+    if (
+        k > 0
+        and drafter is None
+        and sync is None
+        and not defer_commit
+        and draft_jobs is None
+        and commit_cache is None
+        and gdn_states is None
+    ):
+        dspark = _dspark_host(gen_batch.model)
+        prepare_block = getattr(dspark, "dspark_prepare_block", None)
 
     if k == 0:
         # Depth-0 cycle (controller escape hatch): the forward above was a
@@ -4675,6 +4728,17 @@ def _run_verify_cycle_chain(
                     host_arr,
                     m_arr,
                     mx.take(targets, m_arr),
+                )
+            elif prepare_block is not None:
+                prepared_block = _queue_dspark_block(
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    host_arr,
+                    k,
+                    greedy=True,
                 )
             host = host_arr.tolist()
         else:
@@ -4714,8 +4778,23 @@ def _run_verify_cycle_chain(
                 predrafted = _predraft(
                     gen_batch, state, drafter, captured, result, m_arr, anchor
                 )
+            elif prepare_block is not None:
+                prepared_block = _queue_dspark_block(
+                    dspark,
+                    prepare_block,
+                    gen_batch,
+                    state,
+                    hidden,
+                    result,
+                    k,
+                    greedy=False,
+                )
+            verify_packet = result.tolist()
+            if not verify_packet[-1]:
+                # The dense redraw can choose a different row or correction.
+                prepared_block = None
             host = _settled_verify(
-                result.tolist(),
+                verify_packet,
                 sampler,
                 combined_lp,
                 state.drafts,
@@ -4881,6 +4960,7 @@ def _run_verify_cycle_chain(
                 committed,
                 prev_buf,
                 depth=0 if copied else None,
+                prepared_block=prepared_block if m == m_gpu and not copied else None,
             )
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
