@@ -3834,6 +3834,13 @@ class Scheduler:
                 parser_session = self._output_parser_factory.create_session(
                     self.tokenizer
                 )
+            notify_tail = getattr(parser_session, "notify_prompt_tail", None)
+            if (
+                callable(notify_tail)
+                and request is not None
+                and request.prompt_token_ids
+            ):
+                notify_tail(request.prompt_token_ids)
             if request is not None and getattr(request, "needs_think_prefix", False):
                 notify = getattr(parser_session, "notify_prefilled_thought", None)
                 if callable(notify):

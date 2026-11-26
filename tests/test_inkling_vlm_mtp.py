@@ -1664,6 +1664,65 @@ def test_inkling2_vision_encodes_images_independently_and_splices_tokens():
         model.embed_inputs(mx.array([[image, 1]]), second, [[1, 1, 2]])
 
 
+def _release_shaped_tokenizer():
+    """A tokenizer whose template, like the release's, renders no generation prompt."""
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    from omlx.patches.inkling2.opener import install_generation_opener
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(models.WordLevel({"a": 0}, unk_token="a"))
+    )
+    tokenizer.chat_template = (
+        '{%- set effort_map = {"none": 0.0, "low": 0.2, "high": 0.9} -%}'
+        "{%- for m in messages -%}<|message_user|>{{ m.content }}<|end_message|>"
+        "{%- endfor -%}"
+    )
+    assert install_generation_opener(tokenizer)
+    assert not install_generation_opener(tokenizer)
+    return tokenizer
+
+
+@pytest.mark.parametrize(
+    "kwargs, opener",
+    [
+        ({}, ""),
+        ({"generation_opener": "header"}, "<|message_model|>"),
+        ({"generation_opener": "content"}, "<|message_model|><|content_thinking|>"),
+        (
+            {"generation_opener": "content", "reasoning_effort": "low"},
+            "<|message_model|><|content_thinking|>",
+        ),
+        (
+            {"generation_opener": "content", "reasoning_effort": "none"},
+            "<|message_model|><|content_text|>",
+        ),
+        (
+            {"generation_opener": "content", "reasoning_effort": 0.0},
+            "<|message_model|><|content_text|>",
+        ),
+        # A tool call's header carries the tool name: leave it to the model.
+        (
+            {"generation_opener": "content", "reasoning_effort": 0, "tools": [{}]},
+            "<|message_model|>",
+        ),
+        (
+            {"generation_opener": "content", "generation_opener_answer": True},
+            "<|message_model|><|content_text|>",
+        ),
+        ({"generation_opener": "content", "add_generation_prompt": False}, ""),
+    ],
+)
+def test_inkling2_generation_opener_follows_the_request(kwargs, opener):
+    tokenizer = _release_shaped_tokenizer()
+    kwargs = {"add_generation_prompt": True, **kwargs}
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hi"}], tokenize=False, **kwargs
+    )
+    assert rendered == "<|message_user|>hi<|end_message|>" + opener
+
+
 @pytest.mark.parametrize(
     "quant",
     [
