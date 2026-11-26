@@ -30,6 +30,11 @@ from omlx.exceptions import (
     is_metal_out_of_memory,
 )
 from omlx.model_settings import ModelSettings, ModelSettingsManager
+from omlx.patches.mlx_vlm_mtp.bonsai_v2_sidecar import (
+    BONSAI_V2_MODEL_TYPE,
+    BONSAI_V2_SIDECAR_REL_PATH,
+    NORM_STEM_MAP,
+)
 from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
@@ -1227,6 +1232,100 @@ class TestApplySettingsOverrides:
         assert not manager.get_settings("stripped").mtp_enabled
         # Saved settings are the user's; discovery does not touch them.
         assert not manager.get_settings("saved").mtp_enabled
+
+    def test_new_bonsai_v2_mtp_checkpoints_start_with_mtp_on(self, tmp_path):
+        models = tmp_path / "models"
+        hidden_size = 64
+        intermediate_size = 128
+        num_heads = 2
+        num_kv_heads = 1
+        head_dim = 32
+        config = {
+            "model_type": BONSAI_V2_MODEL_TYPE,
+            "vision_config": {},
+            "text_config": {
+                "hidden_size": hidden_size,
+                "intermediate_size": intermediate_size,
+                "num_attention_heads": num_heads,
+                "num_key_value_heads": num_kv_heads,
+                "head_dim": head_dim,
+                "num_hidden_layers": 4,
+                "mtp_num_hidden_layers": 0,
+            },
+        }
+        linear_dims = {
+            "nextn.eh_proj": (hidden_size, 2 * hidden_size),
+            "attn_q": (num_heads * head_dim * 2, hidden_size),
+            "attn_k": (num_kv_heads * head_dim, hidden_size),
+            "attn_v": (num_kv_heads * head_dim, hidden_size),
+            "attn_output": (hidden_size, num_heads * head_dim),
+            "ffn_gate": (intermediate_size, hidden_size),
+            "ffn_up": (intermediate_size, hidden_size),
+            "ffn_down": (hidden_size, intermediate_size),
+        }
+        tensors = {}
+        for stem, (rows, width) in linear_dims.items():
+            tensors[f"{stem}.weight"] = mx.zeros((rows, width // 8), dtype=mx.uint32)
+            tensors[f"{stem}.scales"] = mx.ones((rows, width // 32), dtype=mx.float16)
+            tensors[f"{stem}.biases"] = mx.zeros((rows, width // 32), dtype=mx.float16)
+        for stem in NORM_STEM_MAP:
+            size = head_dim if stem in ("attn_q_norm", "attn_k_norm") else hidden_size
+            tensors[f"{stem}.weight"] = mx.ones((size,), dtype=mx.float32)
+
+        for name, with_sidecar in (("with-sidecar", True), ("without-sidecar", False)):
+            path = models / name
+            path.mkdir(parents=True)
+            (path / "config.json").write_text(json.dumps(config))
+            (path / "model.safetensors").write_bytes(b"0" * 1024)
+            if with_sidecar:
+                sidecar_path = path / BONSAI_V2_SIDECAR_REL_PATH
+                sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+                mx.save_safetensors(
+                    str(sidecar_path),
+                    tensors,
+                    metadata={"bits": "4", "group_size": "32"},
+                )
+
+        manager = ModelSettingsManager(tmp_path / "settings")
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(models))
+
+        pool.apply_settings_overrides(manager)
+
+        assert manager.get_settings("with-sidecar").mtp_enabled is True
+        assert manager.get_settings("without-sidecar").mtp_enabled is False
+
+    def test_bonsai_v2_mtp_sidecar_adds_resident_size_for_vlm_only(self, tmp_path):
+        sidecar = tmp_path / "mtp-v2-head.safetensors"
+        sidecar.write_bytes(b"0" * 1000)
+        pool = _make_pool(ceiling=10 * 1024**3)
+        entry = EngineEntry(
+            model_id="bonsai",
+            model_path=str(tmp_path),
+            model_type="vlm",
+            engine_type="vlm",
+            estimated_size=10_000,
+            config_model_type=BONSAI_V2_MODEL_TYPE,
+        )
+
+        with patch(
+            "omlx.engine_pool.validate_bonsai_v2_sidecar",
+            return_value=(sidecar, ""),
+        ):
+            vlm_delta = pool._entry_runtime_resident_size(
+                entry, ModelSettings(mtp_enabled=True), base_size=entry.estimated_size
+            ) - pool._entry_runtime_resident_size(
+                entry, ModelSettings(mtp_enabled=False), base_size=entry.estimated_size
+            )
+            entry.engine_type = "batched"
+            batched_delta = pool._entry_runtime_resident_size(
+                entry, ModelSettings(mtp_enabled=True), base_size=entry.estimated_size
+            ) - pool._entry_runtime_resident_size(
+                entry, ModelSettings(mtp_enabled=False), base_size=entry.estimated_size
+            )
+
+        assert vlm_delta == 1050
+        assert batched_delta == 0
 
     def test_recommended_sampling_keeps_ocr_defaults(self, tmp_path):
         (tmp_path / "generation_config.json").write_text(

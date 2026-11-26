@@ -590,6 +590,7 @@ def _record_runtime_applies(monkeypatch):
     [
         ("glm5_next", ["glm5_next_vlm_runtime"]),
         ("qwen3_5", ["qwen35_vlm_runtime"]),
+        ("prism_hadamard_qwen35", ["qwen35_vlm_runtime"]),
         ("qwen3_5_moe", ["qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"]),
         # MiniCPM-V 4.7 wraps a Qwen3.5 MoE (or dense Qwen3.5) language model.
         ("minicpmv4_7", ["qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"]),

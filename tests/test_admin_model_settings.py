@@ -1183,3 +1183,181 @@ async def test_paroquant_dflash_allows_only_qwen_targets(
             await _update_settings(pool, settings, request)
         assert exc.value.status_code == 400
         assert exc.value.detail == admin_routes._PAROQUANT_REASON
+
+
+def _write_bonsai_v2_checkpoint(tmp_path, *, sidecar: str) -> None:
+    hidden_size = 64
+    intermediate_size = 128
+    num_heads = 2
+    num_kv_heads = 1
+    head_dim = 32
+    config = {
+        "model_type": "prism_hadamard_qwen35",
+        "text_config": {
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "num_attention_heads": num_heads,
+            "num_key_value_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "mtp_num_hidden_layers": 0,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    if sidecar == "missing":
+        return
+
+    mtp_dir = tmp_path / "mtp"
+    mtp_dir.mkdir()
+    sidecar_path = mtp_dir / "mtp-v2-head.safetensors"
+    if sidecar == "corrupt":
+        sidecar_path.write_bytes(b"not a safetensors file")
+        return
+
+    linear_dims = {
+        "nextn.eh_proj": (hidden_size, 2 * hidden_size),
+        "attn_q": (num_heads * head_dim * 2, hidden_size),
+        "attn_k": (num_kv_heads * head_dim, hidden_size),
+        "attn_v": (num_kv_heads * head_dim, hidden_size),
+        "attn_output": (hidden_size, num_heads * head_dim),
+        "ffn_gate": (intermediate_size, hidden_size),
+        "ffn_up": (intermediate_size, hidden_size),
+        "ffn_down": (hidden_size, intermediate_size),
+    }
+    norm_dims = {
+        "nextn.enorm": hidden_size,
+        "nextn.hnorm": hidden_size,
+        "nextn.shared_head_norm": hidden_size,
+        "attn_norm": hidden_size,
+        "post_attention_norm": hidden_size,
+        "attn_q_norm": head_dim,
+        "attn_k_norm": head_dim,
+    }
+    header: dict[str, object] = {"__metadata__": {"bits": "4", "group_size": "32"}}
+    offset = 0
+    for stem, (rows, width) in linear_dims.items():
+        for suffix, dtype, shape, itemsize in (
+            ("weight", "U32", [rows, width // 8], 4),
+            ("scales", "F16", [rows, width // 32], 2),
+            ("biases", "F16", [rows, width // 32], 2),
+        ):
+            nbytes = shape[0] * shape[1] * itemsize
+            header[f"{stem}.{suffix}"] = {
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [offset, offset + nbytes],
+            }
+            offset += nbytes
+    for stem, dim in norm_dims.items():
+        nbytes = dim * 4
+        header[f"{stem}.weight"] = {
+            "dtype": "F32",
+            "shape": [dim],
+            "data_offsets": [offset, offset + nbytes],
+        }
+        offset += nbytes
+
+    raw_header = json.dumps(header).encode("utf-8")
+    sidecar_path.write_bytes(struct.pack("<Q", len(raw_header)) + raw_header + bytes(offset))
+
+
+@pytest.mark.asyncio
+async def test_bonsai_v2_mtp_setting_accepts_valid_sidecar(tmp_path):
+    _write_bonsai_v2_checkpoint(tmp_path, sidecar="valid")
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "prism_hadamard_qwen35"
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_enabled=True),
+    )
+
+    assert settings.mtp_enabled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sidecar", ["missing", "corrupt"])
+async def test_bonsai_v2_mtp_setting_rejects_missing_or_corrupt_sidecar(
+    tmp_path, sidecar
+):
+    _write_bonsai_v2_checkpoint(tmp_path, sidecar=sidecar)
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "prism_hadamard_qwen35"
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    settings = ModelSettings()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(mtp_enabled=True),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "mtp/mtp-v2-head.safetensors" in exc_info.value.detail
+    assert "MTPLX side-car" not in exc_info.value.detail
+    assert settings.mtp_enabled is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_mtp", "payload"),
+    [
+        (False, {"model_type_override": "llm", "mtp_enabled": True}),
+        (True, {"model_type_override": "llm"}),
+    ],
+)
+async def test_bonsai_v2_model_type_override_llm_rejected_when_mtp_active(
+    tmp_path, initial_mtp, payload
+):
+    _write_bonsai_v2_checkpoint(tmp_path, sidecar="valid")
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "prism_hadamard_qwen35"
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    settings = ModelSettings(mtp_enabled=initial_mtp)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(**payload),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == admin_routes._BONSAI_MTP_VLM_ENGINE_REASON
+    assert entry.model_type == "vlm"
+    assert entry.engine_type == "vlm"
+    assert settings.model_type_override is None
+    assert settings.mtp_enabled is initial_mtp
+
+
+@pytest.mark.asyncio
+async def test_bonsai_v2_model_type_override_llm_allowed_when_disabling_mtp(tmp_path):
+    _write_bonsai_v2_checkpoint(tmp_path, sidecar="valid")
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "prism_hadamard_qwen35"
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    settings = ModelSettings(mtp_enabled=True)
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            model_type_override="llm", mtp_enabled=False
+        ),
+    )
+
+    assert settings.model_type_override == "llm"
+    assert settings.mtp_enabled is False
+    assert entry.model_type == "llm"
+    assert entry.engine_type == "batched"

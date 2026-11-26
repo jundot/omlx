@@ -464,6 +464,24 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {
+                "model_type": "prism_hadamard_qwen35",
+                "vision_config": {"hidden_size": 1152},
+                "text_config": {"hidden_size": 5120},
+            },
+            {
+                "model_type": "prism_hadamard_qwen35",
+                "text_config": {"hidden_size": 5120},
+            },
+        ],
+    )
+    def test_detect_prism_hadamard_qwen35_as_vlm(self, tmp_path, config):
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_vlm_by_architecture(self, tmp_path):
         """Test detection of VLM model by architecture name."""
         config = {
@@ -1018,6 +1036,14 @@ class TestEstimateModelSize:
         size = estimate_model_size(tmp_path)
         # Should use safetensors size only
         assert size == int(1000 * 1.05)
+
+    def test_estimate_excludes_mtp_sidecar_subdir(self, tmp_path):
+        (tmp_path / "model.safetensors").write_bytes(b"0" * 1000)
+        mtp_dir = tmp_path / "mtp"
+        mtp_dir.mkdir()
+        (mtp_dir / "mtp-v2-head.safetensors").write_bytes(b"0" * 2000)
+
+        assert estimate_model_size(tmp_path) == 1050
 
 
 class TestDiscoverModels:

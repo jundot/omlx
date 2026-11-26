@@ -69,6 +69,7 @@ from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
     _resolve_hf_cache_entry,
+    detect_model_type,
 )
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
@@ -98,6 +99,10 @@ from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.k2_horizon import REASONING_EFFORTS
+from ..patches.mlx_vlm_mtp.bonsai_v2_sidecar import (
+    BONSAI_V2_MODEL_TYPE,
+    validate_bonsai_v2_sidecar,
+)
 from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.routes import helper_status as prefill_helper_status
@@ -1271,6 +1276,10 @@ def _sanitize_diffusion_model_settings(settings) -> None:
 _MTP_EXTERNAL_ENGINE_REASON = (
     "MTP is not used when an external engine serves this model"
 )
+_BONSAI_MTP_VLM_ENGINE_REASON = (
+    "Lightning MTP for Ternary Bonsai requires the VLM serving engine; "
+    "set Serving Engine to VLM or Auto."
+)
 
 
 def _mtp_compat_for_model(
@@ -1335,6 +1344,13 @@ def _mtp_compat_for_model(
         if bundled_inkling2_dspark_path(model_path) is not None:
             return True, ""
         return False, "Inkling 2 checkpoint has no bundled mtp.safetensors draft"
+    if model_type == BONSAI_V2_MODEL_TYPE:
+        if model_info.get("engine_type") not in (None, "vlm"):
+            return False, _BONSAI_MTP_VLM_ENGINE_REASON
+        sidecar_path, reason = validate_bonsai_v2_sidecar(model_path)
+        if sidecar_path is not None:
+            return True, ""
+        return False, reason
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
@@ -3141,6 +3157,7 @@ async def update_model_settings(
     )
     prev_specprefill_draft = specprefill_draft(current_settings)
     is_diffusion_model = _entry_is_diffusion_model(entry)
+    alias_value = None
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
         if alias_value == "":
@@ -3165,7 +3182,6 @@ async def update_model_settings(
                 settings_manager=settings_manager,
                 engine_pool=engine_pool,
             )
-        current_settings.model_alias = alias_value
     if "model_type_override" in sent:
         valid_types = {
             "llm",
@@ -3189,8 +3205,6 @@ async def update_model_settings(
                 status_code=400,
                 detail=f"Invalid model_type_override: {request.model_type_override}",
             )
-        current_settings.model_type_override = override_value
-        # Update engine pool entry type immediately
         type_to_engine = {
             "llm": "batched",
             "vlm": "vlm",
@@ -3202,17 +3216,36 @@ async def update_model_settings(
             "decision": "decision",
         }
         if override_value:
-            entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+            candidate_model_type = override_value
         else:
-            # Reset to auto-detected type
-            from pathlib import Path
-
-            from ..model_discovery import detect_model_type
-
-            detected_type = detect_model_type(Path(entry.model_path))
-            entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+            candidate_model_type = detect_model_type(Path(entry.model_path))
+        candidate_engine_type = type_to_engine.get(candidate_model_type, "batched")
+        effective_mtp_enabled = (
+            False
+            if is_diffusion_model
+            else (
+                bool(request.mtp_enabled)
+                if "mtp_enabled" in sent
+                else current_settings.mtp_enabled
+            )
+        )
+        if effective_mtp_enabled:
+            compat_ok, compat_reason = _mtp_compat_for_model(
+                {
+                    "model_path": entry.model_path,
+                    "config_model_type": entry.config_model_type,
+                    "engine_type": candidate_engine_type,
+                }
+            )
+            if not compat_ok:
+                raise HTTPException(status_code=400, detail=compat_reason)
+        if "model_alias" in sent:
+            current_settings.model_alias = alias_value
+        current_settings.model_type_override = override_value
+        entry.model_type = candidate_model_type
+        entry.engine_type = candidate_engine_type
+    elif "model_alias" in sent:
+        current_settings.model_alias = alias_value
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
     if "max_tokens" in sent:

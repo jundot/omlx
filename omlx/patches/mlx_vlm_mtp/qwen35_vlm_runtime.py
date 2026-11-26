@@ -43,7 +43,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..mlx_lm_mtp import prompt_priming
+from ..mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed, prompt_priming
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +241,8 @@ def _register_mtp_classes_for_vlm(q35_lang: Any) -> None:
 
         def __call__(self, hidden_states, next_token_ids, embed_tokens, cache=None):
             embeds = embed_tokens(next_token_ids)
+            if hidden_states.dtype != embeds.dtype:
+                hidden_states = hidden_states.astype(embeds.dtype)
             e = self.pre_fc_norm_embedding(embeds)
             h = self.pre_fc_norm_hidden(hidden_states)
             fused = self.fc(mx.concatenate([e, h], axis=-1))
@@ -264,6 +266,26 @@ def _register_mtp_classes_for_vlm(q35_lang: Any) -> None:
 
     q35_lang.MTPDecoderLayer = MTPDecoderLayer
     q35_lang.MTPModule = MTPModule
+
+
+def _configure_vlm_mtp_host(
+    language_model: nn.Module,
+    mtp_module: nn.Module | None,
+    *,
+    decode_enabled: bool,
+) -> None:
+    language_model._omlx_mtp_multi_request = True
+    language_model._omlx_mtp_decode_enabled = bool(
+        decode_enabled and mtp_module is not None
+    )
+    if mtp_module is not None:
+        language_model.mtp = mtp_module
+    if language_model._omlx_mtp_decode_enabled:
+        language_model._omlx_mtp_chain = True
+        language_model._omlx_mtp_batch_rollback = True
+        language_model._omlx_mtp_depth = get_mtp_depth()
+        language_model._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
+        language_model.model._omlx_mtp_prime_host = weakref.ref(language_model)
 
 
 # ---------------------------------------------------------------------------
@@ -302,28 +324,13 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         # Qwen3.6 UD MLX builds, issue #1426) don't fail strict load_weights
         # with "Missing N parameters" and silently downgrade to LLM.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
-        self._omlx_mtp_multi_request = True
         attach_enabled = bool(is_mtp_attach_enabled())
-        self._omlx_mtp_decode_enabled = bool(
-            n_mtp > 0 and attach_enabled and is_mtp_active()
+        mtp_module = q35_lang.MTPModule(args) if n_mtp > 0 and attach_enabled else None
+        _configure_vlm_mtp_host(
+            self,
+            mtp_module,
+            decode_enabled=bool(is_mtp_active()),
         )
-        if n_mtp > 0 and attach_enabled:
-            self.mtp = q35_lang.MTPModule(args)
-        if self._omlx_mtp_decode_enabled:
-            # Depth-k chained drafting works on this path: mtp_forward
-            # supports return_hidden below, and rollback uses mlx-vlm's
-            # stock rollback_speculative_cache (native partial accepts).
-            from ..mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed
-
-            self._omlx_mtp_chain = True
-            self._omlx_mtp_batch_rollback = True
-            self._omlx_mtp_depth = get_mtp_depth()
-            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
-            # Prompt-priming capture runs inside the inner Qwen3_5Model
-            # forward, which has no reference back to this LanguageModel
-            # (the mtp module / make_mtp_cache live here). A weakref avoids
-            # a tracked module cycle in the nn.Module tree.
-            self.model._omlx_mtp_prime_host = weakref.ref(self)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with optional MTP-cycle return shape.

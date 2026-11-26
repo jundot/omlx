@@ -90,6 +90,10 @@ from .patches.inkling2.dspark import (
     load_inkling2_dspark_drafter,
 )
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
+from .patches.mlx_vlm_mtp.bonsai_v2_sidecar import (
+    BONSAI_V2_MODEL_TYPE,
+    validate_bonsai_v2_sidecar,
+)
 from .patches.qwen35_yarn import yarn_factor
 from .prefill_helper.adapters import adapter_for_model as prefill_stage_adapter
 from .prefill_helper.lending import lending_note
@@ -749,6 +753,14 @@ class EnginePool:
             if draft is not None:
                 # BF16 draft weights plus the folded [vocab, rank] Markov head.
                 extra += draft.stat().st_size + 201024 * 256 * 2
+        elif (
+            getattr(runtime_settings, "mtp_enabled", False)
+            and entry.config_model_type == BONSAI_V2_MODEL_TYPE
+            and entry.engine_type == "vlm"
+        ):
+            sidecar = validate_bonsai_v2_sidecar(entry.model_path)[0]
+            if sidecar is not None:
+                extra += int(sidecar.stat().st_size * 1.05)
         lora_path = getattr(runtime_settings, "lora_adapter", None)
         if lora_path and (info := adapter_info(lora_path)) is not None:
             extra += info.resident_bytes

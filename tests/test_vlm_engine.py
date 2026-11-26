@@ -24,10 +24,19 @@ import pytest
 from transformers.processing_utils import ProcessorMixin
 
 from omlx.exceptions import InvalidRequestError
+from omlx.model_settings import ModelSettings
 from omlx.patches.gemma4_audio import apply_gemma4_audio_patch
+from omlx.patches.mlx_lm_mtp import (
+    get_mtp_depth,
+    is_mtp_active,
+    is_mtp_depth_fixed,
+    set_mtp_active,
+    set_mtp_depth,
+)
 from omlx.patches.mlx_vlm_glm5_next_compat import (
     apply_mlx_vlm_glm5_next_compat_patch,
 )
+from omlx.patches.mlx_vlm_mtp.bonsai_v2_sidecar import BONSAI_V2_SIDECAR_REL_PATH
 
 try:
     import mlx.core as mx
@@ -37,6 +46,16 @@ try:
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
+
+try:
+    import mlx_vlm.utils as vlm_utils
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    from tests.test_vlm_mtp import _build_bonsai_v2_checkpoint
+
+    HAS_MLX_VLM = True
+except ImportError:
+    HAS_MLX_VLM = False
 
 
 # ---------------------------------------------------------------------------
@@ -3966,3 +3985,81 @@ class TestNativeVideo:
         assert estimate.call_count == 2
         kwargs = engine._preflight_or_raise_with_eviction.call_args.kwargs
         assert kwargs["num_prompt_tokens"] == 1002
+
+
+@pytest.mark.skipif(
+    not (HAS_MLX and HAS_MLX_VLM),
+    reason="mlx and mlx_vlm are required to test Bonsai v2 MTP engine start",
+)
+class TestBonsaiV2MtpStart:
+    """Tests for Ternary Bonsai v2 Lightning MTP wiring in VLMBatchedEngine.start."""
+
+    @staticmethod
+    def _mock_vlm_load(model_path, **_kwargs):
+        return vlm_utils.load_model(Path(model_path), lazy=False), MockVLMTokenizer()
+
+    @pytest.mark.asyncio
+    async def test_start_binds_bonsai_v2_mtp_sidecar_when_enabled(self, tmp_path):
+        _build_bonsai_v2_checkpoint(tmp_path, with_sidecar=True)
+        prev_active = is_mtp_active()
+        prev_depth = get_mtp_depth()
+        prev_fixed = is_mtp_depth_fixed()
+        engine = _make_engine(
+            model_name=str(tmp_path),
+            model_settings=ModelSettings(mtp_enabled=True),
+        )
+        try:
+            with patch.object(vlm_utils, "load", side_effect=self._mock_vlm_load):
+                await engine.start()
+            lm = engine._vlm_model.language_model
+            assert isinstance(lm.mtp, q35_lang.MTPModule)
+            assert lm._omlx_mtp_decode_enabled is True
+        finally:
+            await engine.stop()
+            set_mtp_active(prev_active)
+            set_mtp_depth(prev_depth, fixed=prev_fixed)
+
+    @pytest.mark.asyncio
+    async def test_start_skips_bonsai_v2_mtp_sidecar_when_disabled(self, tmp_path):
+        _build_bonsai_v2_checkpoint(tmp_path, with_sidecar=True)
+        prev_active = is_mtp_active()
+        prev_depth = get_mtp_depth()
+        prev_fixed = is_mtp_depth_fixed()
+        engine = _make_engine(
+            model_name=str(tmp_path),
+            model_settings=ModelSettings(mtp_enabled=False),
+        )
+        try:
+            with patch.object(vlm_utils, "load", side_effect=self._mock_vlm_load):
+                await engine.start()
+            lm = engine._vlm_model.language_model
+            assert hasattr(lm, "mtp") is False
+        finally:
+            await engine.stop()
+            set_mtp_active(prev_active)
+            set_mtp_depth(prev_depth, fixed=prev_fixed)
+
+    @pytest.mark.asyncio
+    async def test_start_fails_fast_before_vlm_load_on_corrupt_bonsai_v2_sidecar(
+        self, tmp_path
+    ):
+        _build_bonsai_v2_checkpoint(tmp_path, with_sidecar=True)
+        (tmp_path / BONSAI_V2_SIDECAR_REL_PATH).write_bytes(b"corrupt sidecar")
+        prev_active = is_mtp_active()
+        prev_depth = get_mtp_depth()
+        prev_fixed = is_mtp_depth_fixed()
+        engine = _make_engine(
+            model_name=str(tmp_path),
+            model_settings=ModelSettings(mtp_enabled=True),
+        )
+        try:
+            with patch.object(
+                vlm_utils, "load", side_effect=self._mock_vlm_load
+            ) as load:
+                with pytest.raises(ValueError, match="mtp/mtp-v2-head.safetensors"):
+                    await engine.start()
+                load.assert_not_called()
+        finally:
+            await engine.stop()
+            set_mtp_active(prev_active)
+            set_mtp_depth(prev_depth, fixed=prev_fixed)

@@ -67,6 +67,10 @@ from ..patches.inkling2 import vlm as inkling2_vlm
 from ..patches.inkling2.loopcd import apply_loopcd
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
+from ..patches.mlx_vlm_mtp.bonsai_v2_sidecar import (
+    BONSAI_V2_MODEL_TYPE,
+    bind_bonsai_v2_mtp_sidecar,
+)
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
@@ -2120,6 +2124,16 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         **load_kwargs,
                     )
+                    if (
+                        model_type == BONSAI_V2_MODEL_TYPE
+                        and self._model_settings is not None
+                        and self._model_settings.mtp_enabled is True
+                        and bind_bonsai_v2_mtp_sidecar(loaded[0], self._model_name)
+                    ):
+                        logger.info(
+                            "Bound Ternary Bonsai Lightning MTP sidecar for %s",
+                            self._model_name,
+                        )
                     return loaded
 
         loop = asyncio.get_running_loop()
