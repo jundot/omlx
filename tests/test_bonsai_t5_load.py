@@ -726,15 +726,16 @@ def test_t5_batch4_routing(
     np.testing.assert_array_equal(np.asarray(result.astype(mx.float32)), expected)
 
 
-def test_t5_batch4_native_matches_dense():
+@pytest.mark.parametrize("output_rows", [17, 4097])
+def test_t5_batch4_native_matches_dense(output_rows):
     if not lowbit_fast.has_symbol("t5_qmv_wide_batch4"):
         pytest.skip("native t5 batch4 kernel unavailable")
 
     rng = np.random.default_rng(382)
     x_np = rng.integers(-2, 3, size=(256, 1, 4)).astype(np.float16)
-    codes = rng.integers(0, 3, size=(17, 256), dtype=np.uint8)
+    codes = rng.integers(0, 3, size=(output_rows, 256), dtype=np.uint8)
     packed = pack_t5(codes, group_size=128)
-    scales_np = rng.choice([0.5, 1.0, 2.0], size=(2, 17)).astype(np.float16)
+    scales_np = rng.choice([0.5, 1.0, 2.0], size=(2, output_rows)).astype(np.float16)
     x = mx.array(x_np).transpose(2, 1, 0)
     w = mx.array(packed.T.copy()).T
     scales = mx.array(scales_np).T
