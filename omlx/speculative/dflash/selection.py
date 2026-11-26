@@ -8,6 +8,7 @@ import math
 import mlx.core as mx
 
 from ...patches.mlx_lm_mtp import batch_generator as bg
+from ...patches.mlx_lm_mtp import batched_head
 from ...utils.sampling import top_k_indices
 from .kernels import select_kernel
 
@@ -51,6 +52,11 @@ def select_markov(markov, logits, anchors, samplers) -> list[tuple]:
         step_logits = markov.apply_step_logits(logits[:, step], prev)
         if all(sampler is None for sampler in samplers):
             prev = mx.argmax(step_logits, axis=-1)
+        elif all(sampler is not None for sampler in samplers):
+            lp = step_logits - mx.logsumexp(step_logits, axis=-1, keepdims=True)
+            prev, density = batched_head._sample_rows(samplers, lp)
+            for index in range(batch):
+                accepts[index].append(density[index])
         else:
             lp = step_logits - mx.logsumexp(step_logits, axis=-1, keepdims=True)
             picks = []
