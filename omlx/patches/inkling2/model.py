@@ -416,11 +416,11 @@ class Inkling2Experts(nn.Module):
         do_sort = not fused and inds.size >= 64 and not armed
         if (
             do_sort
-            and expert_mma.applies(inds.size, experts)
+            and not per_pair
+            and inds.size <= expert_mma.MAX_PAIRS
             and expert_mma.supported(self.w13, x.dtype)
             and expert_mma.supported(self.w2, x.dtype)
         ):
-            # The sorted gather_qmm's bits, grouped by expert on the GPU.
             pairs = inds.reshape(-1)
             routing = expert_mma.plan(pairs, experts)
             y = expert_mma.gather(self.w13, x, inds.shape[-1], routing)

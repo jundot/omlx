@@ -1,34 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Expert-grouped 3-bit routed-expert matmul for prefill chunks.
+"""Expert-grouped 3-bit routed-expert matmul for float16 prefill chunks.
 
-A prefill chunk of L tokens routes L x top-k (token, expert) pairs. The
-model sorts them by expert and runs ``gather_qmm(sorted_indices=True)``,
-which (MLX 0.32.4, GPUs without NAX) takes ``gather_qmm_rhs`` once there are
-at least four pairs per expert: tiles of 16 pairs x 32 outputs x 32 inputs
-that dequantize each weight tile to the activation dtype in threadgroup
-memory and accumulate 8x8 simdgroup products in FP32, in input order.
-
-This kernel does the same arithmetic per pair (same dequantized weights,
-same products, same FP32 accumulation order over K, one rounding at the
-end), so every output equals ``gather_qmm``'s bit for bit, with a schedule
-that suits Inkling 2's skewed routing better on M1-class GPUs:
-
-- a threadgroup owns one expert's tile of up to 16 pairs and 64 outputs, so
-  each dequantized 64-wide weight block (one quantization group) serves the
-  four simdgroups that split the outputs;
-- the next K block's weights and token rows are fetched into registers
-  while the current block's products run;
-- the work list (expert, pair tile) is a prefix sum over the per-expert
-  pair counts, computed on the GPU and shared by both projections, and
-  outputs are written at the unsorted pair positions, so the argsorts and
-  the gathers around the sorted ``gather_qmm`` go away.
-
-Inkling 2 Mini oQ3e, fp16, M1 Pro, suffix prefill on an 8K context: 64
-tokens 806 -> 507 ms, 128 tokens 1187 -> 779 ms, 256 tokens 2103 -> 1362
-ms, 512 tokens 2852 -> 2387 ms, logits identical. Chunks past ``MAX_PAIRS``
-keep ``gather_qmm``, which this schedule does not beat there. GPUs with NAX
-(M5) keep ``gather_qmm``, whose NAX kernel has other arithmetic. Rerun tests/test_inkling2_expert_mma.py
-after an MLX pin change.
+A threadgroup owns one expert's tile of up to 16 pairs and 64 outputs and
+accumulates FP32 simdgroup products in K order, as MLX's ``gather_qmm_rhs``
+does. Outputs land at the unsorted pair positions, so the sort and unsort
+around the sorted ``gather_qmm`` go away.
 """
 
 from __future__ import annotations
@@ -39,18 +15,11 @@ import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
 
-# gather_qmm takes its sorted matrix kernel from four pairs per expert on
-# (MLX 0.32.4 ``GatherQMM::eval_gpu``: B >= 16 and B / E >= 4). Fewer pairs
-# run one mat-vec per pair, with other bits, so they keep gather_qmm.
-_MIN_PAIRS_PER_EXPERT = 4
-# Past this many pairs (768 tokens at top-8) gather_qmm is as fast or faster
-# (M1 Pro: 1.08x at 768 tokens, 0.80x at 1024).
 MAX_PAIRS = 6144
 _BM, _BN, _BK = 16, 64, 64
 
 
 def _extract_lines() -> str:
-    """Value j of a 32-value chunk held in words (a, b, d), dequantized."""
     out = []
     for j in range(32):
         bit = 3 * j
@@ -80,14 +49,12 @@ inline short2 frag_coord(ushort lane) {
   return short2{fn, fm};
 }
 
-// MLX's QuantizedBlockLoader dequantization, ``q * scale + bias`` in T.
 template <typename T>
 inline T dequant(uint q, T s, T b) {
   return static_cast<T>(q) * s + b;
 }
 """
 
-# Threadgroup: 4 simdgroups splitting BN outputs; grid z walks work items.
 _SOURCE = r"""
     constexpr int WN = 4, LD = BK + 8;
     constexpr int TN = BN / WN, FM = BM / 8, FN = TN / 8;
@@ -260,33 +227,22 @@ def _kernel():
 
 def supported(proj, dtype) -> bool:
     """True when ``proj`` (an ``ExpertProj``) is a 3-bit group-64 affine
-    stack this kernel matches for ``dtype`` activations."""
+    stack this kernel runs for ``dtype`` activations."""
     if (
-        mx.default_device() != mx.gpu
+        dtype != mx.float16
+        or mx.default_device() != mx.gpu
         or is_nax_available()
-        or getattr(proj, "mode", None) != "affine"
+        or proj.mode != "affine"
         or proj.bits != 3
         or proj.group_size != 64
     ):
         return False
     biases = proj.get("biases")
-    n = int(proj.weight.shape[-2])
-    k = int(proj.scales.shape[-1]) * 64
     return (
         biases is not None
-        and dtype in (mx.bfloat16, mx.float16)
         and proj.scales.dtype == dtype
         and biases.dtype == dtype
-        and n % _BN == 0
-        and k % _BK == 0
-    )
-
-
-def applies(pairs: int, experts: int) -> bool:
-    """Whether a sorted ``gather_qmm`` of ``pairs`` pairs over ``experts``
-    experts takes the matrix kernel this one matches, at a size it wins."""
-    return (
-        pairs >= 16 and pairs >= _MIN_PAIRS_PER_EXPERT * experts and pairs <= MAX_PAIRS
+        and proj.weight.shape[-2] % _BN == 0
     )
 
 
@@ -296,7 +252,7 @@ def plan(rhs: mx.array, experts: int):
     ``order`` lists pair positions by expert; expert ``e``'s pairs are
     ``order[seg_start[e]:seg_start[e + 1]]``, split into tiles numbered from
     ``item_start[e]``."""
-    order = mx.argsort(rhs).astype(mx.uint32)
+    order = mx.argsort(rhs)
     counts = mx.zeros((experts,), mx.int32).at[rhs.astype(mx.int32)].add(1)
     zero = mx.zeros((1,), mx.int32)
     seg = mx.concatenate([zero, mx.cumsum(counts)])
