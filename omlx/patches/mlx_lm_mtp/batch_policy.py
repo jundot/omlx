@@ -7,7 +7,6 @@ from statistics import median
 # Four decisions in a row with MTP below this fraction of ordinary decode
 # (expected tokens per ms) park at once instead of after 16 losing ones.
 _CLEAR_LOSS = 0.9
-# Acceptance assumed for a draft position before any cycle reached it.
 _PRIOR = 0.8
 
 
@@ -31,8 +30,6 @@ class BatchPolicy:
         self.standard_warmup = 2
         self.costs = {}
         self.acceptance = [_PRIOR] * self.max_depth
-        # Cycles that reached each position: early ones weigh more than the EMA allows,
-        # so a pessimistic prior cannot park a cohort before its acceptance is known.
         self.reached = [0] * self.max_depth
         self.losing = 0
         self.clear_losing = 0

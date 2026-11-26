@@ -347,8 +347,6 @@ def test_interleaved_prefills_keep_their_dspark_contexts():
 
 @pytest.mark.parametrize("prompts", [([3, 4, 5, 6], [7, 8, 9, 10]), ([3, 4, 5, 6, 7, 8], [9, 10]), ([3], [4, 5, 6], [7, 8])])
 def test_dspark_stages_batched_across_requests_match_each_request(prompts):
-    """dspark_hidden_rows proposes every request's block in one pass over the stages; each row
-    equals that request's own dspark_hidden, for context rings of equal or unequal length."""
     model = LanguageModel(mtp_config())
     load_reference_weights(model)
     hiddens = []
@@ -358,7 +356,6 @@ def test_dspark_stages_batched_across_requests_match_each_request(prompts):
     anchors = [mx.array([[11 + row]]) for row in range(len(prompts))]
 
     def two_cycles(propose):
-        # The second cycle appends one more committed row to rings that already hold context.
         caches = [model.make_mtp_cache() for _ in prompts]
         first = propose(hiddens, caches)
         second = propose([hidden[:, -1:] for hidden in hiddens], caches)
@@ -367,7 +364,7 @@ def test_dspark_stages_batched_across_requests_match_each_request(prompts):
     single = two_cycles(
         lambda rows, caches: mx.concatenate(
             [
-                model.dspark_hidden(hidden, anchor, cache, draft_length=3)
+                model.dspark_forward(hidden, anchor, cache, draft_length=3)[1]
                 for hidden, anchor, cache in zip(rows, anchors, caches)
             ],
             0,

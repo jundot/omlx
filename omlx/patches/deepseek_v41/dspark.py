@@ -9,7 +9,6 @@ from dataclasses import replace
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..mlx_lm_mtp.deepseek_v4_dspark import DSparkContextCache
 from .head import project_logits
@@ -43,10 +42,9 @@ class DSparkAttention(Attention):
             item.append(kv[:, None, at : at + x.shape[1]])
             at += x.shape[1]
 
-    def _rows(self, x, caches):
-        """__call__ for one draft block per request (x [B, L, D]); each request keeps its own
-        context ring and positions. Rings may differ in length (shorter ones are padded and masked)."""
+    def __call__(self, x, cache):
         c = self._config
+        caches = cache if isinstance(cache, list) else [cache]
         batch, length, _ = x.shape
         positions = [p for item in caches for p in range(item.offset, item.offset + length)]
 
@@ -64,23 +62,17 @@ class DSparkAttention(Attention):
         ).reshape(batch, length, -1)
         sizes = [item.keys.shape[2] for item in caches]
         top = max(sizes)
-        rings = [
-            item.keys[:, 0]
-            if size == top
-            else mx.concatenate(
-                [mx.zeros((1, top - size, item.keys.shape[-1]), item.keys.dtype), item.keys[:, 0]],
-                axis=1,
-            )
-            for item, size in zip(caches, sizes)
-        ]
-        kv = mx.concatenate([mx.concatenate(rings, axis=0), draft_kv], axis=1)
+        rings = mx.concatenate(
+            [mx.pad(item.keys[:, 0], [(0, 0), (top - size, 0), (0, 0)]) for item, size in zip(caches, sizes)]
+        )
+        kv = mx.concatenate([rings, draft_kv], axis=1)
         mask = None
         if min(sizes) != top:
-            # Shorter rings are padded in front; no query attends to the padding.
-            valid = np.ones((batch, 1, 1, top + length), dtype=bool)
-            for row, size in enumerate(sizes):
-                valid[row, ..., : top - size] = False
-            mask = mx.array(valid)
+            mask = mx.arange(top + length) >= mx.array([top - size for size in sizes])[:, None, None, None]
+        # V4.1 does not apply V4's per-head query RMS normalization.
+        # The checkpoint's sink and attention accumulation are FP32. SDPA
+        # requires a matching sink dtype, so promote this small draft block
+        # instead of rounding the learned sink down to BF16.
         out = (
             mx.fast.scaled_dot_product_attention(
                 q.astype(mx.float32).transpose(0, 2, 1, 3),
@@ -96,44 +88,6 @@ class DSparkAttention(Attention):
         out = rope(flat(out), positions, c, False, inverse=True).reshape(
             batch, length, c.n_heads, c.head_dim
         )
-        grouped = quantize_activation(out.reshape(batch, length, c.o_groups, -1))
-        weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
-        return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
-
-    def __call__(self, x, cache):
-        if isinstance(cache, (list, tuple)):
-            return self._rows(x, cache)
-        c = self._config
-        batch, length, _ = x.shape
-        positions = range(cache.offset, cache.offset + length)
-        q = rope(
-            self.wq_b(self.q_norm(self.wq_a(x))).reshape(
-                batch, length, c.n_heads, c.head_dim
-            ),
-            positions,
-            c,
-            False,
-        )
-        draft_kv = quantize_activation(
-            rope(self.kv_norm(self.wkv(x)), positions, c, False)
-        )
-        kv = mx.concatenate([cache.keys[:, 0], draft_kv], axis=1)
-        # V4.1 does not apply V4's per-head query RMS normalization.
-        # The checkpoint's sink and attention accumulation are FP32. SDPA
-        # requires a matching sink dtype, so promote this small draft block
-        # instead of rounding the learned sink down to BF16.
-        out = (
-            mx.fast.scaled_dot_product_attention(
-                q.astype(mx.float32).transpose(0, 2, 1, 3),
-                kv[:, None].astype(mx.float32),
-                kv[:, None].astype(mx.float32),
-                scale=c.head_dim**-0.5,
-                sinks=self.attn_sink.astype(mx.float32),
-            )
-            .transpose(0, 2, 1, 3)
-            .astype(q.dtype)
-        )
-        out = rope(out, positions, c, False, inverse=True)
         # 1017 reference DSparkAttention: act_quant(o) before the wo_a einsum.
         grouped = quantize_activation(out.reshape(batch, length, c.o_groups, -1))
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
