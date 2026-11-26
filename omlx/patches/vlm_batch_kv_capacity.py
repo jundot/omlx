@@ -579,7 +579,7 @@ class _CapacityMethods:
         return cache
 
     def extract(self, idx):
-        padding = int(self.left_padding[idx].item())
+        padding = self.left_padding.tolist()[idx]
         length = self._idx - padding
         # mlx-lm KVCache.state exposes the whole buffer, so its rows keep the
         # exact width.
