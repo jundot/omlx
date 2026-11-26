@@ -2555,6 +2555,13 @@ async def test_inkling2_fp8_kv_ssd_blocks_survive_a_reload_in_the_same_mode(
                 "omlx.utils.model_loading.apply_post_load_transforms",
                 side_effect=lambda model, settings: model,
             ),
+            patch("omlx.patches.sdpa256_attention.apply_sdpa256_attention_patch"),
+            patch("omlx.patches.qwen35_gdn_prework.apply_qwen35_gdn_prework_patch"),
+            patch("omlx.patches.qwen35_gdn_chunked.apply_qwen35_gdn_prefill_patch"),
+            patch("omlx.patches.qwen35_fa256_attention.apply_qwen35_fa256_attention_patch"),
+            patch("omlx.patches.qwen35_q4_mlp.apply_qwen35_q4_mlp_patch"),
+            patch("omlx.patches.qwen35_q4_mlp.apply_qwen35_q4_lm_prefill_linear_patch"),
+            patch("omlx.patches.qwen35_q4_mlp.apply_qwen35_q4_prefill_linear_patch"),
         ):
             await engine.start()
         return engine, engine._engine.engine.scheduler
