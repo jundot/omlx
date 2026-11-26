@@ -117,7 +117,6 @@ struct AttnParams {
   int kb_end;
   // Extent of the relative bias band (has_band), in key positions.
   int band;
-  // Sliding window in key positions (0: full attention); equals band.
   int window;
 };
 
@@ -353,7 +352,6 @@ METAL_FUNC void attention_nax_bdv(
   // This dispatch's key blocks.
   const int kb_lo = params->kb_begin;
   const int kb_hi = min(kb_lim, params->kb_end);
-  // A sliding window starts at the oldest key the block's first row sees.
   const int kb_start = params->window > 0
       ? max(kb_lo, max(0, int(tid.x) * BQ + params->qL_off - params->window + 1) / BK)
       : kb_lo;
@@ -1174,7 +1172,6 @@ def nax_banded_sink_attention(
     ):
         return None
     if window:
-        # Keys older than the first query's window are never read.
         start = max(0, keys.shape[2] - queries.shape[2] - window + 1)
         keys, values = keys[:, :, start:], values[:, :, start:]
         if left_padding is not None:

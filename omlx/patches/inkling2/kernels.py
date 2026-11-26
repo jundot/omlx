@@ -1424,11 +1424,9 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
 
 
 def _use_flash(length: int, window: int) -> bool:
-    """Prefill blocks take the flash kernel on GPUs without tensor units (NAX);
-    NAX hosts run full-attention and sliding blocks on the NAX banded kernel."""
     if length < _FLASH_MIN_QUERIES or mx.default_device() != mx.gpu:
         return False
-    return not is_nax_available()
+    return bool(window) or not is_nax_available()
 
 
 def prefill_mask_elements() -> int | None:
@@ -1537,17 +1535,12 @@ def banded_sink_attention(
             for r in range(length)
         ]
         return mx.concatenate(rows, axis=1).transpose(0, 2, 1, 3)
-    if q.dtype in (mx.bfloat16, mx.float16) and _use_flash(length, window):
-        return flash_banded_attention(
-            q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
-        )
-    # NAX hosts: no additive mask, for full attention and sliding windows.
     out = nax_attention.nax_banded_sink_attention(
         q, k, v, rel, sink, scale=scale, left_padding=left_padding, window=window
     )
     if out is not None:
         return out
-    if window and q.dtype in (mx.bfloat16, mx.float16) and length >= _FLASH_MIN_QUERIES:
+    if q.dtype in (mx.bfloat16, mx.float16) and _use_flash(length, window):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )

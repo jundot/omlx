@@ -1504,8 +1504,6 @@ def test_nax_banded_attention_rows_do_not_depend_on_the_block():
 
 
 def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
-    """Full-attention and sliding blocks of more than 8 queries, lone or
-    left-padded, build no mask on NAX hosts; shorter blocks keep SDPA."""
     from omlx.patches.inkling2 import kernels
 
     nax_attention = _nax_banded_or_skip()
