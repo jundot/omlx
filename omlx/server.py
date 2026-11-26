@@ -234,6 +234,7 @@ from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
     InvalidRequestError,
+    MetalCompilerUnavailableError,
     ModelBusyError,
     ModelLoadingError,
     ModelNotFoundError,
@@ -1110,6 +1111,43 @@ async def scheduler_queue_full_handler(
     )
 
 
+@app.exception_handler(MetalCompilerUnavailableError)
+async def metal_compiler_unavailable_handler(
+    request: FastAPIRequest, exc: MetalCompilerUnavailableError
+):
+    """Map a dead MTLCompilerService to an actionable 503 instead of a bare 500.
+
+    macOS's Metal shader compiler daemon can die mid-process (typically on
+    recent macOS builds or under memory pressure). Once its connection is
+    gone MLX cannot JIT-compile any new kernel and the running oMLX process
+    cannot recover it -- only restarting the server helps (#1335). Say that
+    in the response so callers stop retrying into the same dead process.
+    """
+    logger.error(
+        "%s %s -> 503: Metal compiler service unavailable: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    detail = (
+        "macOS Metal compiler service (MTLCompilerService) is unavailable and "
+        "oMLX cannot compile the kernels this request needs. This is a "
+        "system-level failure; restart the oMLX server to recover, then retry "
+        "the request. Reducing prompt length may avoid triggering new kernel "
+        "compilations in the meantime."
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(detail, 503, code="metal_compiler_unavailable")
+        content["error"]["omlx_code"] = "metal_compiler_unavailable"
+    else:
+        content = {"detail": detail}
+    return JSONResponse(
+        status_code=503,
+        content=content,
+        headers={"Retry-After": "10"},
+    )
+
+
 @app.exception_handler(DistributedInferenceError)
 async def distributed_unavailable_handler(
     request: FastAPIRequest, exc: DistributedInferenceError
@@ -1153,16 +1191,31 @@ def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
 def _streaming_error_payload(e: Exception, context: str) -> dict:
     """Error body for a failure inside an OpenAI SSE generator.
 
-    A prefill-guard rejection raised during streaming must keep its
-    structured body (root ``type``, ``omlx_code``, byte fields) — the
-    blanket ``except`` in the generators would otherwise flatten it to a
-    generic ``server_error`` that clients cannot classify, and the correct
-    handler in ``_with_sse_keepalive`` never sees the exception because the
-    generator's own handler is the innermost one (#3036).
+    Structured failures raised during streaming must keep their structured
+    body (root ``type``, ``omlx_code``, byte fields) — the blanket ``except``
+    in the generators would otherwise flatten them to a generic
+    ``server_error`` that clients cannot classify, and the correct handler in
+    ``_with_sse_keepalive`` never sees the exception because the generator's
+    own handler is the innermost one (#3036). HTTP status is already fixed to
+    200 by any keepalive byte, so the code in the body is the only signal.
     """
     if isinstance(e, PrefillMemoryExceededError):
         logger.warning(f"{context} prefill rejected: {e}")
         return _prefill_memory_openai_error_body(e)
+    if isinstance(e, MetalCompilerUnavailableError):
+        logger.error(f"{context} Metal compiler unavailable: {e}")
+        return {
+            "type": "error",
+            "error": {
+                "message": (
+                    "macOS Metal compiler service (MTLCompilerService) is "
+                    "unavailable. Restart the oMLX server to recover, then retry."
+                ),
+                "type": "server_error",
+                "code": "metal_compiler_unavailable",
+                "omlx_code": "metal_compiler_unavailable",
+            },
+        }
     logger.error(f"Error during {context}: {e}")
     return {"error": {"message": str(e), "type": "server_error"}}
 

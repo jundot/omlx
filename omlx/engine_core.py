@@ -39,10 +39,12 @@ import mlx.core as mx
 
 from .custom_kernels.quant_matmul.fast import share_command_queue
 from .exceptions import (
+    MetalCompilerUnavailableError,
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
     RequestAbortedError,
     describe_ceiling_binding,
+    is_metal_compiler_unavailable,
 )
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
@@ -167,6 +169,13 @@ class _EngineTeardown:
         self.set_phase("closed")
 
 
+def is_metal_compiler_unavailable_text(text: str | None) -> bool:
+    """Classify a scheduler/MLX error string as a lost Metal compiler service."""
+    if not text:
+        return False
+    return is_metal_compiler_unavailable(RuntimeError(text))
+
+
 def _raise_request_output_error(output: RequestOutput) -> None:
     if output.error_code in ("prefill_memory_exceeded", "prefill_memory_aborted"):
         metadata = output.error_metadata or {}
@@ -191,6 +200,11 @@ def _raise_request_output_error(output: RequestOutput) -> None:
         )
     if output.error_code in ("model_unloading", "admin_abort"):
         raise RequestAbortedError(output.error, request_id=output.request_id)
+    if is_metal_compiler_unavailable_text(output.error):
+        raise MetalCompilerUnavailableError(
+            output.error or "Metal compiler service unavailable",
+            request_id=output.request_id,
+        )
     raise RuntimeError(output.error)
 
 

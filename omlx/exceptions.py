@@ -271,6 +271,21 @@ class RequestAbortedError(RequestError):
     pass
 
 
+class MetalCompilerUnavailableError(RequestError):
+    """macOS Metal shader compiler service became unreachable mid-request.
+
+    MLX JIT-compiles kernels through MTLCompilerService. If that system
+    daemon dies (``Connection init failed at lookup with error 32 - Broken
+    pipe``) the running process cannot re-establish the connection, so every
+    request needing a not-yet-cached kernel fails until oMLX restarts. This
+    is a host/OS failure, not a bad request: classify it separately so the
+    server can return an actionable 503 instead of an opaque 500. #1335
+    """
+
+    def __init__(self, message: str, request_id: Optional[str] = None):
+        super().__init__(message, request_id=request_id)
+
+
 class BatchingError(SchedulerError):
     """
     Error during batch processing.
@@ -654,6 +669,31 @@ def is_metal_out_of_memory(exc: BaseException | None) -> bool:
             "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
             or "Insufficient Memory" in text
         ):
+            return True
+        exc = exc.__cause__
+    return False
+
+
+# Substrings macOS/MLX emit when MTLCompilerService is gone. Keep the check
+# narrow: an ordinary "Unable to load kernel ..." for a missing library is a
+# different (and recoverable) failure and must not be misclassified.
+METAL_COMPILER_UNAVAILABLE_PATTERNS = (
+    "Unable to reach MTLCompilerService",
+    "compiler is no longer active",
+)
+
+
+def is_metal_compiler_unavailable(exc: BaseException | None) -> bool:
+    """True when *exc* or any exception in its cause chain is a compiler loss.
+
+    Walks the cause chain like :func:`is_metal_out_of_memory` because the
+    scheduler/engine layers re-raise the original MLX error.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        text = str(exc)
+        if any(p in text for p in METAL_COMPILER_UNAVAILABLE_PATTERNS):
             return True
         exc = exc.__cause__
     return False
