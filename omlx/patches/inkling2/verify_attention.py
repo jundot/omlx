@@ -429,6 +429,7 @@ def rows_attention(q, k, v, rel, sink, *, scale: float, window: int):
     if not windowed:
         # Past ~16K keys two rows per simdgroup measured fastest (M1 Max).
         rps = min(length, SHARED_MAX_ROWS if s < 16384 else 2)
+        rps = max(rps, -(-length // (1024 // (32 * gqa))))
         groups = (length + rps - 1) // rps
         partials, sums, maxs = _pass1_shared()(
             inputs=[

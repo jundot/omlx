@@ -15,16 +15,16 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 _HQ, _HKV, _D, _R = 24, 8, 128, 1024
 
 
-def _inputs(dtype, keys, rows, seed):
+def _inputs(dtype, keys, rows, seed, hq=_HQ):
     mx.random.seed(seed)
     # The model hands q over as a transpose of [B, L, H, D] and the keys and
     # values as views into a longer cache buffer.
-    q = mx.random.normal((1, rows, _HQ, _D)).astype(dtype).transpose(0, 2, 1, 3)
+    q = mx.random.normal((1, rows, hq, _D)).astype(dtype).transpose(0, 2, 1, 3)
     kbuf = mx.random.normal((1, _HKV, keys + 21, _D)).astype(dtype)
     vbuf = mx.random.normal((1, _HKV, keys + 21, _D)).astype(dtype)
     k, v = kbuf[:, :, 3 : 3 + keys], vbuf[:, :, 3 : 3 + keys]
-    rel = (mx.random.normal((1, rows, _HQ, _R)) * 2).astype(dtype)
-    sink = mx.random.normal((1, rows, _HQ)).astype(dtype)
+    rel = (mx.random.normal((1, rows, hq, _R)) * 2).astype(dtype)
+    sink = mx.random.normal((1, rows, hq)).astype(dtype)
     return q, k, v, rel, sink
 
 
@@ -70,6 +70,12 @@ def test_rows_match_decode_steps_bit_for_bit(dtype, window, rows, keys):
         return
     assert out is not None
     assert mx.array_equal(out, _per_row(q, k, v, rel, sink, window))
+
+
+def test_rows_at_gqa_6_fit_one_threadgroup():
+    q, k, v, rel, sink = _inputs(mx.bfloat16, 16399, 16, seed=16399, hq=48)
+    out = verify_attention.rows_attention(q, k, v, rel, sink, scale=_D**-0.5, window=0)
+    assert mx.array_equal(out, _per_row(q, k, v, rel, sink, 0))
 
 
 def test_banded_sink_attention_takes_the_fused_rows(monkeypatch):
