@@ -154,6 +154,8 @@ from .benchmark import (
     _sanitize_upload_error,
     _upload_model_name,
 )
+from .benchmark import get_active_run as get_active_throughput_run
+from .benchmark import get_queue as get_throughput_queue
 from .hf_downloader import MODEL_FORMATS, _is_repo_id
 from .recipe import (
     ALL_FIELDS,
@@ -2166,6 +2168,15 @@ async def setup_api_key(
     )
 
     return {"success": True, "message": "API key configured successfully"}
+
+
+@router.post("/api/auth/api-key")
+async def reveal_api_key(is_admin: bool = Depends(require_admin)):
+    """Return the main API key for an explicit copy or reveal action."""
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    return {"api_key": global_settings.auth.api_key or ""}
 
 
 @router.post("/api/logout")
@@ -5090,7 +5101,6 @@ def _global_settings_response(global_settings):
         },
         "auth": {
             "api_key_set": bool(global_settings.auth.api_key),
-            "api_key": global_settings.auth.api_key or "",
             "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
             "allow_unauthenticated_inference": (
                 global_settings.auth.allow_unauthenticated_inference
@@ -7302,7 +7312,7 @@ async def get_server_stats(
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
     port = global_settings.server.port if global_settings else 8000
-    api_key = global_settings.auth.api_key if global_settings else ""
+    api_key_set = bool(global_settings and global_settings.auth.api_key)
 
     from ..utils.install import get_cli_prefix
 
@@ -7317,7 +7327,7 @@ async def get_server_stats(
         **snapshot,
         "host": host,
         "port": port,
-        "api_key": api_key or "",
+        "api_key_set": api_key_set,
         "cli_prefix": get_cli_prefix(),
         "engines": _get_engine_info(),
         "active_models": active_models_data,
@@ -9412,6 +9422,11 @@ async def start_ane_tuning(
             status_code=409,
             detail=f"A throughput benchmark is already running ({throughput.bench_id}).",
         )
+    if get_throughput_queue():
+        raise HTTPException(
+            status_code=409,
+            detail="Throughput benchmarks are waiting in the queue.",
+        )
     context = get_active_context_run()
     if context is not None:
         raise HTTPException(
@@ -9556,6 +9571,11 @@ async def start_context_benchmark(
                 f"(bench_id={throughput_active.bench_id}, "
                 f"model_id={throughput_active.request.model_id})."
             ),
+        )
+    if get_throughput_queue():
+        raise HTTPException(
+            status_code=409,
+            detail="Throughput benchmarks are waiting in the queue.",
         )
     from .ane_tuning import get_active_run as get_active_ane_tuning
 
@@ -9749,14 +9769,14 @@ async def get_context_benchmark_results(
 
 @router.get("/api/bench/active")
 async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
-    """Return the currently-running throughput benchmark, if any.
+    """Return the currently-running throughput benchmark and the queue.
 
     Symmetric to `/api/bench/accuracy/queue/status` — lets a fresh page
     load or a second tab discover an in-flight run so it can attach to
     the SSE stream. Combined with the replay-on-subscribe stream this
     is what makes the multi-tab + page-refresh story actually work.
     """
-    from .benchmark import get_active_run
+    from .benchmark import get_active_run, get_queue
 
     run = get_active_run()
     if run is None:
@@ -9765,9 +9785,12 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
             "bench_id": None,
             "model_id": None,
             "context_profile": None,
+            "queue": get_queue(),
         }
     return {
         "running": True,
+        "queue": get_queue(),
+        "queue_id": run.queue_id,
         "bench_id": run.bench_id,
         "model_id": run.request.model_id,
         "context_profile": run.request.context_profile.value,
@@ -9784,36 +9807,27 @@ async def start_benchmark(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Start a benchmark run.
+    """Start a benchmark run, or queue it behind the running one.
 
     Validates the model, creates a benchmark run, and starts it
-    as an asyncio background task. Rejects with 409 if another
-    throughput bench is already running — two concurrent runs on
-    the same engine produce mutually-corrupted measurements.
+    as an asyncio background task. Two concurrent runs on the same
+    engine produce mutually-corrupted measurements, so a request that
+    arrives while a throughput bench is running waits in the queue.
     """
     from .benchmark import (
         BenchmarkRequest,
+        add_to_queue,
         cleanup_old_runs,
         create_run,
         get_active_run,
-        run_benchmark,
+        get_queue,
+        queue_busy,
+        run_queue,
     )
 
     engine_pool = _get_engine_pool()
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
-
-    # One throughput bench at a time. The replay-on-subscribe stream lets
-    # clients attach to the already-running one if that's what they want.
-    active = get_active_run()
-    if active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"A throughput benchmark is already running "
-                f"(bench_id={active.bench_id}, model_id={active.request.model_id})."
-            ),
-        )
 
     from .context_benchmark import get_active_run as get_active_context_run
 
@@ -9860,6 +9874,14 @@ async def start_benchmark(
                 detail=f"Model {bench_request.model_id} is not a supported model (type: {entry.model_type})",
             )
 
+    if queue_busy() or get_active_run() is not None:
+        queue_id = add_to_queue(bench_request)
+        return {
+            "status": "queued",
+            "queue_id": queue_id,
+            "queue": get_queue(),
+        }
+
     # Cleanup old runs
     cleanup_old_runs()
 
@@ -9868,7 +9890,9 @@ async def start_benchmark(
     total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
 
     _drop_idle_gpu_power_cap()
-    run.task = asyncio.create_task(run_benchmark(run, engine_pool))
+    run.task = asyncio.create_task(
+        run_queue(run, engine_pool, on_start=_drop_idle_gpu_power_cap)
+    )
 
     logger.info(
         f"Benchmark started: {run.bench_id} model={bench_request.model_id} "
@@ -9880,6 +9904,21 @@ async def start_benchmark(
         "status": "started",
         "total_tests": total_tests,
     }
+
+
+@router.delete("/api/bench/queue/{queue_id}")
+async def remove_from_benchmark_queue(
+    queue_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Remove a request from the throughput benchmark queue by its id."""
+    from .benchmark import get_queue, remove_from_queue
+
+    if not remove_from_queue(queue_id):
+        raise HTTPException(
+            status_code=404, detail=f"Queue entry {queue_id} not found"
+        )
+    return {"queue": get_queue()}
 
 
 @router.get("/api/bench/{bench_id}/stream")
@@ -9944,12 +9983,17 @@ async def cancel_benchmark(
     bench_id: str,
     is_admin: bool = Depends(require_admin),
 ):
-    """Cancel a running benchmark."""
-    from .benchmark import get_run
+    """Cancel a running benchmark and clear the queue behind it."""
+    from .benchmark import clear_queue, get_run
 
     run = get_run(bench_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
+
+    uploading = run.task is not None and not run.task.done()
+    if run.status == "completed" and uploading and get_active_throughput_run() is None:
+        clear_queue()
+        return {"status": "cancelled", "bench_id": bench_id}
 
     if run.status != "running":
         raise HTTPException(
@@ -9957,6 +10001,7 @@ async def cancel_benchmark(
             detail=f"Benchmark is not running (status: {run.status})",
         )
 
+    clear_queue()
     if run.task and not run.task.done():
         run.task.cancel()
 
@@ -10134,6 +10179,9 @@ async def estimate_oq(
     oq_level: float,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
+    text_only: bool = False,
+    dtype: str = "bfloat16",
+    mtp_assistant_model_path: str = "",
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -10144,9 +10192,11 @@ async def estimate_oq(
             estimate_bpw_and_size,
             model_path,
             oq_level,
-            64,  # group_size (default)
-            preserve_mtp,
-            preserve_ngram_table,
+            preserve_mtp=preserve_mtp,
+            preserve_ngram_table=preserve_ngram_table,
+            text_only=text_only,
+            dtype=dtype,
+            mtp_assistant_model_path=mtp_assistant_model_path,
         )
         return result
     except Exception as e:

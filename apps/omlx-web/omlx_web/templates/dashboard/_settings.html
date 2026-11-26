@@ -165,10 +165,11 @@
                                     </div>
                                     <div class="flex items-center gap-2">
                                         <input :type="showApiKey ? 'text' : 'password'"
-                                               x-model="globalSettings.auth.api_key"
+                                               :value="apiKeyInputDisplay"
+                                               @input="globalSettings.auth.api_key = $event.target.value; revealedStoredApiKey = ''"
                                                placeholder="{{ t('settings.auth.api_key_placeholder') }}"
                                                class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
-                                        <button type="button" @click="showApiKey = !showApiKey"
+                                        <button type="button" @click="toggleShowApiKey()"
                                                 class="p-2 rounded-lg hover:bg-neutral-100 transition-colors text-neutral-400 hover:text-neutral-600"
                                                 title="{{ t('settings.auth.toggle_visibility_tooltip') }}">
                                             <template x-if="!showApiKey">

@@ -66,6 +66,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from omlx._version import __version__
 
@@ -250,6 +251,8 @@ from .model_settings import (
     specprefill_draft,
 )
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .patches.inkling2 import INKLING2_MODEL_TYPES
+from .patches.inkling2.grammar import compile_answer_grammar
 from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
 from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
@@ -1008,6 +1011,23 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
     }
 
 
+def _is_anthropic_route(request: FastAPIRequest) -> bool:
+    return request.url.path.startswith("/v1/messages")
+
+
+def _error_body_for(
+    request: FastAPIRequest, message, status_code: int, *, param=None, code=None
+) -> dict:
+    if not _is_api_route(request):
+        return {"detail": message}
+    content = _openai_error_body(message, status_code, param=param, code=code)
+    if _is_anthropic_route(request):
+        content["type"] = "error"
+        if status_code >= 500:
+            content["error"]["type"] = "api_error"
+    return content
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
@@ -1026,12 +1046,19 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.status_code,
             exc.detail,
         )
-    if _is_api_route(request):
-        content = _openai_error_body(
-            exc.detail, exc.status_code, code=getattr(exc, "code", None)
-        )
-    else:
-        content = {"detail": exc.detail}
+    content = _error_body_for(
+        request, exc.detail, exc.status_code, code=getattr(exc, "code", None)
+    )
+    return JSONResponse(
+        status_code=exc.status_code, content=content, headers=exc.headers
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(
+    request: FastAPIRequest, exc: StarletteHTTPException
+):
+    content = _error_body_for(request, exc.detail, exc.status_code)
     return JSONResponse(
         status_code=exc.status_code, content=content, headers=exc.headers
     )
@@ -1041,11 +1068,13 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
 async def validation_exception_handler(
     request: FastAPIRequest, exc: RequestValidationError
 ):
-    """Log request validation errors (422) before returning the response."""
+    """Log request validation errors (422, or 400 on Anthropic routes)."""
+    status_code = 400 if _is_anthropic_route(request) else 422
     logger.warning(
-        "%s %s → 422: %s",
+        "%s %s → %d: %s",
         request.method,
         request.url.path,
+        status_code,
         exc.errors(),
     )
     if _is_api_route(request):
@@ -1057,27 +1086,24 @@ async def validation_exception_handler(
             parts.append(f"{loc}: {msg}" if loc else msg)
         detail_str = "; ".join(parts)
         param = errors[0].get("loc", [None])[-1] if errors else None
-        content = _openai_error_body(detail_str, 422, param=param)
+        content = _error_body_for(request, detail_str, status_code, param=param)
     else:
         content = {"detail": jsonable_encoder(exc.errors())}
-    return JSONResponse(status_code=422, content=content)
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @app.exception_handler(InvalidRequestError)
 async def invalid_request_error_handler(
     request: FastAPIRequest, exc: InvalidRequestError
 ):
-    """Map internal request validation failures to OpenAI-compatible 400s."""
+    """Map internal request validation failures to the route's 400 envelope."""
     logger.warning(
         "%s %s -> 400: %s",
         request.method,
         request.url.path,
         exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body(str(exc), 400, param=exc.field)
-    else:
-        content = {"detail": str(exc)}
+    content = _error_body_for(request, str(exc), 400, param=exc.field)
     return JSONResponse(status_code=400, content=content)
 
 
@@ -1104,10 +1130,7 @@ async def scheduler_queue_full_handler(
         f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
         f"Try again shortly."
     )
-    if _is_api_route(request):
-        content = _openai_error_body(detail, 503)
-    else:
-        content = {"detail": detail}
+    content = _error_body_for(request, detail, 503)
     return JSONResponse(
         status_code=503,
         content=content,
@@ -1133,10 +1156,7 @@ async def distributed_unavailable_handler(
         request.url.path,
         exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body(str(exc), 503)
-    else:
-        content = {"detail": str(exc)}
+    content = _error_body_for(request, str(exc), 503)
     return JSONResponse(status_code=503, content=content)
 
 
@@ -1256,10 +1276,7 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
         exc,
         exc_info=exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body("Internal server error", 500)
-    else:
-        content = {"detail": "Internal server error"}
+    content = _error_body_for(request, "Internal server error", 500)
     return JSONResponse(status_code=500, content=content)
 
 
@@ -3310,6 +3327,15 @@ async def _with_json_keepalive(
                 )
             )
             return
+        except Exception as e:
+            handler = next(
+                app.exception_handlers[cls]
+                for cls in type(e).__mro__
+                if cls in app.exception_handlers
+            )
+            response = await handler(http_request, e)
+            yield response.body.decode()
+            return
         if result is not None:
             yield result
     finally:
@@ -3808,9 +3834,7 @@ async def _create_markitdown_chat_completion(
     )
 
 
-@app.get("/v1/models", response_model=None)
-async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
-    """List all available models with load status."""
+async def _list_visible_models() -> list[ModelInfo]:
     models = []
     favorite_ids: set[str] = set()
 
@@ -3969,6 +3993,14 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
     if favorite_ids:
         models.sort(key=lambda m: m.id not in favorite_ids)
 
+    return models
+
+
+@app.get("/v1/models", response_model=None)
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
+    """List all available models with load status."""
+    models = await _list_visible_models()
+
     # Serialize explicitly: FastAPI's jsonable_encoder and the
     # ``ModelsResponse`` container both serialize items as the base
     # ``ModelInfo`` (dropping the tier metadata), while a route-level
@@ -4033,6 +4065,17 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["is_hidden"] = False
         m["max_tokens"] = max_tokens
     return status
+
+
+@app.get("/v1/models/{model_id:path}", response_model=None)
+async def retrieve_model(
+    model_id: str, _: bool = Depends(verify_inference_api_key)
+) -> JSONResponse:
+    """Return one visible model, matching an OpenAI retrieve call."""
+    for model in await _list_visible_models():
+        if model.id == model_id:
+            return JSONResponse(content=model.model_dump())
+    raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
 
 @app.post("/v1/models/{model_id}/unload")
@@ -5501,10 +5544,8 @@ async def create_chat_completion(
                 if tool_calls and output.finish_reason != "length"
                 else output.finish_reason
             )
-            reasoning_token_count = (
-                len(engine.tokenizer.encode(cleaned_thinking))
-                if cleaned_thinking
-                else 0
+            reasoning_token_count = _estimate_reasoning_tokens(
+                engine.tokenizer, cleaned_thinking, output.completion_tokens
             )
 
             return ChatCompletionResponse(
@@ -5611,6 +5652,15 @@ def _normalize_structured_outputs(
     if guided_grammar:
         return {"grammar": guided_grammar}
     return None
+
+
+def _estimate_reasoning_tokens(
+    tokenizer, reasoning_text: str, completion_tokens: int
+) -> int:
+    if not reasoning_text:
+        return 0
+    token_ids = tokenizer.encode(reasoning_text.strip(), add_special_tokens=False)
+    return min(len(token_ids), completion_tokens)
 
 
 def _choice_logprobs(entries) -> ChoiceLogprobs:
@@ -5834,6 +5884,8 @@ def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | Non
     # channel headers that a bare grammar would mask.
     if reasoning_parser is None and engine.model_type == "gpt_oss":
         return "harmony"
+    if reasoning_parser is None and engine.model_type in INKLING2_MODEL_TYPES:
+        return "inkling2"
     return reasoning_parser
 
 
@@ -5852,6 +5904,10 @@ def _compile_with_structural_tag(
     import xgrammar as xgr
 
     ct_kwargs = chat_template_kwargs or {}
+    if reasoning_parser == "inkling2":
+        return compile_answer_grammar(
+            compiler, fmt, ct_kwargs, max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT
+        )
     if reasoning_parser == "minimax_m3":
         reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
     else:
@@ -7323,10 +7379,8 @@ async def stream_chat_completion(
             total_time = end_time - start_time
             pt = last_output.prompt_tokens
             ct = last_output.completion_tokens
-            reasoning_token_count = (
-                len(engine.tokenizer.encode(accumulated_reasoning))
-                if accumulated_reasoning
-                else 0
+            reasoning_token_count = _estimate_reasoning_tokens(
+                engine.tokenizer, accumulated_reasoning, ct
             )
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
@@ -9169,8 +9223,8 @@ async def create_response(
                         )
                     )
 
-            reasoning_token_count = (
-                len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+            reasoning_token_count = _estimate_reasoning_tokens(
+                engine.tokenizer, reasoning_text, output.completion_tokens
             )
             usage = build_response_usage(
                 input_tokens=output.prompt_tokens,
@@ -9976,8 +10030,8 @@ async def stream_responses_api(
             f"{last_output.completion_tokens} tokens in {total_duration:.2f}s "
             f"({tokens_per_sec:.1f} tok/s)"
         )
-        reasoning_token_count = (
-            len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+        reasoning_token_count = _estimate_reasoning_tokens(
+            engine.tokenizer, reasoning_text, last_output.completion_tokens
         )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,

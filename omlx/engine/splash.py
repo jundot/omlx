@@ -2,8 +2,8 @@
 """Splash engine: serve a model through a Splash server process.
 
 Splash (https://github.com/incoai/splash) runs Qwen3.8-27B,
-Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next and
-Flint on its own Metal engine with DFlash2 speculative decoding.
+Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next,
+Flint and Inkling-2-Mini on its own Metal engine with DFlash2 speculative decoding.
 It is a separate program, so this engine does not load weights in-process.
 ``start()`` stages the oMLX model folder as an entry of a private Hugging Face
 cache, launches ``splash serve --offline`` for it on a loopback port and
@@ -157,11 +157,14 @@ MAX_CONCURRENT_REQUESTS_VERSION = (1, 7, 1)
 _PRUNED_EXPERTS_MULTIPLE = 8
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
-# Every family's native window. From 1.4.0 on Splash serves more with YaRN,
-# which changes answers at every length.
 SPLASH_NATIVE_CONTEXT = 262144
 SPLASH_YARN_CONTEXT = 1010000
 YARN_VERSION = (1, 4, 0)
+_INKLING2_FAMILY = "Inkling-2-Mini"
+_INKLING2_TEXT_TYPE = "inkling2_loop_text"
+_INKLING2_CONTEXT = 1010000
+_INKLING2_LAYER_VISITS = 48
+_INKLING2_FULL_ATTENTION_VISITS = 8
 SPLASH_INSTALL_HINT = (
     "Splash is not installed: brew install incoai/tap/splash (M3 or later), "
     "or splash-m1 for M1/M2 Macs (https://github.com/paperniuk/splash/releases)"
@@ -235,19 +238,30 @@ SPLASH_FAMILIES: dict[str, dict[str, Any]] = {
         "num_experts": 256,
         "num_experts_per_tok": 6,
     },
+    _INKLING2_FAMILY: {
+        "model_type": _INKLING2_TEXT_TYPE,
+        "hidden_size": 2304,
+        "num_hidden_layers": 24,
+        "vocab_size": 201024,
+        "n_routed_experts": 128,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "num_experts_per_tok": 8,
+    },
 }
 # The first Splash release that serves each family, where later than 1.3.0.
 _FAMILY_VERSIONS = {
     "Qwen3.8-Flash-Next": FLASH_NEXT_VERSION,
     "Qwen3.5-122B-A10B": (1, 4, 1),
     "Flint": (1, 4, 1),
+    _INKLING2_FAMILY: (1, 7, 3),
 }
 # Families Splash loads from GGUFs only, not from MLX checkpoints.
 _GGUF_ONLY_FAMILIES = frozenset({"Qwen3.8-Flash-Next", "Flint"})
-# Families without a vision tower; Splash serves their models text only.
 _TEXT_ONLY_FAMILIES = frozenset({"Flint"})
 # Families without YaRN; a longer --max-context stops their startup.
-_NATIVE_CONTEXT_FAMILIES = frozenset({"Flint"})
+_NATIVE_CONTEXT_FAMILIES = frozenset({"Flint", _INKLING2_FAMILY})
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 _SHARD_INDEX = "model.safetensors.index.json"
 # Splash serves vision only with one of these from the target repository.
@@ -261,6 +275,7 @@ SPLASH_DRAFT_REPOS = {
     "Qwen3.8-Flash-Next": "incoai/Qwen3.8-Flash-Next-DFlash2",
     "Qwen3.5-122B-A10B": "incoai/Ornith-1.5-122B-DFlash2",
     "Flint": "incoai/Flint-DFlash2",
+    _INKLING2_FAMILY: "incoai/Inkling-2-Mini-DFlash2",
 }
 
 # Splash quantizes the BF16 DFlash2 draft to 4 bits when it loads it.
@@ -587,11 +602,14 @@ def _quantization_problem(config: dict, binary: SplashBinary) -> str:
 
 def _is_splash_draft(draft: dict, text: dict) -> bool:
     architectures = draft.get("architectures") or []
+    target_layers = text.get("num_hidden_layers")
+    if text.get("model_type") == _INKLING2_TEXT_TYPE:
+        target_layers = _INKLING2_LAYER_VISITS
     return (
         "DFlash2DraftModel" in architectures
         and draft.get("hidden_size") == text.get("hidden_size")
         and draft.get("vocab_size") == text.get("vocab_size")
-        and draft.get("num_target_layers") == text.get("num_hidden_layers")
+        and draft.get("num_target_layers") == target_layers
     )
 
 
@@ -614,13 +632,19 @@ class SplashTarget:
     draft_path: Path
 
     @property
+    def native_context(self) -> int:
+        if self.family == _INKLING2_FAMILY:
+            return _INKLING2_CONTEXT
+        return SPLASH_NATIVE_CONTEXT
+
+    @property
     def max_context(self) -> int:
         """The largest ``--max-context`` Splash starts with."""
         if (
             self.family in _NATIVE_CONTEXT_FAMILIES
             or self.binary.version_tuple < YARN_VERSION
         ):
-            return SPLASH_NATIVE_CONTEXT
+            return self.native_context
         return SPLASH_YARN_CONTEXT
 
 
@@ -769,7 +793,9 @@ def _weight_bytes(path: Path) -> int:
 def _kv_bytes_per_token(text: dict, kv_format: str) -> int:
     layer_types = text.get("layer_types") or []
     layers = sum(1 for kind in layer_types if kind == "full_attention")
-    if not layers:
+    if text.get("model_type") == _INKLING2_TEXT_TYPE:
+        layers = _INKLING2_FULL_ATTENTION_VISITS
+    elif not layers:
         layers = text["num_hidden_layers"] // text.get("full_attention_interval", 1)
     values = layers * 2 * text["num_key_value_heads"] * text["head_dim"]
     # int8 pages carry one 1-byte scale per 64 values.
@@ -847,8 +873,10 @@ def _snapshot_additions(model_path: Path) -> dict[str, Path | bytes]:
         index = {**index, "weight_map": weight_map}
         additions[_SHARD_INDEX] = json.dumps(index, indent=2).encode()
     config = _read_config(model_path) or {}
-    if splash_has_vision(config) and not any(
-        (model_path / name).is_file() for name in _PROCESSOR_FILES
+    if (
+        splash_has_vision(config)
+        and splash_family(config) != _INKLING2_FAMILY
+        and not any((model_path / name).is_file() for name in _PROCESSOR_FILES)
     ):
         vision = config["vision_config"]
         processor = {
@@ -1087,7 +1115,7 @@ class _StreamState:
     def add_choice(self, choice: dict[str, Any]) -> tuple[str, bool]:
         """Apply one streamed choice; returns (new text, produced output)."""
         self.finish_reason = choice.get("finish_reason") or self.finish_reason
-        delta = choice.get("delta") or {}
+        delta = choice.get("delta") or {"content": choice.get("text")}
         piece = ""
         if delta.get("reasoning_content"):
             piece += ("" if self.in_think else "<think>") + delta["reasoning_content"]
@@ -1567,7 +1595,13 @@ class SplashEngine(BaseEngine):
             "repetition_penalty": repetition_penalty,
             "presence_penalty": presence_penalty,
         }
-        for key in ("frequency_penalty", "stop", "seed", "response_format"):
+        for key in (
+            "frequency_penalty",
+            "stop",
+            "seed",
+            "response_format",
+            "ignore_eos",
+        ):
             if kwargs.get(key) is not None:
                 body[key] = kwargs[key]
         # oMLX's resolved budget (request over model settings); the in-process
@@ -1578,9 +1612,12 @@ class SplashEngine(BaseEngine):
         return body
 
     async def _stream(
-        self, body: dict[str, Any], request_id: str | None = None
+        self,
+        body: dict[str, Any],
+        request_id: str | None = None,
+        path: str = "/v1/chat/completions",
     ) -> AsyncIterator[GenerationOutput]:
-        """POST a streaming chat request to Splash and yield oMLX outputs.
+        """POST a streaming request to Splash and yield oMLX outputs.
 
         Timestamps use time.perf_counter(), the clock oMLX measures time to
         first token and generation speed with.
@@ -1600,9 +1637,7 @@ class SplashEngine(BaseEngine):
         self._active += 1
         self._requests += 1
         try:
-            async with self._client.stream(
-                "POST", "/v1/chat/completions", json=body
-            ) as response:
+            async with self._client.stream("POST", path, json=body) as response:
                 if response.status_code != 200:
                     detail = (await response.aread()).decode(errors="replace")
                     if 400 <= response.status_code < 500:
@@ -1754,14 +1789,33 @@ class SplashEngine(BaseEngine):
     # -- plain completions -----------------------------------------------------------
 
     async def stream_generate(
-        self, prompt: str | list[int], **kwargs
+        self,
+        prompt: str | list[int],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
-        # oMLX forwards chat requests only; there is no plain text path.
-        raise InvalidRequestError(
-            "Splash models serve chat requests only; use /v1/chat/completions, "
-            "/v1/responses or /v1/messages"
+        body = self._request_body(
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            kwargs,
         )
-        yield  # pragma: no cover - makes this an async generator
+        body.pop("thinking_token_budget", None)
+        body["prompt"] = prompt
+        async for output in self._stream(
+            body, kwargs.get("_request_id"), "/v1/completions"
+        ):
+            yield output
 
     async def generate(self, prompt: str | list[int], **kwargs) -> GenerationOutput:
         return await self._collect(self.stream_generate(prompt, **kwargs))

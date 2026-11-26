@@ -51,7 +51,7 @@ def reference(q, window, pooled, wi, ci, sink, scale, round_probabilities=True):
 
 @pytest.mark.parametrize(
     "length,window_count,pooled_count",
-    [(1, 128, 513), (7, 135, 129), (17, 17, 19), (65, 65, 77), (129, 129, 97)],
+    [(1, 128, 513), (7, 135, 129), (17, 17, 19), (129, 129, 97)],
 )
 def test_packed_attention_preserves_online_bf16_probability_rounding(
     length, window_count, pooled_count

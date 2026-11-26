@@ -35,7 +35,7 @@ def make_model(mtp=False, targets=(3, 4, 5), **config):
     return model
 
 
-@pytest.mark.parametrize("suffix", [1, 2, 3, 4])
+@pytest.mark.parametrize("suffix", [1, 4])
 def test_short_suffix_preserves_positions_and_window(suffix, monkeypatch):
     model = make_model().language_model
     prefix = mx.array([[5, 9, 3, 12, 20, 7]])

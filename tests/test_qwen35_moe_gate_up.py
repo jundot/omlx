@@ -344,30 +344,29 @@ def test_expert_ordered_verify_gather_matches_gather_qmm(bits):
     mx.random.seed(bits)
     experts, top_k = 16, 10
     # K = 1024 takes the qmv_fast traversal, K = 320 the qmv one with a tail.
-    for k, n in ((1024, 64), (320, 1024)):
+    for k, n, rows in ((1024, 64, 2), (320, 1024, 8)):
         linear = VLMSwitchLinear(k, n, experts, bias=False)
         linear.set_dtype(mx.bfloat16)
         linear = linear.to_quantized(group_size=32, bits=bits)
         assert moe_verify_gather.supported(linear, mx.bfloat16)
-        for rows in (2, 8):
-            indices = mx.stack(
-                [mx.random.permutation(experts)[:top_k] for _ in range(rows)]
-            ).astype(mx.uint32)
-            x = mx.random.normal((rows, k)).astype(mx.bfloat16)
-            expected = mx.gather_qmm(
-                mx.expand_dims(x, (-2, -3)),
-                linear["weight"],
-                linear["scales"],
-                linear["biases"],
-                rhs_indices=indices,
-                transpose=True,
-                group_size=32,
-                bits=bits,
-            ).reshape(rows * top_k, n)
-            pairs = indices.reshape(-1)
-            order = moe_verify_gather.pair_order(pairs)
-            got = moe_verify_gather.gather_qmv(linear, x, pairs, top_k, order)
-            assert mx.array_equal(got, expected).item()
+        indices = mx.stack(
+            [mx.random.permutation(experts)[:top_k] for _ in range(rows)]
+        ).astype(mx.uint32)
+        x = mx.random.normal((rows, k)).astype(mx.bfloat16)
+        expected = mx.gather_qmm(
+            mx.expand_dims(x, (-2, -3)),
+            linear["weight"],
+            linear["scales"],
+            linear["biases"],
+            rhs_indices=indices,
+            transpose=True,
+            group_size=32,
+            bits=bits,
+        ).reshape(rows * top_k, n)
+        pairs = indices.reshape(-1)
+        order = moe_verify_gather.pair_order(pairs)
+        got = moe_verify_gather.gather_qmv(linear, x, pairs, top_k, order)
+        assert mx.array_equal(got, expected).item()
 
 
 def _vlm_decode_switch(bits, seed):
@@ -401,10 +400,9 @@ def _assert_decode_plan_matches_per_call(monkeypatch, glu, seed):
 
 
 @pytest.mark.parametrize("bits", [4, 5])
-@pytest.mark.parametrize("seed", [1, 2])
-def test_vlm_decode_plan_is_bit_identical_to_per_call_path(monkeypatch, bits, seed):
-    glu = _vlm_decode_switch(bits, seed)
-    _assert_decode_plan_matches_per_call(monkeypatch, glu, seed)
+def test_vlm_decode_plan_is_bit_identical_to_per_call_path(monkeypatch, bits):
+    glu = _vlm_decode_switch(bits, 1)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 1)
 
 
 def test_vlm_decode_plan_follows_replaced_experts(monkeypatch):

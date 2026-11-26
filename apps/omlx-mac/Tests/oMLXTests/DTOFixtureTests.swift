@@ -113,8 +113,8 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(stats.port)
         XCTAssertNotNil(stats.cliPrefix,
                         "Stats must carry cli_prefix so Integrations can render `omlx launch …` commands.")
-        XCTAssertNotNil(stats.apiKey,
-                        "Stats must surface api_key (empty string allowed) so the Welcome-skip path can recover it.")
+        XCTAssertNotNil(stats.apiKeySet,
+                        "Stats must surface api_key_set so Integrations can mask the Claude env recipe.")
 
         // active_models is the structure Status renders; nested fields can
         // be nil but the wrapper must always decode.

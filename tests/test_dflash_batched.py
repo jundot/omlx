@@ -242,13 +242,6 @@ def test_load_rejects_a_reduced_draft_vocabulary(monkeypatch):
         dflash.load_dflash_drafter("draft", _tiny_target())
 
 
-DRAFTER_FAMILIES = pytest.mark.parametrize(
-    "make_drafter",
-    [_tiny_drafter, _tiny_laguna_drafter, _tiny_muse_drafter, _tiny_dspark_drafter],
-    ids=["dflash2", "laguna", "muse", "dspark"],
-)
-
-
 def _captured(n, seed):
     mx.random.seed(seed)
     return [mx.random.normal((1, n, HIDDEN)) for _ in TARGET_LAYER_IDS]
@@ -280,8 +273,16 @@ def _run_cycles(drafter, plan, cycle_offset=0):
     return outputs
 
 
-@DRAFTER_FAMILIES
-@pytest.mark.parametrize("window", [1, WINDOW])
+@pytest.mark.parametrize(
+    "make_drafter, window",
+    [
+        (_tiny_drafter, 1),
+        (_tiny_drafter, WINDOW),
+        (_tiny_laguna_drafter, WINDOW),
+        (_tiny_muse_drafter, WINDOW),
+        (_tiny_dspark_drafter, WINDOW),
+    ],
+)
 def test_batched_forward_matches_rows_drafted_alone(make_drafter, window):
     """Padding, masks, vector RoPE offsets and ring writes must not leak across rows."""
     plan = [

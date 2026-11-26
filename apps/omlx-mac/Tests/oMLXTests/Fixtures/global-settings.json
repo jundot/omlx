@@ -68,7 +68,6 @@
     },
     "auth": {
         "api_key_set": true,
-        "api_key": "sk-omlx-EXAMPLE-KEY-REDACTED",
         "skip_api_key_verification": false,
         "sub_keys": []
     },

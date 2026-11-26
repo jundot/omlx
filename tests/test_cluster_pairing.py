@@ -8,6 +8,7 @@ joiner/coordinator APIs.
 """
 
 import base64
+import hashlib
 import json
 import stat
 import threading
@@ -42,6 +43,16 @@ from omlx.cluster.pairing import (
     unwrap_cluster_key,
     wrap_cluster_key,
 )
+
+
+@pytest.fixture(autouse=True)
+def cheap_pbkdf2(monkeypatch):
+    derive = hashlib.pbkdf2_hmac
+
+    def scaled(name, password, salt, iterations, dklen=None):
+        return derive(name, password, salt, iterations // 1000, dklen)
+
+    monkeypatch.setattr(hashlib, "pbkdf2_hmac", scaled)
 
 
 class _Clock:

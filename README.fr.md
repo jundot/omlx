@@ -120,7 +120,7 @@ brew services restart omlx  # Redémarrer
 brew services info omlx     # Vérifier le statut
 ```
 
-Le service lance `omlx serve` avec les paramètres par défaut (`~/.omlx/models`, port 8000). Pour personnaliser, définissez des variables d'environnement (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) ou lancez `omlx serve --model-dir /votre/chemin` une fois pour sauvegarder les paramètres dans `~/.omlx/settings.json`.
+Le service lance `omlx serve` avec les paramètres par défaut (`~/.omlx/models`, port 8000). Pour personnaliser, lancez `omlx serve --model-dir /votre/chemin` une fois pour sauvegarder les paramètres dans `~/.omlx/settings.json`.
 
 Les logs sont écrits à deux endroits :
 - **Log du service** : `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
@@ -236,6 +236,7 @@ Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'us
 | `POST /v1/rerank` | Reranking de documents |
 | `POST /v1/systemone` | Décisions typées avec les modèles de décision ou de chat (TypeSafe System One) |
 | `GET /v1/models` | Lister les modèles disponibles |
+| `GET /v1/models/{model_id}` | Récupérer un modèle |
 | `POST /tokenize`, `POST /detokenize` | API de tokenisation compatible vLLM (aussi sous `/v1`) |
 
 L'API d'administration (réglages, modèles, téléchargements, quantification, benchmarks) accepte la clé API principale comme jeton Bearer et fonctionne aussi en mode headless. Voir [Admin API](docs/admin-api.md).

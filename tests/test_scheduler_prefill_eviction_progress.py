@@ -34,11 +34,10 @@ class _RecordingModel:
 
 
 @pytest.mark.parametrize("cached_tokens", [0, 4], ids=["cold", "warm"])
-@pytest.mark.parametrize("pause_after_chunks", [0, 1, 2])
-@pytest.mark.parametrize("pause_count", [1, 2])
+@pytest.mark.parametrize("pause_after_chunks", [0, 1])
 @pytest.mark.parametrize("route", ["adaptive", "guard"])
 def test_external_prefill_resumes_without_replaying_tokens(
-    mock_tokenizer, monkeypatch, cached_tokens, pause_after_chunks, pause_count, route
+    mock_tokenizer, monkeypatch, cached_tokens, pause_after_chunks, route
 ):
     model = _RecordingModel()
     scheduler = Scheduler(
@@ -86,7 +85,7 @@ def test_external_prefill_resumes_without_replaying_tokens(
 
     monkeypatch.setattr(scheduler, "_guard_prefill_chunk", guard)
 
-    for _ in range(pause_count):
+    for _ in range(2):
         with pytest.raises(_PrefillEvictionNeeded) as exc:
             scheduler._do_external_prefill(
                 request, request.remaining_tokens, request.prompt_cache

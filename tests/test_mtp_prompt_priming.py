@@ -369,9 +369,11 @@ def strict_model():
     """Build and run the strict chunk/seam oracle with CPU reductions."""
     previous = mx.default_device()
     mx.set_default_device(mx.cpu)
+    mx.disable_compile()
     try:
         yield _make_tiny_model()
     finally:
+        mx.enable_compile()
         mx.set_default_device(previous)
 
 

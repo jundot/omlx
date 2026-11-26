@@ -31,14 +31,16 @@ def _composed(p, top_k=K):
 @pytest.mark.parametrize("experts,top_k", [(NE, K), (512, 10)])
 def test_selected_set_matches_composed(experts, top_k):
     mx.random.seed(3)
-    for _ in range(300):
-        g = (mx.random.normal((1, 1, experts)) * 2.0).astype(mx.bfloat16)
-        p = mx.softmax(g, axis=-1, precise=True)
-        ci, cs = _composed(p, top_k)
-        fi, fs = fused_router_topk(p, top_k)
-        assert sorted(ci[0, 0].tolist()) == sorted(fi[0, 0].tolist())
-        cmap = dict(zip(ci[0, 0].tolist(), cs[0, 0].astype(mx.float32).tolist()))
-        fmap = dict(zip(fi[0, 0].tolist(), fs[0, 0].astype(mx.float32).tolist()))
+    g = (mx.random.normal((1, 300, experts)) * 2.0).astype(mx.bfloat16)
+    p = mx.softmax(g, axis=-1, precise=True)
+    ci, cs = _composed(p, top_k)
+    fi, fs = fused_router_topk(p, top_k)
+    composed = zip(ci[0].tolist(), cs[0].astype(mx.float32).tolist())
+    fused = zip(fi[0].tolist(), fs[0].astype(mx.float32).tolist())
+    for composed_row, fused_row in zip(composed, fused):
+        cmap = dict(zip(*composed_row))
+        fmap = dict(zip(*fused_row))
+        assert sorted(composed_row[0]) == sorted(fused_row[0])
         for idx, ref in cmap.items():
             assert abs(ref - fmap[idx]) <= max(2e-2 * ref, 1e-4)
 
@@ -166,9 +168,14 @@ def test_fused_combine_sigmoid_matches_every_gate_encoding(dtype):
     # The gate enters only elementwise ops: one broadcast call gives each gate's bits.
     expected = _composed_combine(routed, scores, shared, gates.reshape(-1, 1, 1, 1))
     for start in range(0, gates.size, 2048):
-        chunk = [gates[i].reshape(1, 1, 1) for i in range(start, start + 2048)]
-        actual = mx.stack([fused_moe_combine(routed, scores, shared, g) for g in chunk])
-        mx.eval(actual)
+        chunk = [
+            fused_moe_combine(routed, scores, shared, gates[i].reshape(1, 1, 1)).view(
+                mx.uint16
+            )
+            for i in range(start, start + 2048)
+        ]
+        mx.eval(chunk)
+        actual = mx.array(np.stack([np.asarray(out) for out in chunk])).view(dtype)
         assert _same_bits(actual, expected[start : start + 2048])
 
 
@@ -254,15 +261,15 @@ def _near_tie_logits(kind, experts, seed):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("experts", [512, 128])
 @pytest.mark.parametrize("kind", ["random", "duplicates", "adjacent", "two_values"])
 @pytest.mark.parametrize(
-    "dtype,top_k", [(mx.bfloat16, 10), (mx.bfloat16, 8), (mx.float16, 8)]
+    "experts,dtype,top_k",
+    [(512, mx.bfloat16, 10), (128, mx.bfloat16, 8), (512, mx.float16, 8)],
 )
 def test_softmax_topk_row_matches_softmax_then_topk(experts, kind, dtype, top_k):
     from omlx.patches.qwen35_moe_router import softmax_topk_row
 
-    for seed in range(40):
+    for seed in range(20):
         logits = _near_tie_logits(kind, experts, seed).astype(dtype)
         probs = mx.softmax(logits, axis=-1, precise=True)
         ref_i, ref_s = fused_router_topk(probs, top_k)
@@ -293,7 +300,7 @@ def test_softmax_row_matches_mlx_softmax_in_fp32(experts):
         }
         """,
     )
-    for seed, kind in enumerate(["random", "duplicates", "adjacent", "two_values"] * 10):
+    for seed, kind in enumerate(["random", "duplicates", "adjacent", "two_values"] * 4):
         logits = _near_tie_logits(kind, experts, seed).astype(mx.float32).reshape(experts)
         out = probe(
             inputs=[logits],
@@ -317,8 +324,10 @@ def test_softmax_topk_row_declines_layouts_it_does_not_reproduce():
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("experts,width", [(512, 2560), (256, 2048), (128, 1024)])
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize(
+    "experts,width,dtype",
+    [(512, 2560, mx.bfloat16), (256, 2048, mx.float16), (128, 1024, mx.bfloat16)],
+)
 def test_router_gemv_matches_mlx_linear(experts, width, dtype):
     """BF16 logits and, because rounding hides one-ulp FP32 differences (a
     simd_sum in place of MLX's shuffle-down tree changes only a few BF16

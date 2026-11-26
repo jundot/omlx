@@ -246,14 +246,14 @@ final class QuantizationScreenVM {
     /// keyboard arrows) collapse to a single network round-trip.
     func scheduleEstimateRefresh(client: OMLXClient) {
         estimateDebounceTask?.cancel()
-        if selectedModelPath.isEmpty {
-            estimate = nil
-            return
-        }
+        estimate = nil
+        guard !selectedModelPath.isEmpty else { return }
         let path = selectedModelPath
         let level = oqLevel
         let preserve = selectedHasMTP && preserveMtp
         let preserveTables = selectedHasEngram && preserveNgram
+        let onlyText = textOnly
+        let outputDtype = dtype
         estimateDebounceTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(300))
             if Task.isCancelled { return }
@@ -262,14 +262,14 @@ final class QuantizationScreenVM {
                     modelPath: path,
                     oqLevel: level,
                     preserveMtp: preserve,
-                    preserveNgramTable: preserveTables
+                    preserveNgramTable: preserveTables,
+                    textOnly: onlyText,
+                    dtype: outputDtype
                 )
-                await MainActor.run {
-                    guard let self else { return }
-                    // Drop the result if the user has moved on to a different
-                    // model since this request was kicked off.
-                    if self.selectedModelPath == path { self.estimate = est }
+                guard let self, !Task.isCancelled, self.selectedModelPath == path else {
+                    return
                 }
+                self.estimate = est
             } catch {
                 // Silent — the strip will read "Calculating…" which is fine
                 // for a transient estimate failure.

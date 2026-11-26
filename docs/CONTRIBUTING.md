@@ -29,7 +29,7 @@ See [Development](../README.md#development) for the other `make` targets and app
 - If you haven't had a PR merged here before, open an issue or discussion before sending a PR with over 1,000 changed lines or a new subsystem, so I can check the approach before you put in the work. I move such PRs to draft until that discussion happens.
 - Keep each PR focused on one problem or coherent feature. Include the settings, API, and UI integration it needs, but separate unrelated changes. For stacked PRs, explain the dependency and merge order.
 - Fix the underlying problem and reuse existing code paths. Preserve supported behavior; explain any compatibility changes or performance tradeoffs.
-- Follow the existing style, Black formatting, and Ruff configuration. Keep unrelated formatting and development artifacts out of the diff. Preserve third-party license notices and use Apache-2.0 SPDX headers for new original code.
+- Format the lines you change with Black and follow the Ruff configuration. Keep unrelated formatting and development artifacts out of the diff. Preserve third-party license notices and use Apache-2.0 SPDX headers for new original code.
 
 ## Test Your Change
 
@@ -67,6 +67,8 @@ Hardware-specific improvements are welcome. If you cannot run representative ben
 
 AI-assisted contributions are welcome. You are responsible for the change however it was produced: understand it, be able to explain it in review, and show how you validated it.
 
+The one part you write yourself is the TL;DR at the top of the PR. Write 1 to 3 sentences in any language. An AI may translate it into English and do nothing else to it. I close PRs without review when the TL;DR is missing, empty or written by an AI. The code rules in [AGENTS.md](../AGENTS.md) apply to every change, however it was written.
+
 ## Submit for Review
 
 Describe the problem, your approach, related issues, and validation results. Update documentation for user-facing changes. Keep unfinished work in Draft; mark it ready when you want review, or ask a specific question for early feedback.
@@ -86,5 +88,6 @@ I use labels and scheduled automation to keep the tracker focused on reports and
 - When I ask for more information, I add `needs-info`. A reply from the reporter removes it. If there is no reply within 14 days, the issue is closed.
 - When a new release line ships, issues whose last activity was before the previous line's first release are closed with the `outdated` label. For example, when 0.8.0 ships, issues last active before 0.7.0 are closed.
 - PRs are closed when they have merge conflicts and no new commits for 30 days, have no new commits for 60 days, or are drafts with no new commits for 30 days. PRs labeled `planned` are exempt.
+- A PR opened without its TL;DR, or without the box that says you wrote it, is closed with the `needs-tldr` label. Fix the description and it reopens automatically. A PR with the other checklist boxes unticked is moved to draft.
 
 Closing is not a judgment on the work. If a closed issue still happens on the latest release, open a new issue and link the old one. To continue a closed PR, rebase on current `main` and open a new PR.

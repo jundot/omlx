@@ -16,6 +16,7 @@ Note: Uses pytest-asyncio for async tests.
 """
 
 import asyncio
+from dataclasses import fields
 
 import pytest
 
@@ -421,6 +422,21 @@ class TestRequestOutputCollectorMergeOutputs:
         result = collector._merge_outputs(existing, new)
 
         assert result.tool_calls == [{"name": "test_tool", "arguments": "{}"}]
+
+    def test_merge_keeps_every_field(self):
+        values = {bool: True, int: 7, str: "x"}
+        new = RequestOutput(request_id="test-001")
+        for f in fields(RequestOutput):
+            if f.name != "request_id":
+                setattr(new, f.name, values.get(type(getattr(new, f.name)), [object()]))
+        collector = RequestOutputCollector(aggregate=True)
+
+        collector.put(RequestOutput(request_id="test-001"))
+        collector.put(new)
+        result = collector.get_nowait()
+
+        for f in fields(RequestOutput):
+            assert getattr(result, f.name) == getattr(new, f.name), f.name
 
     def test_merge_preserves_generated_time_range(self):
         """Aggregated chunks keep the producer-side token time range."""

@@ -35,6 +35,11 @@ from omlx.utils.network import (
 # =============================================================================
 
 
+@pytest.fixture(autouse=True)
+def answered_reverse_lookup(monkeypatch):
+    monkeypatch.setattr(network.socket, "getfqdn", lambda: "mac.example")
+
+
 def _make_global_settings(
     server_aliases: list[str] | None = None, host: str = "127.0.0.1"
 ):
@@ -1281,7 +1286,7 @@ def test_global_defaults_ignore_overrides_and_do_not_write(tmp_path, monkeypatch
     assert data["memory"]["prefill_memory_guard"] is True
     assert data["cache"]["ssd_cache_max_size"] == "auto"
     assert data["sampling"] == defaults.sampling.to_dict()
-    assert data["auth"]["api_key"] == ""
+    assert "api_key" not in data["auth"]
     assert gs.server.port == 9123
     assert gs.auth.api_key == "keep-key"
     assert gs.model.model_dirs == [str(tmp_path / "models")]

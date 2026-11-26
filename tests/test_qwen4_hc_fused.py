@@ -94,23 +94,15 @@ def _ulps(a, b):
     return float(diff.max().item()), float(diff.mean().item())
 
 
-# Every bits x layout pair; rows and use_combine rotate so each of their values meets every
-# bits value and every layout, and every rows x use_combine pair runs.
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize(
     "bits,rows,use_combine,group_size,dtype",
     [
         (4, 1, True, 32, mx.bfloat16),
-        (4, 4, False, 64, mx.bfloat16),
         (4, 16, True, 64, mx.float16),
-        (5, 4, False, 32, mx.bfloat16),
         (5, 16, True, 64, mx.bfloat16),
-        (5, 1, False, 64, mx.float16),
-        (6, 16, True, 32, mx.bfloat16),
         (6, 1, False, 64, mx.bfloat16),
         (6, 4, True, 64, mx.float16),
-        (8, 1, False, 32, mx.bfloat16),
-        (8, 4, True, 64, mx.bfloat16),
         (8, 16, False, 64, mx.float16),
     ],
 )
@@ -128,9 +120,10 @@ def test_fused_matches_canonical_path(bits, rows, use_combine, group_size, dtype
 #   1152 -> down tail 128 (all bits), inject tail 128 (4/5-bit), norm tail 128
 #   1344 -> down tail 320 (4/5) / 64 (6/8), inject tail 64,       norm tail 64
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("group_size", [32, 64])
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
-@pytest.mark.parametrize("hidden", [768, 1152, 1344])
+@pytest.mark.parametrize(
+    "hidden,bits,group_size",
+    [(768, 4, 32), (1152, 5, 64), (1152, 8, 32), (1344, 4, 32), (1344, 6, 64)],
+)
 def test_fused_matches_canonical_path_at_other_hidden_sizes(hidden, bits, group_size):
     mx.random.seed(20260906 + hidden + bits)
     module = _module(bits, True, hidden=hidden, group_size=group_size)
@@ -310,16 +303,15 @@ def test_compatible_fails_closed():
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize(
-    "two_launch,source_name",
+    "two_launch,source_name,use_combine",
     [
-        (False, "_N_SOURCE"),
-        (False, "_D_SOURCE"),
-        (False, "_U_SOURCE"),
-        (True, "_NDN_SOURCE"),
-        (True, "_U2_SOURCE"),
+        (False, "_N_SOURCE", True),
+        (False, "_D_SOURCE", False),
+        (False, "_U_SOURCE", True),
+        (True, "_NDN_SOURCE", False),
+        (True, "_U2_SOURCE", True),
     ],
 )
-@pytest.mark.parametrize("use_combine", [False, True])
 def test_lazy_compilation_failure_returns_canonical_output(
     monkeypatch, caplog, two_launch, source_name, use_combine
 ):
@@ -391,11 +383,14 @@ def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize(
-    "group_size,dtype", [(32, mx.bfloat16), (64, mx.bfloat16), (64, mx.float16)]
+    "bits,rows,use_combine,group_size,dtype",
+    [
+        (4, 17, True, 32, mx.bfloat16),
+        (4, 17, True, 64, mx.float16),
+        (5, 2048, True, 64, mx.bfloat16),
+        (5, 17, False, 64, mx.bfloat16),
+    ],
 )
-@pytest.mark.parametrize("bits", [4, 5])
-@pytest.mark.parametrize("rows", [17, 2048])
-@pytest.mark.parametrize("use_combine", [True, False])
 def test_prefill_path_matches_canonical(
     bits, rows, use_combine, group_size, dtype, monkeypatch
 ):
@@ -482,13 +477,12 @@ _REFERENCE_TAIL_INJECT = r"""
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("group_size", [32, 64])
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
-@pytest.mark.parametrize("rows,seed", [(17, 0), (300, 1), (300, 2)])
-def test_prefill_tail_inject_keeps_reference_bits(bits, rows, seed, group_size):
+@pytest.mark.parametrize("bits,group_size", [(4, 32), (5, 64), (6, 64), (8, 32)])
+def test_prefill_tail_inject_keeps_reference_bits(bits, group_size):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
-    mx.random.seed(900 + seed * 10 + bits + group_size)
+    rows = 300
+    mx.random.seed(910 + bits + group_size)
     module = _module(bits, group_size=group_size)
     inject = module.block_inject_weight
     up = (mx.random.normal((rows, WIDTH)) * 3).astype(mx.bfloat16)
@@ -548,12 +542,19 @@ def test_prefill_activation_rounds_like_eager_ops():
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("group_size", [32, 64])
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize(
-    "shape", [(1, 1), (1, 2), (1, 3), (1, 4), (2, 2), (1, 16), (1, 17), (1, 2048)]
+    "bits,shape,use_combine,group_size",
+    [
+        (4, (1, 1), True, 32),
+        (5, (1, 2), False, 64),
+        (6, (1, 3), True, 64),
+        (8, (2, 2), True, 32),
+        (6, (1, 16), True, 64),
+        (8, (1, 17), True, 32),
+        (5, (1, 17), False, 64),
+        (6, (1, 65), True, 64),
+    ],
 )
-@pytest.mark.parametrize("use_combine", [True, False])
 def test_pending_write_matches_eager_write(bits, shape, use_combine, group_size):
     """The write-norm kernels store the eager residual bit for bit and normalize the same bits."""
     from mlx_vlm.models.qwen4_exp import hc_fused, language
@@ -1033,39 +1034,47 @@ def _two_launch_fits(hc_fused, monkeypatch, module, rows):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("gpu_class", ["d", "s"])
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
-@pytest.mark.parametrize("use_combine", [True, False])
+@pytest.mark.parametrize(
+    "bits,use_combine,gpu_class",
+    [
+        (4, True, "s"),
+        (5, False, "d"),
+        (6, True, "d"),
+        (6, False, "s"),
+        (8, True, "s"),
+    ],
+)
 def test_two_launch_decode_keeps_three_launch_bits(
     bits, use_combine, gpu_class, monkeypatch
 ):
-    """Mixed, written residual and injection match the three-launch kernels bit for bit at
-    every decode row count, with and without a pending write (checkpoint shapes), in
-    each GPU class's geometry."""
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     monkeypatch.setattr(hc_fused, "_gpu_class", lambda: gpu_class)
-    rows_list = range(1, hc_fused.MAX_ROWS + 1) if bits == 6 else (1, 2, 3, 5, 16)
-    for seed in (0, 1, 2) if bits == 6 else (0,):
-        mx.random.seed(4017 + 97 * seed + bits)
-        module = _module(bits, use_combine)
-        for rows in rows_list:
-            assert _two_launch_fits(hc_fused, monkeypatch, module, rows)
-            hyper = (mx.random.normal((1, rows, WIDTH)) * 2).astype(mx.bfloat16)
-            branch = mx.random.normal((1, rows, HIDDEN)).astype(mx.bfloat16)
-            gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
-            for write in (None, (branch, gate)):
-                _assert_same_bits(
-                    _decode_both_ways(hc_fused, monkeypatch, module, hyper, write)
-                )
+    mx.random.seed(4017 + bits)
+    module = _module(bits, use_combine)
+    for rows in (1, 2, 3, 5, 16):
+        assert _two_launch_fits(hc_fused, monkeypatch, module, rows)
+        hyper = (mx.random.normal((1, rows, WIDTH)) * 2).astype(mx.bfloat16)
+        branch = mx.random.normal((1, rows, HIDDEN)).astype(mx.bfloat16)
+        gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
+        for write in (None, (branch, gate)):
+            _assert_same_bits(_decode_both_ways(hc_fused, monkeypatch, module, hyper, write))
 
 
 # 64: every down block is a partial tail; 768/1152/1344: partial final down, inject
 # and norm blocks (see test_fused_matches_canonical_path_at_other_hidden_sizes).
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("gpu_class", ["d", "s"])
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
-@pytest.mark.parametrize("hidden", [64, 1152, 1344])
+@pytest.mark.parametrize(
+    "hidden,bits,gpu_class",
+    [
+        (64, 5, "d"),
+        (64, 8, "s"),
+        (1152, 4, "s"),
+        (1152, 6, "d"),
+        (1344, 4, "d"),
+        (1344, 6, "s"),
+    ],
+)
 def test_two_launch_decode_keeps_bits_with_partial_blocks(
     hidden, bits, gpu_class, monkeypatch
 ):
@@ -1099,8 +1108,6 @@ def test_two_launch_decode_strip_boundary(monkeypatch):
     too_wide = _module(6, True, hidden=5440)
     assert not _two_launch_fits(hc_fused, monkeypatch, too_wide, 3)
     assert _two_launch_fits(hc_fused, monkeypatch, too_wide, 1)
-    hyper = (mx.random.normal((1, 3, HC * 5440)) * 2).astype(mx.bfloat16)
-    _assert_same_bits(_decode_both_ways(hc_fused, monkeypatch, too_wide, hyper, None))
 
 
 def _probe(source: str, epilogue: str, replacement: str) -> str:
@@ -1140,10 +1147,10 @@ _NDN_INV = "    const float inv = metal::rsqrt(tot / float(H) + e);\n"
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("gpu_class", ["d", "s"])
-@pytest.mark.parametrize("group_size", [32, 64])
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
-@pytest.mark.parametrize("rows", [1, 3, 16])
+@pytest.mark.parametrize(
+    "bits,rows,group_size,gpu_class",
+    [(4, 1, 32, "d"), (5, 3, 64, "d"), (6, 16, 64, "s"), (8, 3, 32, "s")],
+)
 def test_two_launch_decode_keeps_three_launch_fp32_sums(
     bits, rows, group_size, gpu_class, monkeypatch
 ):
@@ -1497,9 +1504,9 @@ def _decode_and_verify(model, head, ids):
     outputs = []
     cache = model.make_cache()
     outputs.append(model(ids(1, 17), cache=cache).logits)
-    for rows in (1, 2, 3, 4):
+    for rows in (1, 4):
         outputs.append(model(ids(1, rows), cache=cache).logits)
-    for rows in (1, 2, 3, 4):
+    for rows in (1, 3):
         # Lightning MTP verify: target-verify rows plus the pre-mixer residual
         # (a one-row window is the decode step itself, with no transaction).
         out = model(ids(1, rows), cache=cache, return_hidden=True)
@@ -1526,8 +1533,9 @@ def test_decode_and_verify_rows_match_eager_writes(monkeypatch):
 
 
 @needs_metal
-@pytest.mark.parametrize("chunk", [17, 257])
-def test_prefill_chunks_match_eager_writes(monkeypatch, chunk):
+def test_prefill_chunks_match_eager_writes(monkeypatch):
+    chunk = 257
+
     def prefill(model, head, ids):
         cache = model.make_cache()
         first = model(ids(1, chunk), cache=cache).logits

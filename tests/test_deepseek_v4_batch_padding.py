@@ -87,48 +87,6 @@ def _merge(caches):
 LONG = [(i * 7 + 3) % 64 for i in range(300)]   # 2 ratio-128 pooled rows, 75 ratio-4 rows
 
 
-# 5 tokens: under the 8-token window, so local rows keep left padding; 140: one ratio-128 pooled row vs the long two
-@pytest.mark.parametrize("short_len", [5, 140])
-@pytest.mark.parametrize("decode_consistent", [False, True])
-def test_short_request_after_long_one_leaves_batch(dsv4, short_len, decode_consistent):
-    model = _model(dsv4, decode_consistent)
-    short = [(i * 11 + 5) % 64 for i in range(short_len)]
-    steps_together, steps_alone = 3, 12
-    forced = [(i * 13 + 1) % 64 for i in range(steps_together + steps_alone)]
-
-    # reference: the short request on its own, never batched
-    ref_cache, _ = _prefill(model, short)
-    reference = []
-    for tok in forced:
-        out = model(mx.array([[tok]]), cache=ref_cache)[:, -1]
-        mx.eval(out)
-        reference.append(out[0])
-
-    # batched: prefill separately, merge, decode both rows, drop the long row, keep decoding the short one
-    long_cache, _ = _prefill(model, LONG)
-    short_cache, _ = _prefill(model, short)
-    batch = _merge([long_cache, short_cache])
-    long_forced = [(i * 17 + 2) % 64 for i in range(steps_together)]
-    got = []
-    for step in range(steps_together):
-        out = model(mx.array([[long_forced[step]], [forced[step]]]), cache=batch)[:, -1]
-        mx.eval(out)
-        got.append(out[1])
-    for layer_cache in batch:
-        layer_cache.filter([1])
-    for tok in forced[steps_together:]:
-        out = model(mx.array([[tok]]), cache=batch)[:, -1]
-        mx.eval(out)
-        got.append(out[0])
-
-    worst = max(float(mx.abs(g.astype(mx.float32) - r.astype(mx.float32)).max()) for g, r in zip(got, reference))
-    scale = max(float(mx.abs(r.astype(mx.float32)).max()) for r in reference)
-    argmax_ok = all(int(g.argmax()) == int(r.argmax()) for g, r in zip(got, reference))
-    # rounding between batched and unbatched kernels is allowed; attending to padding is not
-    assert worst <= 1e-2 * scale, f"short request drifted after the long one left: max |dlogit| {worst:.4f} (scale {scale:.3f})"
-    assert argmax_ok
-
-
 def _batched_short_logits(model, short, forced, steps_together):
     long_cache, _ = _prefill(model, LONG)
     short_cache, _ = _prefill(model, short)
@@ -148,14 +106,30 @@ def _batched_short_logits(model, short, forced, steps_together):
     return got
 
 
-@pytest.mark.parametrize("short_len", [5, 140])
-def test_exact_path_is_bitwise_equal_to_stock_after_the_long_request_leaves(dsv4, short_len):
-    """MTP on (decode-consistent exact path) must reproduce MTP off (stock path) bit for bit in the batch scenario:
-    while padding remains both take the masked stock path; once it is gone the mask is dropped and the exact path
-    matches the unmasked stock kernel."""
+@pytest.mark.parametrize(
+    "short_len", [pytest.param(5, id="left-padded-window"), pytest.param(140, id="fewer-pooled-rows")]
+)
+def test_short_request_after_long_one_leaves_batch(dsv4, short_len):
     short = [(i * 11 + 5) % 64 for i in range(short_len)]
     forced = [(i * 13 + 1) % 64 for i in range(3 + 20)]
-    stock = _batched_short_logits(_model(dsv4, False), short, forced, 3)
-    exact = _batched_short_logits(_model(dsv4, True), short, forced, 3)
-    differing = [i for i, (a, b) in enumerate(zip(stock, exact)) if not mx.array_equal(a, b).item()]
+    runs = []
+    for decode_consistent in (False, True):
+        model = _model(dsv4, decode_consistent)
+        got = _batched_short_logits(model, short, forced, 3)
+        runs.append(got)
+
+        alone_cache, _ = _prefill(model, short)
+        alone = []
+        for tok in forced[: 3 + 12]:
+            out = model(mx.array([[tok]]), cache=alone_cache)[:, -1]
+            mx.eval(out)
+            alone.append(out[0])
+
+        worst = max(float(mx.abs(g.astype(mx.float32) - r.astype(mx.float32)).max()) for g, r in zip(got, alone))
+        scale = max(float(mx.abs(r.astype(mx.float32)).max()) for r in alone)
+        argmax_ok = all(int(g.argmax()) == int(r.argmax()) for g, r in zip(got, alone))
+        assert worst <= 1e-2 * scale, f"short request drifted after the long one left: max |dlogit| {worst:.4f} (scale {scale:.3f})"
+        assert argmax_ok
+
+    differing = [i for i, (a, b) in enumerate(zip(*runs)) if not mx.array_equal(a, b).item()]
     assert not differing, f"exact path differs from stock at steps {differing}"

@@ -80,6 +80,7 @@ from ..utils.image import (
     extract_media_from_messages,
     image_hash_prefixes,
 )
+from ..utils.sampling import seed_request_stream
 from ..utils.video import (
     NATIVE_VIDEO_MODEL_TYPES,
     attach_native_video_processor,
@@ -5899,8 +5900,7 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             limit_ctx = contextlib.nullcontext()
 
-        if seed is not None:
-            mx.random.seed(seed)
+        seed_request_stream(seed)
 
         tokenizer = self._tokenizer
         if hasattr(tokenizer, "stopping_criteria"):

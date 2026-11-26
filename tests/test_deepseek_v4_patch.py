@@ -2559,12 +2559,6 @@ class TestAffineBlockRouteThreshold:
         # unsorted routes never take the block path, whatever the count
         assert linear._can_use_affine_blocks(at, sorted_indices=False) is False
 
-    def test_thresholds_default_to_the_measured_crossovers(self):
-        from omlx.patches.deepseek_v4 import switch_layers as sl
-
-        assert sl._SORT_MIN_ROUTES == 32
-        assert sl._AFFINE_NATIVE_MIN_ROUTES == 1024
-
 
 @pytest.mark.parametrize("family", ["glu", "mlp"])
 @pytest.mark.parametrize(

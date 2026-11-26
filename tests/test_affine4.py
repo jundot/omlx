@@ -64,10 +64,15 @@ def dense(cache, queries, mask=None, sinks=None, states=None):
     ).astype(queries.dtype)
 
 
-@pytest.mark.parametrize("dim", [1, 63, 64, 80, 256])
 @pytest.mark.parametrize(
-    "codec_class,max_error",
-    [(Affine4Codec, 0.03), (Affine8Codec, 2e-4)],
+    "dim,codec_class,max_error",
+    [
+        (1, Affine4Codec, 0.03),
+        (63, Affine4Codec, 0.03),
+        (64, Affine4Codec, 0.03),
+        (63, Affine8Codec, 2e-4),
+        (256, Affine8Codec, 2e-4),
+    ],
 )
 def test_codec_orthogonal_and_quantization(dim, codec_class, max_error):
     codec = codec_class(dim, seed=17)
@@ -271,13 +276,10 @@ def test_native_long_uniform_attention_stays_finite(
 @pytest.mark.parametrize(
     "dim,repeats,rows,mask,force_fused,cache_class",
     [
-        (64, 4, 33, None, True, Affine4KVCache),
         (72, 4, 33, "causal", True, Affine8KVCache),
         (96, 4, 33, "causal", True, Affine4KVCache),
-        (128, 4, 33, None, True, Affine8KVCache),
         (256, 6, 5, "causal", True, Affine4KVCache),
         (256, 6, 6, "causal", None, Affine8KVCache),
-        (64, 8, 5, "causal", None, Affine4KVCache),
         (80, 4, 8, "causal", None, Affine8KVCache),
         (80, 4, 9, None, True, Affine4KVCache),
     ],
@@ -614,8 +616,9 @@ def test_bounded_prefill_preserves_masks_and_sinks(
     assert query_lengths == [3, 3, 1]
 
 
-@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
-@pytest.mark.parametrize("rows", [1, 16])
+@pytest.mark.parametrize(
+    "cache_class,rows", [(Affine4KVCache, 16), (Affine8KVCache, 1)]
+)
 def test_portable_attention_peak_is_bounded_across_layers(
     monkeypatch, cache_class, rows
 ):

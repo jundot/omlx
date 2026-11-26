@@ -108,7 +108,6 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
 
     struct AuthSettings: Codable, Equatable, Sendable {
         let apiKeySet: Bool
-        let apiKey: String?
         let skipApiKeyVerification: Bool?
         let allowUnauthenticatedInference: Bool?
         let subKeys: [SubKeyDTO]?

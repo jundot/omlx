@@ -295,20 +295,25 @@ final class IntegrationsScreenVMTests: XCTestCase {
         let noKey = IntegrationsScreenVM()
         await noKey.load(client: client)
         noKey.claudeMode = "local"
-        XCTAssertEqual(noKey.claudeEnvRecipe, noKey.claudeEnvRecipeDisplay)
-        XCTAssertFalse(noKey.claudeEnvRecipe.contains("ANTHROPIC_AUTH_TOKEN="))
+        XCTAssertFalse(noKey.claudeEnvRecipeDisplay.contains("ANTHROPIC_AUTH_TOKEN="))
+        let noKeyCopy = try await noKey.claudeEnvRecipeForCopy(client: client)
+        XCTAssertEqual(noKeyCopy, noKey.claudeEnvRecipeDisplay)
 
         server.setApiKey("sk-live-secret")
         let vm = IntegrationsScreenVM()
         await vm.load(client: client)
         vm.claudeMode = "local"
-        XCTAssertTrue(vm.claudeEnvRecipe.contains("sk-live-secret"))
         XCTAssertFalse(vm.claudeEnvRecipeDisplay.contains("sk-live-secret"))
-        XCTAssertEqual(vm.claudeEnvRecipeDisplay.replacingOccurrences(of: "••••••••", with: "sk-live-secret"),
-                       vm.claudeEnvRecipe)
+        let copied = try await vm.claudeEnvRecipeForCopy(client: client)
+        XCTAssertTrue(copied.contains("sk-live-secret"))
+        XCTAssertEqual(
+            vm.claudeEnvRecipeDisplay.replacingOccurrences(of: "••••••••", with: "sk-live-secret"),
+            copied
+        )
 
         vm.claudeMode = "cloud"
-        XCTAssertEqual(vm.claudeEnvRecipe, vm.claudeEnvRecipeDisplay)
+        let cloudCopy = try await vm.claudeEnvRecipeForCopy(client: client)
+        XCTAssertEqual(cloudCopy, vm.claudeEnvRecipeDisplay)
     }
 }
 
@@ -343,22 +348,30 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
             heldPost = nil
             recordedSearchRequests = []
             searchResponse = ["ok": true, "results": [["title": "Example", "url": "https://example.com", "snippet": "Example result"]]]
-            stats = Self.statsBody(apiKey: "")
+            stats = Self.statsBody(apiKeySet: false)
+            revealedApiKey = ""
         }
     }
 
     /// Required stats aggregates plus the fields the command builders read.
-    private static func statsBody(apiKey: String) -> [String: Any] {
+    private static func statsBody(apiKeySet: Bool) -> [String: Any] {
         [
             "total_tokens_served": 0, "total_cached_tokens": 0, "cache_efficiency": 0.0,
             "total_prompt_tokens": 0, "total_completion_tokens": 0, "total_requests": 0,
             "avg_prefill_tps": 0.0, "avg_generation_tps": 0.0, "uptime_seconds": 0.0,
-            "host": "127.0.0.1", "port": 8000, "api_key": apiKey, "cli_prefix": "omlx",
+            "host": "127.0.0.1", "port": 8000, "api_key_set": apiKeySet, "cli_prefix": "omlx",
             "active_models": ["models": [Any]()],
         ]
     }
 
-    func setApiKey(_ apiKey: String) { lock.withLock { stats = Self.statsBody(apiKey: apiKey) } }
+    private var revealedApiKey: String = ""
+
+    func setApiKey(_ apiKey: String) {
+        lock.withLock {
+            stats = Self.statsBody(apiKeySet: !apiKey.isEmpty)
+            revealedApiKey = apiKey
+        }
+    }
 
     func setSearchResponse(_ body: [String: Any]) { lock.withLock { searchResponse = body } }
 
@@ -393,6 +406,8 @@ private final class IntegrationsSettingsServer: @unchecked Sendable {
             body = settings
         case ("GET", "/admin/api/stats"):
             body = stats
+        case ("POST", "/admin/api/auth/api-key"):
+            body = ["api_key": revealedApiKey]
         case ("GET", "/admin/api/models"):
             modelReadCount += 1
             if modelReadsRejected {
