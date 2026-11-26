@@ -146,13 +146,17 @@ audio = [
     # mlx-audio from commit (1157775, v0.6.5) with tts/stt/sts extras
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Neywa-Labs/mlx-audio@1157775c1999654b1ebde41ed03d88108e23f88b",
     # Keep dependencies for existing audio models removed from upstream extras.
+    "cn2an>=0.5.24",
     "espeakng-loader>=0.2.4",
+    "jieba>=0.42.1",
     "librosa==0.11.0",
     "misaki>=0.9.4",
     "num2words>=0.5.14",
     "numba>=0.60.0",
+    "ordered-set>=4.1.0",
     "phonemizer-fork>=3.3.2",
     "pyloudnorm>=0.2.0",
+    "pypinyin>=0.55.0",
     "spacy>=3.8.4",
     # WebSocket protocol impl for uvicorn (realtime STT endpoint). Pure
     # python; uvicorn's ws="auto" picks it up when installed.
@@ -184,6 +188,10 @@ bundle = [
     "pyloudnorm>=0.1.0",
     "sounddevice>=0.4.6",
     "misaki>=0.9.4",
+    "cn2an>=0.5.24",
+    "jieba>=0.42.1",
+    "ordered-set>=4.1.0",
+    "pypinyin>=0.55.0",
     "num2words>=0.5.14",
     "spacy>=3.8.4",
     "phonemizer-fork>=3.3.2",

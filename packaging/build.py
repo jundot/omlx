@@ -976,6 +976,12 @@ _STRIP_DIST_PREFIXES = [
     "torch-", "sympy-", "pyarrow-", "pandas-", "datasets-",
 ]
 
+_JIEBA_DIRS_UNUSED_BY_MISAKI = [
+    "jieba/analyse",
+    "jieba/lac_small",
+    "jieba/posseg",
+]
+
 
 def _strip_unused_packages(export_dir: Path):
     """Remove large packages not needed for inference from exported framework."""
@@ -1006,6 +1012,13 @@ def _strip_unused_packages(export_dir: Path):
                 item.unlink()
             saved += size
             print(f"    Removed {name} ({size / 1024 / 1024:.0f} MB)")
+
+    for rel in _JIEBA_DIRS_UNUSED_BY_MISAKI:
+        item = fw_site / rel
+        size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
+        shutil.rmtree(item)
+        saved += size
+        print(f"    Removed {rel} ({size / 1024 / 1024:.0f} MB)")
 
     print(f"  ✓ Stripped {saved / 1024 / 1024:.0f} MB total")
 
