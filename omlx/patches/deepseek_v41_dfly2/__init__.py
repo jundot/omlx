@@ -34,6 +34,7 @@ from .dfly2_heads import final_norm, hidden_correction, mtp_fusion
 from .dfly2_sparse_attention import selected_target_attention
 from .dsv41_bridge import DSV41History, DSV41TargetBridge
 from .dsv41_verify import GreedyVerification, greedy_prefix
+from .omlx_v41_capture import capture_attention_slice
 from .official_loader import (
     LoadPlan,
     LoadedOfficialWeights,
@@ -54,6 +55,7 @@ __all__ = [
     "OfficialDFly2Checkpoint",
     "build_dfly2_context",
     "build_layer_context",
+    "capture_attention_slice",
     "draft_block",
     "draft_layer_ids",
     "final_norm",

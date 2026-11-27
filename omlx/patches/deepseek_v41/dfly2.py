@@ -10,6 +10,7 @@ set ``model._dfly_cache = bridge`` before the generator invokes
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Mapping
 
 import mlx.core as mx
@@ -17,6 +18,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from ..deepseek_v41_dfly2 import (
+    capture_attention_slice,
     DSV41TargetBridge,
     hidden_correction,
 )
@@ -328,3 +330,36 @@ def attach(model_class):
 
 
 __all__ = ["DFly2Attention", "DFly2Block", "DFly2Config", "DFly2Heads", "DFly2StageCache", "attach", "load_official_weights", "make_cache", "make_stages", "map_official_weights"]
+
+
+def bind_bridge(model, bridge: DSV41TargetBridge):
+    """Route target attention slices into ``bridge`` for one request.
+
+    Installs the capture callback on the index-source layers that the draft
+    actually reads, and parks the bridge on the model where ``dspark_forward``
+    expects it. Returns a teardown that restores the previous state, so a
+    request can never leak its bridge into the next one.
+    """
+    cfg = DFly2Config.from_config(getattr(model, "_config", getattr(model, "args", {})))
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        raise RuntimeError("DFly2 needs a model with layers to bind a target bridge")
+    previous_bridge = getattr(model, "_dfly_cache", None)
+    installed = []
+    for layer_id in cfg.target_index_layers:
+        attention = layers[layer_id].self_attn
+        installed.append((attention, getattr(attention, "_omlx_dfly_capture", None)))
+        attention._omlx_dfly_capture = partial(
+            capture_attention_slice, bridge=bridge
+        )
+    model._dfly_cache = bridge
+
+    def teardown():
+        for attention, previous in installed:
+            if previous is None:
+                del attention._omlx_dfly_capture
+            else:
+                attention._omlx_dfly_capture = previous
+        model._dfly_cache = previous_bridge
+
+    return teardown

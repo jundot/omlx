@@ -195,3 +195,30 @@ def test_attached_forward_rejects_mismatched_target_stage_offsets():
     )
     with pytest.raises(ValueError, match="stage offsets differ"):
         host.dspark_forward(mx.zeros((1, 1, 32)), mx.array([[1]], dtype=mx.int32), [])
+
+
+def test_bind_bridge_installs_capture_and_tears_down(monkeypatch):
+    """The seam must be reversible: a request may not leak its bridge."""
+    from types import SimpleNamespace
+
+    from omlx.patches.deepseek_v41.dfly2 import bind_bridge
+    from omlx.patches.deepseek_v41_dfly2 import DSV41TargetBridge
+
+    attentions = {layer: SimpleNamespace() for layer in (28, 32, 36)}
+    model = SimpleNamespace(
+        _config={"dfly_config": {"block_size": 6, "mask_token_id": 128799, "index_topk": 512,
+                                  "target_kv_layers": [28, 32, 36], "target_index_layers": [28, 32, 36],
+                                  "hidden_correction": {"intermediate_size": 5120}}},
+        layers={layer: SimpleNamespace(self_attn=attention) for layer, attention in attentions.items()},
+    )
+    bridge = DSV41TargetBridge(target_layers=(28, 32, 36))
+
+    teardown = bind_bridge(model, bridge)
+    for attention in attentions.values():
+        assert getattr(attention, "_omlx_dfly_capture", None) is not None
+    assert model._dfly_cache is bridge
+
+    teardown()
+    for attention in attentions.values():
+        assert not hasattr(attention, "_omlx_dfly_capture")
+    assert model._dfly_cache is None
