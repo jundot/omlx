@@ -1027,6 +1027,7 @@ def test_quantized_conversion_and_loaded_projection(tmp_path):
     model, _ = load(tmp_path / "converted")
     projection = model.language_model.layers[0].attn.wq_a
     assert isinstance(projection, QuantizedProjection)
+    assert (projection.input_dims, projection.output_dims) == (32, 32)
     values = np.random.default_rng(14).normal(0, 0.1, (2, 32)).astype(np.float32)
     x = reference_activation(values)
     weight = decode_e4m3(fp8) * 0.125
