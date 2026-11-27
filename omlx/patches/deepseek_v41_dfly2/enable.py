@@ -9,6 +9,7 @@ is loading and wiring; no math.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -18,6 +19,8 @@ from .dfly2_heads import final_norm, hidden_correction, mtp_fusion
 from .dfly2_layer import make_draft_layer
 from .official_loader import OfficialDFly2Checkpoint, draft_layer_ids, required_prefixes
 from .runtime import DFly2Runtime
+
+logger = logging.getLogger(__name__)
 
 
 def _config_value(config: Any, *names: str, default: Any = None) -> Any:
@@ -109,4 +112,13 @@ def enable_dfly2(model: Any, checkpoint_dir: str | Path):
     for holder in (model, getattr(model, "language_model", None), getattr(model, "_language_model", None)):
         if holder is not None:
             holder._omlx_dspark_decode_enabled = True
+            # The cycle log line reads this: "DSpark" alone would be ambiguous
+            # between the checkpoint's own head and this replacement drafter.
+            holder._omlx_spec_backend_name = "DFly2"
+    logger.info(
+        "DFly2 draft replaces the checkpoint MTP head: block_size=%d target_kv_layers=%s draft_layers=%d",
+        checkpoint_config.get("block_size"),
+        checkpoint_config.get("target_kv_layers", checkpoint_config.get("target_kv_index_layers")),
+        len(runtime.layers) if hasattr(runtime, "layers") else -1,
+    )
     return runtime
