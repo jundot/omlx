@@ -249,3 +249,30 @@ def test_bridge_anchor_and_rollback_drop_rejected_tail():
     bridge.rollback(keep_positions=bridge.committed_anchor())
     ends = [segment.end for segment in bridge._window[28]]
     assert max(ends) == 5, ends
+
+
+def test_capture_at_position_zero_starts_a_fresh_bridge():
+    """A new prompt must not draft against the previous request's rows."""
+    import mlx.core as mx
+
+    from omlx.patches.deepseek_v41_dfly2 import capture_attention_slice
+    from omlx.patches.deepseek_v41_dfly2.dsv41_bridge import DSV41TargetBridge
+
+    bridge = DSV41TargetBridge(target_layers=(28,), index_topk=2, local_window=2)
+    row = mx.zeros((1, 2, 4))
+    picks = mx.array([[[0, -1], [1, -1]]], dtype=mx.int32)
+
+    capture_attention_slice(
+        bridge=bridge, layer=28, start=40, ratio=4,
+        window_latents=row, compressed_latents=row, compressed_start=40,
+        native_index_topk=picks,
+    )
+    assert bridge._window[28]
+
+    capture_attention_slice(
+        bridge=bridge, layer=28, start=0, ratio=4,
+        window_latents=row, compressed_latents=row, compressed_start=0,
+        native_index_topk=picks,
+    )
+    ends = [segment.end for segment in bridge._window[28]]
+    assert ends == [2], ends

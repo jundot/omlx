@@ -74,6 +74,20 @@ class DSV41TargetBridge:
         if value.ndim != dims or value.shape[0] != 1:
             raise ValueError(f"{name} must be [1,...] for one request row, got {value.shape}")
 
+    def reset(self) -> None:
+        """Drop every captured row: a new request starts from an empty bridge.
+
+        The bridge holds one request row by construction, so a forward that
+        begins at position zero is a new prompt and must not read the previous
+        request's rows.
+        """
+        for layer in self.target_layers:
+            self._window[layer].clear()
+            self._global[layer].clear()
+            self._index[layer].clear()
+        self.last_start = None
+        self.last_end = None
+
     def committed_anchor(self) -> int:
         """Absolute position just past the newest committed target token.
 

@@ -1841,6 +1841,16 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
             logger.info(f"IndexCache applied: freq={index_cache_freq}")
 
     apply_loopcd(model, model_settings)
+    # DFly2 replaces the checkpoint's own MTP head with a separate three-layer
+    # drafter that reads the target's cached latents and indexer picks. Off
+    # unless a checkpoint path is configured, so every other model load is
+    # untouched.
+    dfly2_checkpoint = getattr(model_settings, "dfly2_checkpoint", None)
+    if dfly2_checkpoint:
+        from ..patches.deepseek_v41_dfly2.enable import enable_dfly2
+
+        enable_dfly2(model, dfly2_checkpoint)
+        logger.info("DFly2 draft enabled from %s", dfly2_checkpoint)
     return model
 
 

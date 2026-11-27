@@ -48,6 +48,11 @@ def capture_attention_slice(
 
     # The reference Indexer returns positions in the compressed lattice. Do not
     # multiply -1, because it is the invalid sentinel consumed by sparse gather.
+    if start == 0:
+        # Position zero is a fresh prompt: the previous request's rows would
+        # otherwise be read by the first draft of this one.
+        bridge.reset()
+
     native = native_index_topk.astype(mx.int32)
     absolute_index_topk = mx.where(native >= 0, native * ratio, mx.array(-1, mx.int32))
     compressed_positions = (
