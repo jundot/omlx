@@ -222,3 +222,30 @@ def test_bind_bridge_installs_capture_and_tears_down(monkeypatch):
     for attention in attentions.values():
         assert not hasattr(attention, "_omlx_dfly_capture")
     assert model._dfly_cache is None
+
+
+def test_bridge_anchor_and_rollback_drop_rejected_tail():
+    """A rejected verify tail must never survive into the next draft."""
+    import mlx.core as mx
+
+    from omlx.patches.deepseek_v41_dfly2 import DSV41TargetBridge
+
+    bridge = DSV41TargetBridge(target_layers=(28,), index_topk=2, local_window=2)
+    with pytest.raises(RuntimeError):
+        bridge.committed_anchor()
+
+    def row(values):
+        return mx.array([[[float(v), float(v)] for v in values]])
+
+    def picks():
+        return mx.array([[[0, 1]]], dtype=mx.int32)
+
+    bridge.record(layer=28, start=0, window_latents=row([0, 1, 2]), global_positions=mx.array([], dtype=mx.int32),
+                  global_latents=mx.zeros((1, 0, 2)), index_topk=mx.array([[[0, 1], [0, 1], [0, 1]]], dtype=mx.int32))
+    assert bridge.committed_anchor() == 3
+    bridge.record(layer=28, start=3, window_latents=row([3, 4]), global_positions=mx.array([], dtype=mx.int32),
+                  global_latents=mx.zeros((1, 0, 2)), index_topk=mx.array([[[0, 1], [0, 1]]], dtype=mx.int32))
+    assert bridge.committed_anchor() == 5
+    bridge.rollback(keep_positions=bridge.committed_anchor())
+    ends = [segment.end for segment in bridge._window[28]]
+    assert max(ends) == 5, ends

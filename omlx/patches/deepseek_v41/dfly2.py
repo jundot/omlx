@@ -255,18 +255,6 @@ def _runtime_cfg(runtime, host):
     return runtime.cfg if isinstance(getattr(runtime, "cfg", None), DFly2Config) else DFly2Config.from_config(getattr(host, "_config", getattr(host, "args", {})))
 
 
-def _bridge_extent(bridge, cfg):
-    ends = []
-    for layer in cfg.target_kv_layers:
-        segments = bridge._window[layer]
-        if not segments:
-            raise RuntimeError("DFly2 target bridge has no captured MLA rows")
-        ends.append(max(segment.end for segment in segments))
-    if len(set(ends)) != 1:
-        raise ValueError("DFly2 target bridge stage offsets differ")
-    return ends[0]
-
-
 def _embed(host, ids):
     fn = getattr(host, "embed", None) or getattr(getattr(host, "model", None), "embed_tokens", None)
     if fn is None:
@@ -302,7 +290,20 @@ def attach(model_class):
         if not isinstance(bridge, DSV41TargetBridge):
             raise TypeError("_dfly_cache must be a DSV41TargetBridge")
         runtime, cfg = _runtime(self), _runtime_cfg(_runtime(self), self)
-        start = _bridge_extent(bridge, cfg)
+        # The target keeps only accepted rows; the bridge may still hold the
+        # rejected tail of a verify block. Trim to the committed anchor before
+        # reading, so a draft can never key on positions the target discarded.
+        anchor_position = bridge.committed_anchor()
+        bridge.rollback(keep_positions=anchor_position)
+        ends = []
+        for layer in cfg.target_kv_layers:
+            segments = bridge._window[layer]
+            if not segments:
+                raise RuntimeError("DFly2 target bridge has no captured MLA rows")
+            ends.append(max(segment.end for segment in segments))
+        if len(set(ends)) != 1:
+            raise ValueError("DFly2 target bridge stage offsets differ")
+        start = anchor_position
         delta = getattr(getattr(self, "_position_delta", None), "value", None)
         if delta is not None:
             start += int(delta)

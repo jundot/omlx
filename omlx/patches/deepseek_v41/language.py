@@ -442,6 +442,9 @@ class Attention(nn.Module):
                         compressed_latents=latent,
                         compressed_start=(kv_start if layer in c.kv_source_layers else start),
                         native_index_topk=shared["idx"],
+                        # A verify block commits only its accepted prefix; the
+                        # draft anchor must not run ahead of that.
+                        committed_rows=(1 if verify_state is not None else length),
                     )
             if latent is not None:
                 compressed = rope(

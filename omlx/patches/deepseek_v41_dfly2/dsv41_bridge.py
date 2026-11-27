@@ -62,11 +62,28 @@ class DSV41TargetBridge:
         # contiguous decoder/window segments above.
         self._global: dict[int, list[tuple[mx.array, mx.array]]] = {layer: [] for layer in self.target_layers}
         self._index: dict[int, list[_Segment]] = {layer: [] for layer in self.target_layers}
+        # Start position of the most recent target forward. After a decode step
+        # the committed anchor is exactly ``last_start + 1``; after a verify
+        # block it is somewhere inside that block, so a draft must not trust any
+        # captured row at or beyond it until the next forward rewrites them.
+        self.last_start: int | None = None
+        self.last_end: int | None = None
 
     @staticmethod
     def _require_row(name: str, value: mx.array, dims: int) -> None:
         if value.ndim != dims or value.shape[0] != 1:
             raise ValueError(f"{name} must be [1,...] for one request row, got {value.shape}")
+
+    def committed_anchor(self) -> int:
+        """Absolute position just past the newest committed target token.
+
+        A plain decode or prefill commits every row it forwarded; a verify block
+        commits only the accepted prefix, so the caller reports ``committed_rows``
+        (1 for a verify block) instead of letting the bridge guess.
+        """
+        if self.last_end is None:
+            raise RuntimeError("DFly2 bridge has no target forward yet")
+        return int(self.last_end)
 
     def record(
         self,
@@ -77,6 +94,7 @@ class DSV41TargetBridge:
         global_positions: mx.array,
         global_latents: mx.array,
         index_topk: mx.array,
+        committed_rows: int | None = None,
     ) -> None:
         """Record one target forward slice without reading/modifying target caches.
 
@@ -102,6 +120,12 @@ class DSV41TargetBridge:
         # an empty [1,0,D] segment for those steps.
         self._window[layer].append(_Segment(int(start), window_latents))
         self._index[layer].append(_Segment(int(start), index_topk.astype(mx.int32)))
+        if self.last_start is None or int(start) > self.last_start:
+            self.last_start = int(start)
+        rows = int(window_latents.shape[1]) if committed_rows is None else int(committed_rows)
+        end = int(start) + rows
+        if self.last_end is None or end > self.last_end:
+            self.last_end = end
         if int(global_latents.shape[1]):
             self._global[layer].append((global_positions.astype(mx.int32)[None], global_latents))
 

@@ -23,6 +23,7 @@ def capture_attention_slice(
     compressed_latents: mx.array,
     compressed_start: int,
     native_index_topk: mx.array,
+    committed_rows: int | None = None,
 ) -> None:
     """Capture one DSV41 attention slice in bridge coordinates.
 
@@ -60,4 +61,5 @@ def capture_attention_slice(
         global_positions=compressed_positions,
         global_latents=compressed_latents,
         index_topk=absolute_index_topk,
+        committed_rows=committed_rows,
     )
