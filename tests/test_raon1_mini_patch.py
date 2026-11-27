@@ -96,13 +96,20 @@ def _dequant_experts(wq, sq, gs):
     )
 
 
-def test_nvfp4_checkpoint_loads_strictly_without_remote_code(tmp_path):
+@pytest.mark.parametrize("alpha", [None, 0.05], ids=["preview", "release"])
+def test_nvfp4_checkpoint_loads_strictly_without_remote_code(tmp_path, alpha):
     """An NVFP4 Raon checkpoint (per-expert global scales, separate up/gate as
     exported) loads strictly through mlx-lm without importing ``model_file``,
     and its prefill + cached decode match a float model with the dequantized
     expert weights."""
     raon = _load_patch_module()
     config = _minimal_config()
+    if alpha is not None:
+        config["reasoning_effort_steering"] = {
+            "layers": [1],
+            "alpha": {"none": 0.0, "high": alpha},
+            "default": "high",
+        }
     args = raon.ModelArgs.from_dict(
         {k: v for k, v in config.items() if k != "model_file"}
     )
@@ -116,6 +123,9 @@ def test_nvfp4_checkpoint_loads_strictly_without_remote_code(tmp_path):
         elif k.endswith("moe.gate.weight"):
             params[k] = mx.random.normal(v.shape) * 0.1
 
+    vector_key = "model.layers.1.moe.reasoning_effort_steering"
+    if alpha is not None:
+        params[vector_key] = mx.linspace(-1, 1, args.hidden_size)
     ckpt = dict(params)
     reference = dict(params)
     quant = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
@@ -178,6 +188,17 @@ def test_nvfp4_checkpoint_loads_strictly_without_remote_code(tmp_path):
     glu = loaded.layers[1].moe.switch_mlp
     assert glu.gate_up.global_scale.shape == (args.num_experts,)
     assert glu.down_proj.global_scale.shape == (args.num_experts,)
+
+    if alpha is not None:
+        moe = loaded.layers[1].moe
+        assert not moe.fusable()
+        x = mx.zeros((1, 2, args.hidden_size))
+        got = moe(x)
+        vector = moe.reasoning_effort_steering
+        moe.reasoning_effort_steering = mx.zeros_like(vector)
+        plain = moe(x)
+        assert mx.allclose(got, plain + alpha * vector)
+        moe.reasoning_effort_steering = vector
 
     ref_model = raon.Model(args)
     ref_model.update(tree_unflatten(list(reference.items())))

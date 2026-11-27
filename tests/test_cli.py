@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from omlx._version import __version__
-from omlx.cli import _migrate_saved_network_auth
+from omlx.cli import _migrate_saved_network_auth, serve_command
 from omlx.settings import GlobalSettings
 
 
@@ -1351,6 +1351,45 @@ class TestServeCommandFunctions:
             if previous_server is not None:
                 sys.modules["omlx.server"] = previous_server
 
+    def test_serve_logs_cli_flags_saved_to_settings(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        listener = self._reserve_port()
+        host, port = listener.getsockname()
+        settings = self._make_settings(tmp_path, host=host, port=port)
+        change = "cache.enabled: True -> False"
+        settings.save_cli_overrides = MagicMock(return_value=[change])
+        args = self._make_serve_args(tmp_path, host=host, port=port)
+        previous_server = sys.modules.pop("omlx.server", None)
+
+        def reported():
+            return [
+                record
+                for record in caplog.records
+                if record.name == "omlx.cli" and change in record.getMessage()
+            ]
+
+        reported_before_file_logging = []
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: reported_before_file_logging.extend(reported()),
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+        try:
+            with (
+                caplog.at_level("INFO", logger="omlx.cli"),
+                pytest.raises(SystemExit),
+            ):
+                serve_command(args)
+
+            assert reported_before_file_logging == []
+            assert len(reported()) == 1
+        finally:
+            listener.close()
+            if previous_server is not None:
+                sys.modules["omlx.server"] = previous_server
+
     def test_offline_secondary_bind_address_is_detected(self):
         from omlx.cli import _is_local_address
 
@@ -1417,6 +1456,7 @@ class TestServeCommandFunctions:
             events.append("run")
             captured["socket_name"] = sockets[0].getsockname()
             captured["socket_count"] = len(sockets)
+            captured["shutdown"] = self.config.timeout_graceful_shutdown
 
         monkeypatch.setattr("uvicorn.Config.bind_socket", tracking_bind_socket)
         monkeypatch.setattr("uvicorn.Server.run", fake_run)
@@ -1425,6 +1465,7 @@ class TestServeCommandFunctions:
 
         fake_server.init_server.assert_called_once()
         assert events == ["bind", "init", "1" if headless else None, "run"]
+        assert captured["shutdown"] == 5
         assert captured["socket_count"] == 1
         assert captured["socket_name"][0] == host
         assert captured["socket_name"][1] > 0

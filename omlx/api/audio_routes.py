@@ -54,7 +54,7 @@ from ..engine.vlm import (
 )
 from ..exceptions import InvalidRequestError, ModelNotFoundError
 from ..server_metrics import get_server_metrics
-from ..utils import gpu_power
+from ..utils import gpu_power, macos_say
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
 logger = logging.getLogger(__name__)
@@ -1615,6 +1615,32 @@ async def create_speech(request: AudioSpeechRequest):
                 detail="Streaming TTS currently only supports response_format='wav'",
             )
         streaming_interval = _resolve_tts_streaming_interval(request)
+
+    from omlx.server import _server_state
+
+    if request.model == macos_say.MODEL_ID and macos_say.enabled(
+        _server_state.global_settings
+    ):
+        try:
+            wav_bytes = await asyncio.to_thread(
+                macos_say.synthesize,
+                request.input,
+                request.voice,
+                request.language,
+                request.speed,
+            )
+            if response_format != "wav":
+                wav_bytes = await asyncio.to_thread(
+                    _transcode_speech_output, wav_bytes, response_format
+                )
+        except InvalidRequestError:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        _record_audio_request(macos_say.MODEL_ID)
+        return Response(
+            content=wav_bytes, media_type=_SPEECH_RESPONSE_FORMATS[response_format]
+        )
 
     audio_bytes = _decode_ref_audio_base64(request)
 

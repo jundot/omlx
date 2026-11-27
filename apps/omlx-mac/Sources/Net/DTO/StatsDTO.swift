@@ -18,9 +18,7 @@ struct StatsDTO: Codable, Equatable, Sendable {
 
     let host: String?
     let port: Int?
-    /// Server-configured API key, surfaced for the Integrations setup-command
-    /// builders. Empty string when the server has no key configured.
-    let apiKey: String?
+    let apiKeySet: Bool?
     /// Absolute CLI invocation prefix used for `omlx launch <tool>` strings.
     /// `nil` on older servers; callers fall back to the bare `"omlx"` token
     /// (matches the dashboard JS `_launchCmd`).

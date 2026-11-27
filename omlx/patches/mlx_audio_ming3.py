@@ -335,7 +335,7 @@ class _TinyFlowState:
         times = tiny_flow.get_epss_timesteps(steps, mx.float32)
         times = times - (mx.cos(math.pi / 2 * times) - 1 + times)
         t_emb = [
-            dit.t_embedder(mx.full((1,), times[i], dtype=dtype))[:, None, :]
+            dit.t_embedder(mx.full((1,), times[i]))[:, None, :]
             for i in range(steps)
         ]
         dts = [times[i + 1] - times[i] for i in range(steps)]

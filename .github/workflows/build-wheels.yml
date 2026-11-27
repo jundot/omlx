@@ -49,7 +49,7 @@ jobs:
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-version
           python -m pip install --upgrade pip
-          python -m pip install build setuptools wheel "cmake>=3.27" "nanobind==3.1.0" "mlx==0.32.4"
+          python -m pip install build setuptools wheel "cmake>=3.27" "nanobind==3.1.0" "mlx==0.32.5"
           export CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
           python -m build --wheel --no-isolation
 
@@ -78,7 +78,7 @@ jobs:
               raise SystemExit(f"native kernels missing from wheel: {failed}")
 
           # Exercise a real primitive, not just the nanobind ABI probe, so the
-          # wheel also proves dylib/metallib lookup and MLX 0.32.4 runtime
+          # wheel also proves dylib/metallib lookup and MLX 0.32.5 runtime
           # dispatch.
           from omlx.custom_kernels.attention import fast as attention_fast
 

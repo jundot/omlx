@@ -34,6 +34,30 @@ struct PortConflictResolver: Sendable {
 }
 
 @MainActor
+private enum NSApp {
+    static func activate(ignoringOtherApps: Bool) {}
+}
+
+@MainActor
+private final class NSAlert {
+    enum Style { case warning }
+    enum Level { case normal, floating }
+    struct Window { var level = Level.normal }
+    var alertStyle = Style.warning
+    var messageText = ""
+    var informativeText = ""
+    var window = Window()
+    func addButton(withTitle: String) {}
+    func runModal() {}
+}
+
+extension Task where Success == Never, Failure == Never {
+    static func sleep(for duration: Duration) async throws {
+        try await sleep(for: duration / 50, tolerance: nil, clock: .continuous)
+    }
+}
+
+@MainActor
 private enum ProbeControl {
     static var hold = false
     static var continuation: CheckedContinuation<HealthProbeResult, Never>?

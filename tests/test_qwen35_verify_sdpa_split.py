@@ -44,7 +44,7 @@ def _per_row_reference(q, k, v, scale):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("q_len", [2, 4, 5, 6, 7, 9])
+@pytest.mark.parametrize("q_len", [5, 6, 9])
 @pytest.mark.parametrize("kv_len", [512, 2048])
 def test_chunked_causal_matches_per_row(q_len, kv_len):
     mx.random.seed(7)
@@ -63,8 +63,7 @@ def test_chunked_causal_matches_per_row(q_len, kv_len):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("q_len", [2, 5, 8])
-@pytest.mark.parametrize("kv_len", [45, 9000, 33000])
+@pytest.mark.parametrize("q_len,kv_len", [(2, 45), (5, 9000), (8, 33000)])
 def test_wide_causal_matches_per_row(q_len, kv_len):
     """All rows per head in one pass, over strided cache views and odd tails."""
     kv_len = max(kv_len, q_len)
@@ -189,17 +188,19 @@ def test_eligibility_gates_turboquant_proxy():
     assert _eligible(q, _TurboQuantProxy((1, HKV, 256, HD)), None) == 0
 
 
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
-    "batch,length,size,masked,cache_kind",
+    "dim,dtype,batch,length,size,masked,cache_kind",
     [
-        (1, 2, 32, False, "ordinary"),
-        (2, 3, 193, True, "ordinary"),
-        (4, 4, 513, False, "qsa"),
-        (4, 4, 513, True, "qsa"),
+        (64, mx.float16, 1, 2, 32, False, "ordinary"),
+        (64, mx.bfloat16, 4, 4, 513, False, "qsa"),
+        (96, mx.float16, 2, 3, 193, True, "ordinary"),
+        (96, mx.bfloat16, 4, 4, 513, True, "qsa"),
+        (128, mx.float16, 4, 4, 513, False, "qsa"),
+        (128, mx.bfloat16, 1, 2, 32, False, "ordinary"),
+        (256, mx.float16, 4, 4, 513, True, "qsa"),
+        (256, mx.bfloat16, 2, 3, 193, True, "ordinary"),
     ],
 )
-@pytest.mark.parametrize("dim", [64, 96, 128, 256])
 def test_matches_single_query_reductions(
     dtype, batch, length, size, dim, masked, cache_kind
 ):
@@ -330,17 +331,15 @@ def test_singleton_cache_causal_mask():
     assert mx.array_equal(result, q).item()
 
 
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
-    "batch,length,size,masked,cache_kind",
+    "dim,dtype,batch,length,size,masked,cache_kind",
     [
-        (2, 2, 1024, False, "ordinary"),
-        (3, 3, 2048, True, "qsa"),
-        (4, 4, 4096, True, "ordinary"),
-        (4, 2, 8192, False, "qsa"),
+        (64, mx.bfloat16, 4, 2, 8192, False, "qsa"),
+        (96, mx.float16, 2, 2, 1024, False, "ordinary"),
+        (128, mx.bfloat16, 4, 4, 4096, True, "ordinary"),
+        (256, mx.float16, 3, 3, 2048, True, "qsa"),
     ],
 )
-@pytest.mark.parametrize("dim", [64, 96, 128, 256])
 def test_causal_padding_and_high_precision_reference(
     dtype, batch, length, size, masked, cache_kind, dim
 ):

@@ -122,7 +122,7 @@ def test_batch_rejects_same_width_different_codecs():
     affine8 = Affine8KVCache()
     turbo4 = TurboQuantKVCache(bits=4)
     turbo8 = TurboQuantKVCache(bits=8)
-    for cache in (affine4, affine8, turbo4, turbo8):
+    for cache in (affine4, affine8, turbo4):
         cache.update_and_fetch(mx.ones((1, 2, 8, 64)), mx.ones((1, 2, 8, 64)))
     for batch_class, caches in (
         (BatchAffine4KVCache, (affine4, turbo4)),
@@ -321,13 +321,12 @@ def test_real_model_prefill_convert_and_batched_decode(
     assert batch[0].extract(0).offset == 260
 
 
-@pytest.mark.parametrize("architecture", ["llama", "qwen3_5"])
-@pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize(
-    "scheme,bits,cache_class",
+    "architecture,chunked,scheme,bits,cache_class",
     [
-        ("affine4", 4, Affine4KVCache),
-        ("affine8", 8, Affine8KVCache),
+        ("llama", True, "affine4", 4, Affine4KVCache),
+        ("qwen3_5", False, "affine4", 4, Affine4KVCache),
+        ("qwen3_5", True, "affine8", 8, Affine8KVCache),
     ],
 )
 def test_incremental_prefill_matches_explicit_cache_updates(

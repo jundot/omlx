@@ -305,6 +305,8 @@ class Request:
     needs_think_prefix: bool = False  # True if prompt ends with <think> token
     preserve_reasoning: bool = False  # history keeps the <think> output, so output tokens are cacheable
     think_prefix_sent: bool = False  # Track if prefix already sent
+    # Engine burst loop: set once a chunk with client-visible text is released.
+    first_text_released: bool = False
     # Close-think token matched to the prompt's opener for multi-marker parsers
     think_end_token_id: int | None = None
 

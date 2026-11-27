@@ -409,6 +409,8 @@ class TestSetModelInfoTurboQuantDtype:
         sched.memory_monitor = MagicMock()
         sched.model = MagicMock()
         sched.model.config = config
+        sched.model._language_model = None
+        sched.model.language_model = None
         sched.model.make_cache.return_value = [KVCache() for _ in range(40)]
         del sched.model.args
         return sched

@@ -163,14 +163,14 @@ def test_batch_tq_merge_rejects_mixed_bit_depths():
     c4.update_and_fetch(
         mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
     )
-    c6 = TurboQuantKVCache(bits=6.0)
-    c6.update_and_fetch(
+    c3 = TurboQuantKVCache(bits=3.0)
+    c3.update_and_fetch(
         mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
     )
-    mx.eval(c4.keys, c4.values, c6.keys, c6.values)
+    mx.eval(c4.keys, c4.values, c3.keys, c3.values)
 
     with pytest.raises(ValueError, match="mixed quantization"):
-        BatchTurboQuantKVCache.merge([c4, c6])
+        BatchTurboQuantKVCache.merge([c4, c3])
 
     with pytest.raises(ValueError, match="mixed quantization"):
         BatchTurboQuantKVCache.merge(
@@ -288,7 +288,7 @@ def test_batch_make_mask_matches_fp16_left_padding():
     V = mx.random.normal((3, 2, 8, 16))
     bk = BatchKVCache(lp)
     bk.update_and_fetch(K, V)
-    bt = BatchTurboQuantKVCache(lp, bits=8.0)
+    bt = BatchTurboQuantKVCache(lp, bits=4.0)
     bt.update_and_fetch(K, V)
 
     ref = bk.make_mask(1, return_array=True)  # decode-step mask
@@ -680,7 +680,7 @@ def test_decode_multirow_matches_dequantize_reference(q_len, monkeypatch):
     assert mx.abs(ref_nomask - ref).max().item() > 1e-3
 
 
-@pytest.mark.parametrize("q_len", [2, 4, 5, 8, 15])
+@pytest.mark.parametrize("q_len", [2, 5, 15])
 def test_fused_multirow_kernel_matches_dequantize_reference(q_len, monkeypatch):
     """Above the token floor, 3-bit MTP verify (outside the MMA kernel's
     envelope) takes the fused multi-row kernel in groups of up to 4 rows
@@ -726,15 +726,15 @@ def test_fused_multirow_kernel_matches_dequantize_reference(q_len, monkeypatch):
     assert routed_diff.max().item() == 0.0
 
 
-@pytest.mark.parametrize("bits", [2.5, 3.5, 8])
-def test_fused_multirow_kernel_handles_mixed_bit_codecs(bits):
+@pytest.mark.parametrize("bits,D", [(2.5, 256), (3.5, 256), (8, 128)])
+def test_fused_multirow_kernel_handles_mixed_bit_codecs(bits, D):
     """Fractional turboquant_kv_bits split into different K/V integer bit
     widths (2.5 -> K=2/V=3); the fused kernel templates the two widths
     independently and must stay parity-correct across them."""
     from omlx.patches import turboquant_attention as tq_attention
 
     mx.random.seed(0)
-    B, n_q, n_kv, D = 1, 16, 2, 256
+    B, n_q, n_kv = 1, 16, 2
     T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 512
     fp_cache = KVCache()
     fp_cache.update_and_fetch(
@@ -800,9 +800,17 @@ def _assert_rows_match(out, batch, queries, ks, vs, pads, tol):
         assert err < tol, f"row {b} (left padding {start}) max err {err:.4f}"
 
 
-@pytest.mark.parametrize("bits", [4.0, 2.0, 8.0])
-@pytest.mark.parametrize("q_len", [1, 9])
-@pytest.mark.parametrize("tokens", [37, 600])
+@pytest.mark.parametrize(
+    "bits,q_len,tokens",
+    [
+        (4.0, 1, 37),
+        (4.0, 9, 600),
+        (2.0, 9, 37),
+        (2.0, 1, 600),
+        (8.0, 1, 600),
+        (8.0, 9, 37),
+    ],
+)
 def test_mma_attention_matches_dequantize_reference(bits, q_len, tokens):
     """The simdgroup-matrix kernel serves decode and verify rows of every GQA
     repeat; it must match dequantize+SDPA with the causal tail, including

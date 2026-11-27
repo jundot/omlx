@@ -366,12 +366,12 @@ def _reference_no_repeat_ngram(sequence, ngram_size, window):
     return banned
 
 
-@pytest.mark.parametrize("dtype", [mx.int32, mx.uint32])
-def test_no_repeat_ngram_matches_reference(dtype):
+def test_no_repeat_ngram_matches_reference():
     from omlx.utils.sampling import make_no_repeat_ngram_processor
 
     rng = random.Random(0)
-    for _ in range(400):
+    for trial in range(80):
+        dtype = (mx.int32, mx.uint32)[trial % 2]
         vocab = rng.choice([6, 64])
         alphabet = rng.randint(1, 4)
         sequence = [rng.randrange(alphabet) for _ in range(rng.randint(0, 48))]

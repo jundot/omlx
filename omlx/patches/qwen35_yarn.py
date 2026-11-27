@@ -5,8 +5,9 @@ A ``max_context_window`` above the checkpoint's ``max_position_embeddings``
 adds a yarn ``rope_parameters`` entry with ``factor = window / native`` when
 the config is loaded. A yarn entry already in ``config.json`` is used as is.
 
-mlx-lm builds ``YarnRoPE`` from that entry. mlx-vlm's MRoPE ignores the rope
-type, so the attention constructor rewrites its frequencies and scaling here.
+mlx-lm builds ``YarnRoPE`` from that entry. mlx-vlm derives frequencies that
+differ in the last bit, so the attention constructor replaces them here: the
+text engine and stored KV blocks keep the same rotation.
 """
 
 from __future__ import annotations

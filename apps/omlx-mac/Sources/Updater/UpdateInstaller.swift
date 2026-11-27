@@ -8,6 +8,7 @@
 
 import Darwin
 import Foundation
+import os
 
 enum UpdateInstaller {
     static let workerModeArgument = "--omlx-update-worker"
@@ -49,7 +50,7 @@ enum UpdateInstaller {
         }
     }
 
-    private struct ProcessResult {
+    struct ProcessResult {
         let status: Int32
         let stdout: String
         let stderr: String
@@ -295,7 +296,7 @@ enum UpdateInstaller {
         }
     }
 
-    private static func runProcess(
+    static func runProcess(
         _ executable: String,
         arguments: [String]
     ) throws -> ProcessResult {
@@ -306,20 +307,20 @@ enum UpdateInstaller {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        let stderrReader = DispatchGroup()
+        let stderrData = OSAllocatedUnfairLock(initialState: Data())
         try process.run()
+        DispatchQueue.global(qos: .utility).async(group: stderrReader) {
+            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            stderrData.withLock { $0 = data }
+        }
+        let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        let stdout = String(
-            data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
-        let stderr = String(
-            data: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
+        stderrReader.wait()
         return ProcessResult(
             status: process.terminationStatus,
-            stdout: stdout,
-            stderr: stderr
+            stdout: String(data: stdout, encoding: .utf8) ?? "",
+            stderr: stderrData.withLock { String(data: $0, encoding: .utf8) ?? "" }
         )
     }
 }

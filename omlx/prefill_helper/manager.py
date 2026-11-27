@@ -54,6 +54,9 @@ _RETRY_DELAYS_S = (15.0, 30.0, 60.0, 120.0, 300.0)
 # A prompt that could use a helper in backoff retries it at most this often.
 _RETRY_ON_USE_S = 15.0
 _WATCH_S = 2.0
+# Long prompts that run here while the helper is not ready log each of its
+# states at most this often.
+_NOTE_LOCAL_S = 60.0
 # A helper with open jobs that sends nothing for this long is gone.
 _STALL_S = 60.0
 _SPEEDS_LOCK = threading.Lock()
@@ -108,6 +111,12 @@ def helper_reserve(info: dict) -> int:
     daemon reports the reserve it plans its stages with."""
     reserve = info.get("reserve")
     return _RESERVE_BYTES if reserve is None else int(reserve)
+
+
+def no_gpu(info: dict, name: str) -> str:
+    """Why a helper daemon that answers has no GPU left."""
+    error = info.get("gpu_error")
+    return f"{name} lost its GPU, restart its helper" + (f": {error}" if error else "")
 
 
 def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
@@ -170,9 +179,11 @@ def held_layers(
     """Layers the helper holds: as many as fit, or the fixed number."""
     shared, per_layer = adapter.memory_plan(model_path)
     limit = adapter.split_limit(len(per_layer))
-    held = fit_layers(
-        shared, per_layer, helper_budget(info), limit, helper_reserve(info)
-    )
+    budgets = helper_budget(info)
+    if not budgets:
+        # A helper daemon starts only with a GPU, so a lost one may come back.
+        raise UnreachableError(no_gpu(info, name))
+    held = fit_layers(shared, per_layer, budgets, limit, helper_reserve(info))
     if fixed is not None:
         if fixed > limit:
             raise _PermanentError(
@@ -573,6 +584,7 @@ class PrefillHelperManager:
         self._process = None
         self._session: PrefillHelperSession | None = None
         self._copy_ok = threading.Event()
+        self._noted: dict[str, float] = {}
         self._lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run, name="omlx-prefill-helper", daemon=True
@@ -596,11 +608,27 @@ class PrefillHelperManager:
         self._commands.put(("retry",))
 
     def retry_if_offline(self) -> None:
-        """Only when offline: any queued command cancels a copy waiting for the user."""
+        """Log that a long prompt runs here, and retry a helper that is offline.
+
+        Only when offline: any queued command cancels a copy waiting for the user.
+        """
         with self._lock:
             status = self._status
+            state, now = status["state"], time.monotonic()
+            # A helper that is being detached still says ready.
             if (
-                status["state"] == "offline"
+                state not in ("off", "stopped", "ready")
+                and now - self._noted.get(state, float("-inf")) >= _NOTE_LOCAL_S
+            ):
+                self._noted[state] = now
+                logger.warning(
+                    "Prefill helper for %s is not ready (%s); a long prompt runs "
+                    "on this Mac alone",
+                    Path(self.model_path).name,
+                    status.get("reason") or state,
+                )
+            if (
+                state == "offline"
                 and time.time() - status["since"] >= _RETRY_ON_USE_S
                 and self._commands.empty()
             ):

@@ -2,6 +2,7 @@
 
 import json
 import math
+import shutil
 import struct
 
 import mlx.core as mx
@@ -776,28 +777,33 @@ def test_official_oq3_refines_routed_expert_codes_in_place(tmp_path, monkeypatch
     tokens = mx.array([[3, 4, 5, 6, 7, 8, 9, 10], [9, 8, 7, 6, 5, 4, 3, 11]])
     monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
 
-    def export(name):
-        output = tmp_path / name
-        oq.quantize_oq_streaming(
-            str(source),
-            str(output),
-            3,
-            enhanced=True,
-            target_bpw=32,
-            hard_cap_bpw=32,
-            imatrix_num_samples=2,
-            imatrix_seq_length=8,
-            sensitivity_map_override={i: 1.0 for i in range(5)},
-        )
-        tensors = {}
+    real_refine = converter.refine_experts
+
+    def keep_unrefined_copy(source, destination, *args, **kwargs):
+        shutil.copytree(destination, tmp_path / "plain")
+        return real_refine(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(converter, "refine_experts", keep_unrefined_copy)
+    refined = tmp_path / "refined"
+    oq.quantize_oq_streaming(
+        str(source),
+        str(refined),
+        3,
+        enhanced=True,
+        target_bpw=32,
+        hard_cap_bpw=32,
+        imatrix_num_samples=2,
+        imatrix_seq_length=8,
+        sensitivity_map_override={i: 1.0 for i in range(5)},
+    )
+
+    def tensors(output):
+        loaded = {}
         for shard in output.glob("*.safetensors"):
-            tensors.update(mx.load(str(shard)))
-        return output, tensors
+            loaded.update(mx.load(str(shard)))
+        return loaded
 
-    refined, after = export("refined")
-    monkeypatch.setattr(converter, "refine_experts", lambda *a, **kw: None)
-    _, before = export("plain")
-
+    after, before = tensors(refined), tensors(tmp_path / "plain")
     report = json.loads((refined / "quantization_report.json").read_text())["refine"]
     assert report["status"] == "done" and report["tensors"] > 0
     assert report["after"] < report["before"]

@@ -94,8 +94,8 @@ def test_decode_batches_take_the_batched_affine_kernels():
     batched_decode_qmm.apply_batched_decode_qmm_patch()
     n = k = 1024
     mx.random.seed(5)
-    m = OqhLinear(k, n, 4, 256)
-    m.weight = mx.random.randint(0, 2**32 - 1, (n, k * 4 // 32)).astype(mx.uint32)
+    m = OqhLinear(k, n, 2, 256)
+    m.weight = mx.random.randint(0, 2**32 - 1, (n, k * 2 // 32)).astype(mx.uint32)
     m.rscale = (mx.random.uniform(shape=(n,)) * 0.02).astype(mx.bfloat16)
     m.oqh_signs = _signs("b", k).reshape(-1, 256).astype(mx.bfloat16)
     x = mx.random.normal((8, 1, k)).astype(mx.bfloat16)

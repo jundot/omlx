@@ -292,6 +292,13 @@ def test_omlx_drives_the_helper_over_its_control_channel(monkeypatch):
         agent.delete_copies(target, ["Model", "Mine"])
         assert not copied.exists() and mine.is_dir()
 
+        # A lost GPU reaches the host with what nvidia-smi says.
+        smi = "Failed to initialize NVML: Unknown Error"
+        monkeypatch.setattr(gpus, "gpus", lambda only=None: [])
+        monkeypatch.setattr(gpus, "_run", lambda *command: smi + "\n")
+        info = agent.remote_info(target)
+        assert (info["budgets"], info["gpu_error"]) == ([], smi)
+
         stranger = agent.AgentTarget(
             state.node_id, "nvidia1", "127.0.0.1", "ethernet", control.port, bytes(32)
         )

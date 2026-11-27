@@ -42,7 +42,12 @@ MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 # qwen4_exp (Qwen3.8-Flash-Next) drafts from its embedded native head, whose
 # experts the generic SwitchGLU adapter leaves resident (see
 # apply_moe_expert_offload's mtp_resident).
-MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next", "qwen4_exp")
+MOE_OFFLOAD_MTP_MODEL_TYPES = (
+    "deepseek_v41",
+    "glm5_next",
+    "qwen4_exp",
+    "inkling2_loop",
+)
 
 
 # Paths that run the targeted projections from the checkpoint weights, or
@@ -247,6 +252,13 @@ def _setting(settings: Any, name: str) -> Any:
     if isinstance(settings, dict):
         return settings.get(name)
     return getattr(settings, name, None)
+
+
+def specprefill_draft(settings: Any) -> str | None:
+    """Return the SpecPrefill draft path, or None while SpecPrefill is off."""
+    if not _setting(settings, "specprefill_enabled"):
+        return None
+    return _setting(settings, "specprefill_draft_model") or None
 
 
 def a8_prefill_on(settings: Any) -> bool:
@@ -616,6 +628,9 @@ class ModelSettings:
     # LoRA adapter folder applied on top of the weights at load (PEFT or mlx).
     # The adapter is never served on its own; profiles can expose a variant.
     lora_adapter: Optional[str] = None
+
+    loopcd_enabled: bool = False
+    loopcd_skip_thinking: bool = False
 
     # Model management flags
     is_pinned: bool = False

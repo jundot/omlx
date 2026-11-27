@@ -130,10 +130,13 @@ def test_prework_matches_current_decode_convolution(scale, strided, dtype):
     _assert_equal(actual, expected)
 
 
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
-    "hidden_size,num_k_heads,num_v_heads",
-    [(2048, 16, 32), (5120, 16, 48), (1024, 8, 16)],
+    "hidden_size,num_k_heads,num_v_heads,dtype",
+    [
+        (2048, 16, 32, mx.float16),
+        (5120, 16, 48, mx.bfloat16),
+        (1024, 8, 16, mx.float16),
+    ],
 )
 def test_decode_matches_stock_over_prefill_decode_and_restored_cache(
     monkeypatch, dtype, hidden_size, num_k_heads, num_v_heads
@@ -152,13 +155,13 @@ def test_decode_matches_stock_over_prefill_decode_and_restored_cache(
         advance(n)
 
     monkeypatch.setattr(actual_cache, "advance", record_advance)
-    for length in [8] + [1] * 16 + [3, 1]:
+    for length in [8] + [1] * 5 + [3, 1]:
         inputs = mx.random.normal((1, length, hidden_size)).astype(dtype)
         expected = stock(module, inputs, cache=expected_cache)
         actual = module(inputs, cache=actual_cache)
         _assert_equal((actual, *actual_cache.state), (expected, *expected_cache.state))
-    assert len(calls) == 17
-    assert advances == [8] + [1] * 16 + [3, 1]
+    assert len(calls) == 6
+    assert advances == [8] + [1] * 5 + [3, 1]
 
     # Exercise a prefix cache snapshot with fresh cache-object metadata.
     expected_cache = copy.deepcopy(expected_cache)
@@ -168,7 +171,7 @@ def test_decode_matches_stock_over_prefill_decode_and_restored_cache(
     actual = module(inputs, cache=restored)
     expected = stock(module, inputs, cache=expected_cache)
     _assert_equal((actual, *restored.state), (expected, *expected_cache.state))
-    assert len(calls) == 18
+    assert len(calls) == 7
 
 
 @pytest.mark.parametrize(

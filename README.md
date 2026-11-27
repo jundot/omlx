@@ -140,7 +140,7 @@ brew services restart omlx  # Restart
 brew services info omlx     # Check status
 ```
 
-The service runs `omlx serve` with zero-config defaults (`~/.omlx/models`, port 8000). `omlx start`, `omlx stop`, and `omlx restart` are the portable lifecycle commands; Homebrew installs delegate them to `brew services`. To customize, either set environment variables (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) or run `omlx serve --model-dir /your/path` once to persist settings to `~/.omlx/settings.json`.
+The service runs `omlx serve` with zero-config defaults (`~/.omlx/models`, port 8000). `omlx start`, `omlx stop`, and `omlx restart` are the portable lifecycle commands; Homebrew installs delegate them to `brew services`. To customize, run `omlx serve --model-dir /your/path` once to persist settings to `~/.omlx/settings.json`.
 
 Logs are written to two locations:
 - **Service log**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
@@ -289,6 +289,7 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/rerank` | Document reranking |
 | `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
+| `GET /v1/models/{model_id}` | Retrieve one model |
 | `POST /v1/audio/transcriptions` | Speech-to-text, including speaker labels when supported |
 | `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`); embedding models take `prompt` only |
 
@@ -392,7 +393,7 @@ omlx serve --model-dir ~/models --api-key your-secret-key
 # Localhost-only: skip verification via admin panel global settings
 
 # Network access requires authentication
-OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
+omlx serve --model-dir ~/models --host 0.0.0.0 --api-key your-secret-key
 
 # Inference and admin APIs only, without the web UI (not saved to settings)
 omlx serve --model-dir ~/models --headless
@@ -505,3 +506,4 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
 - [m5gpu](https://github.com/beamivalice/m5gpu) - The GPU power limit writes the AGX GPU power target that m5gpu by beamivalice documented (`SetMaxGPUAbsolutePower` with `AbsoluteTarget`, and `-1000` to remove it)
 - [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Ming-3.0-tts's pipelined decode loop follows Stéphane Busso's ming-tts-serve, and its fused DiT kernels are adapted from ming-tts-serve's MIT-licensed `ming_fused.zig`
+- [Wikipedia](https://www.wikipedia.org) - Parts of the built-in oQ and oQe calibration text are truncated excerpts of Wikipedia articles, licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)

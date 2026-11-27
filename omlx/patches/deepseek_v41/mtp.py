@@ -92,15 +92,25 @@ class DSparkMixin:
         self.dspark_append_context(main_hidden, cache)
         return proposal_forward(self, anchor_ids, cache, draft_length)
 
-    def dspark_hidden(self, main_hidden, anchor_ids, cache, *, draft_length=None):
-        """dspark_forward without the vocabulary head: the last stage's normed input."""
+    def dspark_hidden_rows(self, main_hiddens, anchor_ids, caches, *, draft_length=None):
+        """The hidden dspark_forward returns, for several requests in one pass over the
+        stages: [B, L, D]. Each request appends its own committed rows to its own context
+        rings, which may differ in length."""
         from .dspark import proposal_hidden
 
-        self.dspark_append_context(main_hidden, cache)
-        return proposal_hidden(self, anchor_ids, cache, draft_length)
+        first = self.mtp[0]
+        projected = first.main_norm(first.main_proj(mx.concatenate(main_hiddens, axis=1)))
+        parts, at = [], 0
+        for hidden in main_hiddens:
+            parts.append(projected[:, at : at + hidden.shape[1]])
+            at += hidden.shape[1]
+        by_stage = [[cache[s] for cache in caches] for s in range(len(self.mtp))]
+        for stage, items in zip(self.mtp, by_stage):
+            stage.attn.append_context_rows(parts, items)
+        return proposal_hidden(self, mx.concatenate(anchor_ids, axis=0), by_stage, draft_length)
 
     def dspark_logits(self, hidden):
-        """The DSpark vocabulary head of dspark_hidden outputs (any number of rows)."""
+        """The DSpark vocabulary head of dspark_hidden_rows outputs (any number of rows)."""
         return project_logits(self.mtp[-1].norm(hidden), self.head.weight)
 
     def dspark_markov(self, token_ids):
@@ -222,7 +232,7 @@ class DSparkMixin:
         # A verify-only rank may not hold the target layers the taps come from.
         capture = (return_hidden or bool(capture_dspark)) and not verify_only
         if kwargs.get("_ced_prefill", False) and self._config.ced_prefill:
-            if input_ids.shape[0] != 1:
+            if input_ids.shape[0] != 1 and self._stage()[0][1]._tensor_group is None:
                 raise ValueError("CED scheduler prefill requires one request row")
             if capture or verify:
                 raise ValueError("CED prefill cannot supply full hidden/verify states")

@@ -116,12 +116,15 @@ def _rope_freqs_cached(d, base, original_seq_len, factor, beta_fast, beta_slow):
 
 
 def _rope_positions(positions):
-    if isinstance(positions, range):
+    """The _rope_table key of positions: (start, stop, step) of an arithmetic run with a
+    nonzero step, else ("at", *positions) (e.g. batched decode rows, which may repeat)."""
+    if isinstance(positions, range) and positions.step:
         return positions.start, positions.stop, positions.step
-    values = np.asarray(positions, np.int64).reshape(-1)  # host sync; callers pass ranges
-    if len(values) > 1 and np.all(np.diff(values) == values[1] - values[0]):
-        return int(values[0]), int(values[-1]) + int(values[1] - values[0]), int(values[1] - values[0])
-    return tuple(int(v) for v in values)
+    values = np.asarray(positions, np.int64).reshape(-1)  # host sync unless a list or range
+    step = int(values[1] - values[0]) if len(values) > 1 else 0
+    if step and np.all(np.diff(values) == step):
+        return int(values[0]), int(values[-1]) + step, step
+    return ("at", *(int(v) for v in values))
 
 
 @lru_cache(maxsize=32)   # a decode step or verify block needs one range per RoPE variant
@@ -131,7 +134,7 @@ def _rope_table(params, key):
     value lies within ~2^-29 relative of an fp32 midpoint. Computed once per position range
     and shared by every layer of the step."""
     freqs = _rope_freqs(*params)
-    pos = np.arange(*key) if len(key) == 3 else np.array(key)
+    pos = np.array(key[1:]) if key[0] == "at" else np.arange(*key)
     angles = (pos.astype(np.float32)[:, None] * freqs[None, :]).astype(np.float32).astype(np.float64)
     return mx.array(np.cos(angles).astype(np.float32)), mx.array(np.sin(angles).astype(np.float32))
 
@@ -256,51 +259,49 @@ class Indexer(nn.Module):
             self.k_norm = RMSNorm(c.index_head_dim, c.norm_eps)
         self._config, self._layer = c, layer
 
-    def __call__(self, x, qr, latent, cache, shared, start, ratio, latent_start=None):
+    def update_keys(self, latent, cache, shared, start, end, ratio, dtype, latent_start=None):
+        """A kv-source layer's index keys of the rows start..end (cache[3], shared["index_k"]);
+        latent: their compressed rows (None when none completes)."""
+        c = self._config
+        if self._layer not in c.kv_source_layers:
+            return
+        # CED keeps the query path on the tail while the key path still
+        # spans the full chunk; latent_start marks that wider key origin.
+        kv_start = start if latent_start is None else int(latent_start)
+        kv_end = (
+            end
+            if latent_start is None
+            else kv_start + (0 if latent is None else latent.shape[1])
+        )
+        previous = cache[3]
+        previous = (
+            previous[:, : kv_start // ratio]
+            if previous is not None
+            else pack_activation(mx.zeros((1, 0, c.index_head_dim), dtype), bits=4)
+        )
+        if latent is not None:
+            pos = range(kv_start // ratio * ratio, kv_end // ratio * ratio, ratio)
+            key = pack_activation(
+                rope(self.k_norm(self.wk(latent)), pos, c, True), bits=4
+            )
+            previous = growth.append(cache, 3, previous, key, kv_start // ratio)
+        shared["index_k"] = cache[3] = previous
+
+    def candidate_rows(self, blocks):
+        """The candidate key ids [1, L, n * block] of candidate blocks [1, L, n] (-1 stays -1)."""
+        c = self._config
+        candidates = blocks[..., None] * c.candidate_block_size + mx.arange(
+            c.candidate_block_size
+        )
+        return mx.where(blocks[..., None] >= 0, candidates, -1).reshape(
+            1, blocks.shape[1], blocks.shape[-1] * c.candidate_block_size
+        )
+
+    def select(self, q, weights, shared, start, ratio):
+        """The selected compressed indices of the query rows q / weights from start."""
         c, layer = self._config, self._layer
-        end = start + x.shape[1]
-        if layer in c.kv_source_layers:
-            # CED keeps the query path on the tail while the key path still
-            # spans the full chunk; latent_start marks that wider key origin.
-            kv_start = start if latent_start is None else int(latent_start)
-            kv_end = (
-                end
-                if latent_start is None
-                else kv_start + (0 if latent is None else latent.shape[1])
-            )
-            previous = cache[3]
-            previous = (
-                previous[:, : kv_start // ratio]
-                if previous is not None
-                else pack_activation(
-                    mx.zeros((1, 0, c.index_head_dim), x.dtype), bits=4
-                )
-            )
-            if latent is not None:
-                pos = range(kv_start // ratio * ratio, kv_end // ratio * ratio, ratio)
-                key = pack_activation(
-                    rope(self.k_norm(self.wk(latent)), pos, c, True), bits=4
-                )
-                previous = growth.append(cache, 3, previous, key, kv_start // ratio)
-            shared["index_k"] = cache[3] = previous
         key = shared["index_k"]
-        q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
-        q = quantize_activation(rope(q, range(start, end), c, True), bits=4)
-        # Reference: weights_proj(x) * scale is a tensor of the activation dtype (bf16).
-        weights = (
-            self.weights_proj(x)
-            * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
-        ).astype(x.dtype).astype(mx.float32)
-        candidates = None
-        if 0 <= c.candidate_source_layer < layer:
-            blocks = shared["candidates"]
-            candidates = blocks[..., None] * c.candidate_block_size + mx.arange(
-                c.candidate_block_size
-            )
-            candidates = mx.where(blocks[..., None] >= 0, candidates, -1).reshape(
-                1, x.shape[1], blocks.shape[-1] * c.candidate_block_size
-            )
-        if candidates is None:
+        if not 0 <= c.candidate_source_layer < layer:
             idx, blocks = packed_index_topk(
                 q,
                 key,
@@ -316,15 +317,29 @@ class Indexer(nn.Module):
             if layer == c.candidate_source_layer:
                 shared["candidates"] = blocks
             return idx
+        candidates = self.candidate_rows(shared["candidates"])
         scores = packed_index_scores(q, key, weights, start, ratio, candidates)
         count = min(c.index_topk, scores.shape[-1])
-        if x.shape[1] <= 8:
+        if q.shape[1] <= 8:
             return index_select(scores, count, candidates)
         order = mx.argsort(-scores, axis=-1)[..., :count].astype(mx.int32)
         valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
         idx = mx.take_along_axis(candidates, order, -1)
         # Keep chronological order; invalid slots are masked by attention.
         return mx.sort(mx.where(valid, idx, -1), axis=-1)
+
+    def __call__(self, x, qr, latent, cache, shared, start, ratio, latent_start=None):
+        c = self._config
+        end = start + x.shape[1]
+        self.update_keys(latent, cache, shared, start, end, ratio, x.dtype, latent_start)
+        q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
+        q = quantize_activation(rope(q, range(start, end), c, True), bits=4)
+        # Reference: weights_proj(x) * scale is a tensor of the activation dtype (bf16).
+        weights = (
+            self.weights_proj(x)
+            * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
+        ).astype(x.dtype).astype(mx.float32)
+        return self.select(q, weights, shared, start, ratio)
 
 
 class Attention(nn.Module):
@@ -1691,6 +1706,13 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # rows rather than re-concatenating every slot of every layer each step.
             item.adopt_rows(rows[i])
             item.advance(input_ids.shape[1])
+        width = max(row.shape[1] for row in results)
+        results = [
+            row
+            if row.shape[1] == width
+            else mx.pad(row, [(0, 0), (width - row.shape[1], 0), (0, 0)])
+            for row in results
+        ]
         logits = mx.concatenate(results, 0)
         if capture:
             if skip_decoder:

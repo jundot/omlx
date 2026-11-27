@@ -352,14 +352,25 @@ inline void affine_codes8(const device uchar* p, thread float* q) {
 // The codes one lane reads per step in aff8_rows / aff8_rows_nb: 16 at 2 bits (one uint32), else 8.
 template <int BITS>
 constexpr int aff_lane_codes() { return BITS == 2 ? 16 : 8; }
-// 2- and 4-bit codes are masked in place, as MLX's qdot does: q[j] = code j * 2^(BITS * j), against x
-// pre-scaled by aff_unit<BITS>(j) = 2^-(BITS * j). Power-of-two scaling is exact, so q[j] * x[j] = code * x.
+// 2- and 4-bit codes are masked in place, as MLX's qdot does: q[j] = code j * 2^e(j), against x
+// pre-scaled by aff_unit<BITS>(j) = 2^-e(j). Power-of-two scaling is exact, so q[j] * x[j] = code * x.
+// At 2 bits one half2 takes codes j and j + 8 in its 10-bit mantissas; codes 5..7 are shifted down first.
 template <int BITS>
-inline float aff_unit(int j) { return (BITS == 2 || BITS == 4) ? as_type<float>(uint(127 - BITS * j) << 23) : 1.0f; }
+inline int aff_exp(int j) { const int p = j % 8; return BITS == 2 ? 2 * (p < 5 ? p : p - 5) : BITS * j; }
+template <int BITS>
+inline float aff_unit(int j) { return (BITS == 2 || BITS == 4) ? as_type<float>(uint(127 - aff_exp<BITS>(j)) << 23) : 1.0f; }
 template <int BITS>
 inline void affine_codes_lane(const device uchar* p, thread float* q) {
     constexpr uint MASK = (1u << BITS) - 1u;
-    if (BITS == 2 || BITS == 4) {
+    if (BITS == 2) {
+        const uint v = *reinterpret_cast<const device uint*>(p);
+        for (int t = 0; t < 8; ++t) {
+            const uint src = t < 5 ? v : v >> 10;
+            const half2 h = as_type<half2>((src & (0x00030003u << aff_exp<2>(t))) | 0x64006400u) - half2(1024.0h);
+            q[t] = float(h.x);
+            q[t + 8] = float(h.y);
+        }
+    } else if (BITS == 4) {
         const uint v = *reinterpret_cast<const device uint*>(p);
         for (int j = 0; j < aff_lane_codes<BITS>(); ++j) q[j] = float(v & (MASK << (BITS * j)));
     } else {

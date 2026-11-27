@@ -1512,19 +1512,19 @@ class TestNativeEmbeddingLoading:
         config = {
             "model_type": "xlm-roberta",
             "architectures": ["XLMRobertaModel"],
-            "hidden_size": 768,
-            "num_hidden_layers": 12,
-            "vocab_size": 250002,
-            "num_attention_heads": 12,
-            "intermediate_size": 3072,
-            "max_position_embeddings": 514,
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 64,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "max_position_embeddings": 66,
             "attention_probs_dropout_prob": 0.1,
             "hidden_dropout_prob": 0.1,
             "pad_token_id": 1,
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
 
-        vocab_size = 250002
+        vocab_size = 64
         save_file(
             {"embeddings.word_embeddings.weight": np.zeros((1, 1), dtype=np.float32)},
             str(tmp_path / "model.safetensors"),
@@ -1608,12 +1608,12 @@ class TestNativeEmbeddingLoading:
         config = {
             "model_type": "bert",
             "architectures": ["BertModel"],
-            "hidden_size": 384,
-            "num_hidden_layers": 2,
-            "vocab_size": 30522,
-            "num_attention_heads": 12,
-            "intermediate_size": 1536,
-            "max_position_embeddings": 512,
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 64,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "max_position_embeddings": 64,
             "hidden_dropout_prob": 0.1,
             "attention_probs_dropout_prob": 0.1,
             "pad_token_id": 0,
@@ -1621,14 +1621,14 @@ class TestNativeEmbeddingLoading:
         (tmp_path / "config.json").write_text(json.dumps(config))
 
         save_file(
-            {"embeddings.word_embeddings.weight": np.random.randn(30522, 384).astype(np.float32)},
+            {"embeddings.word_embeddings.weight": np.random.randn(64, 32).astype(np.float32)},
             str(tmp_path / "model.safetensors"),
         )
 
         from omlx.models.embedding import MLXEmbeddingModel
 
         model = MLXEmbeddingModel(str(tmp_path))
-        tokenizer = self.MockNativeTokenizer(vocab_size=30522)
+        tokenizer = self.MockNativeTokenizer(vocab_size=64)
         with patch(
             "transformers.AutoTokenizer.from_pretrained",
             return_value=tokenizer,
@@ -1645,12 +1645,12 @@ class TestNativeEmbeddingLoading:
         config = {
             "model_type": "bert",
             "architectures": ["BertModel"],
-            "hidden_size": 384,
-            "num_hidden_layers": 2,
-            "vocab_size": 30522,
-            "num_attention_heads": 12,
-            "intermediate_size": 1536,
-            "max_position_embeddings": 512,
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 64,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "max_position_embeddings": 64,
             "hidden_dropout_prob": 0.1,
             "attention_probs_dropout_prob": 0.1,
             "pad_token_id": 0,
@@ -1666,7 +1666,7 @@ class TestNativeEmbeddingLoading:
             for key in f.keys():
                 weights[key] = np.array(f.get_tensor(key))
 
-        weights["embeddings.word_embeddings.weight"] = np.random.randn(30523, 384).astype(
+        weights["embeddings.word_embeddings.weight"] = np.random.randn(65, 32).astype(
             np.float32
         )
         save_file(weights, str(tmp_path / "model.safetensors"))
@@ -1674,7 +1674,7 @@ class TestNativeEmbeddingLoading:
         from omlx.models.embedding import MLXEmbeddingModel
 
         model = MLXEmbeddingModel(str(tmp_path))
-        tokenizer = self.MockNativeTokenizer(vocab_size=30522)
+        tokenizer = self.MockNativeTokenizer(vocab_size=64)
         with patch(
             "transformers.AutoTokenizer.from_pretrained",
             return_value=tokenizer,

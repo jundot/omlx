@@ -3,13 +3,13 @@ requires = [
     "setuptools>=61.0",
     "wheel",
     "cmake>=3.27",
-    # Pin nanobind to match the ABI version MLX 0.32.4 was built with
+    # Pin nanobind to match the ABI version MLX 0.32.5 was built with
     # (MLX pins nanobind v3.1.0 via FetchContent in its CMakeLists.txt).
     # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
     # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
     # type caster with `incompatible function arguments`.
     "nanobind==3.1.0",
-    "mlx==0.32.4",
+    "mlx==0.32.5",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -38,11 +38,11 @@ classifiers = [
 ]
 
 dependencies = [
-    # Vanilla MLX v0.32.4; optional custom kernels live under
+    # Vanilla MLX v0.32.5; optional custom kernels live under
     # omlx.custom_kernels.* when built for release. The bundled kernel
     # binaries are ABI-coupled to this exact mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
-    "mlx==0.32.4",
+    "mlx==0.32.5",
     # mlx-lm main after 0.32.2. setuptools-scm reports it as 0.32.3.devN.
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
@@ -110,9 +110,9 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit 138d761 (v0.7.11). oMLX model implementations remain registered
+    # mlx-vlm from commit 36494b4 (v0.8.1). oMLX model implementations remain registered
     # by their pre-load patches.
-    "mlx-vlm @ git+https://github.com/Neywa-Labs/mlx-vlm@138d7617d39653b39a5cbc379b1b5907a4481d67",
+    "mlx-vlm @ git+https://github.com/Neywa-Labs/mlx-vlm@36494b42c7676081aa3c14878b3175b90c2fedf4",
     # mlx-vlm requires mlx-audio>=0.6.2 in the shared runtime.
     "mlx-audio @ git+https://github.com/Neywa-Labs/mlx-audio@1157775c1999654b1ebde41ed03d88108e23f88b",
     "Pillow>=9.0.0",
@@ -126,7 +126,7 @@ grammar = [
     # build. xgrammar 0.2.3 crashes at import with apache-tvm-ffi 0.1.13
     # on macOS arm64, so an open-ended resolver can break Homebrew installs
     # without any oMLX source change (#2428).
-    "xgrammar==0.2.8",
+    "xgrammar==0.2.9",
     "apache-tvm-ffi==0.1.11",
 ]
 mcp = [
@@ -146,13 +146,17 @@ audio = [
     # mlx-audio from commit (1157775, v0.6.5) with tts/stt/sts extras
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Neywa-Labs/mlx-audio@1157775c1999654b1ebde41ed03d88108e23f88b",
     # Keep dependencies for existing audio models removed from upstream extras.
+    "cn2an>=0.5.24",
     "espeakng-loader>=0.2.4",
+    "jieba>=0.42.1",
     "librosa==0.11.0",
     "misaki>=0.9.4",
     "num2words>=0.5.14",
     "numba>=0.60.0",
+    "ordered-set>=4.1.0",
     "phonemizer-fork>=3.3.2",
     "pyloudnorm>=0.2.0",
+    "pypinyin>=0.55.0",
     "spacy>=3.8.4",
     # WebSocket protocol impl for uvicorn (realtime STT endpoint). Pure
     # python; uvicorn's ws="auto" picks it up when installed.
@@ -184,6 +188,10 @@ bundle = [
     "pyloudnorm>=0.1.0",
     "sounddevice>=0.4.6",
     "misaki>=0.9.4",
+    "cn2an>=0.5.24",
+    "jieba>=0.42.1",
+    "ordered-set>=4.1.0",
+    "pypinyin>=0.55.0",
     "num2words>=0.5.14",
     "spacy>=3.8.4",
     "phonemizer-fork>=3.3.2",
@@ -215,7 +223,7 @@ dev = [
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
     # importable, which silently hides regressions — install no-deps
     # in the dev environment so the test actually runs.
-    "xgrammar==0.2.8",
+    "xgrammar==0.2.9",
     "apache-tvm-ffi==0.1.11",
 ]
 
@@ -255,7 +263,7 @@ include = ["omlx*"]
 # mlx and mlx-lm are git-pinned; override transitive pins
 # so dependency resolution retains the selected runtime versions.
 override-dependencies = [
-    "mlx==0.32.4",
+    "mlx==0.32.5",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d",
 ]
 

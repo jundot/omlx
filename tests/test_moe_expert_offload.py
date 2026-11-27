@@ -703,8 +703,8 @@ def _assert_slot_state(cache, glu):
             if slots is None:
                 continue
             assert slots.shape[0] == cache.capacity
-            for e, s in cache.slot_of.items():
-                assert bool(mx.array_equal(slots[s], lin[field][e]))
+            held = np.array(slots)[list(cache.slot_of.values())]
+            assert np.array_equal(held, np.array(lin[field])[list(cache.slot_of)])
 
 
 class TestSlotRelease:

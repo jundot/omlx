@@ -64,6 +64,11 @@ def gpus(only: list[int] | None = None) -> list[dict[str, Any]]:
     return found
 
 
+def smi_error() -> str:
+    """Why ``gpus`` found none; nvidia-smi writes its errors to stdout."""
+    return " ".join(_run("nvidia-smi", "-L").split())
+
+
 # What MLX does not count on a card: CUDA's context and the cuBLAS and cuDNN
 # work buffers, which grow with a long prompt.
 UNCOUNTED_BYTES = 2 << 30

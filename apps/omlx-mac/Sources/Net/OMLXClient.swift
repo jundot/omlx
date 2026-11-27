@@ -436,6 +436,11 @@ final class OMLXClient: ObservableObject {
         ))
     }
 
+    func revealApiKey() async throws -> String {
+        let response: RevealApiKeyResponse = try await postEmpty(AdminAPI.revealApiKey)
+        return response.apiKey
+    }
+
     @discardableResult
     func createSubKey(key: String, name: String) async throws -> CreateSubKeyResponse {
         try await post(AdminAPI.subKeys, body: CreateSubKeyRequest(key: key, name: name))
@@ -459,7 +464,10 @@ final class OMLXClient: ObservableObject {
     func estimateOQ(
         modelPath: String,
         oqLevel: Double,
-        preserveMtp: Bool = false
+        preserveMtp: Bool = false,
+        preserveNgramTable: Bool = false,
+        textOnly: Bool = false,
+        dtype: String = "bfloat16"
     ) async throws -> OQEstimateResponse {
         // `oq_level` accepts ints and fractional levels. Send it without a
         // trailing `.0` so the server parses an int when the user picked one.
@@ -470,6 +478,9 @@ final class OMLXClient: ObservableObject {
             URLQueryItem(name: "model_path", value: modelPath),
             URLQueryItem(name: "oq_level", value: levelStr),
             URLQueryItem(name: "preserve_mtp", value: preserveMtp ? "true" : "false"),
+            URLQueryItem(name: "preserve_ngram_table", value: preserveNgramTable ? "true" : "false"),
+            URLQueryItem(name: "text_only", value: textOnly ? "true" : "false"),
+            URLQueryItem(name: "dtype", value: dtype),
         ])
     }
 
@@ -530,6 +541,15 @@ final class OMLXClient: ObservableObject {
     @discardableResult
     func startThroughputBench(_ body: BenchStartRequest) async throws -> BenchStartResponse {
         try await post(AdminAPI.benchStart, body: body)
+    }
+
+    func getActiveThroughputBench() async throws -> BenchActiveResponse {
+        try await get(AdminAPI.benchActive)
+    }
+
+    @discardableResult
+    func removeThroughputQueue(queueId: String) async throws -> BenchQueueResponse {
+        try await delete(AdminAPI.benchQueueRemove(queueId))
     }
 
     func getBenchResults(benchId: String) async throws -> BenchResultsResponse {

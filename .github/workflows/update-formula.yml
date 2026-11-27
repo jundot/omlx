@@ -30,7 +30,8 @@ jobs:
       - name: Calculate sha256
         id: sha
         run: |
-          sha=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" | shasum -a 256 | cut -d' ' -f1)
+          set -o pipefail
+          sha=$(curl -fsSL --retry 3 "https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" | shasum -a 256 | cut -d' ' -f1)
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Update formula

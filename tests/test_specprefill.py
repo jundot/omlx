@@ -730,7 +730,7 @@ class TestRequestFields:
 class TestEngineCorePropagation:
     """Tests for SpecPrefill param propagation through AsyncEngineCore.add_request."""
 
-    def _make_engine_core(self, draft_model=None):
+    def _make_engine_core(self, draft_model=None, default_enabled=True):
         """Create a minimal EngineCore for testing add_request propagation."""
         from unittest.mock import AsyncMock, MagicMock
 
@@ -744,6 +744,7 @@ class TestEngineCorePropagation:
 
         mock_scheduler = MagicMock(spec=[])
         mock_scheduler._specprefill_draft_model = draft_model
+        mock_scheduler._specprefill_default_enabled = default_enabled
         core.scheduler = mock_scheduler
 
         mock_config = MagicMock(spec=[])
@@ -791,6 +792,17 @@ class TestEngineCorePropagation:
         req = core.scheduler.add_request.call_args[0][0]
         assert not hasattr(req, "_specprefill_threshold")
         assert not hasattr(req, "_specprefill_keep_pct")
+
+    @pytest.mark.asyncio
+    async def test_draft_attached_for_an_alias_stays_idle_by_default(self):
+        from omlx.request import SamplingParams
+
+        core = self._make_engine_core(draft_model="/draft", default_enabled=False)
+
+        await core.add_request(prompt=[1, 2, 3], sampling_params=SamplingParams())
+
+        req = core.scheduler.add_request.call_args[0][0]
+        assert req._specprefill_enabled is False
 
 
 class TestRoPEReWrap:

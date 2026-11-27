@@ -108,7 +108,6 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
 
     struct AuthSettings: Codable, Equatable, Sendable {
         let apiKeySet: Bool
-        let apiKey: String?
         let skipApiKeyVerification: Bool?
         let allowUnauthenticatedInference: Bool?
         let subKeys: [SubKeyDTO]?
@@ -212,6 +211,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let splashMaxMemoryGb: Double?
         let splashSsdCacheGb: Double?
         let splashAnePrefill: Bool?
+        let splashMaxConcurrentRequests: Int?
     }
 
     /// Read-only `external_engines` block: the launcher each external engine
@@ -337,6 +337,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var splashMaxMemoryGb: PatchOptionalInt? = nil
     var splashSsdCacheGb: PatchOptionalInt? = nil
     var splashAnePrefill: Bool? = nil
+    var splashMaxConcurrentRequests: PatchOptionalInt? = nil
 
     /// Path to an MCP server config file. Empty string clears the field on
     /// the server (`global_settings.mcp.config_path = None`). Shared across

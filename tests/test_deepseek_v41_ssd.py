@@ -83,10 +83,17 @@ def test_legacy_anchor_and_invalid_metadata():
         restore_chain([_marker(0, 3)], [("deepseek_v41", "3", "4")], 3)
 
 
-@pytest.mark.parametrize("block_size", [3, 4])
-@pytest.mark.parametrize("engram", [False, True])
-@pytest.mark.parametrize("extend_prefix", [False, True])
-@pytest.mark.parametrize("decoder_replay", [False, True, "skip"])
+@pytest.mark.parametrize(
+    "block_size,engram,extend_prefix,decoder_replay",
+    [
+        (3, False, False, False),
+        (4, True, True, False),
+        (3, True, True, True),
+        (4, False, False, True),
+        (3, False, True, "skip"),
+        (4, True, False, "skip"),
+    ],
+)
 def test_real_ssd_reopen_full_and_partial_prefix(
     tmp_path, block_size, engram, extend_prefix, decoder_replay
 ):

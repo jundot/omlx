@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 # Settings file version for future migrations
 SETTINGS_VERSION = "1.0"
 
+# Seconds in-flight requests get to finish on SIGINT/SIGTERM. The Mac app kills
+# the server after 10 s, and the engine teardown needs the rest.
+GRACEFUL_SHUTDOWN_TIMEOUT_S = 5
+
 # Default base path
 DEFAULT_BASE_PATH = Path.home() / ".omlx"
 
@@ -590,6 +594,8 @@ VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"
 SPLASH_KV_FORMATS = frozenset({"int8", "bf16"})
 # Activation precisions `splash serve --activations` accepts (Splash 1.6.1+).
 SPLASH_ACTIVATIONS = frozenset({"auto", "bf16"})
+# `splash serve --max-concurrent-requests` accepts 1-8.
+SPLASH_MAX_CONCURRENT_REQUESTS = 8
 
 
 @dataclass
@@ -1003,6 +1009,7 @@ class IntegrationSettings:
     markitdown_max_file_size_mb: int = 25
     markitdown_max_files_per_request: int = 5
     markitdown_pdf_processing_engine: str = "markitdown"
+    macos_say_enabled: bool = False
     # "ddgs" (all engines) | "ddgs_custom" | "duckduckgo" | "brave" | "searxng"
     web_search_provider: str = "ddgs"
     web_search_brave_api_key: str = ""
@@ -1020,6 +1027,7 @@ class IntegrationSettings:
     splash_max_memory_gb: float | None = None  # None = what the ceiling leaves
     splash_ssd_cache_gb: float | None = None  # None = oMLX's SSD cache size
     splash_ane_prefill: bool = True
+    splash_max_concurrent_requests: int | None = None  # None = Splash's default
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -1038,6 +1046,7 @@ class IntegrationSettings:
             "markitdown_max_file_size_mb": self.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": self.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": self.markitdown_pdf_processing_engine,
+            "macos_say_enabled": self.macos_say_enabled,
             "web_search_provider": self.web_search_provider,
             "web_search_brave_api_key": self.web_search_brave_api_key,
             "web_search_searxng_url": self.web_search_searxng_url,
@@ -1052,6 +1061,7 @@ class IntegrationSettings:
             "splash_max_memory_gb": self.splash_max_memory_gb,
             "splash_ssd_cache_gb": self.splash_ssd_cache_gb,
             "splash_ane_prefill": self.splash_ane_prefill,
+            "splash_max_concurrent_requests": self.splash_max_concurrent_requests,
         }
 
     @classmethod
@@ -1076,6 +1086,7 @@ class IntegrationSettings:
             markitdown_pdf_processing_engine=data.get(
                 "markitdown_pdf_processing_engine", "markitdown"
             ),
+            macos_say_enabled=bool(data.get("macos_say_enabled", False)),
             web_search_provider=data.get("web_search_provider", "ddgs"),
             web_search_brave_api_key=data.get("web_search_brave_api_key", ""),
             web_search_searxng_url=data.get("web_search_searxng_url", ""),
@@ -1094,7 +1105,30 @@ class IntegrationSettings:
             splash_max_memory_gb=data.get("splash_max_memory_gb"),
             splash_ssd_cache_gb=data.get("splash_ssd_cache_gb"),
             splash_ane_prefill=data.get("splash_ane_prefill", True),
+            splash_max_concurrent_requests=data.get("splash_max_concurrent_requests"),
         )
+
+
+_CREDENTIAL_SECTIONS = frozenset({"auth", "network", "huggingface", "modelscope"})
+
+
+def _describe_setting_changes(
+    before: dict[str, Any], after: dict[str, Any]
+) -> list[str]:
+    changes: list[str] = []
+    for section, values in after.items():
+        if not isinstance(values, dict):
+            continue
+        previous = before[section]
+        for key, value in values.items():
+            old = previous.get(key)
+            if old == value:
+                continue
+            if section in _CREDENTIAL_SECTIONS:
+                changes.append(f"{section}.{key}: (value hidden)")
+            else:
+                changes.append(f"{section}.{key}: {old!r} -> {value!r}")
+    return changes
 
 
 @dataclass
@@ -1646,14 +1680,17 @@ class GlobalSettings:
             temp_file.unlink(missing_ok=True)
             raise
 
-    def save_cli_overrides(self, args: Any) -> None:
+    def save_cli_overrides(self, args: Any) -> list[str]:
         """Persist explicit non-secret CLI configuration without freezing env state."""
         persisted = type(self)(base_path=self.base_path)
         settings_file = self.base_path / "settings.json"
         if settings_file.exists():
             persisted._load_from_file(settings_file)
+        before = persisted.to_dict()
         persisted._apply_cli_overrides(args, include_api_key=False)
+        changes = _describe_setting_changes(before, persisted.to_dict())
         persisted.save()
+        return changes
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""
@@ -1957,6 +1994,14 @@ class GlobalSettings:
         ssd = self.integrations.splash_ssd_cache_gb
         if ssd is not None and ssd < 0:
             errors.append("splash_ssd_cache_gb must be >= 0")
+        concurrent = self.integrations.splash_max_concurrent_requests
+        if concurrent is not None and not (
+            1 <= concurrent <= SPLASH_MAX_CONCURRENT_REQUESTS
+        ):
+            errors.append(
+                "splash_max_concurrent_requests must be between 1 and "
+                f"{SPLASH_MAX_CONCURRENT_REQUESTS}"
+            )
 
         # HuggingFace validation
         if self.huggingface.endpoint:

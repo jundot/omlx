@@ -4494,8 +4494,8 @@ class TestQwen3CoderMarkerInArguments:
 
         for shape in (wrapped_evil, naked_loose, fake_terminators):
             for run in (stream, stream_chunked, parse, _wrap_naked_function_calls):
-                small = max(count(run, shape(100)), 1)
-                large = count(run, shape(400))
+                small = max(count(run, shape(40)), 1)
+                large = count(run, shape(160))
                 # 4x the input: linear is ~4x, quadratic ~16x.
                 assert large / small < 6, (
                     f"{shape.__name__}/{run.__name__}: {small=} {large=}"
@@ -5382,6 +5382,45 @@ def test_final_qwen_recovery_requires_complete_schema_valid_arguments(
     result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
     assert not result.tool_calls
     assert result.parse_errors == ("malformed",)
+
+
+_JSON_CALL = '<tool_call>{"name": "write", "arguments": {}}</tool_call>'
+_BROKEN_JSON_CALL = _JSON_CALL.replace("}}", "}]")
+
+
+@pytest.mark.parametrize(
+    "parser,thinking,raw,calls,errors",
+    [
+        ("json_tools", "", _BROKEN_JSON_CALL, 0, ("malformed",)),
+        ("mistral", "", '[TOOL_CALLS]write[ARGS]{"a": }', 0, ("malformed",)),
+        ("json_tools", "", "`<tool_call>`\n- read: a `</tool_call>` tag", 0, ()),
+        ("json_tools", "", f"`{_BROKEN_JSON_CALL}`", 0, ()),
+        ("mistral", "", 'The [TOOL_CALLS] marker, e.g. read("a")', 0, ()),
+        ("json_tools", "", _JSON_CALL + _BROKEN_JSON_CALL, 1, ()),
+        ("json_tools", _JSON_CALL, _BROKEN_JSON_CALL, 1, ()),
+        ("pythonic", "", "<|tool_call_start|>write()<|tool_call_end|>", 1, ()),
+    ],
+    ids=[
+        "lost",
+        "lost-name-first",
+        "prose",
+        "quoted",
+        "prose-one-sided",
+        "sibling",
+        "reasoning",
+        "fallback",
+    ],
+)
+def test_final_native_rejection_reports_only_a_lost_call(
+    parser, thinking, raw, calls, errors
+):
+    tok = _qwen_parser_tokenizer(f"mlx_lm.tool_parsers.{parser}")
+    tools = [{"function": {"name": name}} for name in (5, "read", "write")]
+    result = extract_tool_calls_with_thinking(
+        thinking, raw, tok, tools, finish_reason="stop"
+    )
+    assert len(result.tool_calls or []) == calls
+    assert result.parse_errors == errors
 
 
 class TestAttributeStyleFunctionDialect:

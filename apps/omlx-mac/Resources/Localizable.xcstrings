@@ -15407,6 +15407,54 @@
         }
       }
     },
+    "integrations.splash.max_concurrent" : {
+      "comment" : "Row label for the Splash concurrent request limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gleichzeitige Anfragen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Concurrent Requests"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Richieste simultanee"
+          }
+        }
+      }
+    },
+    "integrations.splash.max_concurrent.sub" : {
+      "comment" : "Sublabel for the Splash concurrent request limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wie viele Anfragen jedes Splash-Modell gleichzeitig bedient. Auto nutzt Splashs Standard von 4. Gilt ab Splash 1.7.1."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How many requests each Splash model serves at once. Auto uses Splash's default of 4. Applies to Splash 1.7.1 and later."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quante richieste ogni modello Splash gestisce contemporaneamente. Auto usa il valore predefinito di Splash, 4. Vale da Splash 1.7.1."
+          }
+        }
+      }
+    },
     "integrations.splash.max_memory" : {
       "comment" : "Row label for the Splash memory limit",
       "extractionState" : "manual",
@@ -26477,6 +26525,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "不可用 — 源模型没有 MTP 头"
+          }
+        }
+      }
+    },
+    "quant.advanced.preserve_ngram.label" : {
+      "comment" : "Toggle row label: keep DeepSeek V4.1 Engram tables in FP8",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Originale Engram-Tabellen beibehalten"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep original Engram tables"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantieni le tabelle Engram originali"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сохранять исходные таблицы Engram"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保留原始 Engram 表"
+          }
+        }
+      }
+    },
+    "quant.advanced.preserve_ngram.sub" : {
+      "comment" : "Toggle row sublabel: effect of keeping the original Engram tables",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Engram-Tabellen in FP8 statt in 4 Bit behalten (mehr Speicherplatz auf dem Datenträger)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep the Engram tables in FP8 instead of 4-bit (larger on disk)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantiene le tabelle Engram in FP8 anziché a 4 bit (più spazio su disco)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Оставить таблицы Engram в FP8 вместо 4 бит (больше места на диске)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Engram 表保持 FP8，不量化为 4 位（占用更多磁盘空间）"
           }
         }
       }
@@ -40170,6 +40290,150 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "DSA 模型的稀疏注意力索引缓存。THUDM/IndexCache。"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.label" : {
+      "comment" : "Row label for the LoopCD toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.skip_thinking.label" : {
+      "comment" : "Row label for the toggle that keeps LoopCD out of thinking blocks",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thinking-Blöcke ausnehmen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exclude Thinking Blocks"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escludi i blocchi di ragionamento"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Исключить блоки thinking"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "排除思考块"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.skip_thinking.sub" : {
+      "comment" : "Sublabel for the toggle that keeps LoopCD out of thinking blocks",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD nur auf Antwort und Tool-Aufrufe anwenden. Von den Autoren für Coding-Agenten empfohlen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply LoopCD only to the answer and tool calls. Recommended by its authors for coding agents."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applica LoopCD solo a risposta e chiamate agli strumenti. Consigliato dagli autori per gli agenti di programmazione."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Применять LoopCD только к ответу и вызовам инструментов. Авторы рекомендуют для агентов-программистов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅对回答和工具调用应用 LoopCD。作者建议编程智能体使用。"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.sub" : {
+      "comment" : "Sublabel describing LoopCD",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vergleicht bei der Tokenwahl den letzten Schleifendurchlauf mit dem ersten. Kann Antworten verbessern, ist aber langsamer und braucht mehr Speicher."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Contrast the last loop pass with the first to choose tokens. Can improve answers, but is slower and uses more memory."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Confronta l'ultimo passaggio del ciclo con il primo per scegliere i token. Può migliorare le risposte, ma è più lento e usa più memoria."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сопоставляет последний проход цикла с первым при выборе токенов. Может улучшить ответы, но медленнее и требует больше памяти."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择 token 时将最后一次循环与第一次对比。可能改善回答，但更慢且占用更多内存。"
           }
         }
       }

@@ -1,10 +1,10 @@
 # Splash engine
 
-[Splash](https://github.com/incoai/splash) runs Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next and Flint on its own Metal engine with DFlash2 speculative decoding. oMLX can serve a model through Splash as an external engine instead of its in-process MLX engines, including GGUF files, which only an external engine runs. The model stays in oMLX's model list, API, dashboard and usage statistics like any other; Splash does the inference in its own process.
+[Splash](https://github.com/incoai/splash) runs Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next, Flint and Inkling-2-Mini on its own Metal engine with DFlash2 speculative decoding. oMLX can serve a model through Splash as an external engine instead of its in-process MLX engines, including GGUF files, which only an external engine runs. The model stays in oMLX's model list, API, dashboard and usage statistics like any other; Splash does the inference in its own process.
 
 ## Setup
 
-1. Install Splash 1.3.0 or later (1.4.0 or later for Flash-Next, 1.4.1 or later for Ornith-1.5-122B and Flint):
+1. Install Splash 1.3.0 or later (1.4.0 or later for Flash-Next, 1.4.1 or later for Ornith-1.5-122B and Flint, 1.7.3 or later for Inkling-2-Mini):
 
    | Build | Launcher | Macs | Install |
    | --- | --- | --- | --- |
@@ -12,7 +12,7 @@
    | Splash M1 | `splash-m1` | M1 and M2 as well | `install-m1.sh` from [paperniuk/splash releases](https://github.com/paperniuk/splash/releases) |
 
 2. Open **Settings → Integrations → External engines**. oMLX looks for the launcher on `PATH`, then in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`, preferring Splash M1 on M1/M2 Macs and the official build elsewhere. When it finds one, the card shows its path and version. Otherwise, enter the launcher's path there (a source checkout's `./splash`, for example).
-3. Download the DFlash2 draft Splash pairs with the model's family into a model directory: `incoai/Qwen3.8-27B-DFlash2` (`z-lab/Qwen3.8-27B-DFlash2` holds the same weights), `incoai/Qwen3.6-35B-A3B-DFlash2`, `incoai/Ornith-1.5-122B-DFlash2` (for every Qwen3.5-122B-A10B model), `incoai/Qwen3.8-Flash-Next-DFlash2` or `incoai/Flint-DFlash2`. The model's **Model Settings → Advanced** offers a button that downloads it.
+3. Download the DFlash2 draft Splash pairs with the model's family into a model directory: `incoai/Qwen3.8-27B-DFlash2` (`z-lab/Qwen3.8-27B-DFlash2` holds the same weights), `incoai/Qwen3.6-35B-A3B-DFlash2`, `incoai/Ornith-1.5-122B-DFlash2` (for every Qwen3.5-122B-A10B model), `incoai/Qwen3.8-Flash-Next-DFlash2`, `incoai/Flint-DFlash2` or `incoai/Inkling-2-Mini-DFlash2`. The model's **Model Settings → Advanced** offers a button that downloads it.
 4. In the model's **Model Settings → Advanced**, turn on **Use external engine** and pick Splash. A GGUF model has it on already.
 
 The toggle stays off, with the reason shown, until all of this is in place. The macOS app has the same settings under Integrations and the model's Advanced tab. In the model list, a model Splash can serve carries a Splash badge.
@@ -27,6 +27,7 @@ Quantized checkpoints of the families Splash supports:
 - Qwen3.8-Flash-Next GGUFs need Splash 1.4.0 or later, for example the Q2_0 variant of `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` or an Unsloth GGUF. Flash-Next MLX checkpoints do not run on Splash. Its DFlash2 draft is `incoai/Qwen3.8-Flash-Next-DFlash2`.
 - Qwen3.5-122B-A10B models, such as Ornith-1.5-122B, need Splash 1.4.1 or later, as MLX checkpoints (`ornith-ai/Ornith-1.5-122B-MLX-4bit`, with its vision tower) or GGUFs (`unsloth/Ornith-1.5-122B-GGUF`, with a vision projector for image input). Their DFlash2 draft is `incoai/Ornith-1.5-122B-DFlash2`.
 - Flint GGUFs need Splash 1.4.1 or later, for example a variant of `unsloth/flint-GGUF`. Flint has no vision tower, so it always serves text only, and Flint MLX checkpoints do not run on Splash. Its DFlash2 draft is `incoai/Flint-DFlash2`.
+- Inkling-2-Mini needs Splash 1.7.3 or later, as GGUFs (`unsloth/Inkling-2-Mini-GGUF`, with a vision projector for image input), MLX conversions such as `mlx-community/Inkling-2-Mini-4bit`, or the original mixed NVFP4/MXFP8 weights in `thinkingmachines/Inkling-2-Mini`. Its draft is `incoai/Inkling-2-Mini-DFlash2`.
 - MoE GGUFs pruned to fewer routed experts than their family need Splash 1.4.1 or later, for example `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF`, which keeps 256 of Flash-Next's 512 experts. The expert count must be a multiple of 8; Splash checks the rest when it loads the file. Pruned MLX checkpoints do not run on Splash.
 
 Prebuilt Splash packages (`incoai/*-Splash`) are not supported; Splash 1.3.1 replaced them with the MLX checkpoints above. The model downloader refuses them and names the MLX model that holds the same weights.
@@ -35,7 +36,7 @@ Prebuilt Splash packages (`incoai/*-Splash`) are not supported; Splash 1.3.1 rep
 
 In the model downloader, the **GGUF only** view lists GGUF repositories. Downloading one opens its file list: check the GGUF to download, and its vision projector (`mmproj-*.gguf`) is checked with it. Only the checked files are fetched, into `<model dir>/<owner>/<repo>/`.
 
-oMLX lists each GGUF in a model directory, an organization folder (`<owner>/<repo>/`, as the downloader and LM Studio lay them out) or the Hugging Face cache as its own model, named by its file, for example `Qwen3.8-27B-UD-Q4_K_M`. Split GGUFs can also be in a folder named for their variant, such as `Q2_0/Model-Q2_0-00001-of-00002.gguf`. All parts must be present; a vision projector at the repository root is paired with them. Vision projectors, imatrix files and draft subfolders are not models. For each GGUF oMLX generates a folder under `<base path>/gguf` with a `config.json` derived from the file's header and links to the file and its projectors; for the Qwen families and Flint the folder also holds the tokenizer the header defines. A GGUF runs only on an external engine: it never loads in oMLX's MLX engines, and `/v1/models` lists it only while an engine can serve it. Deleting a GGUF in the model manager removes its parts, and the folder goes with its last GGUF.
+oMLX lists each GGUF in a model directory, an organization folder (`<owner>/<repo>/`, as the downloader and LM Studio lay them out) or the Hugging Face cache as its own model, named by its file, for example `Qwen3.8-27B-UD-Q4_K_M`. Split GGUFs can also be in a folder named for their variant, such as `Q2_0/Model-Q2_0-00001-of-00002.gguf`. All parts must be present; a vision projector at the repository root is paired with them. Vision projectors, imatrix files and draft subfolders are not models. For each GGUF oMLX generates a folder under `<base path>/gguf` with a `config.json` derived from the file's header and links to the file and its projectors; for the Qwen families, Flint and Inkling-2-Mini the folder also holds the tokenizer the header defines. A GGUF runs only on an external engine: it never loads in oMLX's MLX engines, and `/v1/models` lists it only while an engine can serve it. Deleting a GGUF in the model manager removes its parts, and the folder goes with its last GGUF.
 
 PLE variants such as `Q4-PLE8/` can keep their lookup table in a separately named last shard. oMLX groups the complete numbered set as one model and includes the variant name in its model ID, so `Q4-PLE4` and `Q4-PLE8` remain separate even when their body files have the same names. Pick any shard in the downloader to select the whole set and its projector.
 
@@ -45,7 +46,7 @@ Splash finds models by Hugging Face repository ID in a Hugging Face cache. oMLX 
 
 On the first start Splash hashes the model files once (about one full read of the weights); later starts only check their sizes and times. A model folder that is itself a Hugging Face cache snapshot skips the hashing. Splash keeps its own selection links under `~/Library/Application Support/Splash/models/omlx/`.
 
-Loading the model starts `splash serve` from the selected launcher on a free loopback port with a random API key, which travels in the environment rather than on the command line. Requests are forwarded to Splash's OpenAI-compatible API. Reasoning comes back inside `<think>` tags for oMLX's reasoning parser, and tool calls come back structured, so chat completions, the Responses API and the Anthropic Messages API all work. The dashboard's active-models card shows Splash requests live (prefill progress from Splash's progress events, then generation speed), and the cache block lists Splash models next to MLX ones with Splash's own counters.
+Loading the model starts `splash serve` from the selected launcher on a free loopback port with a random API key, which travels in the environment rather than on the command line. Requests are forwarded to Splash's OpenAI-compatible API. Reasoning comes back inside `<think>` tags for oMLX's reasoning parser, and tool calls come back structured, so chat completions, the Responses API and the Anthropic Messages API all work. Text completions (`/v1/completions`) go to Splash's own text completions endpoint. The dashboard's active-models card shows Splash requests live (prefill progress from Splash's progress events, then generation speed), and the cache block lists Splash models next to MLX ones with Splash's own counters.
 
 Unloading the model stops the Splash process. Splash runs in its own process group under a small watchdog shell: if oMLX exits without unloading, even from `kill -9`, the watchdog stops Splash within two seconds. Splash's log is in oMLX's log directory under `splash/`.
 
@@ -53,13 +54,14 @@ Unloading the model stops the Splash process. Splash runs in its own process gro
 
 | oMLX | Splash |
 | --- | --- |
-| Model's max context window, when set | `--max-context` (at most 256K); Splash refuses to start when its memory budget cannot hold it |
+| Model's max context window, when set | `--max-context`, at most 256K for Flint and for Qwen models before Splash 1.4.0, and up to 1,010,000 for Inkling-2-Mini and for Qwen models from Splash 1.4.0 on. Qwen models use YaRN past 256K, which changes answers at every length. When the memory budget cannot hold it, Splash fits the context to the budget |
 | Integrations → Memory limit (empty: enough for the model's context window) | `--max-memory`, never more than the oMLX memory limit leaves free |
 | Integrations → KV cache precision | `--kv-format` |
 | Integrations → Activation precision (Splash 1.6.1+) | `--activations`; `auto` is left implicit, `bf16` pins attention to bf16 on M5 and later |
 | Integrations → SSD cache, per Splash model (empty: the oMLX SSD cache size, 0: off) | `--max-cache-disk` with `--persistent-cache` under `<SSD cache dir>/splash/<model>/`; `--max-cache-disk 0` when it is 0 or the oMLX SSD cache is off (cache disabled or hot cache only) |
 | Integrations → Neural Engine prefill | off adds `--disable-ane` |
-| `reasoning_effort`, `enable_thinking: false` | `reasoning_effort` (`enable_thinking: false` becomes `none`); Flint decides when to reason itself and ignores it |
+| Integrations → Concurrent requests (Splash 1.7.1+; Auto: Splash's default of 4) | `--max-concurrent-requests`; requests beyond it wait in Splash's queue |
+| `reasoning_effort`, `enable_thinking: false` | `reasoning_effort` (`enable_thinking: false` becomes `none`); Flint and Inkling-2-Mini can still reason with thinking off |
 | `response_format` (JSON object / JSON schema) | enforced by Splash itself, no prompt injection |
 
 The SSD cache size is a limit for each Splash model, not a shared total. Each Splash process enforces it on its own folder, and a model's folder stays after the model unloads. Three Splash models with a 100 GB limit can therefore hold up to 300 GB, in addition to oMLX's own SSD cache. Left empty, every Splash model may use the whole oMLX SSD cache size (with `auto`, about half the free disk space), so set a size when you use more than one Splash model. The dashboard's SSD cache Delete button clears these folders too.
@@ -80,10 +82,10 @@ With Splash 1.4.0 or later, MoE models can stream their experts from SSD when th
 
 ## Benchmarks
 
-The admin benchmark runs on Splash models through Splash's chat API, with thinking off (Flint may still reason), a unique prefix on every prompt so Splash's prefix cache cannot skew prefill, and the Splash process group's peak memory. Splash results are not uploaded to omlx.ai.
+The admin benchmark runs on Splash models through Splash's chat API, with thinking off (Flint and Inkling-2-Mini may still reason), a unique prefix on every prompt so Splash's prefix cache cannot skew prefill, and the Splash process group's peak memory. Splash results are not uploaded to omlx.ai.
 
 ## Limits
 
-- Splash serves chat requests only. `/v1/completions` returns HTTP 400.
-- Image input works for checkpoints with a vision tower (`vision_config` in `config.json`): oMLX passes image parts through to Splash, in chat completions, the Responses API and the Anthropic Messages API. Checkpoints without one, and Flint models, start with `--language-only`. Splash does not read video or audio input.
+- Text completions send the prompt as raw text, without the chat template. Nothing splits reasoning out of the reply, so the thinking budget does not apply to them.
+- Image input works for checkpoints with a vision tower (`vision_config` in `config.json`): oMLX passes image parts through to Splash, in chat completions, the Responses API and the Anthropic Messages API. Flint and checkpoints without a vision tower start with `--language-only`. Splash does not read video or audio input.
 - The other acceleration settings (MTP, DFlash, TurboQuant, ANE prefill, and so on) configure oMLX's MLX engines and do not apply while Splash serves the model.
