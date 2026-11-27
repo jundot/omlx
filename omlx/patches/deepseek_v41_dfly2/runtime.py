@@ -8,12 +8,14 @@ model wiring so it can be exercised with synthetic layers.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Callable, Sequence
 
 import mlx.core as mx
 
 from .dfly2_block import draft_block
 from .dfly2_context import DFly2LayerContext
+from .dfly2_layer import attentive_correction
 
 
 class DFly2Runtime:
@@ -33,6 +35,8 @@ class DFly2Runtime:
         correct: Callable[[mx.array, mx.array], mx.array],
         lm_head: Callable[[mx.array], mx.array],
         mask_token_id: int,
+        correction_weights: Mapping[str, mx.array] | None = None,
+        correction_config=None,
     ) -> None:
         if not layers:
             raise ValueError("DFly2Runtime needs at least one draft layer")
@@ -42,6 +46,8 @@ class DFly2Runtime:
         self.correct_hidden = correct
         self.lm_head = lm_head
         self.mask_token_id = int(mask_token_id)
+        self.correction_weights = correction_weights
+        self.correction_config = correction_config
 
     def block_hidden(
         self,
@@ -84,10 +90,32 @@ class DFly2Runtime:
         embed: Callable[[mx.array], mx.array],
         hidden: mx.array,
         previous_token: mx.array,
+        *,
+        slot: int | None = None,
+        history: DFly2LayerContext | None = None,
+        start_position: int = 0,
+        predecessor_embeddings: mx.array | None = None,
     ) -> mx.array:
-        """Correct one slot's hidden state with the previous token's embedding."""
+        """Correct a hidden slot, using Eq. (11) when its attention weights are bound.
+
+        The engine's legacy three-argument call remains the inherited-SwiGLU path.
+        Full attentive correction needs the whole block, its slot, and target history.
+        """
         token = previous_token.reshape(-1)[:1].astype(mx.int32)
-        return self.correct_hidden(hidden, embed(token.reshape(1, 1))[:, 0].astype(hidden.dtype))
+        embedded = embed(token.reshape(1, 1))[:, 0].astype(hidden.dtype)
+        if slot is None or history is None or self.correction_weights is None or self.correction_config is None:
+            # Old checkpoints/runtime construction omit the correction attention.
+            return self.correct_hidden(hidden if slot is None else hidden[:, slot], embedded)
+        previous = predecessor_embeddings if predecessor_embeddings is not None else embedded
+        return attentive_correction(
+            hidden,
+            int(slot),
+            previous.astype(hidden.dtype),
+            history,
+            self.correction_weights,
+            self.correction_config,
+            start_position=int(start_position),
+        )
 
     def draft(
         self,
