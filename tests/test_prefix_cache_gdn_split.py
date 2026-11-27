@@ -750,6 +750,108 @@ def test_scheduler_exact_split_hit_reprefills_only_last_block():
     )
 
 
+def test_scheduler_restores_system_tail_when_longer_match_has_no_sidecar(tmp_path):
+    cache_dir = tmp_path / "cache"
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="hybrid-model",
+        initial_blocks=100,
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=100 * 1024**2,
+        expected_model_name="hybrid-model",
+        expected_num_layers=2,
+        expected_block_size=BLOCK_SIZE,
+        expected_layer_cache_types=LAYER_TYPES,
+        gdn_ssd_split_enabled=True,
+    )
+    paged.set_paged_ssd_cache_manager(ssd)
+    boundary = BoundarySnapshotSSDStore(cache_dir, pending_max_bytes=1024**2)
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=True,
+    )
+    prefix.set_gdn_checkpoint_loader(boundary.load_file)
+    signature = ssd.gdn_cache_signature_for(
+        model_name="hybrid-model",
+        num_layers=2,
+        block_size=BLOCK_SIZE,
+        layer_cache_types=LAYER_TYPES,
+    )
+
+    def store(request_id, tokens, boundaries, **flags):
+        for token_count in boundaries:
+            extracted = _hybrid_extracted(token_count, float(token_count))
+            assert boundary.save(
+                request_id,
+                token_count,
+                [MagicMock()],
+                lambda _snapshot, extracted=extracted: (extracted, None),
+            )
+        stored = prefix.store_cache(
+            request_id,
+            tokens,
+            _hybrid_extracted(len(tokens), float(len(tokens))),
+            boundary_snapshots=_BoundarySnapshotProvider(
+                boundary, request_id, boundaries[:-1], {}, paged_ssd_manager=ssd
+            ),
+            **flags,
+        )
+        paged.release_for_eviction(stored.block_ids)
+        return _block_hashes(prefix, stored)
+
+    try:
+        conversation = list(range(20))
+        for block_hash in store("conversation", conversation, [4, 8, 12, 16, 20]):
+            assert ssd.forget_gdn_checkpoint(block_hash, signature)
+        prefix.fetch_cache("system", conversation[:12], record_stats=False)
+        store(
+            "system",
+            conversation[:13],
+            [13],
+            _store_tail_terminal=True,
+            _store_shared_tail=True,
+        )
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.model = _HybridModel()
+        scheduler.config = SchedulerConfig(
+            paged_cache_block_size=BLOCK_SIZE,
+            gdn_ssd_split_enabled=True,
+        )
+        scheduler._prefix_cache_prepared = set()
+        scheduler._gdn_split_active = MagicMock(return_value=True)
+        scheduler._bypass_hot_cache_under_pressure = MagicMock(return_value=False)
+        scheduler._log_prefix_divergence = MagicMock()
+        scheduler._try_specprefill_scoring = MagicMock()
+        scheduler.paged_cache_manager = paged
+        scheduler.block_aware_cache = prefix
+
+        request = MagicMock()
+        request.request_id = "new-context"
+        request.prompt_token_ids = conversation + [90, 91]
+        request.system_prefix_end = 13
+        request.vlm_extra_keys_for_cache = None
+        request.vlm_extra_key_token_start_for_cache = None
+        request.vlm_extra_key_ranges_for_cache = None
+
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        assert request.cached_tokens == 13
+        assert {
+            block_id
+            for block_id, block in paged.allocated_blocks.items()
+            if block.ref_count > 0 and not block.is_null
+        } == set(request.block_table.block_ids)
+    finally:
+        boundary.shutdown()
+        ssd.close()
+
+
 def test_split_restore_retries_legacy_candidate_at_the_same_endpoint(tmp_path):
     """A corrupt current sidecar falls back in place instead of walking back.
 

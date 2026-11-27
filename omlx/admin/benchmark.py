@@ -12,6 +12,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
@@ -187,6 +188,7 @@ class BenchmarkRun:
 
     bench_id: str
     request: BenchmarkRequest
+    queue_id: Optional[str] = None
     status: str = "running"  # running, completed, cancelled, error
     events: list[dict] = field(default_factory=list)
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
@@ -405,6 +407,8 @@ _UPLOADED_SETTING_FIELDS = (
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
+    "loopcd_enabled",
+    "loopcd_skip_thinking",
     "qwen35_ane_prefill_enabled",
     "qwen35_ane_prefill_sequence_length",
     "qwen35_ane_prefill_tail_padding_min_tokens",
@@ -520,6 +524,8 @@ def _setting_feature_flags(
         flags.append(
             {"key": "qwen4_wide_decode", "label": "Qwen4 Extended Fused Decode"}
         )
+    if getattr(model_settings, "loopcd_enabled", False):
+        flags.append({"key": "loopcd", "label": "LoopCD"})
     if getattr(model_settings, "activation_fp16_enabled", False):
         flags.append({"key": "activation_fp16", "label": "Float16 Activations"})
     return flags
@@ -614,10 +620,12 @@ def get_active_run() -> Optional[BenchmarkRun]:
     return None
 
 
-def create_run(request: BenchmarkRequest) -> BenchmarkRun:
+def create_run(
+    request: BenchmarkRequest, queue_id: Optional[str] = None
+) -> BenchmarkRun:
     """Create and register a new benchmark run."""
     bench_id = f"bench-{uuid.uuid4().hex[:12]}"
-    run = BenchmarkRun(bench_id=bench_id, request=request)
+    run = BenchmarkRun(bench_id=bench_id, request=request, queue_id=queue_id)
     _benchmark_runs[bench_id] = run
     return run
 
@@ -632,6 +640,81 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
     if len(completed) > max_runs:
         for bid, _ in completed[:-max_runs]:
             del _benchmark_runs[bid]
+
+
+_queue: list[tuple[str, BenchmarkRequest]] = []
+
+
+def queue_busy() -> bool:
+    """True while a run's `run_queue` task is alive, including during uploads."""
+    return any(
+        r.task is not None and not r.task.done() for r in _benchmark_runs.values()
+    )
+
+
+def add_to_queue(request: BenchmarkRequest) -> str:
+    """Queue `request` and return the id the caller can watch for."""
+    queue_id = f"q-{uuid.uuid4().hex[:8]}"
+    _queue.append((queue_id, request))
+    return queue_id
+
+
+def remove_from_queue(queue_id: str) -> bool:
+    """Remove the entry with `queue_id`; ids stay stable while the queue moves."""
+    for idx, (queued_id, _) in enumerate(_queue):
+        if queued_id == queue_id:
+            _queue.pop(idx)
+            return True
+    return False
+
+
+def clear_queue() -> None:
+    _queue.clear()
+
+
+def get_queue() -> list[dict]:
+    return [
+        {
+            "queue_id": queue_id,
+            "model_id": r.model_id,
+            "external": r.external is not None,
+        }
+        for queue_id, r in _queue
+    ]
+
+
+async def run_queue(
+    run: BenchmarkRun,
+    engine_pool: Any,
+    on_start: Callable[[], None] | None = None,
+) -> None:
+    """Run `run`, then each queued request in turn until the queue is empty.
+
+    Cancel ends the chain by clearing the queue, so a request queued after
+    the cancel still runs. `on_start` runs before each promoted request.
+    """
+    try:
+        while True:
+            try:
+                await run_benchmark(run, engine_pool)
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    f"Benchmark queue: run {run.bench_id} raised: {e}", exc_info=True
+                )
+                run.status = "error"
+                run.error_message = str(e)
+                if not run.terminal:
+                    await _send_event(run, {"type": "error", "message": str(e)})
+            if not _queue or getattr(engine_pool, "_shutting_down", False):
+                return
+            cleanup_old_runs()
+            queue_id, request = _queue.pop(0)
+            run = create_run(request, queue_id=queue_id)
+            run.task = asyncio.current_task()
+            if on_start is not None:
+                on_start()
+    finally:
+        _queue.clear()
 
 
 # Bundled corpora for benchmark prompts. They contain long-form code or prose,

@@ -173,6 +173,41 @@ def test_a_hole_in_the_chain_hides_deeper_boundaries(tmp_path):
     assert store.load(MODEL, tokens, 4) is not None
 
 
+def test_a_full_state_file_restores_past_a_hole(tmp_path):
+    store = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    tokens = list(range(12))
+    state = ArraysCache(size=1)
+    for boundary in (4, 8, 12):
+        _advance([state], 4)
+        assert store.put(MODEL, tokens[:boundary], [state])
+
+    reopened = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    reopened._path(reopened._chain_keys(MODEL, tuple(tokens))[1]).unlink()
+
+    assert reopened.present_boundaries(MODEL, tokens) == (12, 4)
+    assert mx.array_equal(reopened.load(MODEL, tokens, 12)[0][0], state[0])
+
+
+def test_an_older_full_state_entry_stands_alone_once_written_again(tmp_path):
+    store = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    tokens = list(range(8))
+    state = ArraysCache(size=1)
+    for boundary in (4, 8):
+        _advance([state], 4)
+        assert store.put(MODEL, tokens[:boundary], [state])
+    manifest = tmp_path / "index.json"
+    payload = json.loads(manifest.read_text())
+    for row in payload["entries"]:
+        del row["standalone"]
+    manifest.write_text(json.dumps(payload))
+
+    reopened = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    assert reopened.put(MODEL, tokens, [state])
+    reopened._path(reopened._chain_keys(MODEL, tuple(tokens))[0]).unlink()
+
+    assert reopened.present_boundaries(MODEL, tokens) == (8,)
+
+
 def test_branching_prompts_share_their_common_chain(tmp_path):
     store = SSDPromptSnapshotStore(tmp_path, step=4)
     trunk = list(range(8))

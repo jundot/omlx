@@ -15,6 +15,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from omlx.patches import qwen35_verify_qmm
+from omlx.speculative import vlm_mtp
 from omlx.speculative.vlm_mtp import (
     _MTPResetBindingProxy,
     _VLMAdapterMTPProxy,
@@ -151,6 +153,46 @@ class TestVLMAdapterMTPProxy:
         # _mtp_rounds line 547: lm = model.language_model if hasattr(...) else model
         lm = proxy.language_model if hasattr(proxy, "language_model") else proxy
         assert lm is proxy
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_mtp", "gemma4_assistant"])
+def test_qwen_drafter_verify_kernels_and_post_norm_hidden(monkeypatch, model_type):
+    qwen = model_type == "qwen3_5_mtp"
+    adapter = FakeVLMAdapter(uses_mrope=True)
+    language_model = adapter._language_model
+    language_model.model = SimpleNamespace(norm=lambda h: h + 1)
+    armed, hiddens = [], []
+    pre_norm = FakeLanguageModel.__call__
+
+    def forward(self, *args, **kwargs):
+        armed.append(qwen35_verify_qmm._is_armed())
+        return pre_norm(self, *args, **kwargs)
+
+    def rounds(target, drafter, cache, hidden, shared_kv, **kwargs):
+        out = target(mx.zeros((1, 3)), cache=cache, return_hidden=True)
+        hiddens.extend([hidden, out.hidden_states[-1]])
+        yield 11, None
+
+    monkeypatch.setattr(FakeLanguageModel, "__call__", forward)
+    monkeypatch.setattr(vlm_mtp, "_mtp_rounds", rounds)
+    monkeypatch.setattr(vlm_mtp, "_buffer_mtp_target_cache", lambda *args: None)
+    monkeypatch.setattr(vlm_mtp, "_sync_and_clear_cache", lambda *args: None)
+    draft = SimpleNamespace(config=SimpleNamespace(model_type=model_type))
+    list(
+        vlm_mtp.run_vlm_mtp_decode(
+            target_language_model=adapter,
+            drafter=vlm_mtp.VLMMTPDrafter(draft, "mtp", "/p"),
+            prompt_cache=[],
+            hidden=mx.zeros((1, 1, 8)),
+            shared_kv_states={},
+            first_bonus=7,
+            max_tokens=4,
+            sampler=lambda x: x,
+        )
+    )
+
+    assert armed == [qwen] and not qwen35_verify_qmm._is_armed()
+    assert all((h == float(qwen)).all().item() for h in hiddens)
 
 
 # ---------------------------------------------------------------------------

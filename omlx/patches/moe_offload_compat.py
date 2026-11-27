@@ -20,6 +20,8 @@ _SUPPORTED_TYPES = frozenset(
         "glm_moe_dsa",
         "glm5_next",
         "minicpmv4_7",
+        "inkling2_loop",
+        "bailing_hybrid",
     }
 )
 
@@ -60,7 +62,11 @@ def _inspect(path, signature):
     from .moe_expert_offload import CheckpointExpertStore, _qwen35_checkpoint_prefix
 
     text = raw.get("text_config", raw)
-    if kind in ("glm_moe_dsa", "deepseek_v4", "glm5_next"):
+    if kind == "bailing_hybrid":
+        count = int(text.get("num_experts") or 0)
+        first_moe = int(text.get("first_k_dense_replace") or 0)
+        moe_freq = int(text.get("moe_layer_freq") or 1)
+    elif kind in ("glm_moe_dsa", "deepseek_v4", "glm5_next", "inkling2_loop"):
         count = int(text.get("n_routed_experts") or 0)
         first_moe = int(text.get("first_k_dense_replace") or 0)
         moe_freq = int(text.get("moe_layer_freq") or 1)
@@ -70,7 +76,11 @@ def _inspect(path, signature):
     layers = int(text.get("num_hidden_layers") or 0)
     hidden = int(text.get("hidden_size") or 0)
     intermediate = int(
-        text.get("intermediate_size" if kind == "olmoe" else "moe_intermediate_size")
+        text.get(
+            "intermediate_size"
+            if kind in ("olmoe", "inkling2_loop")
+            else "moe_intermediate_size"
+        )
         or 0
     )
     if min(count, layers, hidden, intermediate) <= 0 or (
@@ -97,7 +107,7 @@ def _inspect(path, signature):
             continue  # dense layer (GLM's first_k_dense_replace)
         if sparse_layers is not None and layer not in sparse_layers:
             continue  # dense layer (glm5_next's mlp_layer_types)
-        if kind in ("olmoe", "glm_moe_dsa"):
+        if kind in ("olmoe", "glm_moe_dsa", "bailing_hybrid"):
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         elif kind in ("qwen4_exp", "qwen3_5_moe", "minicpmv4_7"):
@@ -109,25 +119,37 @@ def _inspect(path, signature):
         elif kind == "glm5_next":
             parent = f"language_model.model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
+        elif kind == "inkling2_loop":
+            parent = f"model.layers.{layer}.mlp"
+            prefix = parent + ".experts"
         else:
             parent = f"language_model.model.layers.{layer}.experts"
             prefix = parent + ".switch_glu"
         if kind in ("qwen3_5_moe", "minicpmv4_7"):
             prefix = _qwen35_checkpoint_prefix(store, prefix)
+        projs = (
+            (("w13", 2 * intermediate, hidden), ("w2", hidden, intermediate))
+            if kind == "inkling2_loop"
+            else (
+                ("gate_proj", intermediate, hidden),
+                ("up_proj", intermediate, hidden),
+                ("down_proj", hidden, intermediate),
+            )
+        )
+        first = f"{prefix}.{projs[0][0]}.weight"
         if kind in (
             "deepseek_v4",
             "glm5_next",
             "qwen3_5_moe",
             "minicpmv4_7",
-        ) and not store.has(prefix + ".gate_proj.weight"):
+            "inkling2_loop",
+            "bailing_hybrid",
+        ) and not store.has(first):
             # These adapters read the stacked slabs positionally; a
             # per-expert layout wraps nothing.
-            return (
-                False,
-                f"Checkpoint is missing expert tensor: {prefix}.gate_proj.weight",
-            )
-        per_expert = not store.has(prefix + ".gate_proj.weight")
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+            return False, f"Checkpoint is missing expert tensor: {first}"
+        per_expert = not store.has(first)
+        for proj, output, width in projs:
             key = prefix + "." + proj
             spec = quant.get(key, quant)
             if not isinstance(spec, dict):
@@ -135,7 +157,10 @@ def _inspect(path, signature):
             bits = spec.get("bits", 4)
             group = spec.get("group_size", 64)
             mode = spec.get("mode", "affine")
-            if mode not in ("affine", "mxfp4", "mxfp8") or bits not in (
+            modes = ("affine", "mxfp4", "mxfp8") + (
+                ("nvfp4",) if kind == "inkling2_loop" else ()
+            )
+            if mode not in modes or bits not in (
                 2,
                 3,
                 4,
@@ -144,11 +169,11 @@ def _inspect(path, signature):
                 8,
             ):
                 return False, f"Unsupported expert quantization: {key}"
-            output, width = (
-                (hidden, intermediate)
-                if proj == "down_proj"
-                else (intermediate, hidden)
-            )
+            if mode == "nvfp4" and (
+                not store.has(key + ".global_scale")
+                or store.spec(key + ".global_scale") != ((count,), "F32")
+            ):
+                return False, f"Unsupported expert tensor shape or dtype: {key}"
             if (
                 not isinstance(group, int)
                 or group <= 0

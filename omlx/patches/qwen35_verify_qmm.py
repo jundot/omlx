@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from functools import wraps
 
 from omlx.custom_kernels import nax_skinny_qmm
 from omlx.custom_kernels.nax import is_nax_available
@@ -1321,6 +1322,9 @@ def _patch_verify_swiglu() -> None:
     if getattr(original, "_omlx_sg8_swiglu", False):
         return
 
+    # Keep the inner markers visible: the router patch checks the outermost
+    # function on every load and would wrap over the verify window again.
+    @wraps(original)
     def _feed_forward(self, feed_forward, x):
         gate = getattr(feed_forward, "gate_proj", None)
         up = getattr(feed_forward, "up_proj", None)

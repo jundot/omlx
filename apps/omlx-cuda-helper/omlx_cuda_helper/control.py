@@ -157,13 +157,18 @@ class ControlServer:
             return {"op": "ok"}
         if op == "info":
             total, available = gpus.memory()
+            found = gpus.gpus(self.gpu_indices)
+            error = "" if found else gpus.smi_error()
+            if error:
+                logger.warning("no GPU is left: %s", error)
             return {
                 "op": "ok",
                 "version": __version__,
                 "data_protocol": DATA_PROTOCOL,
                 "contracts": self.contracts,
                 "oqh": self.oqh,
-                "gpus": gpus.gpus(self.gpu_indices),
+                "gpus": found,
+                "gpu_error": error,
                 "reserve": RESERVE_BYTES,
                 "ram": total,
                 "ram_available": available,

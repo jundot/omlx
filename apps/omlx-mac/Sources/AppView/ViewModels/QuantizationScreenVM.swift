@@ -9,6 +9,7 @@ final class QuantizationScreenVM {
     var oqLevel: Double = 4
     var textOnly: Bool = false
     var preserveMtp: Bool = false
+    var preserveNgram: Bool = false
     var dtype: String = "bfloat16"
     var enhanced: Bool = false
     var hadamard: Bool = false
@@ -94,6 +95,10 @@ final class QuantizationScreenVM {
 
     var selectedHasMTP: Bool {
         models.first(where: { $0.path == selectedModelPath })?.hasMtpHeads ?? false
+    }
+
+    var selectedHasEngram: Bool {
+        models.first(where: { $0.path == selectedModelPath })?.modelType == "deepseek_v41"
     }
 
     /// Estimate strip — memory pill. Mirrors `oqEstimatedMemory` in JS:
@@ -241,13 +246,14 @@ final class QuantizationScreenVM {
     /// keyboard arrows) collapse to a single network round-trip.
     func scheduleEstimateRefresh(client: OMLXClient) {
         estimateDebounceTask?.cancel()
-        if selectedModelPath.isEmpty {
-            estimate = nil
-            return
-        }
+        estimate = nil
+        guard !selectedModelPath.isEmpty else { return }
         let path = selectedModelPath
         let level = oqLevel
         let preserve = selectedHasMTP && preserveMtp
+        let preserveTables = selectedHasEngram && preserveNgram
+        let onlyText = textOnly
+        let outputDtype = dtype
         estimateDebounceTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(300))
             if Task.isCancelled { return }
@@ -255,14 +261,15 @@ final class QuantizationScreenVM {
                 let est = try await client.estimateOQ(
                     modelPath: path,
                     oqLevel: level,
-                    preserveMtp: preserve
+                    preserveMtp: preserve,
+                    preserveNgramTable: preserveTables,
+                    textOnly: onlyText,
+                    dtype: outputDtype
                 )
-                await MainActor.run {
-                    guard let self else { return }
-                    // Drop the result if the user has moved on to a different
-                    // model since this request was kicked off.
-                    if self.selectedModelPath == path { self.estimate = est }
+                guard let self, !Task.isCancelled, self.selectedModelPath == path else {
+                    return
                 }
+                self.estimate = est
             } catch {
                 // Silent — the strip will read "Calculating…" which is fine
                 // for a transient estimate failure.
@@ -285,6 +292,7 @@ final class QuantizationScreenVM {
             textOnly: textOnly,
             dtype: dtype,
             preserveMtp: selectedHasMTP && preserveMtp,
+            preserveNgramTable: selectedHasEngram && preserveNgram,
             enhanced: enhanced,
             hadamard: hadamardActive,
             imatrixCachePath: imatrixCachePath.trimmingCharacters(in: .whitespacesAndNewlines),

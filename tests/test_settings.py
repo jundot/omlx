@@ -2194,6 +2194,34 @@ class TestGlobalSettings:
             assert persisted.auth.api_key == "stored-key"
             assert persisted.cache.enabled is True
 
+    def test_save_cli_overrides_reports_changed_settings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            stored = GlobalSettings(base_path=base_path)
+            stored.save()
+
+            args = Namespace(no_cache=True, port=stored.server.port)
+            runtime = GlobalSettings.load(base_path=base_path, cli_args=args)
+
+            assert runtime.save_cli_overrides(args) == [
+                "cache.enabled: True -> False",
+                "cache.gdn_ssd_split_enabled: True -> False",
+            ]
+            assert runtime.save_cli_overrides(args) == []
+
+    def test_save_cli_overrides_hides_credential_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                http_proxy="http://user:secret@proxy.example:8080",
+                hf_endpoint="https://user:secret@mirror.example",
+            )
+            runtime = GlobalSettings.load(base_path=tmpdir, cli_args=args)
+
+            assert runtime.save_cli_overrides(args) == [
+                "huggingface.endpoint: (value hidden)",
+                "network.http_proxy: (value hidden)",
+            ]
+
     def test_cli_override_initial_cache_blocks(self):
         """Test CLI override for initial_cache_blocks."""
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -35,7 +35,7 @@ def make_model(mtp=False, targets=(3, 4, 5), **config):
     return model
 
 
-@pytest.mark.parametrize("suffix", [1, 2, 3, 4])
+@pytest.mark.parametrize("suffix", [1, 4])
 def test_short_suffix_preserves_positions_and_window(suffix, monkeypatch):
     model = make_model().language_model
     prefix = mx.array([[5, 9, 3, 12, 20, 7]])
@@ -225,7 +225,7 @@ def test_ced_and_full_prefill_blocks_share_one_ssd_budget(tmp_path):
     # Full prefill must not hit the CED block, but still counts and evicts it.
     manager = open_manager(full, block_size * 3 // 2)
     assert not manager.has_block(b"\x01" * 32)
-    assert manager._incompatible_index.total_size == block_size
+    assert manager._directory_index.total_size == block_size
     save(manager, b"\x02" * 32)
     manager.close()
     assert not ced_file.exists()

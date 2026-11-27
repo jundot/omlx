@@ -41,9 +41,15 @@ contiguous, as for MLX's SDPA. The output is written in MLX's SDPA layout
 (``[B, L, H, V]`` rows returned as a ``[B, H, L, V]`` view), so the caller's
 ``swapaxes(1, 2).reshape(B, L, -1)`` stays free.
 
-Fail-closed: only (192, 128) bf16/fp16 prefill on NAX GPUs is handled, the
-first use runs a small self-check against an fp32 reference, and any
-unsupported input returns None so the caller keeps its existing route.
+``nax_banded_sink_attention`` runs the same kernel for Inkling 2's
+full-attention prefill: it reads the relative bias band and per-row sinks in
+place (``has_band``, ``row_sinks``) instead of an additive mask, whose build
+and read cost more than the attention at long contexts.
+
+Fail-closed: only (192, 128) and banded (128, 128) bf16/fp16 prefill on NAX
+GPUs is handled, the first use of each runs a small self-check against an
+fp32 reference, and any unsupported input returns None so the caller keeps
+its existing route.
 """
 
 from __future__ import annotations
@@ -109,6 +115,9 @@ struct AttnParams {
   // Key blocks [kb_begin, kb_end) of this dispatch (key-range passes).
   int kb_begin;
   int kb_end;
+  // Extent of the relative bias band (has_band), in key positions.
+  int band;
+  int window;
 };
 
 struct MaxOp {
@@ -177,6 +186,8 @@ template <
     bool has_mask,
     bool do_causal,
     bool has_sinks,
+    bool has_band,
+    bool row_sinks,
     bool FIRST,
     bool LAST,
     typename MaskType,
@@ -295,7 +306,16 @@ METAL_FUNC void attention_nax_bdv(
     if (has_sinks) {
       OMLX_NAX_UNROLL
       for (short i = 0; i < kRowsPT; ++i) {
-        max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
+        int64_t sink_at = tidl.y;
+        if (row_sinks) {
+          // One sink per query row: [B, qL, H]. Rows past a query tail
+          // read the last row's and are never output.
+          const int row = min(
+              int(tid.x) * BQ + tm + sm + i * otile_t::kFragRowsJump,
+              params->qL - 1);
+          sink_at = (int64_t(tid.z) * params->qL + row) * params->H + tid.y;
+        }
+        max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[sink_at]);
         sum_score[i] = 1;
       }
     }
@@ -332,8 +352,11 @@ METAL_FUNC void attention_nax_bdv(
   // This dispatch's key blocks.
   const int kb_lo = params->kb_begin;
   const int kb_hi = min(kb_lim, params->kb_end);
-  K += int64_t(kb_lo) * BK * K_strides[2];
-  V += int64_t(kb_lo) * BK * V_strides[2];
+  const int kb_start = params->window > 0
+      ? max(kb_lo, max(0, int(tid.x) * BQ + params->qL_off - params->window + 1) / BK)
+      : kb_lo;
+  K += int64_t(kb_start) * BK * K_strides[2];
+  V += int64_t(kb_start) * BK * V_strides[2];
 
   // Query fragments, loaded once and kept in registers.
   NAXTile<T, TQ, TD> Qreg;
@@ -344,7 +367,7 @@ METAL_FUNC void attention_nax_bdv(
   }
 
   // Loop over KV seq length
-  for (int kb = kb_lo; kb < kb_hi; kb++) {
+  for (int kb = kb_start; kb < kb_hi; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
 
     // Do S = Q @ K.T
@@ -472,6 +495,54 @@ METAL_FUNC void attention_nax_bdv(
               const auto c = base_col + ik * kU + jj + sn;
               const auto loc = ii * stile_t::kFragThrCols + jj;
               fg[loc] = (r < c) ? neg_inf : fg[loc];
+            }
+          }
+        }
+      }
+    }
+
+    // Relative bias band: a query at key position p adds rel[p - c] to its
+    // score of key c for 0 <= p - c < band. ``mask`` holds rel as
+    // [B, qL, H, band], read in place of a [qL, kL] additive mask. The
+    // first left_pad keys of a batch row are padding (one int per row
+    // follows the parameter struct).
+    if (has_band) {
+      constexpr auto neg_inf = Limits<AccumType>::finite_min;
+
+      const int base_row = tid.x * BQ + tm;
+      const int base_col = kb * BK;
+      const int left_pad =
+          reinterpret_cast<const device int*>(params + 1)[tid.z];
+
+      if (params->window > 0 ||
+          base_col + BK + params->band > base_row + params->qL_off + 1 ||
+          base_col < left_pad) {
+        OMLX_NAX_UNROLL
+        for (short iq = 0; iq < TQ; iq++) {
+          OMLX_NAX_UNROLL
+          for (short ik = 0; ik < TK; ik++) {
+            thread auto& fg = Stile.frag_at(iq, ik);
+
+            OMLX_NAX_UNROLL
+            for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+              OMLX_NAX_UNROLL
+              for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+                const int r =
+                    base_row + iq * kU + ii * stile_t::kFragRowsJump + sm;
+                const int c = base_col + ik * kU + jj + sn;
+                const int d = r + params->qL_off - c;
+                const int64_t at =
+                    ((int64_t(tid.z) * params->qL + min(r, params->qL - 1)) *
+                            params->H +
+                        tid.y) *
+                        params->band +
+                    clamp(d, 0, params->band - 1);
+                const auto loc = ii * stile_t::kFragThrCols + jj;
+                const AccumType bias = M_LOG2E_F * AccumType(mask[at]);
+                fg[loc] += (d >= 0 && d < params->band) ? bias : AccumType(0);
+                fg[loc] = (c < left_pad || (params->window > 0 && d >= params->window))
+                    ? neg_inf : fg[loc];
+              }
             }
           }
         }
@@ -697,7 +768,7 @@ _SOURCE = r"""
   omlx_nax::attention_nax_bdv<
       {T}, {BQ}, {BK}, {BD}, {BDV}, {WM}, {WN},
       {ALIGN_Q}, {ALIGN_K}, {HAS_MASK}, {DO_CAUSAL}, {HAS_SINKS},
-      {FIRST}, {LAST}, bool, float>(
+      {HAS_BAND}, {ROW_SINKS}, {FIRST}, {LAST}, bool, float>(
       q, k, v, out,
       reinterpret_cast<const device omlx_nax::AttnParams*>(params),
       q_strides, k_strides, v_strides, mask_strides,
@@ -725,6 +796,8 @@ def _kernel(
     first: bool = True,
     last: bool = True,
     wn: int = 1,
+    has_band: bool = False,
+    row_sinks: bool = False,
 ):
     wm = _WM // wn
     source = (
@@ -740,6 +813,8 @@ def _kernel(
         .replace("{HAS_MASK}", _flag(has_mask))
         .replace("{DO_CAUSAL}", _flag(do_causal))
         .replace("{HAS_SINKS}", _flag(has_sinks))
+        .replace("{HAS_BAND}", _flag(has_band))
+        .replace("{ROW_SINKS}", _flag(row_sinks))
         .replace("{FIRST}", _flag(first))
         .replace("{LAST}", _flag(last))
     )
@@ -753,10 +828,12 @@ def _kernel(
             has_sinks,
             first,
             last,
+            has_band,
+            row_sinks,
         )
     )
     return mx.fast.metal_kernel(
-        name=f"omlx_nax_attention_v2_bd{bd}_bdv{bdv}_wn{wn}_{tag}",
+        name=f"omlx_nax_attention_v3_bd{bd}_bdv{bdv}_wn{wn}_{tag}",
         input_names=["q", "k", "v", "mask", "sinks", "state", "params"],
         output_names=["out", "state_out"],
         header=_HEADER,
@@ -803,8 +880,15 @@ def _run(
     return _run_edges(q, k, v, scale, mask, sinks, edges, wn)
 
 
-def _run_edges(q, k, v, scale, mask, sinks, edges, wn) -> mx.array:
-    """Dispatch the key blocks between consecutive ``edges`` in turn."""
+def _run_edges(
+    q, k, v, scale, mask, sinks, edges, wn, rel=None, left_padding=None, window=0
+) -> mx.array:
+    """Dispatch the key blocks between consecutive ``edges`` in turn.
+
+    With ``rel`` ([B, qL, H, R]) the kernel adds the relative bias band,
+    ``sinks`` holds one logit per query row ([B, qL, H]) and the first
+    ``left_padding[b]`` keys of row b are masked.
+    """
     B, H, qL, D = q.shape
     kL = k.shape[2]
     DV = v.shape[3]
@@ -817,8 +901,11 @@ def _run_edges(q, k, v, scale, mask, sinks, edges, wn) -> mx.array:
     NQ = (qL + bq - 1) // bq
     NQ_aligned = qL // bq
     has_sinks = sinks is not None
+    has_band = rel is not None
     # Unused inputs get a one-element placeholder (never read).
-    if has_mask:
+    if has_band:
+        mask = mx.contiguous(rel.astype(q.dtype))
+    elif has_mask:
         mask = mx.broadcast_to(mask, (B, H, qL, kL))
     else:
         mask = mx.zeros((1,), dtype=mx.bool_)
@@ -835,7 +922,7 @@ def _run_edges(q, k, v, scale, mask, sinks, edges, wn) -> mx.array:
     for i in range(n_pass):
         first, last = i == 0, i == n_pass - 1
         params = struct.pack(
-            "<6if9i",
+            "<6if11i",
             B,
             H,
             D,
@@ -852,20 +939,33 @@ def _run_edges(q, k, v, scale, mask, sinks, edges, wn) -> mx.array:
             kL - qL,
             edges[i],
             edges[i + 1],
+            rel.shape[-1] if has_band else 0,
+            window,
         )
         params = mx.array(memoryview(params), dtype=mx.uint8)
+        if has_band:
+            pad = (
+                mx.zeros((B,), dtype=mx.int32)
+                if left_padding is None
+                else left_padding.astype(mx.int32)
+            )
+            params = mx.concatenate([params, pad.view(mx.uint8)])
         kernel = _kernel(
             q.dtype,
             D,
             DV,
-            qL % bq == 0,
-            kL % _BK == 0,
+            # The banded kernel is always built for ragged tails: four
+            # variants per dtype, each compiled by that dtype's self-check.
+            qL % bq == 0 and not has_band,
+            kL % _BK == 0 and not has_band,
             has_mask,
             do_causal,
             has_sinks,
             first,
             last,
             wn,
+            has_band,
+            has_band,
         )
         out, state = kernel(
             inputs=[q, k, v, mask, sinks, state, params],
@@ -877,6 +977,8 @@ def _run_edges(q, k, v, scale, mask, sinks, edges, wn) -> mx.array:
             ],
             output_dtypes=[q.dtype, mx.float32],
         )
+        if has_band and not last and (i + 1) % _BANDED_EVAL_PASSES == 0:
+            mx.eval(state)
     # [B, qL, H, DV] rows viewed as [B, H, qL, DV], like MLX's SDPA output.
     return out.transpose(0, 2, 1, 3)
 
@@ -950,6 +1052,140 @@ def _passes_check_passed(wn: int) -> bool:
     if not ok:
         logger.warning("NAX JIT attention key-range passes disabled: check failed")
     return ok
+
+
+# Banded prefill always uses key-range passes and the head-dim split: one
+# unsplit dispatch measured 1.3-1.7x slower at 128-wide heads.
+_BANDED_PASS_KEYS = 4096
+# Passes queued between evaluations: each holds its fp32 row state until its
+# command buffer ends (26 MB at 2,048 queries x 24 heads).
+_BANDED_EVAL_PASSES = 16
+
+
+def _banded_reference(q, k, v, rel, sink, scale, left_padding=None):
+    """fp32 causal attention with the bias band and a zero-value sink."""
+    B, H, qL, _ = q.shape
+    Hk, kL = k.shape[1], k.shape[2]
+    g, r = H // Hk, rel.shape[-1]
+    qf = q.astype(mx.float32).reshape(B, Hk, g, qL, -1) * scale
+    s = (qf @ k.astype(mx.float32)[:, :, None].swapaxes(-1, -2)).reshape(
+        B, H, qL, kL
+    )
+    dist = (mx.arange(qL)[:, None] + (kL - qL)) - mx.arange(kL)[None]
+    idx = mx.broadcast_to(mx.clip(dist, 0, r - 1), (B, H, qL, kL))
+    bias = mx.take_along_axis(
+        rel.astype(mx.float32).transpose(0, 2, 1, 3), idx, axis=-1
+    )
+    s = s + mx.where(dist < r, bias, 0)
+    s = mx.where(dist >= 0, s, -mx.inf)
+    if left_padding is not None:
+        real = mx.arange(kL)[None] >= left_padding[:, None]
+        s = mx.where(real[:, None, None], s, -mx.inf)
+    sk = sink.astype(mx.float32).transpose(0, 2, 1)[..., None]
+    p = mx.softmax(mx.concatenate([sk, s], axis=-1), axis=-1)[..., 1:]
+    vf = v.astype(mx.float32)[:, :, None]
+    return (p.reshape(B, Hk, g, qL, kL) @ vf).reshape(B, H, qL, -1)
+
+
+def _run_banded(
+    q, k, v, rel, sink, scale, pass_keys=None, left_padding=None, window=0
+) -> mx.array:
+    B, H, qL, _ = q.shape
+    NK = (k.shape[2] + _BK - 1) // _BK
+    edges = _pass_edges(
+        B * H, NK, _BANDED_PASS_KEYS if pass_keys is None else pass_keys, 0
+    )
+    sinks = mx.contiguous(sink.astype(q.dtype))
+    return _run_edges(
+        q,
+        k,
+        v,
+        scale,
+        "causal",
+        sinks,
+        edges,
+        2,
+        rel=rel,
+        left_padding=left_padding,
+        window=window,
+    )
+
+
+@lru_cache(maxsize=None)
+def banded_check_passed(dtype: mx.Dtype = mx.bfloat16) -> bool:
+    """Check one small banded case against fp32, once per dtype; its two
+    runs also compile every banded kernel variant for that dtype."""
+    if not _nax_available() or dtype not in _METAL_TYPES:
+        return False
+    try:
+        key = mx.random.key(128128)
+        kq, kk, kv, kr, ks = mx.random.split(key, 5)
+        q = (0.5 * mx.random.normal((2, 4, 100, 128), key=kq)).astype(dtype)
+        k = (0.5 * mx.random.normal((2, 2, 300, 128), key=kk)).astype(dtype)
+        v = (0.5 * mx.random.normal((2, 2, 300, 128), key=kv)).astype(dtype)
+        rel = mx.random.normal((2, 100, 4, 48), key=kr).astype(dtype)
+        sink = mx.random.normal((2, 100, 4), key=ks).astype(dtype)
+        lp = mx.array([0, 37], dtype=mx.int32)
+        scale = 128**-0.5
+        one = _run_banded(q, k, v, rel, sink, scale, 0, lp)
+        many = _run_banded(q, k, v, rel, sink, scale, 96, lp)
+        ref = _banded_reference(q, k, v, rel, sink, scale, lp)
+        err = mx.abs(many.astype(mx.float32) - ref).max().item()
+        ok = err < 2e-2 and bool(mx.array_equal(many, one).item())
+    except Exception as exc:  # noqa: BLE001 - any failure disables the route
+        logger.warning("NAX banded attention disabled: self-check failed (%s)", exc)
+        return False
+    if not ok:
+        logger.warning("NAX banded attention disabled: self-check error %.3g", err)
+        return False
+    logger.info("NAX banded attention (128-wide heads, %s) enabled", dtype)
+    return True
+
+
+def nax_banded_sink_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    rel: mx.array,
+    sink: mx.array,
+    *,
+    scale: float,
+    left_padding: Optional[mx.array] = None,
+    window: int = 0,
+) -> Optional[mx.array]:
+    """``kernels.banded_sink_attention`` for prefill blocks, full attention or
+    a sliding window as wide as the bias band, or None when unsupported (the
+    caller keeps its masked SDPA).
+
+    ``queries`` [B, H, L, 128] are the last L of the S keys of ``keys`` and
+    ``values`` [B, Hk, S, 128]; ``rel`` [B, L, H, R]; ``sink`` [B, L, H];
+    ``left_padding`` [B] or None.
+    """
+    if (
+        queries.shape[-1] != 128
+        or values.shape[-1] != 128
+        or queries.dtype not in _METAL_TYPES
+        # MLX's SDPA runs up to 8 queries in its vector kernel, which is faster.
+        or queries.shape[2] <= 8
+        or not banded_check_passed(queries.dtype)
+        or (window and window != rel.shape[-1])
+    ):
+        return None
+    if window:
+        start = max(0, keys.shape[2] - queries.shape[2] - window + 1)
+        keys, values = keys[:, :, start:], values[:, :, start:]
+        if left_padding is not None:
+            left_padding = mx.maximum(left_padding - start, 0)
+    return _run_banded(
+        queries,
+        keys,
+        values,
+        rel,
+        sink,
+        scale,
+        left_padding=left_padding,
+        window=window,
+    )
 
 
 def uses_key_passes(queries: mx.array, keys: mx.array) -> bool:

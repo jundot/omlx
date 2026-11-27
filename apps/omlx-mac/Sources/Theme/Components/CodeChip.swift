@@ -49,6 +49,7 @@ struct CodeChip: View {
 
 struct CopyIconButton: View {
     let value: String
+    var valueLoader: (() async throws -> String)? = nil
     var helpText = String(localized: "common.copy_model_id",
                           defaultValue: "Copy model ID",
                           comment: "Tooltip and accessibility label for a button that copies a model identifier")
@@ -71,9 +72,19 @@ struct CopyIconButton: View {
     }
 
     private func copy() {
+        guard let valueLoader else {
+            paste(value)
+            return
+        }
+        Task {
+            if let text = try? await valueLoader() { paste(text) }
+        }
+    }
+
+    private func paste(_ text: String) {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(value, forType: .string)
+        pb.setString(text, forType: .string)
         copied = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
             copied = false

@@ -140,7 +140,7 @@ brew services restart omlx  # 재시작
 brew services info omlx     # 상태 확인
 ```
 
-서비스는 기본 설정으로 `omlx serve`를 실행합니다 (`~/.omlx/models`, 포트 8000). `omlx start`, `omlx stop`, `omlx restart`는 공통 lifecycle 명령이며, Homebrew 설치에서는 `brew services`로 위임됩니다. 커스터마이즈하려면 환경 변수(`OMLX_MODEL_DIR`, `OMLX_PORT` 등)를 설정하거나, `omlx serve --model-dir /your/path`를 한 번 실행하여 `~/.omlx/settings.json`에 설정을 저장하세요.
+서비스는 기본 설정으로 `omlx serve`를 실행합니다 (`~/.omlx/models`, 포트 8000). `omlx start`, `omlx stop`, `omlx restart`는 공통 lifecycle 명령이며, Homebrew 설치에서는 `brew services`로 위임됩니다. 커스터마이즈하려면 `omlx serve --model-dir /your/path`를 한 번 실행하여 `~/.omlx/settings.json`에 설정을 저장하세요.
 
 로그는 두 곳에 기록됩니다:
 - **서비스 로그**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
@@ -269,6 +269,7 @@ OpenAI 및 Anthropic API를 그대로 대체합니다. 스트리밍 사용량 �
 | `POST /v1/rerank` | 문서 리랭킹 |
 | `POST /v1/systemone` | Decision 모델 또는 채팅 모델의 타입별 판단 (TypeSafe System One) |
 | `GET /v1/models` | 사용 가능한 모델 목록 |
+| `GET /v1/models/{model_id}` | 모델 하나 조회 |
 | `POST /tokenize`, `POST /detokenize` | vLLM 호환 토크나이저 API (`/v1` 경로도 지원) |
 
 설정, 모델, 다운로드, 양자화, 벤치마크를 다루는 관리자 API는 메인 API 키를 Bearer 토큰으로 받으며 headless 모드에서도 동작합니다. [Admin API](docs/admin-api.md)를 참고하세요.

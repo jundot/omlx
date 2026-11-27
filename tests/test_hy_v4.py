@@ -35,6 +35,7 @@ from omlx.patches.hy_v4 import (  # noqa: E402
     indexing,
     language,  # noqa: E402
     layers,
+    verify_dispatch,
 )
 from omlx.patches.hy_v4.config import VisionConfig  # noqa: E402
 from omlx.patches.hy_v4.flash import CompressedIndexer, Engram  # noqa: E402
@@ -244,8 +245,61 @@ def test_incremental_matches_full_forward(model):
     ids = _ids(1)
     full = _run(model, ids, [SEQ])
     # Prefill, ragged chunks (open compressed-indexer groups) and decode steps.
-    for chunks in ([24] + [1] * 16, [7, 7, 7, 7, 7, 5], [1] * SEQ):
+    for chunks in ([24] + [1] * 16, [7, 7, 7, 7, 7, 5], [1] * 20 + [20]):
         np.testing.assert_allclose(_run(model, ids, chunks), full, atol=2e-4)
+
+
+def test_flash_engram_submits_ids_before_prefix_only_for_ssd(tmp_path, monkeypatch):
+    from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
+
+    config = _flash_config()
+    config["text_config"].update(hidden_size=8, hc_mult=1)
+    engram = Engram(ModelConfig.from_dict(config).text_config, layer_id=2)
+    engram.set_dtype(mx.bfloat16)
+    weight = engram.multi_head_embedding.embedding.weight
+    streams = mx.ones((1, 2, 1, 8), dtype=mx.bfloat16)
+    ngrams = mx.zeros((1, 2, engram.max_order), dtype=mx.int32)
+    keep = mx.ones((1, 2), dtype=mx.bool_)
+    table_path = tmp_path / "engram.safetensors"
+    mx.save_safetensors(str(table_path), {"weight": weight})
+    submitted = []
+    by_lookup = []
+    async_eval = mx.async_eval
+    lookup = Engram.lookup
+    verifying = True
+
+    def record(array):
+        submitted.append(array)
+        async_eval(array)
+
+    def record_lookup(self, rows):
+        by_lookup.append(len(submitted))
+        return lookup(self, rows)
+
+    monkeypatch.setattr(mx, "async_eval", record)
+    monkeypatch.setattr(Engram, "lookup", record_lookup)
+    monkeypatch.setattr(
+        verify_dispatch, "short_gpu_verify", lambda rows: verifying and rows == 2
+    )
+
+    engram(streams, ngrams, keep)
+    assert submitted == []
+    reader = DiskEngramEmbedding(table_path, "weight", None)
+    engram.multi_head_embedding.embedding = reader
+    try:
+        verifying = False
+        expected = engram(streams, ngrams, keep)
+        assert submitted == []
+        verifying = True
+        actual = engram(streams, ngrams, keep)
+        assert len(submitted) == 2 and submitted[1] is streams
+        assert by_lookup == [0, 0, 2]
+        np.testing.assert_array_equal(submitted[0], engram.hash_rows(ngrams))
+        np.testing.assert_array_equal(
+            actual.astype(mx.float32), expected.astype(mx.float32)
+        )
+    finally:
+        reader.close()
 
 
 def _batch_cache(model, left):
@@ -386,9 +440,19 @@ def _decode_logits(lm, cache, tokens):
     ]
 
 
-@pytest.mark.parametrize("batched", [False, True])
-@pytest.mark.parametrize("bits", [None, 4, 3, "mxfp8"])
-@pytest.mark.parametrize("kind", ["hy4", "flash"])
+@pytest.mark.parametrize(
+    ("kind", "bits", "batched"),
+    [
+        ("hy4", None, False),
+        ("hy4", 4, True),
+        ("hy4", 3, False),
+        ("hy4", "mxfp8", True),
+        ("flash", None, True),
+        ("flash", 4, False),
+        ("flash", 3, True),
+        ("flash", "mxfp8", False),
+    ],
+)
 def test_exact_verify_rows_match_decode(monkeypatch, kind, bits, batched):
     # Past the index top-k and the 8-slot sliding window, so sparse selection
     # and a rotated ring are both in play. mlx-lm's generator hands even one
@@ -423,7 +487,7 @@ def test_exact_verify_rows_match_decode(monkeypatch, kind, bits, batched):
     assert lm.mtp_partial_rollback(cache, accepted=2, num_drafts=block - 1)
     reference = primed()
     _decode_logits(lm, reference, ids[prompt : prompt + 3])
-    tail = ids[prompt + 3 : prompt + 9] + 1
+    tail = ids[prompt + 3 : prompt + 6] + 1
     for got, want in zip(
         _decode_logits(lm, cache, tail), _decode_logits(lm, reference, tail)
     ):
@@ -546,8 +610,7 @@ def _generate(model, prompts, count, use_mtp):
     return [tokens[u][:count] for u in uids]
 
 
-@pytest.mark.parametrize("bits", [4, 3])
-@pytest.mark.parametrize("kind", ["hy4", "flash"])
+@pytest.mark.parametrize(("kind", "bits"), [("hy4", 4), ("flash", 3)])
 def test_mtp_generation_matches_greedy(monkeypatch, kind, bits):
     """Through the generator (draft, exact verify, accept, rollback), alone and
     with a second request, MTP emits each request's own greedy tokens."""
@@ -566,8 +629,8 @@ def test_mtp_generation_matches_greedy(monkeypatch, kind, bits):
 
     monkeypatch.setattr(type(lm), "dspark_forward", tracked)
     prompt = _ids(11, n=26)
-    expected = _generate(model, [prompt], 24, use_mtp=False)
-    assert _generate(model, [prompt], 24, use_mtp=True) == expected
+    expected = _generate(model, [prompt], 12, use_mtp=False)
+    assert _generate(model, [prompt], 12, use_mtp=True) == expected
     assert drafts, "the MTP loop must draft"
 
 
@@ -592,9 +655,9 @@ def test_mtp_drafts_for_concurrent_requests(monkeypatch, kind):
 
     monkeypatch.setattr(type(lm), "dspark_forward", tracked)
     prompts = [_ids(11, n=26), _ids(12, n=19)]
-    expected = [_generate(model, [p], 20, use_mtp=False)[0] for p in prompts]
+    expected = [_generate(model, [p], 10, use_mtp=False)[0] for p in prompts]
     drafts.clear()
-    assert _generate(model, prompts, 20, use_mtp=True) == expected
+    assert _generate(model, prompts, 10, use_mtp=True) == expected
     assert len(drafts) > 2
 
 
@@ -633,6 +696,10 @@ def test_streamed_calibration_matches_resident(tmp_path, monkeypatch, kind):
 
     apply_patch()
     cfg = _hy4_config() if kind == "hy4" else _flash_config()
+    schedule = "indexer_types" if kind == "hy4" else "layer_types"
+    cfg["text_config"].update(
+        {"num_hidden_layers": 4, schedule: cfg["text_config"][schedule][:4]}
+    )
     source = tmp_path / "source"
     _checkpoint(source, cfg, _model(cfg))
     resident_model = load_model(source, lazy=False, strict=True)

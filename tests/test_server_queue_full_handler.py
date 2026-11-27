@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Verify SchedulerQueueFullError maps to HTTP 503 + Retry-After in server.py."""
 
-from fastapi import FastAPI
+import asyncio
+
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from omlx.exceptions import SchedulerQueueFullError
@@ -28,6 +30,14 @@ def _build_test_app():
     @app.get("/health/raise")
     def raise_queue_full_health():
         raise SchedulerQueueFullError(current_depth=33, max_depth=32)
+
+    @app.get("/v1/raise-late")
+    async def raise_queue_full_late(request: Request):
+        async def reject():
+            await asyncio.sleep(0.05)
+            raise SchedulerQueueFullError(current_depth=32, max_depth=32)
+
+        return await srv._json_response_or_keepalive(request, reject())
 
     return app
 
@@ -59,3 +69,11 @@ class TestQueueFullHandler:
         body = resp.json()
         assert "detail" in body
         assert "queue full" in body["detail"].lower()
+
+    def test_late_rejection_keeps_the_503_body(self, monkeypatch):
+        monkeypatch.setattr("omlx.server._JSON_KEEPALIVE_GRACE_S", 0.01)
+        with TestClient(_build_test_app()) as client:
+            fast = client.get("/v1/raise")
+            late = client.get("/v1/raise-late")
+        assert late.status_code == 200
+        assert late.json() == fast.json()

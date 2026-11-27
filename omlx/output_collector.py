@@ -8,7 +8,7 @@ providing non-blocking output collection with intelligent aggregation.
 """
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 from .request import RequestOutput
@@ -136,16 +136,10 @@ class RequestOutputCollector:
         merged_new_token_ids = existing.new_token_ids + new.new_token_ids
         merged_new_text = existing.new_text + new.new_text
 
-        return RequestOutput(
-            request_id=new.request_id,
+        return replace(
+            new,
             new_token_ids=merged_new_token_ids,
             new_text=merged_new_text,
-            output_token_ids=new.output_token_ids,  # Use latest cumulative
-            output_text=new.output_text,  # Use latest cumulative
-            finished=new.finished,
-            finish_reason=new.finish_reason,
-            prompt_tokens=new.prompt_tokens,
-            completion_tokens=new.completion_tokens,
             generated_at=(
                 existing.generated_at
                 if existing.generated_at is not None
@@ -156,13 +150,11 @@ class RequestOutputCollector:
                 if new.generated_until is not None
                 else existing.generated_until
             ),
-            tool_calls=new.tool_calls,  # Preserve tool_calls for Harmony models
             logprobs=(
                 (existing.logprobs or []) + (new.logprobs or [])
                 if existing.logprobs or new.logprobs
                 else None
             ),
-            cached_tokens=new.cached_tokens,
             error=new.error or existing.error,
             error_code=new.error_code or existing.error_code,
             error_metadata=new.error_metadata or existing.error_metadata,

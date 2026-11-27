@@ -75,6 +75,17 @@ FLASH_NEXT_TEXT = {
     "num_experts": 512,
     "num_experts_per_tok": 10,
 }
+INKLING2_TEXT = {
+    "model_type": "inkling2_loop_text",
+    "hidden_size": 2304,
+    "num_hidden_layers": 24,
+    "vocab_size": 201024,
+    "n_routed_experts": 128,
+    "num_experts_per_tok": 8,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+}
 REPO_ID = splash_repo_id("Qwen3.8-27B-4bit")
 MLX_4BIT = {"mode": "affine", "bits": 4, "group_size": 64}
 GIB = 1024**3
@@ -94,7 +105,7 @@ def _write_model(path: Path, text_config=None, quantization=None) -> Path:
     return path
 
 
-def _write_draft(path: Path, text=None) -> Path:
+def _write_draft(path: Path, text=None, *, target_layers=None) -> Path:
     text = QWEN38_TEXT if text is None else text
     path.mkdir(parents=True)
     config = {
@@ -102,7 +113,7 @@ def _write_draft(path: Path, text=None) -> Path:
         "model_type": "qwen3",
         "hidden_size": text["hidden_size"],
         "vocab_size": text["vocab_size"],
-        "num_target_layers": text["num_hidden_layers"],
+        "num_target_layers": target_layers or text["num_hidden_layers"],
         "dflash_config": {"block_size": 8},
     }
     (path / "config.json").write_text(json.dumps(config))
@@ -421,6 +432,34 @@ class TestBinary:
 
 class TestCompatibility:
 
+    def test_inkling2_uses_its_loop_draft_on_splash_1_7_3(self, tmp_path, launchers):
+        model = _write_model(tmp_path / "Inkling-2-Mini", INKLING2_TEXT)
+        wrong = _write_draft(tmp_path / "24-layers", INKLING2_TEXT)
+        draft = _write_draft(tmp_path / "48-visits", INKLING2_TEXT, target_layers=48)
+
+        launchers("splash", version="1.7.2")
+        assert resolve_splash_target(model, None, [str(draft)]) == (
+            None,
+            "Inkling-2-Mini needs Splash 1.7.3 or later",
+        )
+
+        launchers("splash", version="1.7.3")
+        assert splash_mod.splash_draft_to_download(model, None, [str(wrong)]) == (
+            "incoai/Inkling-2-Mini-DFlash2"
+        )
+        target, reason = resolve_splash_target(model, None, [str(wrong), str(draft)])
+        assert reason == ""
+        assert target.draft_path == draft
+        assert target.max_context == target.native_context == 1010000
+        assert splash_mod.splash_has_vision(
+            {"text_config": INKLING2_TEXT, "vision_config": {}}
+        )
+
+        def estimate(context):
+            return splash_memory_estimate(model, draft, context, "bf16")
+
+        assert estimate(2) - estimate(1) == 8 * 2 * 8 * 128 * 2
+
     def test_flash_next_mlx_checkpoint_explains_gguf_requirement(
         self, tmp_path, launchers
     ):
@@ -621,6 +660,44 @@ def _qwen38_gguf(vocab: list[str]) -> dict:
 
 
 class TestGguf:
+
+    @pytest.mark.parametrize("arch, layers", [("inkling2", 48), ("inkling2_loop", 24)])
+    def test_inkling2_gguf_discovers_and_resolves(
+        self, tmp_path, launchers, write_gguf, arch, layers
+    ):
+        vocab = sorted(pre_tokenizers.ByteLevel.alphabet()) + ["<|im_end|>", "123"]
+        metadata = {
+            key: value
+            for key, value in _qwen38_gguf(vocab).items()
+            if key.startswith("tokenizer.")
+        }
+        metadata["tokenizer.ggml.pre"] = "inkling2"
+        fields = {
+            "block_count": layers,
+            "embedding_length": 2304,
+            "attention.head_count": [24] * layers,
+            "attention.head_count_kv": [8] * layers,
+            "attention.key_length": 128,
+            "expert_count": 128,
+            "expert_used_count": 8,
+            "vocab_size": 201024,
+        }
+        if arch == "inkling2":
+            fields.update({"loop.core_start": 6, "loop.core_end": 18, "num_loops": 3})
+        metadata.update({f"{arch}.{key}": value for key, value in fields.items()})
+        metadata["general.architecture"] = arch
+        source = write_gguf(tmp_path / "models" / "Inkling-2-Mini-Q4.gguf", metadata)
+        draft = _write_draft(tmp_path / "draft", INKLING2_TEXT, target_layers=48)
+
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        folder = Path(models[source.stem].model_path)
+        launchers("splash", version="1.7.3")
+        target, reason = resolve_splash_target(folder, None, [str(draft)])
+        assert reason == ""
+        assert target.family == "Inkling-2-Mini"
+
+        tokenizer = AutoTokenizer.from_pretrained(folder)
+        assert tokenizer.encode("123") == [vocab.index("123")]
 
     @pytest.mark.parametrize("layout", ["single", "split", "variant"])
     def test_flash_next_gguf_discovery_draft_and_engine(
@@ -953,6 +1030,15 @@ class TestStaging:
 
         assert (staged / "config.json").resolve().parent == blobs.resolve()
 
+    def test_inkling2_vision_checkpoint_stages_without_a_processor_file(self, tmp_path):
+        model = _write_model(tmp_path / "m", INKLING2_TEXT)
+        config = json.loads((model / "config.json").read_text())
+        (model / "config.json").write_text(json.dumps({**config, "vision_config": {}}))
+
+        snapshot = stage_model(model, "omlx/m", tmp_path / "hub")
+
+        assert not (snapshot / "preprocessor_config.json").exists()
+
     def test_optiq_layout_stages_as_splash_reads_it(self, tmp_path):
         # Splash refuses index shards outside the snapshot root and a vision
         # checkpoint without a processor file.
@@ -1067,7 +1153,7 @@ class TestRequestTranslation:
         assert value("--draft-model") == str((tmp_path / "draft").resolve())
         assert value("--idle-release") == "off"
         assert value("--kv-format") == "bf16"
-        assert value("--max-context") == str(splash_mod.SPLASH_MAX_CONTEXT)
+        assert value("--max-context") == "1000000"
         assert value("--max-memory") == str(24 * GIB)
         assert value("--max-cache-disk") == str(5 * GIB)
         assert value("--cache-dir") == str(tmp_path / "ssd")
@@ -1092,6 +1178,20 @@ class TestRequestTranslation:
 
     def test_default_activation_precision_keeps_bf16(self):
         assert SplashOptions().activations == "bf16"
+
+    @pytest.mark.parametrize(
+        ("version", "limit", "sent"),
+        [("1.7.1", 6, "6"), ("1.7.0", 6, None), ("1.7.1", None, None)],
+    )
+    def test_serve_command_max_concurrent_requests(
+        self, tmp_path, version, limit, sent
+    ):
+        engine = _engine(tmp_path, version=version, max_concurrent_requests=limit)
+
+        command = engine._serve_command(9000)
+
+        flag = "--max-concurrent-requests"
+        assert (command[command.index(flag) + 1] if flag in command else None) == sent
 
     def test_serve_command_leaves_unset_limits_to_splash(self, tmp_path):
         command = _engine(tmp_path)._serve_command(9000)
@@ -1366,9 +1466,58 @@ class TestStreaming:
                 pass
         assert engine.get_live_requests() == {"prefilling": [], "generating": []}
 
-    async def test_plain_completions_are_rejected(self, tmp_path):
-        with pytest.raises(InvalidRequestError, match="chat requests only"):
-            await _engine(tmp_path).generate("Once upon a time")
+    async def test_text_completions_go_to_splash_completions(self, tmp_path):
+        seen = {}
+
+        def handler(request):
+            seen["path"] = request.url.path
+            seen["body"] = json.loads(request.content)
+            progress = {"total": 5, "cache": 4, "processed": 5, "time_ms": 1.0}
+            usage = {
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "prompt_tokens_details": {"cached_tokens": 4},
+            }
+            return httpx.Response(
+                200,
+                content=_sse(
+                    {"choices": [{"text": ""}], "prompt_progress": progress},
+                    {"choices": [{"text": " 4"}]},
+                    {"choices": [{"text": "2"}]},
+                    {"choices": [{"text": "", "finish_reason": "length"}]},
+                    {"choices": [], "usage": usage},
+                ),
+            )
+
+        engine = _engine(tmp_path, version="1.3.2")
+        engine._client = httpx.AsyncClient(
+            base_url="http://splash", transport=httpx.MockTransport(handler)
+        )
+        outputs = [
+            o
+            async for o in engine.stream_generate(
+                "12 + 30 =",
+                max_tokens=2,
+                stop=["\n"],
+                ignore_eos=True,
+                thinking_budget=512,
+            )
+        ]
+
+        assert [o.new_text for o in outputs] == [" 4", "2", ""]
+        final = outputs[-1]
+        assert (final.text, final.finish_reason) == (" 42", "length")
+        assert (final.prompt_tokens, final.completion_tokens, final.cached_tokens) == (
+            5,
+            2,
+            4,
+        )
+        assert seen["path"] == "/v1/completions"
+        body = seen["body"]
+        assert body["prompt"] == "12 + 30 =" and "messages" not in body
+        assert body["max_tokens"] == 2 and body["stop"] == ["\n"]
+        assert body["ignore_eos"] is True
+        assert "thinking_token_budget" not in body
 
 
 # -- process lifecycle -------------------------------------------------------------
@@ -1408,6 +1557,7 @@ FAKE_SERVER = textwrap.dedent("""\
 @pytest.fixture
 def lifecycle(tmp_path, monkeypatch, launchers):
     monkeypatch.setattr(splash_mod, "STARTUP_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(splash_mod, "WATCHDOG_POLL_SECONDS", 0.05)
     monkeypatch.setattr(
         SplashEngine,
         "_load_tokenizer",
@@ -1473,21 +1623,28 @@ class TestLifecycle:
     async def test_stop_waits_for_splash_and_kills_a_stuck_one(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(splash_mod, "STOP_TIMEOUT_SECONDS", 1)
+        monkeypatch.setattr(splash_mod, "STOP_TIMEOUT_SECONDS", 0.5)
+        ready = tmp_path / "ready"
         # A Splash stand-in that outlives SIGTERM; the watchdog shell does not.
         stuck = [
             sys.executable,
             "-c",
-            "import signal, time\n"
+            "import pathlib, signal, sys, time\n"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "pathlib.Path(sys.argv[1]).touch()\n"
             "while True: time.sleep(0.1)",
+            str(ready),
         ]
         engine = _engine(tmp_path)
         engine._process = subprocess.Popen(
             splash_mod._watchdog_command(stuck), start_new_session=True
         )
         group = engine._process.pid
-        await asyncio.sleep(0.5)
+        for _ in range(500):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.02)
+        assert ready.exists()
 
         await engine.stop()
 
@@ -1777,6 +1934,36 @@ class TestEnginePool:
         assert engine._options.max_memory_bytes == 4 * GIB
         assert engine._options.max_context is None
 
+    def test_context_past_the_native_window_needs_room_and_yarn(
+        self, tmp_path, launchers, global_settings, caplog
+    ):
+        launchers("splash", version="1.4.0")
+        pool, entry = _pool(tmp_path)
+        pool._get_final_ceiling = lambda: 0
+        settings = ModelSettings(external_engine="splash", max_context_window=2 * 10**6)
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        draft = engine._target.draft_path
+
+        def estimate(context):
+            return splash_memory_estimate(entry.model_path, draft, context, "int8")
+
+        assert engine._options.max_context == 1010000
+        assert engine._options.max_memory_bytes == estimate(1010000)
+        assert "YaRN is on" in caplog.text
+
+        # No room for the longer window: the budget of the native one.
+        caplog.clear()
+        pool._get_final_ceiling = lambda: estimate(1010000) - 1
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        assert engine._options.max_context is None
+        assert engine._options.max_memory_bytes == estimate(262144)
+        assert "YaRN is on" not in caplog.text
+
+        launchers("splash", version="1.3.2")
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        assert engine._options.max_context == 262144
+        assert SplashTarget(_binary("1.7.1"), "Flint", draft).max_context == 262144
+
     async def test_load_counts_the_planned_budget_and_unload_skips_mlx_barrier(
         self, tmp_path, launchers, global_settings
     ):
@@ -1911,6 +2098,7 @@ class TestAdminAPI:
             splash_ssd_cache_gb=0,
             splash_ane_prefill=False,
             splash_activations="auto",
+            splash_max_concurrent_requests=6,
         )
 
         assert "integrations" in result["runtime_applied"]
@@ -1921,11 +2109,13 @@ class TestAdminAPI:
         )
         assert (restored.splash_ssd_cache_gb, restored.splash_ane_prefill) == (0, False)
         assert restored.splash_activations == "auto"
+        assert restored.splash_max_concurrent_requests == 6
         for fields in (
             {"splash_kv_format": "fp8"},
             {"splash_activations": "fp8"},
             {"splash_max_memory_gb": 0},
             {"splash_ssd_cache_gb": -1},
+            {"splash_max_concurrent_requests": 9},
         ):
             with pytest.raises(HTTPException):
                 await _post_global(settings, **fields)
@@ -2211,9 +2401,8 @@ class TestMemoryEstimate:
         assert int8 - fixed == 33_280 * 262144
         bf16 = splash_memory_estimate(model, draft, 65536, "bf16")
         assert bf16 - fixed == 65_536 * 65536
-        # Splash caps context at 256K, and no limit means the whole window.
+        # No limit means the whole native window.
         assert splash_memory_estimate(model, draft, None, "int8") == int8
-        assert splash_memory_estimate(model, draft, 10**6, "int8") == int8
 
     def test_counts_a_vision_tower_in_a_subdirectory(self, tmp_path):
         model = _write_model(tmp_path / "m")
@@ -2223,6 +2412,60 @@ class TestMemoryEstimate:
         _add_optiq_vision(model)
 
         assert splash_memory_estimate(model, draft, 1024, "int8") == before + 512
+
+    def test_flash_next_gguf_counts_ple_table_as_row_cache(
+        self, tmp_path, monkeypatch, write_gguf
+    ):
+        vocab = ["a", "b", "c"]
+        metadata = {
+            "general.architecture": "qwen4exp",
+            "qwen4exp.block_count": 48,
+            "qwen4exp.context_length": 262144,
+            "qwen4exp.embedding_length": 2560,
+            "qwen4exp.attention.head_count": 24,
+            "qwen4exp.attention.head_count_kv": 2,
+            "qwen4exp.attention.key_length": 256,
+            "qwen4exp.expert_used_count": 10,
+            "tokenizer.ggml.tokens": vocab,
+        }
+        source = tmp_path / "models" / "Flash-Next"
+        write_gguf(source / "Flash-Next-00001-of-00002.gguf", metadata)
+        write_gguf(
+            source / "Flash-Next-00002-of-00002.gguf",
+            {},
+            tensors=[
+                ("output_norm.weight", (8,)),
+                ("per_layer_token_embd.weight", (1024, 64)),
+            ],
+        )
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        folder = Path(models["Flash-Next"].model_path)
+        monkeypatch.setitem(
+            splash_mod.SPLASH_FAMILIES["Qwen3.8-Flash-Next"], "vocab_size", len(vocab)
+        )
+        monkeypatch.setattr(splash_mod, "PLE_ROW_CACHE_BYTES", 64 * 1024)
+        draft = _write_draft(tmp_path / "draft", FLASH_NEXT_TEXT)
+
+        full = splash_memory_estimate(folder, draft, 1024, "int8", "1.6.0")
+        streamed = 64 * 1024 - 1024 * 64 * 4
+        assert (
+            splash_memory_estimate(folder, draft, 1024, "int8", "1.6.1")
+            == full + streamed
+        )
+
+        engine = SplashEngine(
+            model_name=str(folder),
+            model_id="Flash-Next",
+            target=SplashTarget(_binary("1.6.1"), "Qwen3.8-Flash-Next", draft),
+            hub_dir=tmp_path / "hub",
+            log_dir=tmp_path / "logs",
+            options=SplashOptions(),
+        )
+        engine._process = MagicMock(pid=4200, **{"poll.return_value": None})
+        monkeypatch.setattr(splash_mod, "list_process_group_pids", lambda pgid: [4200])
+        monkeypatch.setattr(splash_mod, "get_phys_footprint", lambda pid: 0)
+        parts = sum(path.stat().st_size for path in source.iterdir())
+        assert engine.process_memory_bytes() == parts + streamed
 
 
 class TestProcessMemory:

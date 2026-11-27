@@ -40,7 +40,7 @@ template <typename T, int group_size>
         tid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int vecs_per_tg, int k_lanes>
+template <typename T, int group_size, int vecs_per_tg, int k_lanes, bool use_lut = false>
 [[kernel]] void affine_qmv_wide_t5(
     const device uint8_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -61,7 +61,7 @@ template <typename T, int group_size, int vecs_per_tg, int k_lanes>
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    qmv_wide_t5_impl<T, group_size, vecs_per_tg, k_lanes>(
+    qmv_wide_t5_impl<T, group_size, vecs_per_tg, k_lanes, use_lut>(
         w, scales, x, y, in_vec_size, out_vec_size, M, t5_lut,
         tid, simd_gid, simd_lid);
 }
@@ -99,6 +99,12 @@ bonsai_qmv_fast_t5_types(128)
 // qmv_wide_t5: gs=64 and gs=128
 bonsai_qmv_wide_t5_types(64)
 bonsai_qmv_wide_t5_types(128)
+instantiate_kernel(
+    "affine_qmv_wide_t5_float16_t_gs_128_nv_4_kl_8_batch4_lut",
+    affine_qmv_wide_t5, float16_t, 128, 4, 8, true)
+instantiate_kernel(
+    "affine_qmv_wide_t5_float16_t_gs_128_nv_4_kl_4_batch4_lut",
+    affine_qmv_wide_t5, float16_t, 128, 4, 4, true)
 
 // ---- t5 MMA GEMM (Identity I-M): fused dequant + simdgroup matmul for prefill ----
 // w(0)=uint8 t5 bytes, scales(1), x(2), out(3), M(4), N(5), K(6)

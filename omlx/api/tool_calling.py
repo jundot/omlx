@@ -2031,6 +2031,7 @@ def parse_tool_calls(
     text: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    parse_errors: Optional[List[str]] = None,
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse tool calls from model output.
@@ -2049,6 +2050,8 @@ def parse_tool_calls(
         text: Raw model output text
         tokenizer: mlx-lm's TokenizerWrapper (required)
         tools: Tool definitions for type conversion (optional)
+        parse_errors: Collects "malformed" when the native parser yields no
+            call from a span that calls a declared tool (optional)
 
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
@@ -2062,7 +2065,9 @@ def parse_tool_calls(
         ).strip()
         return cleaned_text, tool_calls or None
 
-    cleaned_text, tool_calls = _parse_tool_calls_impl(text, tokenizer, tools)
+    cleaned_text, tool_calls = _parse_tool_calls_impl(
+        text, tokenizer, tools, parse_errors
+    )
     if tool_calls and getattr(tokenizer, "tool_call_start", None) != "<｜DSML｜ calls>":
         _remap_tool_call_names(tool_calls, tools)
     return cleaned_text, tool_calls
@@ -2072,6 +2077,7 @@ def _parse_tool_calls_impl(
     text: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    parse_errors: Optional[List[str]] = None,
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """parse_tool_calls body, pre-remap. See the public wrapper's docstring."""
     cleaned_text = text
@@ -2271,6 +2277,14 @@ def _parse_tool_calls_impl(
                         cleaned_text = cleaned_text[:idx].strip()
                 return cleaned_text, tool_calls
 
+            if (
+                parse_errors is not None
+                and matches
+                and text.rstrip().endswith(tool_call_end or matches[-1].rstrip())
+                and _opens_call(matches[-1], tools)
+            ):
+                parse_errors.append("malformed")
+
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if "<tool_call>" in cleaned_text:
         return _parse_xml_tool_calls(cleaned_text, tools)
@@ -2367,9 +2381,16 @@ def _extract_tool_names(tools: List) -> set:
             func = tool.get("function", {})
             if isinstance(func, dict):
                 name = func.get("name")
-                if name:
+                if isinstance(name, str) and name:
                     names.add(name)
     return names
+
+
+def _opens_call(payload: str, tools: Optional[List]) -> bool:
+    return bool(re.match(r"\s*(?:[<{\[]|call:)", payload)) or any(
+        re.match(rf"\s*{re.escape(name)}\s*[(\[{{<:]", payload)
+        for name in _extract_tool_names(tools or [])
+    )
 
 
 def parse_qwen_tool_calls(
@@ -2516,6 +2537,7 @@ def extract_tool_calls_with_thinking(
       of whether regular text was also produced.
     """
     parse_errors = ()
+    rejected: list[str] = []
     parser = getattr(tokenizer, "tool_parser", None)
     if (
         finish_reason is not None
@@ -2530,7 +2552,9 @@ def extract_tool_calls_with_thinking(
             regular_content, tokenizer, tools, finish_reason
         )
     else:
-        cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+        cleaned_text, tool_calls = parse_tool_calls(
+            regular_content, tokenizer, tools, rejected
+        )
 
     dsml_start = getattr(tokenizer, "tool_call_start", None)
     if (
@@ -2557,6 +2581,7 @@ def extract_tool_calls_with_thinking(
             cleaned_text = visible.strip()
             errors.append("incomplete")
         parse_errors = tuple(errors)
+        rejected = []
 
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer, tools=tools)
     tool_calls_from_thinking = False
@@ -2610,8 +2635,13 @@ def extract_tool_calls_with_thinking(
                     tool_calls = None
                     tool_calls_from_thinking = False
 
-    if tools and finish_reason == "tool_calls" and not tool_calls and not parse_errors:
+    if (
+        tools
+        and not tool_calls
+        and not parse_errors
         # A remote backend can consume the call span and still report this finish.
+        and (finish_reason == "tool_calls" or (finish_reason == "stop" and rejected))
+    ):
         parse_errors = ("malformed",)
 
     return ToolCallExtraction(

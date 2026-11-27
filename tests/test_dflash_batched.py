@@ -233,11 +233,13 @@ def _tiny_dspark_drafter(seed=0):
     return dd.DFlashDrafter(model, block_size=BLOCK, source_path="tiny")
 
 
-DRAFTER_FAMILIES = pytest.mark.parametrize(
-    "make_drafter",
-    [_tiny_drafter, _tiny_laguna_drafter, _tiny_muse_drafter, _tiny_dspark_drafter],
-    ids=["dflash2", "laguna", "muse", "dspark"],
-)
+def test_load_rejects_a_reduced_draft_vocabulary(monkeypatch):
+    from omlx.speculative import dflash
+
+    model = SimpleNamespace(d2t=mx.zeros((8,), dtype=mx.int32))
+    monkeypatch.setattr(dflash, "load_drafter", lambda *a, **k: (model, "dflash"))
+    with pytest.raises(ValueError, match="reduced vocabulary"):
+        dflash.load_dflash_drafter("draft", _tiny_target())
 
 
 def _captured(n, seed):
@@ -271,8 +273,16 @@ def _run_cycles(drafter, plan, cycle_offset=0):
     return outputs
 
 
-@DRAFTER_FAMILIES
-@pytest.mark.parametrize("window", [1, WINDOW])
+@pytest.mark.parametrize(
+    "make_drafter, window",
+    [
+        (_tiny_drafter, 1),
+        (_tiny_drafter, WINDOW),
+        (_tiny_laguna_drafter, WINDOW),
+        (_tiny_muse_drafter, WINDOW),
+        (_tiny_dspark_drafter, WINDOW),
+    ],
+)
 def test_batched_forward_matches_rows_drafted_alone(make_drafter, window):
     """Padding, masks, vector RoPE offsets and ring writes must not leak across rows."""
     plan = [

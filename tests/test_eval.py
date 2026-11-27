@@ -448,6 +448,16 @@ class TestStripThinkTags:
         # Incomplete think tag (no closing) — should be left as-is
         assert BaseBenchmark._strip_think_tags("<think>still thinking") == "<think>still thinking"
 
+    def test_strip_hy4_close_tag_with_open_tag_in_prompt(self):
+        text = (
+            "We need code.\nFinal code.</think:opensource>"
+            "import sys\n\ndef main():\n    pass"
+        )
+        assert (
+            BaseBenchmark._strip_think_tags(text)
+            == "import sys\n\ndef main():\n    pass"
+        )
+
 
 # --- Thinking Mode Tests ---
 

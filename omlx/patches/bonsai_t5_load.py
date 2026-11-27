@@ -198,7 +198,11 @@ def _t5_quantized_matmul(
 
     if has_native() and M <= _T5_PREFILL_THRESHOLD:
         # scales dtype coercion is handled by the C++ ensure_dtype layer.
-        if M >= 2:
+        if M >= 2 or (
+            x.size == 4 * x.shape[-1]
+            and x.dtype == mx.float16
+            and w.shape[-1] == 26 * scales.shape[-1]
+        ):
             return t5_qmv_wide(x, w, scales)
         return t5_qmv(x, w, scales)
 

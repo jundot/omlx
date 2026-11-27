@@ -2254,6 +2254,59 @@ class TestEnginePoolAsync:
         assert second is base_engine
         profile_engine.stop.assert_awaited_once()
 
+    def test_k2_ane_prefill_keeps_specprefill_in_the_signature(
+        self, pool_with_mock_engines
+    ):
+        """The reload is what rejects this combination."""
+        pool = pool_with_mock_engines
+        pool.get_entry("model-a").config_model_type = "k2_horizon"
+
+        def signature(**specprefill):
+            settings = ModelSettings(qwen35_ane_prefill_enabled=True, **specprefill)
+            return pool._engine_runtime_signature("model-a", settings)
+
+        assert signature() != signature(
+            specprefill_enabled=True, specprefill_draft_model="/draft"
+        )
+
+    @pytest.mark.asyncio
+    async def test_specprefill_draft_attaches_without_reload(
+        self, pool_with_mock_engines
+    ):
+        """An alias adds its draft to a busy engine, which then serves both."""
+        pool = pool_with_mock_engines
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings()
+        alias, other_draft = (
+            ModelSettings(specprefill_enabled=True, specprefill_draft_model=draft)
+            for draft in ("/draft", "/other")
+        )
+        engine = MagicMock(specprefill_draft_path=None)
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+
+        def attach(engine, draft_path):
+            assert pool.get_entry("model-a").in_use == 2
+            engine.specprefill_draft_path = draft_path
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch(
+                "omlx.engine_pool.attach_specprefill_draft", side_effect=attach
+            ) as attach_mock,
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            for settings in (alias, None, alias):
+                served = await pool.get_engine("model-a", runtime_settings=settings)
+                assert served is engine
+            with pytest.raises(ModelBusyError):
+                await pool.get_engine("model-a", runtime_settings=other_draft)
+
+        attach_mock.assert_called_once_with(engine, "/draft")
+        engine.start.assert_awaited_once()
+        engine.stop.assert_not_awaited()
+        assert pool.get_entry("model-a").in_use == 1
+
     @pytest.mark.asyncio
     async def test_embedding_engine_receives_scheduler_config(self, tmp_path):
         """Embedding chunk sizing should come from the shared scheduler config."""
@@ -5110,7 +5163,7 @@ class TestEnginePoolInUseLease:
         entry = self._loaded_entry("model-a")
         entry.pending_unload_reason = "settings changed"
         pool._entries = {"model-a": entry}
-        pool._unloading_models.add("model-a")
+        pool._unloading_models["model-a"] = MagicMock()
         pool._unload_engine = AsyncMock()
 
         async with pool._lock:
@@ -5423,7 +5476,10 @@ class TestLoadRefusalNamesBindingCeiling:
             tier="safe",
         )
 
-        with pytest.raises(ModelTooLargeError) as exc_info:
+        with (
+            patch("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0),
+            pytest.raises(ModelTooLargeError) as exc_info,
+        ):
             asyncio.run(pool.get_engine("model-a"))
 
         message = str(exc_info.value)
@@ -5487,6 +5543,7 @@ class TestLoadRefusalNamesBindingCeiling:
         mock_engine.start = AsyncMock()
 
         with (
+            patch("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0),
             patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
             patch("omlx.engine_pool.get_phys_footprint", return_value=2000),
             patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
@@ -5798,7 +5855,7 @@ async def test_loaded_model_acquire_and_release_bypass_unrelated_unload_lock():
     pool = _make_pool(ceiling=0)
     entry = TestEnginePoolInUseLease._loaded_entry("ready")
     pool._entries = {"ready": entry}
-    pool._unloading_models.add("other")
+    pool._unloading_models["other"] = MagicMock()
     async with pool._lock:
         engine = await asyncio.wait_for(pool.get_engine("ready", _lease=True), 0.2)
         assert engine is entry.engine
@@ -5812,7 +5869,7 @@ async def test_unloading_model_cannot_use_loaded_fast_path():
     pool = _make_pool(ceiling=0)
     entry = TestEnginePoolInUseLease._loaded_entry("closing")
     pool._entries = {"closing": entry}
-    pool._unloading_models.add("closing")
+    pool._unloading_models["closing"] = MagicMock()
     assert pool._acquire_loaded_engine("closing", False, True, None) is None
     assert entry.in_use == 0
 
@@ -5821,9 +5878,11 @@ async def test_unloading_model_cannot_use_loaded_fast_path():
 async def test_unload_marker_exists_before_stop_yields_and_clears_on_error():
     pool = _make_pool(ceiling=0)
     entered, release = asyncio.Event(), asyncio.Event()
+    stop_calls = []
 
     async def stop(model_id):
         assert model_id in pool._unloading_models
+        stop_calls.append(model_id)
         entered.set()
         await release.wait()
         raise RuntimeError("stop failed")
@@ -5831,12 +5890,41 @@ async def test_unload_marker_exists_before_stop_yields_and_clears_on_error():
     pool._stop_and_unload_engine = stop
     task = asyncio.create_task(pool._unload_engine("closing"))
     await entered.wait()
-    with pytest.raises(ModelBusyError):
-        await pool._unload_engine("closing")
+    joiner = asyncio.create_task(pool._unload_engine("closing"))
     release.set()
-    with pytest.raises(RuntimeError):
-        await task
+    for unload in (task, joiner):
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await unload
+    assert stop_calls == ["closing"]
     assert not pool._unloading_models
+
+
+@pytest.mark.asyncio
+async def test_get_engine_waits_for_teardown_in_progress(small_mock_model_dir):
+    pool = _make_pool(ceiling=10 * 1024**3)
+    pool.discover_models(str(small_mock_model_dir))
+    entry = pool._entries["model-a"]
+    entry.engine = MagicMock()
+    release = asyncio.Event()
+
+    async def stop(model_id):
+        await release.wait()
+        entry.engine = None
+
+    pool._stop_and_unload_engine = stop
+    engine = MagicMock()
+    engine.start = AsyncMock()
+    with (
+        patch("omlx.engine_pool.mx") as mock_mx,
+        patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+        patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+    ):
+        mock_mx.get_active_memory.return_value = 0
+        unload = asyncio.create_task(pool._unload_engine("model-a"))
+        load = asyncio.create_task(pool.get_engine("model-a"))
+        release.set()
+        assert await load is engine
+        await unload
 
 
 @pytest.mark.asyncio

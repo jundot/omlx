@@ -414,9 +414,9 @@ final class AppUpdater {
     // MARK: - Mount / unmount
 
     private nonisolated static func mountDMG(at dmg: URL) throws -> URL {
-        let result = try runProcess(
+        let result = try UpdateInstaller.runProcess(
             "/usr/bin/hdiutil",
-            args: ["attach", "-nobrowse", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
+            arguments: ["attach", "-nobrowse", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
         )
         guard result.status == 0 else {
             throw UpdateError.mountFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
@@ -437,9 +437,9 @@ final class AppUpdater {
     }
 
     private nonisolated static func unmountDMG(at mountPoint: URL) throws {
-        let result = try runProcess(
+        let result = try UpdateInstaller.runProcess(
             "/usr/bin/hdiutil",
-            args: ["detach", mountPoint.path, "-force"]
+            arguments: ["detach", mountPoint.path, "-force"]
         )
         guard result.status == 0 else {
             throw UpdateError.unmountFailed(
@@ -458,12 +458,13 @@ final class AppUpdater {
         // `ditto` preserves resource forks, extended attributes, and
         // symlinks — straight `FileManager.copyItem` is known to drop
         // some of those on .app bundles.
-        let result = try runProcess(
+        let result = try UpdateInstaller.runProcess(
             "/usr/bin/ditto",
-            args: [appInVolume.path, stagedApp.path]
+            arguments: [appInVolume.path, stagedApp.path]
         )
         guard result.status == 0 else {
-            throw UpdateError.stageFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
+            let output = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw UpdateError.stageFailed(String(output.prefix { !$0.isNewline }))
         }
     }
 
@@ -485,9 +486,9 @@ final class AppUpdater {
         #"=anchor apple generic and identifier "app.omlx" and certificate leaf[subject.OU] = "PSK5Q5T46L""#
 
     nonisolated static func verifyAppSignature(at appPath: String) throws {
-        let result = try runProcess(
+        let result = try UpdateInstaller.runProcess(
             "/usr/bin/codesign",
-            args: ["--verify", "--deep", "--strict", "-R", Self.releaseRequirement, appPath]
+            arguments: ["--verify", "--deep", "--strict", "-R", Self.releaseRequirement, appPath]
         )
         guard result.status == 0 else {
             let detail = result.stderr.isEmpty ? result.stdout : result.stderr
@@ -535,27 +536,4 @@ final class AppUpdater {
         }
         return true
     }
-}
-
-// MARK: - Process helper
-
-private struct ProcessResult {
-    let status: Int32
-    let stdout: String
-    let stderr: String
-}
-
-private func runProcess(_ executable: String, args: [String]) throws -> ProcessResult {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = args
-    let stdoutPipe = Pipe()
-    let stderrPipe = Pipe()
-    process.standardOutput = stdoutPipe
-    process.standardError = stderrPipe
-    try process.run()
-    process.waitUntilExit()
-    let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    return ProcessResult(status: process.terminationStatus, stdout: stdout, stderr: stderr)
 }

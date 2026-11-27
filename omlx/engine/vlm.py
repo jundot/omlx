@@ -56,6 +56,7 @@ from ..model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
     ced_prefill_on,
+    specprefill_draft,
 )
 from ..models.vlm import VLMModelAdapter
 from ..oqh.format import is_oqh_checkpoint
@@ -63,6 +64,7 @@ from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
+from ..patches.inkling2.loopcd import apply_loopcd
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
@@ -70,6 +72,7 @@ from ..patches.muse_spark import model as muse_spark_model
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..specprefill.draft import attach_specprefill_draft
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
     compute_per_image_hashes,
@@ -77,6 +80,7 @@ from ..utils.image import (
     extract_media_from_messages,
     image_hash_prefixes,
 )
+from ..utils.sampling import seed_request_stream
 from ..utils.video import (
     NATIVE_VIDEO_MODEL_TYPES,
     attach_native_video_processor,
@@ -838,63 +842,6 @@ def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
     return isinstance(metadata, dict) and metadata.get("format") == "mlx"
 
 
-def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
-    """Derive Gemma4's legacy full-attention head fields from ``per_layer_config``.
-
-    Newer Gemma4 checkpoints (Transformers >= 5.15) record the ``head_dim`` /
-    ``num_key_value_heads`` overrides of the full-attention layers under
-    ``text_config.per_layer_config`` instead of the legacy global
-    ``global_head_dim`` / ``num_global_key_value_heads`` fields. The pinned
-    mlx-vlm Gemma4 loader reads only the legacy fields, so it sizes the
-    full-attention K/V projections with the sliding-window head count and
-    ``load_weights`` fails with a shape mismatch (#3537).
-
-    Returns the legacy fields that are absent from ``text_config`` and can be
-    derived unambiguously (every overridden full-attention layer agrees), or
-    an empty dict.
-    """
-    text_config = config.get("text_config")
-    if not isinstance(text_config, dict):
-        return {}
-    model_type = str(text_config.get("model_type") or config.get("model_type") or "")
-    if not model_type.startswith("gemma4"):
-        return {}
-    per_layer = text_config.get("per_layer_config")
-    if not isinstance(per_layer, dict) or not per_layer:
-        return {}
-    layer_types = text_config.get("layer_types")
-    if not isinstance(layer_types, list):
-        layer_types = None
-
-    derived: dict[str, int] = {}
-    for legacy_key, layer_key in (
-        ("global_head_dim", "head_dim"),
-        ("num_global_key_value_heads", "num_key_value_heads"),
-    ):
-        if text_config.get(legacy_key) is not None:
-            continue
-        values: set[int] = set()
-        for layer_id, overrides in per_layer.items():
-            if not isinstance(overrides, dict) or overrides.get(layer_key) is None:
-                continue
-            if layer_types is not None:
-                try:
-                    layer_idx = int(layer_id)
-                except (TypeError, ValueError):
-                    continue
-                if not 0 <= layer_idx < len(layer_types):
-                    continue
-                if layer_types[layer_idx] != "full_attention":
-                    continue
-            try:
-                values.add(int(overrides[layer_key]))
-            except (TypeError, ValueError):
-                continue
-        if len(values) == 1:
-            derived[legacy_key] = values.pop()
-    return derived
-
-
 @contextlib.contextmanager
 def _preserve_gemma4_unified_image_processor_on_load(model_dir: Path):
     """Keep the gemma4_unified image processor built from processor_config.json.
@@ -913,55 +860,6 @@ def _preserve_gemma4_unified_image_processor_on_load(model_dir: Path):
         yield
     finally:
         _vu.load_image_processor = original
-
-
-@contextlib.contextmanager
-def _derive_gemma4_global_kv_on_load(model_dir: Path):
-    """Feed ``per_layer_config``-only Gemma4 head overrides to the mlx-vlm loader.
-
-    Wraps ``mlx_vlm.utils.load_config`` for one ``vlm_load(...)`` so the
-    config handed to the Gemma4 ``TextConfig`` carries ``global_head_dim`` /
-    ``num_global_key_value_heads`` derived from ``per_layer_config`` when the
-    checkpoint does not spell them out (#3537). Checkpoints that already
-    carry the legacy fields, and non-Gemma4 models, are untouched.
-    """
-    config_path = model_dir / "config.json"
-    try:
-        config = json.loads(config_path.read_text())
-    except Exception:
-        yield
-        return
-    derived = (
-        _gemma4_global_kv_from_per_layer_config(config)
-        if isinstance(config, dict)
-        else {}
-    )
-    if not derived:
-        yield
-        return
-
-    import mlx_vlm.utils as _vu
-
-    original_load_config = _vu.load_config
-
-    def _patched_load_config(model_path, **kwargs):
-        loaded = original_load_config(model_path, **kwargs)
-        text_config = loaded.get("text_config") if isinstance(loaded, dict) else None
-        if isinstance(text_config, dict):
-            for key, value in derived.items():
-                if text_config.get(key) is None:
-                    text_config[key] = value
-        return loaded
-
-    logger.info(
-        "derive_gemma4_global_kv_on_load: per_layer_config -> %s",
-        ", ".join(f"{k}={v}" for k, v in derived.items()),
-    )
-    _vu.load_config = _patched_load_config
-    try:
-        yield
-    finally:
-        _vu.load_config = original_load_config
 
 
 @contextlib.contextmanager
@@ -1841,6 +1739,8 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the DFlash block drafter attached to Lightning MTP when
         # dflash_enabled.
         self._dflash_drafter: Any | None = None
+        self.specprefill_draft_path: str | None = None
+        self.specprefill_failed_draft: str | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
@@ -2110,7 +2010,6 @@ class VLMBatchedEngine(BaseEngine):
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _strip_vision_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
-                _derive_gemma4_global_kv_on_load(Path(self._model_name)),
                 _preserve_gemma4_unified_image_processor_on_load(
                     Path(self._model_name)
                 ),
@@ -2186,7 +2085,14 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
                 if model_type in INKLING2_MODEL_TYPES:
-                    return inkling2_vlm.load(self._model_name)
+                    loaded = inkling2_vlm.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
+                    )
+                    apply_loopcd(loaded[0], self._model_settings)
+                    return loaded
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
                         self._model_name,
@@ -2572,6 +2478,13 @@ class VLMBatchedEngine(BaseEngine):
             self._vision_cache = None
             self._vision_cache_enabled = False
 
+        if getattr(self._processor, "tool_parser_type", None) == "deepseek_v4":
+            from ..patches.deepseek_v4.tokenizer_patch import (
+                install_vlm_tokenizer_protocol,
+            )
+
+            install_vlm_tokenizer_protocol(self._processor.tokenizer)
+
         # Extract tokenizer from processor with deep-copy for thread safety.
         # The processor keeps the original tokenizer for executor-thread work
         # (_prepare_vision_inputs / prepare_inputs), while this deep copy is
@@ -2925,85 +2838,11 @@ class VLMBatchedEngine(BaseEngine):
             logger.debug("qwen3_5 padded-row attention patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
-        # SpecPrefill: load draft model and pass to scheduler
-        if self._model_settings is not None:
-            specprefill_draft = getattr(
-                self._model_settings, "specprefill_draft_model", None
+        draft_path = specprefill_draft(self._model_settings)
+        if draft_path:
+            await loop.run_in_executor(
+                get_mlx_executor(), attach_specprefill_draft, self, draft_path
             )
-            specprefill_enabled = getattr(
-                self._model_settings, "specprefill_enabled", False
-            )
-            if specprefill_enabled and specprefill_draft:
-                try:
-                    from ..utils.model_loading import (
-                        lm_load_compat as mlx_lm_load,
-                    )
-                    from ..utils.model_loading import (
-                        maybe_load_custom_quantization,
-                    )
-                    from ..utils.tokenizer import get_tokenizer_config
-
-                    def _load_draft():
-                        from ..patches.mlx_lm_mtp import set_mtp_active
-                        from ..utils.model_loading import materialize_lazy_state
-
-                        was_mtp = False
-                        try:
-                            from ..patches.mlx_lm_mtp import is_mtp_active
-
-                            was_mtp = is_mtp_active()
-                        except Exception:
-                            pass
-                        set_mtp_active(False)
-                        try:
-                            custom_loaded = maybe_load_custom_quantization(
-                                specprefill_draft,
-                                is_vlm=False,
-                            )
-                            if custom_loaded is not None:
-                                draft_model, _ = custom_loaded
-                            else:
-                                draft_tokenizer_config = get_tokenizer_config(
-                                    specprefill_draft,
-                                    trust_remote_code=self._trust_remote_code,
-                                )
-                                draft_model, _ = mlx_lm_load(
-                                    specprefill_draft,
-                                    tokenizer_config=draft_tokenizer_config,
-                                    trust_remote_code=self._trust_remote_code,
-                                )
-                            # Materialize frozen buffers (RoPE freqs, etc.)
-                            # on the loader thread. mlx_lm.load only does
-                            # mx.eval(model.parameters()) and leaves siblings
-                            # lazy bound to this thread's stream. Without
-                            # this, the first score_tokens() call from
-                            # Scheduler.step on the per-engine executor
-                            # thread raises "no Stream(gpu, X) in current
-                            # thread". Same root cause and fix as e93c408
-                            # for the VLM MTP drafter.
-                            materialize_lazy_state(draft_model)
-                            return draft_model
-                        finally:
-                            set_mtp_active(was_mtp)
-
-                    draft_model = await loop.run_in_executor(
-                        get_mlx_executor(), _load_draft
-                    )
-                    self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model,
-                        draft_model_name=specprefill_draft,
-                        keep_pct=getattr(
-                            self._model_settings, "specprefill_keep_pct", None
-                        ),
-                        threshold=getattr(
-                            self._model_settings, "specprefill_threshold", None
-                        ),
-                    )
-                    logger.info(
-                        f"SpecPrefill: draft model loaded ({specprefill_draft})"
-                    )
-                except Exception as e:
-                    logger.error(f"SpecPrefill: draft model load failed: {e}")
 
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)
@@ -3138,6 +2977,8 @@ class VLMBatchedEngine(BaseEngine):
                 "_grammar_compiler",
                 "_vlm_mtp_drafter",
                 "_dflash_drafter",
+                "specprefill_draft_path",
+                "specprefill_failed_draft",
                 "_diffusion_family",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
@@ -3607,6 +3448,8 @@ class VLMBatchedEngine(BaseEngine):
                     skip_audio_token=role != "user" or msg_num_audios == 0,
                     num_images=msg_num_images,
                     num_audios=msg_num_audios,
+                    # Phi-3-V numbers images across the whole conversation.
+                    image_offset=num_images - remaining_images - msg_num_images,
                 )
                 # Prompt-only message formats render a plain string instead of a
                 # role/content dict; there is no content list to collapse.
@@ -4459,7 +4302,12 @@ class VLMBatchedEngine(BaseEngine):
             prompts = [prompt] if isinstance(prompt, str) else prompt
             # A text-only chat template renders images as prose, and the
             # processor then fails with a misleading image-count error.
-            image_token = getattr(self._processor, "image_token", None)
+            # Gemma 3 expands boi_token into image tokens in its processor.
+            image_token = getattr(
+                self._processor,
+                "boi_token" if model_type == "gemma3" else "image_token",
+                None,
+            )
             texts = [item for item in prompts if isinstance(item, str)]
             if (
                 num_images
@@ -5011,18 +4859,16 @@ class VLMBatchedEngine(BaseEngine):
         from the full prompt token count (system-only messages usually can't be
         templated on their own). Shared by ``chat`` and ``stream_chat`` so the
         non-streaming path protects the system prompt identically. No-op unless
-        the model has SpecPrefill enabled and the request has a system prompt.
+        SpecPrefill applies to the request and the request has a system prompt.
 
         ``prompt`` is the already-tokenized VLM prompt (a list of token IDs,
         per ``_process_chat_messages``), so the full-prompt count is just its
         length rather than a re-encode.
         """
-        specprefill_model_enabled = (
-            getattr(self._model_settings, "specprefill_enabled", False)
-            if self._model_settings
-            else False
-        )
-        if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
+        enabled = kwargs.get("specprefill")
+        if enabled is None:
+            enabled = getattr(self._model_settings, "specprefill_enabled", False)
+        if not enabled:
             return
         non_system = [
             m for m in messages if m.get("role") not in ("system", "developer")
@@ -6059,8 +5905,7 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             limit_ctx = contextlib.nullcontext()
 
-        if seed is not None:
-            mx.random.seed(seed)
+        seed_request_stream(seed)
 
         tokenizer = self._tokenizer
         if hasattr(tokenizer, "stopping_criteria"):

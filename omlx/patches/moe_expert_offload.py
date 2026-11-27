@@ -1141,6 +1141,12 @@ def apply_moe_expert_offload(
     wrapped += apply_deepseek_v4_moe_expert_offload(
         model, model_dir, resident_fraction, mtp_resident=mtp_resident
     )
+    if kind == "inkling2_loop":
+        from .inkling2.moe_offload import apply_inkling2_moe_expert_offload
+
+        wrapped += apply_inkling2_moe_expert_offload(
+            model, model_dir, resident_fraction
+        )
     total_bytes = resident_bytes = 0
     staging_sizes = {}
     staging_requested = (
@@ -1248,12 +1254,15 @@ def estimate_offload_admission_bytes(
             return full_size
         minimum = _minimum_experts(model_dir)
         config_path = Path(model_dir) / "config.json"
+        projs, nvfp4_ok = _PROJS, False
         if config_path.exists():
             kind = json.loads(config_path.read_text()).get("model_type", "")
             if kind == "deepseek_v41":
                 # V4.1 admission is owned by its own adapter's estimator.
                 return full_size
-            if kind == "qwen3_5_moe":
+            if kind == "inkling2_loop":
+                projs, nvfp4_ok = ("w13", "w2"), True
+            if kind in ("qwen3_5_moe", "inkling2_loop"):
                 from .moe_offload_compat import moe_offload_compatibility
 
                 if not moe_offload_compatibility(model_dir)[0]:
@@ -1299,7 +1308,7 @@ def estimate_offload_admission_bytes(
                     nvfp4.add(name.rsplit(".", 2)[0])
                 elif len(shape) == 3:
                     parts = name.rsplit(".", 2)
-                    if len(parts) == 3 and parts[1] in _PROJS and parts[2] in (
+                    if len(parts) == 3 and parts[1] in projs and parts[2] in (
                         "weight", "scales", "biases"
                     ):
                         b = stacked.setdefault(
@@ -1309,10 +1318,10 @@ def estimate_offload_admission_bytes(
                         b["fields"].add((parts[1], parts[2]))
                         b["e"].add(int(shape[0]))
 
-        required = {(p, f) for p in _PROJS for f in ("weight", "scales")}
+        required = {(p, f) for p in projs for f in ("weight", "scales")}
         saved = 0.0
         for container, b in stacked.items():
-            if not required <= b["fields"] or container in nvfp4:
+            if not required <= b["fields"] or (container in nvfp4 and not nvfp4_ok):
                 continue  # unquantized, partial or NVFP4: wraps nothing
             if len(b["e"]) != 1:  # projections disagree on E
                 continue

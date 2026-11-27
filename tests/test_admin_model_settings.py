@@ -166,6 +166,21 @@ async def test_lora_adapter_is_checked_when_it_changes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_loopcd_needs_a_looped_checkpoint_and_reloads_it():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+    request = admin_routes.ModelSettingsRequest(loopcd_enabled=True)
+    await _update_settings(pool, settings, request)
+    assert settings.loopcd_enabled is False
+    entry.config_model_type = "inkling2_loop"
+    await _update_settings(pool, settings, request)
+    assert settings.loopcd_enabled is True
+    loaded = pool._engine_runtime_signature(entry.model_id, settings)
+    settings.loopcd_skip_thinking = True
+    assert pool._engine_runtime_signature(entry.model_id, settings) != loaded
+
+
+@pytest.mark.asyncio
 async def test_load_time_setting_change_clears_cached_failure():
     pool, entry = _failed_pool()
     settings = ModelSettings(trust_remote_code=False)
@@ -404,6 +419,37 @@ async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
     assert result["auto_unloaded"] is True
     assert result["reload_deferred"] is False
     pool._unload_engine.assert_awaited_once_with("ling")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "before, change, reloads",
+    [
+        (False, {"specprefill_enabled": True}, False),
+        (True, {"specprefill_keep_pct": 0.4, "specprefill_threshold": 1024}, False),
+        (True, {"specprefill_enabled": False}, True),
+    ],
+)
+async def test_specprefill_change_unloads_only_to_release_the_draft(
+    tmp_path, before, change, reloads
+):
+    (tmp_path / "config.json").write_text('{"model_type": "llama"}')
+    pool, entry = _failed_pool()
+    entry.engine = _idle_engine()
+    entry.engine.specprefill_draft_path = str(tmp_path)
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(
+            specprefill_enabled=before, specprefill_draft_model=str(tmp_path)
+        ),
+        admin_routes.ModelSettingsRequest(**change),
+    )
+
+    assert result["requires_reload"] is reloads
+    assert pool._unload_engine.await_count == int(reloads)
 
 
 @pytest.mark.asyncio

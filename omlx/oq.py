@@ -45,6 +45,7 @@ try:
     from omlx.patches.inkling2 import apply_inkling2_patch
     from omlx.patches.inkling2 import oq_layout as inkling2_layout
     from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
+    from omlx.utils.model_loading import _nextn_weight_prefixes_from_config
 
     HAS_MLX = True
 except ImportError:
@@ -4102,12 +4103,34 @@ def make_predicate(config: dict, oq_level: int = 4) -> Callable:
     return predicate
 
 
+def _estimate_mtp_donor_bytes(source: Path, config: dict, donor: Path) -> int:
+    donor_config = json.loads((donor / "config.json").read_text())
+    assistant = donor_config.get("model_type") in GEMMA4_ASSISTANT_TYPES.values()
+    if assistant:
+        validate_gemma4_assistant_pair(config, donor_config)
+    else:
+        validate_mtp_donor_pair(source, donor)
+    mapping = _shard_key_map(donor)
+    if not assistant:
+        mapping = {
+            key: shard for key, shard in mapping.items() if _strip_mtp_key_prefix(key)
+        }
+    if not mapping:
+        raise ValueError(f"No MTP tensors found in donor model: {donor}")
+    index = _LazyTensorIndex({donor / shard for shard in mapping.values()})._index
+    return sum(index[key][3] - index[key][2] for key in mapping)
+
+
 def estimate_bpw_and_size(
     model_path: str,
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
+    *,
+    text_only: bool = False,
+    dtype: str = "bfloat16",
+    mtp_assistant_model_path: str = "",
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -4123,6 +4146,10 @@ def estimate_bpw_and_size(
             source bytes, as ``quantize_oq_streaming`` stores them.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
+        text_only: Omit vision and audio tensors from the output.
+        dtype: Output dtype used by the streaming exporter.
+        mtp_assistant_model_path: Add the donor head's stored bytes to the
+            output size. Effective bpw describes the weights priced by oQ.
 
     Returns:
         Dict with effective_bpw, output_size_bytes, output_size_formatted.
@@ -4131,6 +4158,12 @@ def estimate_bpw_and_size(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+
+    if dtype not in OQ_DTYPES:
+        raise ValueError(f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}")
+    _validate_oq_dtype_for_model(config, dtype)
+    if text_only and decision_kind(source, config) == "d3":
+        raise ValueError("Decision 3.0 requires its vision encoder")
 
     weight_files = _source_weight_files(source)
     if not weight_files:
@@ -4146,10 +4179,22 @@ def estimate_bpw_and_size(
         if not _checkpoint_has_mtp_weights(source):
             preserve_mtp = False
 
+    donor_bytes = 0
+    if mtp_assistant_model_path:
+        if preserve_mtp:
+            raise ValueError(
+                "Preserving MTP and combining an MTP head are mutually exclusive"
+            )
+        donor_bytes = _estimate_mtp_donor_bytes(
+            source, config, Path(mtp_assistant_model_path)
+        )
+
     if config.get("model_type") == "deepseek_v41":
         from .patches.deepseek_v41.oq import source_budget
 
-        _validate_v41_oq_settings(oq_level, group_size=group_size)
+        _validate_v41_oq_settings(oq_level, dtype, group_size)
+        if text_only:
+            raise ValueError("V4.1 oQ export currently preserves the vision encoder")
         if "omlx_deepseek_v41" in config:
             raise ValueError("V4.1 quantization requires the original checkpoint")
         mapping = json.loads((source / "model.safetensors.index.json").read_text())[
@@ -4211,13 +4256,16 @@ def estimate_bpw_and_size(
     # model as fp16 passthrough (15.8 bpw for a 4-bit run). Falls back to
     # the raw header names when discovery is unavailable.
     plan_view = None
+    cast_predicate = None
     try:
         _sanitize_fn = _build_model_sanitizer(
             config,
+            text_only=text_only,
             model_path=source,
             preserve_mtp=preserve_mtp,
         )
         if _sanitize_fn is not None:
+            cast_predicate = getattr(_sanitize_fn, "_omlx_cast_predicate", None)
             _plan = _discover_sanitize_plan(_sanitize_fn, idx)
             if _plan:
                 plan_view = _DiscoveredPlan(_plan, idx)
@@ -4230,13 +4278,13 @@ def estimate_bpw_and_size(
             if info.get("transform") == "literal":
                 continue
             shape = tuple(info.get("shape") or ())
-            dtype = info.get("dtype")
+            tensor_dtype = info.get("dtype")
             sources = info.get("sources") or []
-            if dtype is None and len(sources) == 1:
+            if tensor_dtype is None and len(sources) == 1:
                 src_meta = logical.get(sources[0])
                 if src_meta is not None:
-                    dtype = src_meta[1]
-            planned_logical[out_name] = (shape, dtype)
+                    tensor_dtype = src_meta[1]
+            planned_logical[out_name] = (shape, tensor_dtype)
         if planned_logical:
             logical = planned_logical
 
@@ -4244,6 +4292,14 @@ def estimate_bpw_and_size(
         if plan_view is not None:
             return plan_view.source_quant_info(name)
         return idx.source_quant_info(name)
+
+    nextn_prefixes = _nextn_weight_prefixes_from_config(config)
+    logical = {
+        name: meta
+        for name, meta in logical.items()
+        if not _should_skip_tensor(name, preserve_mtp, text_only=text_only)
+        and (preserve_mtp or not name.startswith(nextn_prefixes))
+    }
 
     named_shapes = {}
     for name, (shape, _dtype) in logical.items():
@@ -4311,24 +4367,12 @@ def estimate_bpw_and_size(
         for d in shape:
             n_elements *= d
 
-        if _should_skip_tensor(name, preserve_mtp=preserve_mtp):
-            continue
-
-        if not _should_quantize_tensor(name, shape):
-            total_params += n_elements
-            total_weighted_bits += n_elements * 16
-            total_output_bytes += n_elements * 2
-            continue
-
-        bits, gs, _mode = _get_predicate_bits(name, config, oq_level, group_size)
-        if bits is None:
-            total_params += n_elements
-            total_weighted_bits += n_elements * 16
-            total_output_bytes += n_elements * 2
-            continue
-
         total_params += n_elements
-        src_info = _source_quant_info(name)
+        bits, gs, mode = (None, None, None)
+        if _should_quantize_tensor(name, shape):
+            bits, gs, mode = _get_predicate_bits(name, config, oq_level, group_size)
+
+        src_info = _source_quant_info(name) if bits is not None else None
         if src_info is not None and bits >= src_info["bits"]:
             # Passthrough: packed weight at source bits plus one e8m0
             # uint8 scale byte per group.
@@ -4336,25 +4380,28 @@ def estimate_bpw_and_size(
             n_groups = shape[-1] // src_info["group_size"]
             tensor_bytes = (n_elements * src_info["bits"] + 7) // 8
             tensor_bytes += rows * n_groups
-            total_output_bytes += tensor_bytes
-            total_weighted_bits += tensor_bytes * 8
-        elif len(shape) >= 2:
-            n_groups = (shape[-1] + gs - 1) // gs
+        elif bits is not None and shape[-1] % gs == 0:
+            n_groups = shape[-1] // gs
             rows = n_elements // max(shape[-1], 1)
             weight_bytes = (n_elements * bits + 7) // 8
-            if _mode == "mxfp4":
+            if mode == "mxfp4":
                 bytes_per_group = 1
-            elif _mode == "mxfp8":
+            elif mode == "mxfp8":
                 bytes_per_group = 2
             else:
                 bytes_per_group = 4
             overhead_bytes = rows * n_groups * bytes_per_group
             tensor_bytes = weight_bytes + overhead_bytes
-            total_output_bytes += tensor_bytes
-            total_weighted_bits += tensor_bytes * 8
         else:
-            total_output_bytes += n_elements * 2
-            total_weighted_bits += n_elements * 16
+            cast = cast_predicate is None or cast_predicate(name)
+            fp32 = (
+                _oq_media_output_is_fp32(name, dtype == "float16")
+                if cast
+                else _dtype is not None and _dtype in ("F32", mx.float32)
+            )
+            tensor_bytes = n_elements * (4 if fp32 else 2)
+        total_output_bytes += tensor_bytes
+        total_weighted_bits += tensor_bytes * 8
 
     for k in ("_oq_use_budget_plan", "_oq_boost_map", "_oq_sensitivity_map"):
         config.pop(k, None)
@@ -4377,6 +4424,7 @@ def estimate_bpw_and_size(
             effective_bpw += 0.3 * _down_boost
             total_output_bytes = int(effective_bpw * total_params / 8)
 
+    total_output_bytes += donor_bytes
     source_total = sum(sf.stat().st_size for sf in _source_weight_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
@@ -4718,17 +4766,12 @@ _SKIP_QUANT_PATTERNS = (
 )
 
 
-def _should_skip_tensor(name: str, preserve_mtp: bool = False) -> bool:
-    """Check if a tensor should be completely excluded from output.
-
-    By default mtp.* tensors are stripped because mlx-lm's stock sanitize()
-    removes them when the model has no MTP head. When ``preserve_mtp`` is
-    True the caller has stashed mtp.* tensors around the sanitize call and
-    re-merged them, so we must keep them in the output shards.
-    """
-    if ".mtp." in name or name.startswith("mtp."):
-        return not preserve_mtp
-    return False
+def _should_skip_tensor(
+    name: str, preserve_mtp: bool = False, *, text_only: bool = False
+) -> bool:
+    return (not preserve_mtp and _is_mtp_tensor(name)) or (
+        text_only and (_is_vision_tensor(name) or _is_audio_tensor(name))
+    )
 
 
 def _is_mtp_tensor(name: str) -> bool:
@@ -4844,14 +4887,16 @@ def _should_quantize_tensor(name: str, shape: tuple) -> bool:
     return True
 
 
+def _oq_media_output_is_fp32(name: str, fp16: bool) -> bool:
+    return fp16 and (_is_vision_tensor(name) or _is_audio_tensor(name))
+
+
 def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
     """Cast an unquantized output tensor to its storage dtype."""
     if not mx.issubdtype(w_mx.dtype, mx.floating):
         return w_mx
 
-    if target_dtype == mx.float16 and (
-        _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
-    ):
+    if _oq_media_output_is_fp32(tensor_name, target_dtype == mx.float16):
         if w_mx.dtype != mx.float32:
             return w_mx.astype(mx.float32)
         return w_mx

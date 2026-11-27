@@ -233,15 +233,15 @@ def _inputs(seed, length, heads, dim, window_rows, pooled_rows, w, c):
     return q, window, pooled, wi, ci, sink, dim**-0.5
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
 @pytest.mark.parametrize(
-    "length,heads,dim,window_rows,pooled_rows,w,c",
+    "dtype,length,heads,dim,window_rows,pooled_rows,w,c",
     [
-        (1, 64, 512, 128, 1024, 128, 512),  # decode: only the selected rows are decoded
-        (2, 8, 128, 128, 900, 128, 449),  # gathered rows, last 64-key block partial
-        (9, 16, 128, 128, 300, 128, 448),  # prefill: every cached row decoded once
-        (3, 8, 32, 64, 600, 64, 513),  # D = 32: fewer dimension slices
-        (4, 8, 64, 600, 0, 520, 0),  # window only, no compressed pool
+        pytest.param(mx.bfloat16, 1, 64, 512, 128, 1024, 128, 512, id="decode-bf16"),
+        pytest.param(mx.float32, 1, 64, 512, 128, 1024, 128, 512, id="decode"),
+        pytest.param(mx.float32, 2, 8, 128, 128, 900, 128, 449, id="partial-key-block"),
+        pytest.param(mx.float32, 9, 16, 128, 128, 300, 128, 448, id="prefill"),
+        pytest.param(mx.float32, 3, 8, 32, 64, 600, 64, 513, id="dim-32"),
+        pytest.param(mx.float32, 4, 8, 64, 600, 0, 520, 0, id="window-only"),
     ],
 )
 def test_fused_attention_matches_three_kernel_reference(

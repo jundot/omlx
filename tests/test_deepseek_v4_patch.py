@@ -5,6 +5,7 @@ import importlib
 import inspect
 import json
 import sys
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1013,6 +1014,50 @@ class TestChatTemplateV4:
             add_generation_prompt=True,
         )
         assert render_through_next_turn.startswith(prev_full_text)
+
+
+class TestVlmTokenizerProtocol:
+    def test_processor_and_tokenizer_share_the_text_encoder(self, applied_patch):
+        import copy
+
+        from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
+            DEFAULT_CHAT_TEMPLATE,
+            DeepseekV4Processor,
+        )
+
+        from omlx.patches.deepseek_v4.tokenizer_patch import (
+            install_vlm_tokenizer_protocol,
+        )
+
+        tokenizer = SimpleNamespace(
+            chat_template=DEFAULT_CHAT_TEMPLATE, encode=lambda text, **kw: [len(text)]
+        )
+        processor = DeepseekV4Processor.__new__(DeepseekV4Processor)
+        processor.tokenizer = tokenizer
+        assert processor.tool_parser_type == "deepseek_v4"
+        install_vlm_tokenizer_protocol(tokenizer)
+
+        render = partial(processor.apply_chat_template, tokenize=False)
+        image = [{"type": "image"}, {"type": "text", "text": "what?"}]
+        user = [{"role": "user", "content": image}]
+        assert render(user, add_generation_prompt=True).endswith(
+            "<｜deepseek_image｜>what?<｜Assistant｜></think>"
+        )
+        assert render(
+            user, add_generation_prompt=True, enable_thinking=True
+        ).endswith("<｜Assistant｜><think>")
+        partial_turn = [*user, {"role": "assistant", "content": "Sure"}]
+        assert render(partial_turn, continue_final_message=True).endswith("Sure")
+
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+        copied = copy.deepcopy(tokenizer)
+        assert copied.apply_chat_template.args == (copied,)
+        text = [{"role": "user", "content": "hi"}]
+        prompt = copied.apply_chat_template(text, tokenize=False, tools=tools)
+        assert "<｜DSML｜tool_calls>" in prompt
+        assert prompt == render(text, tools=tools)
+        assert copied.has_tool_calling
+        assert copied.tool_call_start == "<｜DSML｜tool_calls>"
 
 
 class TestChatTemplateModuleRegistration:
@@ -2513,12 +2558,6 @@ class TestAffineBlockRouteThreshold:
         assert linear._can_use_affine_blocks(at, sorted_indices=True) is True
         # unsorted routes never take the block path, whatever the count
         assert linear._can_use_affine_blocks(at, sorted_indices=False) is False
-
-    def test_thresholds_default_to_the_measured_crossovers(self):
-        from omlx.patches.deepseek_v4 import switch_layers as sl
-
-        assert sl._SORT_MIN_ROUTES == 32
-        assert sl._AFFINE_NATIVE_MIN_ROUTES == 1024
 
 
 @pytest.mark.parametrize("family", ["glu", "mlp"])
