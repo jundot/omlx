@@ -276,3 +276,30 @@ def test_capture_at_position_zero_starts_a_fresh_bridge():
     )
     ends = [segment.end for segment in bridge._window[28]]
     assert ends == [2], ends
+
+
+def test_capture_rotates_compressed_rows_before_recording():
+    """The reference records compressed rows rotated; the compressor emits them raw."""
+    import mlx.core as mx
+
+    from omlx.patches.deepseek_v41_dfly2 import capture_attention_slice
+    from omlx.patches.deepseek_v41_dfly2.dsv41_bridge import DSV41TargetBridge
+
+    bridge = DSV41TargetBridge(target_layers=(28,), index_topk=2, local_window=2)
+    row = mx.ones((1, 2, 4))
+    picks = mx.array([[[0, -1], [1, -1]]], dtype=mx.int32)
+    seen = {}
+
+    def fake_rope(latents, positions):
+        seen["positions"] = positions
+        return latents * 7.0
+
+    capture_attention_slice(
+        bridge=bridge, layer=28, start=8, ratio=4,
+        window_latents=row, compressed_latents=row, compressed_start=8,
+        native_index_topk=picks, compressed_rope=fake_rope,
+    )
+    assert "positions" in seen, "compressed rows were recorded without rotation"
+    stored = bridge._global[28][0][1]
+    mx.eval(stored)
+    assert float(stored.reshape(-1)[0]) == 7.0

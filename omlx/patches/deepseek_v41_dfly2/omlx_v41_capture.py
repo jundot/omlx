@@ -8,6 +8,8 @@ absolute anchor `i * compress_ratio`; native `-1` remains `-1`.
 """
 from __future__ import annotations
 
+from typing import Callable
+
 import mlx.core as mx
 
 from .dsv41_bridge import DSV41TargetBridge
@@ -24,6 +26,7 @@ def capture_attention_slice(
     compressed_start: int,
     native_index_topk: mx.array,
     committed_rows: int | None = None,
+    compressed_rope: "Callable[[mx.array, mx.array], mx.array] | None" = None,
 ) -> None:
     """Capture one DSV41 attention slice in bridge coordinates.
 
@@ -59,6 +62,12 @@ def capture_attention_slice(
         (compressed_start // ratio) * ratio
         + mx.arange(compressed_latents.shape[1], dtype=mx.int32) * ratio
     )
+    if compressed_rope is not None:
+        # The reference records BOTH reusable row classes after RoPE (window rows
+        # already arrive rotated from the source path). Compressed rows leave the
+        # compressor unrotated, so they must be rotated here, at their own
+        # absolute positions, or the draft attends to them as if position-free.
+        compressed_latents = compressed_rope(compressed_latents, compressed_positions)
     bridge.record(
         layer,
         start=start,

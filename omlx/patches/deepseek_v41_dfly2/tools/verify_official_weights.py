@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only verifier for an official DFly2 weight staging directory.
 
-Run this beside a parent-owned isolated download on omlx-8. It neither downloads
+Run this beside the staged download, outside any model directory. It neither downloads
 nor writes to model directories. The default inspection uses safetensors slices,
 so it validates names, dtypes and shapes without materialising multi-GB tensors.
 """

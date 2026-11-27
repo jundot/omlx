@@ -445,6 +445,10 @@ class Attention(nn.Module):
                         # A verify block commits only its accepted prefix; the
                         # draft anchor must not run ahead of that.
                         committed_rows=(1 if verify_state is not None else length),
+                        # Compressed rows leave the compressor unrotated while
+                        # the reference records them rotated; rotate here at
+                        # their own absolute positions.
+                        compressed_rope=lambda latents, positions: rope(latents, positions, c, True),
                     )
             if latent is not None:
                 compressed = rope(

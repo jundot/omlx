@@ -145,13 +145,45 @@ def _moe(x: mx.array, weights: Mapping[str, mx.array], config) -> mx.array:
     picked_scores = mx.take_along_axis(scores, picked, axis=-1)
     if route_norm:
         picked_scores = picked_scores / mx.sum(picked_scores, axis=-1, keepdims=True)
-    out = mx.zeros_like(x)
-    for expert in range(experts):
-        gate = _linear(x, _weight(weights, f"ffn.experts.{expert}.w1.weight"))
-        up = _linear(x, _weight(weights, f"ffn.experts.{expert}.w3.weight"))
+    # Dispatch only selected (token, expert) pairs.  The route slots are sorted
+    # by expert so every expert invocation receives only its assigned tokens;
+    # empty experts never run.  Results are scattered into an expert-major
+    # buffer before summation so the reduction order still matches the former
+    # ascending-expert loop.
+    flat_x = x.reshape(-1, x.shape[-1])
+    flat_picked = picked.reshape(-1)
+    flat_scores = picked_scores.astype(x.dtype).reshape(-1)
+    token_ids = mx.repeat(mx.arange(flat_x.shape[0], dtype=mx.uint32), topk)
+    route_order = mx.argsort(flat_picked)
+    sorted_experts = flat_picked[route_order]
+    selected_experts, selected_counts = mx.unique(
+        sorted_experts, experts, return_counts=True, fill_value=0
+    )
+    mx.eval(selected_experts, selected_counts)
+
+    route_offsets = 0
+    route_indices = []
+    routed_values = []
+    for expert, count in zip(selected_experts.tolist(), selected_counts.tolist()):
+        if count == 0:
+            break
+        routes = route_order[route_offsets : route_offsets + count]
+        expert_x = flat_x[token_ids[routes]]
+        gate = _linear(expert_x, _weight(weights, f"ffn.experts.{expert}.w1.weight"))
+        up = _linear(expert_x, _weight(weights, f"ffn.experts.{expert}.w3.weight"))
         value = _linear(_swiglu(gate, up, swiglu_limit), _weight(weights, f"ffn.experts.{expert}.w2.weight"))
-        selected = mx.sum((picked == expert).astype(x.dtype) * picked_scores.astype(x.dtype), axis=-1, keepdims=True)
-        out = out + selected * value
+        route_indices.append(token_ids[routes].astype(mx.uint32) * experts + flat_picked[routes].astype(mx.uint32))
+        routed_values.append(value * flat_scores[routes, None])
+        route_offsets += count
+
+    dense_routes = mx.zeros((flat_x.shape[0] * experts, x.shape[-1]), dtype=x.dtype)
+    dense_routes = mx.put_along_axis(
+        dense_routes,
+        mx.concatenate(route_indices)[:, None],
+        mx.concatenate(routed_values),
+        axis=0,
+    )
+    out = mx.sum(dense_routes.reshape(*x.shape[:-1], experts, x.shape[-1]), axis=-2)
     shared_gate = _linear(x, _weight(weights, "ffn.shared_experts.w1.weight"))
     shared_up = _linear(x, _weight(weights, "ffn.shared_experts.w3.weight"))
     shared = _linear(_swiglu(shared_gate, shared_up, swiglu_limit), _weight(weights, "ffn.shared_experts.w2.weight"))
