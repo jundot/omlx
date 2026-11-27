@@ -70,6 +70,24 @@ def build_runtime(tensors: Mapping[str, mx.array], config: Any, checkpoint_confi
     )
 
 
+def _model_config(model: Any):
+    """The text config, wherever the engine hid it.
+
+    A VLM engine hands us its own wrapper, whose config lives one level down on
+    the language model it holds; a text engine hands us the model itself.
+    """
+    candidates = [model]
+    for attr in ("language_model", "_language_model", "model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    for candidate in candidates:
+        config = getattr(candidate, "_config", None) or getattr(candidate, "args", None)
+        if config is not None:
+            return config
+    return None
+
+
 def enable_dfly2(model: Any, checkpoint_dir: str | Path):
     """Load the draft into ``model`` and arm the generator methods.
 
@@ -79,8 +97,7 @@ def enable_dfly2(model: Any, checkpoint_dir: str | Path):
     from ..deepseek_v41.dfly2 import attach
 
     directory = Path(checkpoint_dir)
-    checkpoint_config = json.loads((directory / "config.json").read_text())
-    model_config = getattr(model, "_config", None) or getattr(model, "args", None)
+    model_config = _model_config(model)
     if model_config is None:
         raise RuntimeError("DFly2 needs the loaded model's config to size its layers")
     tensors, checkpoint_config = load_checkpoint_tensors(directory)
