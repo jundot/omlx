@@ -18,6 +18,7 @@ import mlx.nn as nn
 from mlx_vlm.speculative.ops.linear import _target_verify_linear
 
 from ..custom_kernels.oqh import fast
+from ..patches import m5_gather_qmm
 from . import format as fmt
 
 # In row-exact forwards (Lightning MTP decode and verify), up to this many rows
@@ -228,7 +229,10 @@ class OqhSwitchLinear(_Rotating):
 
     def gemv_rows(self, x: mx.array, sorted_indices: bool = False) -> bool:
         """Whether x runs the native gather GEMV; callers sort large route sets."""
-        return not sorted_indices and x.shape[-2] == 1
+        rows = x.size // self.input_dims
+        return x.shape[-2] == 1 and (
+            not sorted_indices or not m5_gather_qmm._nax_rows_ok(rows, self["weight"])
+        )
 
     def _gemv(self, x: mx.array, indices: mx.array, *pair) -> mx.array:
         rows = x.size // self.input_dims
@@ -252,6 +256,12 @@ class OqhSwitchLinear(_Rotating):
     ):
         if self.gemv_rows(x, sorted_indices):
             return self._gemv(x, indices)
+        if sorted_indices:
+            y = m5_gather_qmm.oqh_sorted_gather_qmm(
+                x, self["weight"], self["rscale"], indices, self.bits
+            )
+            if y is not None:
+                return y
         return fast.gather_qmm(
             x, self["weight"], self["rscale"], indices, self.bits, sorted_indices
         )
