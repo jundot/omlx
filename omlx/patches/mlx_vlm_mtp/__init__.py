@@ -88,6 +88,7 @@ _RUNTIME_PATCHES: tuple[str, ...] = (
     "gemma4_vlm_runtime",
     "inkling_vlm_runtime",
     "glm5_next_vlm_runtime",
+    "sensenova_loop_vlm_mtp",
 )
 
 # Which runtime sub-patch belongs to which ``model_type``. These patches
@@ -105,6 +106,11 @@ _RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
     "inkling": ("inkling_vlm_runtime",),
     "inkling_mm_model": ("inkling_vlm_runtime",),
     "glm5_next": ("glm5_next_vlm_runtime",),
+    # SenseNova-Loop (VLM engine): loop-aware MTP/DFlash2 adaptation.
+    # sensenova_loop_vlm_mtp adapts the built-in MTPModule to the VLM
+    # drafter interface (vlm_mtp_enabled path) — registered after the
+    # runtime so the MTPModule attach happens first.
+    "sensenova_loop": ("sensenova_loop_vlm_mtp",),
     "qwen4_exp": (),
     "minimax_m3": (),
     "minimax_m3_vl": (),
