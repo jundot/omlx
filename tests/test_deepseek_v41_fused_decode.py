@@ -243,6 +243,21 @@ def test_fused_decode_rejects_unsupported_layouts():
     assert not decode_fused.supported(model.layers[3], c)
 
 
+def test_fused_blocks_hold_wo_a_once_as_mxfp8():
+    model = build()
+    c = model._config
+    ids = mx.array([np.random.default_rng(5).integers(3, 60, 17).tolist()])
+    ref = model(ids, cache=model.make_cache())
+    mx.eval(ref)
+    mx.random.seed(7)
+    draw = mx.random.uniform(shape=(4,))
+    mx.random.seed(7)
+    assert all(decode_fused.supported(layer, c) for layer in model.layers)
+    assert mx.array_equal(mx.random.uniform(shape=(4,)), draw).item()
+    assert all(layer.attn.wo_a.mode == "mxfp8" for layer in model.layers)
+    assert mx.array_equal(model(ids, cache=model.make_cache()), ref).item()
+
+
 def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
     model = build()
     c = model._config
