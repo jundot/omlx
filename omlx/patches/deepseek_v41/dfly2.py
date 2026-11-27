@@ -255,18 +255,31 @@ def _runtime_cfg(runtime, host):
     return runtime.cfg if isinstance(getattr(runtime, "cfg", None), DFly2Config) else DFly2Config.from_config(getattr(host, "_config", getattr(host, "args", {})))
 
 
+def _inner_language_model(host):
+    """The text model under whatever wrapper the engine handed us."""
+    for attr in ("language_model", "_language_model", "model"):
+        inner = getattr(host, attr, None)
+        if inner is not None and inner is not host:
+            return inner
+    return host
+
+
 def _embed(host, ids):
-    fn = getattr(host, "embed", None) or getattr(getattr(host, "model", None), "embed_tokens", None)
-    if fn is None:
-        raise RuntimeError("DFly2 host has no token embedding")
-    return fn(ids)
+    for candidate in (host, _inner_language_model(host), getattr(host, "model", None)):
+        if candidate is None:
+            continue
+        fn = getattr(candidate, "embed", None) or getattr(candidate, "embed_tokens", None)
+        if fn is not None:
+            return fn(ids)
+    raise RuntimeError("DFly2 host has no token embedding")
 
 
 def _head_weight(host):
-    head = getattr(host, "head", None) or getattr(host, "lm_head", None)
-    if head is None:
-        raise RuntimeError("DFly2 host has no language-model head")
-    return head.weight if hasattr(head, "weight") else head
+    for candidate in (host, _inner_language_model(host)):
+        head = getattr(candidate, "head", None) or getattr(candidate, "lm_head", None)
+        if head is not None:
+            return head.weight if hasattr(head, "weight") else head
+    raise RuntimeError("DFly2 host has no language-model head")
 
 
 def attach(model_class):

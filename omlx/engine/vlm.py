@@ -2889,8 +2889,11 @@ class VLMBatchedEngine(BaseEngine):
         if dfly2_checkpoint:
             from ..patches.deepseek_v41_dfly2.enable import enable_dfly2
 
-            language_model = getattr(self._vlm_model, "language_model", self._vlm_model)
-            enable_dfly2(language_model, dfly2_checkpoint)
+            # Arm the object the generator will actually be handed: the batch
+            # generator looks for the DSpark marker one level down from its
+            # model, so the runtime must sit on the VLM model itself, not only on
+            # the text model it wraps.
+            enable_dfly2(self._vlm_model, dfly2_checkpoint)
             logger.info("DFly2 draft enabled from %s", dfly2_checkpoint)
 
         self._loaded = True
