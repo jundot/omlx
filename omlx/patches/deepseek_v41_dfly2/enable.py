@@ -87,4 +87,9 @@ def enable_dfly2(model: Any, checkpoint_dir: str | Path):
     runtime = build_runtime(tensors, model_config, checkpoint_config)
     model.dfly = runtime
     attach(type(model))
+    # The generator only drafts from a host it considers DSpark-active; without
+    # this marker the runtime would load and then never be asked for a block.
+    for holder in (model, getattr(model, "language_model", None), getattr(model, "_language_model", None)):
+        if holder is not None:
+            holder._omlx_dspark_decode_enabled = True
     return runtime

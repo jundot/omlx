@@ -135,6 +135,8 @@ def test_enable_builds_a_runtime_that_drafts_a_block(tmp_path):
     runtime = enable_dfly2(host, directory)
     assert host.dfly is runtime
     assert len(runtime.layers) == len(DRAFT_LAYERS)
+    # Without this marker the generator never asks the runtime for a block.
+    assert host._omlx_dspark_decode_enabled is True
 
     history = [
         SimpleNamespace(
