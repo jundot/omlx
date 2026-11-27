@@ -2882,6 +2882,17 @@ class VLMBatchedEngine(BaseEngine):
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)
 
+        # A VLM-classified checkpoint loads through this engine, not the text
+        # one, so the DFly2 hook has to live here too: the flag is per model and
+        # the runtime is built from the language model's own config.
+        dfly2_checkpoint = getattr(self._model_settings, "dfly2_checkpoint", None)
+        if dfly2_checkpoint:
+            from ..patches.deepseek_v41_dfly2.enable import enable_dfly2
+
+            language_model = getattr(self._vlm_model, "language_model", self._vlm_model)
+            enable_dfly2(language_model, dfly2_checkpoint)
+            logger.info("DFly2 draft enabled from %s", dfly2_checkpoint)
+
         self._loaded = True
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
