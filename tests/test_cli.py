@@ -38,14 +38,16 @@ class TestCLIModule:
         # The module should have the main entry point
         assert callable(cli.main)
 
-    def test_package_import_relaxes_metal_preemption_timeout(self):
-        """Importing omlx sets the Metal driver flag and keeps an explicit value."""
-        code = (
-            "import os, omlx; print(os.environ.get('AGX_RELAX_CDM_CTXSTORE_TIMEOUT'))"
-        )
-        env = {
-            k: v for k, v in os.environ.items() if k != "AGX_RELAX_CDM_CTXSTORE_TIMEOUT"
-        }
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1"),
+            ("MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS", "1000"),
+        ],
+    )
+    def test_package_import_sets_metal_env_defaults(self, name, value):
+        code = f"import os, omlx; print(os.environ.get({name!r}))"
+        env = {k: v for k, v in os.environ.items() if k != name}
         default = subprocess.run(
             [sys.executable, "-c", code],
             env=env,
@@ -55,12 +57,12 @@ class TestCLIModule:
         )
         explicit = subprocess.run(
             [sys.executable, "-c", code],
-            env={**env, "AGX_RELAX_CDM_CTXSTORE_TIMEOUT": "0"},
+            env={**env, name: "0"},
             capture_output=True,
             text=True,
             timeout=30,
         )
-        expected = "1" if sys.platform == "darwin" else "None"
+        expected = value if sys.platform == "darwin" else "None"
         assert default.stdout.strip() == expected
         assert explicit.stdout.strip() == "0"
 
