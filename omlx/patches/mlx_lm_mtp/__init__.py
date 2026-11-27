@@ -115,7 +115,6 @@ def apply_mlx_lm_mtp_patch() -> bool:
         nemotron_h_chain,
         nemotron_h_model,
         qwen35_model,
-        sensenova_loop_mtp,
         step3p7_model,
     )
 
@@ -127,12 +126,6 @@ def apply_mlx_lm_mtp_patch() -> bool:
         # Qwen models are the main target; if the qwen patch refuses we
         # still continue so DeepSeek-V4 users aren't blocked.
         logger.debug("Qwen3.5/3.6 MTP patch did not apply (likely import error)")
-    else:
-        # SenseNova Loop MTP rollback specialization -- apply only the
-        # slot-based cache rollback.  The Loop/MHC architecture itself is
-        # registered independently (model_loading pre-load dispatch), so it
-        # loads whether or not MTP is enabled.
-        sensenova_loop_mtp.apply_mtp()
     if not deepseek_v4_model.apply():
         logger.debug("DeepSeek-V4 MTP patch did not apply (likely missing base patch)")
     if not glm_moe_dsa_model.apply():
