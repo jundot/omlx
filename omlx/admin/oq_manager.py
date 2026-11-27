@@ -20,6 +20,7 @@ try:
     import mlx.core as mx
 
     from ..oqh import targets as oqh_targets
+    from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
 
     HAS_MLX = True
 except ImportError:
@@ -282,6 +283,8 @@ class OQManager:
                                 # mm_vision_tower). Same predicate as model_discovery.
                                 "is_vlm": _has_vision_subconfig(config),
                                 "has_mtp_heads": has_mtp,
+                                "has_bundled_dspark": bundled_inkling2_dspark_path(path)
+                                is not None,
                                 "oqh_supported": oqh_targets.supports(config),
                                 "oqh_max_level": getattr(
                                     oqh_targets.scheme_for(config), "max_level", None

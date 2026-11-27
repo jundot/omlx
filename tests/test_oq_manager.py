@@ -216,6 +216,50 @@ class TestOQManagerMtpDetection:
         assert model_info["has_mtp_heads"] is True
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_sidecar", [True, False])
+    async def test_inkling2_bundled_dspark_is_distinct_from_mtp(
+        self, tmp_path, with_sidecar
+    ):
+        model = self._write_model(
+            tmp_path,
+            "Inkling-2-Mini",
+            index_weight_map={"model.embed_tokens.weight": "model.safetensors"},
+        )
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "inkling2_loop",
+                    "text_config": {
+                        "num_hidden_layers": 24,
+                        "loop_config": {
+                            "core_start": 6,
+                            "core_end": 18,
+                            "num_passes": 3,
+                        },
+                    },
+                    "mtp_config": {
+                        "num_hidden_layers": 3,
+                        "markov_head_type": "rnn_hidden",
+                        "target_layer_ids": [5, 23, 41, 48],
+                    },
+                    "quantization_config": {"quant_method": "modelopt"},
+                }
+            )
+        )
+        if with_sidecar:
+            (model / "mtp.safetensors").write_bytes(b"\x00" * 4096)
+
+        source_models, all_models = await OQManager(
+            model_dirs=[str(tmp_path)]
+        ).list_quantizable_models()
+
+        [source] = source_models
+        [listed] = all_models
+        assert source["has_bundled_dspark"] is with_sidecar
+        assert listed["has_bundled_dspark"] is with_sidecar
+        assert source["has_mtp_heads"] is False
+
+    @pytest.mark.asyncio
     async def test_start_quantization_disables_preserve_mtp_without_weights(
         self, tmp_path, monkeypatch
     ):

@@ -120,6 +120,8 @@ Sample selection uses a fixed seed, so repeated runs on the same model see the s
 | Calibration samples, Sequence length | How much text oQe runs for the imatrix |
 | Strict imatrix coverage | Stops with an error when a tensor has no imatrix entry, instead of quantizing that tensor with standard oQ |
 
+Inkling 2 checkpoints with a bundled DSpark drafter show **Bundled DSpark drafter** instead of the MTP preservation toggle. The drafter is automatically preserved during quantization.
+
 ## Memory and disk
 
 Writing the quantized model needs little memory because tensors are read and written one at a time. Calibration needs the model in memory:

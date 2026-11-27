@@ -444,6 +444,8 @@
   "models.oq.preserve_ngram": "원본 Engram 테이블 유지",
   "models.oq.preserve_ngram_help": "Engram 테이블을 4비트로 양자화하지 않고 원본 FP8 저장 형식 그대로 복사합니다. 디스크 사용량은 늘지만 SSD N-gram 오프로드를 쓰면 메모리 사용량은 같습니다. 출력 이름에 -ngram 접미사가 붙습니다.",
   "models.oq.preserve_mtp_unavailable": "소스 모델에 MTP heads 가 없습니다.",
+  "models.oq.bundled_dspark": "Bundled DSpark drafter",
+  "models.oq.bundled_dspark_help": "Automatically preserved during quantization.",
   "models.oq.combine_assistant": "Combine assistant model as MTP head",
   "models.oq.combine_assistant_help": "Merge a separate gemma4_assistant checkpoint into the output as a Lightning MTP head. The output name gets a -mtp suffix and the Lightning MTP toggle works on the result.",
   "models.oq.combine_assistant_none": "None",

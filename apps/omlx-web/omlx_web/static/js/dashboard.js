@@ -8622,6 +8622,11 @@
                 return model?.has_mtp_heads || false;
             },
 
+            oqSelectedModelHasBundledDspark() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.has_bundled_dspark || false;
+            },
+
             oqEstimatedMemory() {
                 // Use precise estimate from API if available
                 if (this.oqEstimate) {

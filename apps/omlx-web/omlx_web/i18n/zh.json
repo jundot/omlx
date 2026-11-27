@@ -444,6 +444,8 @@
   "models.oq.preserve_ngram": "保留原始 Engram 表",
   "models.oq.preserve_ngram_help": "按原始 FP8 存储格式复制 Engram 表，不量化为 4 位。输出会占用更多磁盘空间，但开启 SSD N-gram 卸载时内存占用不变。输出名称追加 -ngram 后缀。",
   "models.oq.preserve_mtp_unavailable": "源模型没有 MTP 头。",
+  "models.oq.bundled_dspark": "Bundled DSpark drafter",
+  "models.oq.bundled_dspark_help": "Automatically preserved during quantization.",
   "models.oq.combine_assistant": "合并助手模型为 MTP 头",
   "models.oq.combine_assistant_help": "将独立的 gemma4_assistant 检查点合并到输出中作为 Lightning MTP 头。输出名称追加 -mtp 后缀，Lightning MTP 开关对结果生效。",
   "models.oq.combine_assistant_none": "无",
