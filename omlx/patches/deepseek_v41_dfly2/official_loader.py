@@ -105,12 +105,32 @@ class OfficialDFly2Checkpoint:
         # Import here: metadata-only validation works even if safetensors is absent.
         from safetensors import safe_open
 
+        # The official checkpoint is bfloat16, which numpy cannot represent and
+        # which safetensors' mlx backend still refuses (it converts through
+        # numpy). MLX reads bfloat16 natively, so the mlx path loads a whole
+        # shard at a time; numpy remains the fallback for metadata-only use.
+        try:
+            import mlx.core as mx
+        except ImportError:  # pragma: no cover - numpy fallback
+            mx = None
+
         tensors: dict[str, object] = {}
         selected = set(plan.tensor_names)
         for path in paths:
+            expected = {name for name in selected if self.weight_map[name] == path.name}
+            if mx is not None:
+                shard = mx.load(str(path))
+                missing = expected - set(shard)
+                if missing:
+                    raise ValueError(f"{path.name} is missing indexed tensor(s): {sorted(missing)}")
+                for name in sorted(expected):
+                    tensors[name] = shard[name]
+                del shard
+                continue
+            from safetensors import safe_open
+
             with safe_open(str(path), framework="numpy") as handle:
                 names = set(handle.keys())
-                expected = {name for name in selected if self.weight_map[name] == path.name}
                 missing = expected - names
                 if missing:
                     raise ValueError(f"{path.name} is missing indexed tensor(s): {sorted(missing)}")
