@@ -995,6 +995,17 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type in _SENSENOVA_LOOP_MODEL_TYPES:
+        from ..patches.mlx_vlm_sensenova_loop_compat import (
+            apply_mlx_vlm_sensenova_loop_compat_patch,
+        )
+
+        if apply_mlx_vlm_sensenova_loop_compat_patch():
+            logger.info(
+                "SenseNova-Loop mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     if for_vlm and model_type == "qwen4_exp":
         from ..patches.mlx_vlm_qwen4_exp_compat import (
             apply_mlx_vlm_qwen4_exp_compat_patch,
