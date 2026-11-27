@@ -14,9 +14,16 @@ def test_setting_a_checkpoint_alone_is_allowed():
     assert settings.dfly2_checkpoint == "/models/dfly2"
 
 
-def test_dfly2_and_mtp_cannot_share_a_model():
-    with pytest.raises(ValueError, match="dfly2_checkpoint replaces"):
-        ModelSettings(dfly2_checkpoint="/models/dfly2", mtp_enabled=True)
+def test_dfly2_may_run_with_the_mtp_machinery_armed():
+    """The draft is called from the MTP cycle, so the cycle must stay enabled."""
+    settings = ModelSettings(dfly2_checkpoint="/models/dfly2", mtp_enabled=True)
+    assert settings.dfly2_checkpoint == "/models/dfly2"
+    assert settings.mtp_enabled is True
+
+
+def test_empty_checkpoint_path_is_rejected():
+    with pytest.raises(ValueError, match="must be a path or None"):
+        ModelSettings(dfly2_checkpoint="   ")
 
 
 def test_validator_accepts_either_drafter_alone():

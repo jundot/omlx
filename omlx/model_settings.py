@@ -89,16 +89,17 @@ def resolve_lora_conflicts(data: dict) -> tuple:
 
 
 def validate_dfly2_settings(settings: dict) -> None:
-    """DFly2 is a drafter in its own right, so it cannot share a model with MTP.
+    """DFly2 rides the MTP generator, so it needs that machinery armed.
 
-    Both would draft from the same target and both own the decode loop; a model
-    loaded with the checkpoint's MTP head and a DFly2 runtime would draft twice
-    per cycle. Fail at save time instead of silently preferring one.
+    The drafter replaces the checkpoint's MTP *head* at runtime, not the batch
+    generator's speculative cycle: the cycle is what calls into the draft. So a
+    DFly2 checkpoint is valid together with ``mtp_enabled``, and forbidding the
+    pair (as an earlier revision did) silently disabled the draft: the settings
+    failed to load and the model fell back to plain decoding.
     """
-    if settings.get("dfly2_checkpoint") and settings.get("mtp_enabled"):
-        raise ValueError(
-            "dfly2_checkpoint replaces the checkpoint's MTP head; disable mtp_enabled first."
-        )
+    checkpoint = settings.get("dfly2_checkpoint")
+    if checkpoint is not None and not str(checkpoint).strip():
+        raise ValueError("dfly2_checkpoint must be a path or None, not an empty string")
 
 
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
