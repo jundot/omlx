@@ -107,6 +107,7 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     # The VLM engine's loader also reads the earlier oMLX layout of text-only
     # Muse Spark conversions.
     "muse_spark",
+    "prism_hadamard_qwen35",
 }
 
 # Multimodal checkpoints whose currently vendored mlx-lm implementation only

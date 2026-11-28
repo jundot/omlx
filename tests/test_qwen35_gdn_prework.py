@@ -14,6 +14,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx_lm.models.gated_delta import normalize_qk
+from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.qwen3_5 import language
 from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from mlx_vlm.speculative.cache_state import start_speculative_cache
@@ -21,6 +22,7 @@ from mlx_vlm.speculative.ops import linear as linear_ops
 
 
 from omlx.patches import qwen35_gdn_prework as prework_mod
+from omlx.patches import qwen35_gdn_verify_fused as fused_mod
 
 
 @pytest.fixture(autouse=True)
@@ -1709,3 +1711,32 @@ def test_qwen4_fused_verify_multi_row_blocks_need_row_exact_arming(qwen4_verify)
         )
         transaction.abort()
     assert qwen4_verify == [1]
+
+
+def test_gdn_replay_eligible_accepts_float32_a_log_with_fp16_queries():
+    assert fused_mod.apply_arrays_cache_replay_patch()
+    args = SimpleNamespace(
+        hidden_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = language.Qwen3_5GatedDeltaNet(args)
+    layer.set_dtype(mx.float16)
+    layer.A_log = layer.A_log.astype(mx.float32)
+
+    cache = ArraysCache(size=2)
+    cache[0] = mx.zeros((1, 3, layer.conv_dim), dtype=mx.float16)
+    cache[1] = mx.zeros((1, 4, 128, 128), dtype=mx.float32)
+    q = mx.zeros((1, 3, 2, 128), dtype=mx.float16)
+    transaction = start_speculative_cache([cache], 3)
+    try:
+        assert fused_mod.replay_eligible(layer, q, cache, 3) is True
+        layer.dt_bias = layer.dt_bias.astype(mx.float32)
+        assert fused_mod.replay_eligible(layer, q, cache, 3) is False
+    finally:
+        transaction.abort()
+

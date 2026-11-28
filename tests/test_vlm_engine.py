@@ -38,6 +38,17 @@ try:
 except ImportError:
     HAS_MLX = False
 
+try:
+    import mlx_vlm.utils as vlm_utils
+    from mlx_vlm.models.prism_hadamard_qwen35 import Model as PrismModel
+
+    from tests.test_model_loading import _build_prism_hadamard_checkpoint
+
+    HAS_MLX_VLM = True
+except ImportError:
+    PrismModel = None
+    HAS_MLX_VLM = False
+
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -3966,3 +3977,36 @@ class TestNativeVideo:
         assert estimate.call_count == 2
         kwargs = engine._preflight_or_raise_with_eviction.call_args.kwargs
         assert kwargs["num_prompt_tokens"] == 1002
+
+
+@pytest.mark.skipif(
+    not (HAS_MLX and HAS_MLX_VLM),
+    reason="mlx and mlx_vlm are required to test prism_hadamard_qwen35 VLM start",
+)
+class TestPrismHadamardStart:
+    @staticmethod
+    def _mock_vlm_load(model_path, **_kwargs):
+        return vlm_utils.load_model(Path(model_path), lazy=False), MockVLMTokenizer()
+
+    @pytest.mark.asyncio
+    async def test_start_installs_prism_hadamard_verify(self, tmp_path, monkeypatch):
+        assert PrismModel is not None
+        unpatched = getattr(
+            PrismModel.load_weights, "__wrapped__", PrismModel.load_weights
+        )
+        monkeypatch.setattr(PrismModel, "load_weights", unpatched)
+        monkeypatch.setattr(
+            PrismModel, "_omlx_prism_load_weights_patched", False, raising=False
+        )
+        _build_prism_hadamard_checkpoint(tmp_path)
+        engine = _make_engine(model_name=str(tmp_path))
+        try:
+            with patch.object(vlm_utils, "load", side_effect=self._mock_vlm_load):
+                await engine.start()
+            assert getattr(engine._vlm_model, "_omlx_prism_hadamard_installed", False) is True
+            layer0 = engine._vlm_model.language_model.model.layers[0]
+            assert layer0.input_layernorm.weight.dtype == mx.float16
+            assert layer0.linear_attn.A_log.dtype == mx.float32
+        finally:
+            await engine.stop()
+

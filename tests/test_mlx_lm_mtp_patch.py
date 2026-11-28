@@ -22,9 +22,10 @@ from mlx_lm.models import qwen3, qwen3_5
 from mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
 from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+from mlx_vlm.speculative.ops import linear as vlm_linear_ops
 
 from omlx.model_settings import ModelSettings
-from omlx.patches import batched_decode_qmm, mlx_lm_mtp, qwen35_verify_qmm
+from omlx.patches import batched_decode_qmm, mlx_lm_mtp, q2_verify_qmv, qwen35_verify_qmm
 from omlx.patches.laguna import laguna_model
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
 from omlx.patches.mlx_lm_mtp import (
@@ -6466,6 +6467,8 @@ def test_batched_decode_leaves_exact_modes_on_stock(monkeypatch, mode):
 @pytest.mark.parametrize(
     "bits,rows,dtype",
     [
+        (2, 2, mx.float16),
+        (2, 3, mx.float16),
         (2, 8, mx.bfloat16),
         (3, 4, mx.float16),
         (4, 4, mx.bfloat16),
@@ -6501,10 +6504,10 @@ def test_sg8_kernels_match_quantized_matmul(bits, rows, dtype):
         swiglu = vq.vk_swiglu_sg8(x, gate, up, sums)
         assert _close(swiglu, nn.silu(g) * u, tol=2e-2)
 
-        if bits not in (4, 5):
+        if bits not in (2, 4, 5):
             continue
-        # Mixed 4/5-bit projections of one input share a launch.
-        group = [layer, _quantized_linear(512, 1024, 9 - bits, 14, dtype), gate]
+        partner_bits = 2 if bits == 2 else 9 - bits
+        group = [layer, _quantized_linear(512, 1024, partner_bits, 14, dtype), gate]
         for got, linear in zip(vq.vk_group_sg8(x, group, sums), group):
             assert _close(got, _reference(linear, x))
 
@@ -6787,3 +6790,198 @@ def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
     actual, _ = generate(model, prompts, limits)
     assert fired
     assert actual == expected
+
+
+def test_verify_qmm_routes_2bit_short_blocks_and_dense_linears(monkeypatch):
+    qwen35_verify_qmm.apply_verify_qmm_patch()
+    qwen35_verify_linear.apply()
+    monkeypatch.setattr(qwen35_verify_qmm, "_m1_route", lambda *args: None)
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: True)
+
+    for rows in (2, 3, 4, 5):
+        assert qwen35_verify_qmm._verify_route(rows, 5120, 5120, 2, 128, mx.float16) == "q2"
+    assert qwen35_verify_qmm._verify_route(2, 5120, 248320, 2, 128, mx.float16) == "q2"
+    for rows in (6, 7, 8):
+        assert qwen35_verify_qmm._verify_route(rows, 5120, 5120, 2, 128, mx.float16) == "sg8"
+    assert qwen35_verify_qmm._verify_route(3, 256, 1024, 2, 32, mx.float16) == "sg8"
+    assert qwen35_verify_qmm._verify_route(3, 3200, 16384, 2, 128, mx.float16) == "vk"
+    assert qwen35_verify_qmm._verify_route(2, 5120, 5120, 4, 64, mx.float16) is None
+    assert qwen35_verify_qmm._verify_route(4, 5120, 5120, 4, 64, mx.float16) is None
+
+    monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: True)
+    qkv = nn.QuantizedLinear(5120, 10240, bias=False, group_size=128, bits=2)
+    z = nn.QuantizedLinear(5120, 6144, bias=False, group_size=128, bits=2)
+    for proj in (qkv, z):
+        proj.scales = proj.scales.astype(mx.float16)
+        proj.biases = proj.biases.astype(mx.float16)
+    q4 = nn.QuantizedLinear(5120, 4096, bias=False, group_size=128, bits=4)
+    q4.scales = q4.scales.astype(mx.float16)
+    q4.biases = q4.biases.astype(mx.float16)
+    x = mx.zeros((1, 2, 5120), dtype=mx.float16)
+    x4 = mx.zeros((1, 4, 5120), dtype=mx.float16)
+    x6 = mx.zeros((1, 6, 5120), dtype=mx.float16)
+    assert q2_verify_qmv.group_eligible((qkv, z), x)
+    assert not qwen35_verify_qmm.sg8_group_eligible((qkv, z), x)
+    assert not qwen35_verify_qmm.sg8_group_eligible((qkv, z), x4)
+    assert qwen35_verify_qmm.sg8_group_eligible((q4, z), x4)
+    assert qwen35_verify_qmm.sg8_group_eligible((qkv, z), x6)
+    assert q2_verify_qmv.swiglu_eligible(qkv, qkv, x)
+    assert not qwen35_verify_qmm.sg8_swiglu_eligible(qkv, qkv, x)
+    assert qwen35_verify_qmm.sg8_swiglu_eligible(qkv, qkv, x6)
+
+    assert not q2_verify_qmv.is_ternary_linear(qkv)
+    qkv.biases = -qkv.scales
+    assert q2_verify_qmv.mark_ternary(qkv) is True
+    assert q2_verify_qmv.is_ternary_linear(qkv) is True
+    qkv.biases = qkv.scales
+    assert q2_verify_qmv.is_ternary_linear(qkv) is False
+    assert q2_verify_qmv.mark_ternary(qkv) is False
+
+    monkeypatch.setattr(q2_verify_qmv, "get_apple_gpu_generation", lambda: 16)
+    assert q2_verify_qmv._geometry(3, 1024) == (2, 4)
+    assert q2_verify_qmv._geometry(3, 5120) == (2, 8)
+    assert q2_verify_qmv._geometry(3, 5128) == (2, 4)
+    assert q2_verify_qmv._geometry(3, 248320) == (2, 4)
+    assert q2_verify_qmv._group_geometry(3, (10240, 6144)) == (2, 8)
+    assert q2_verify_qmv._group_geometry(3, (4096, 1032)) == (2, 4)
+    assert q2_verify_qmv._swiglu_geometry(3, 2048) == (1, 4)
+    assert q2_verify_qmv._swiglu_geometry(3, 17408) == (1, 8)
+
+    mismatched = nn.QuantizedLinear(512, 1024, bias=False, group_size=128, bits=2)
+    mismatched.scales = mismatched.scales.astype(mx.float16)
+    mismatched.biases = mismatched.biases.astype(mx.float16)
+    with pytest.raises(ValueError):
+        mismatched(mx.zeros((1, 2, 1024), dtype=mx.float16))
+    with pytest.raises(ValueError, match="q2_qmm incompatible shapes"):
+        q2_verify_qmv.q2_qmm(
+            mx.zeros((2, 1024), dtype=mx.float16),
+            mismatched.weight,
+            mismatched.scales,
+            mismatched.biases,
+            group_size=128,
+        )
+    with pytest.raises(ValueError, match="q2_qmm incompatible shapes"):
+        q2_verify_qmv.q2_qmm(
+            mx.zeros((2, 512), dtype=mx.float16),
+            mismatched.weight,
+            mismatched.scales,
+            None,
+            group_size=128,
+            neg_scale=False,
+        )
+
+    monkeypatch.setattr(
+        vlm_linear_ops, "exact_speculative_verify_dense_available", lambda: True
+    )
+    dense = nn.Linear(5120, 48, bias=False)
+    dense.weight = dense.weight.astype(mx.float16)
+    router = nn.Linear(2560, 256, bias=False)
+    router.weight = router.weight.astype(mx.float16)
+    assert (
+        vlm_linear_ops._use_target_verify_dense(
+            dense, mx.zeros((1, 3, 5120), dtype=mx.float16)
+        )
+        is False
+    )
+    assert (
+        vlm_linear_ops._use_target_verify_dense(
+            router, mx.zeros((1, 3, 2560), dtype=mx.float16)
+        )
+        is True
+    )
+
+    dense_calls: list[tuple[int, ...]] = []
+    orig_linear_call = nn.Linear.__call__
+
+    def spy_dense(self, inp):
+        dense_calls.append(tuple(inp.shape))
+        return orig_linear_call(self, inp)
+
+    monkeypatch.setattr(nn.Linear, "__call__", spy_dense)
+    out = vlm_linear_ops._target_verify_linear(
+        dense, mx.zeros((1, 3, 5120), dtype=mx.float16)
+    )
+    assert out.shape == (1, 3, 48)
+    assert dense_calls == [(1, 3, 5120)]
+
+    dense_calls.clear()
+    monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: False)
+    monkeypatch.setattr(qwen35_verify_qmm, "is_row_exact_armed", lambda: True)
+    vlm_linear_ops._target_verify_linear(
+        dense, mx.zeros((1, 3, 5120), dtype=mx.float16)
+    )
+    assert dense_calls == [(1, 1, 5120)] * 3
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows,cols", [(2, 4096), (3, 4096), (2, 100032)])
+def test_vk_qmm_2bit_ksplit_and_msg_match_quantized_matmul(rows, cols):
+    mx.random.seed(19)
+    k = 512
+    x = (mx.random.normal((rows, k)) * 0.5).astype(mx.float16)
+    w_fp = (mx.random.normal((cols, k)) * 0.02).astype(mx.float16)
+    wq, scales, biases = mx.quantize(w_fp, group_size=128, bits=2)
+    got = qwen35_verify_qmm.vk_qmm(x, wq, scales, biases, bits=2, group_size=128)
+    expected = mx.quantized_matmul(
+        x.astype(mx.float32),
+        wq,
+        scales.astype(mx.float32),
+        biases.astype(mx.float32),
+        transpose=True,
+        group_size=128,
+        bits=2,
+    )
+    mx.eval(got, expected)
+    assert _close(got, expected)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("ternary", [False, True])
+@pytest.mark.parametrize(("dtype", "group_size"), [(mx.float16, 128), (mx.bfloat16, 32)])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5])
+def test_q2_verify_qmv_single_group_and_swiglu_match_reference(
+    rows, dtype, group_size, ternary
+):
+    mx.random.seed(31 + rows + group_size + int(ternary))
+    k = 1024
+    x = (mx.random.normal((rows, k)) * 0.5).astype(dtype)
+
+    def _make_q2(cols: int) -> nn.QuantizedLinear:
+        layer = nn.QuantizedLinear(k, cols, bias=False, group_size=group_size, bits=2)
+        w_fp = (mx.random.normal((cols, k)) * 0.02).astype(dtype)
+        layer.weight, layer.scales, layer.biases = mx.quantize(
+            w_fp, group_size=group_size, bits=2
+        )
+        if ternary:
+            layer.biases = -layer.scales
+            assert q2_verify_qmv.mark_ternary(layer) is True
+        return layer
+
+    single = _make_q2(4096 if ternary else 1024)
+    got_single = q2_verify_qmv.q2_qmm(
+        x,
+        single.weight,
+        single.scales,
+        None if ternary else single.biases,
+        group_size=group_size,
+        neg_scale=ternary,
+    )
+    exp_single = single(x[None])[0]
+
+    g0 = _make_q2(4096 if ternary else 2048)
+    g1 = _make_q2(1024 if ternary else 1032)
+    got_g0, got_g1 = q2_verify_qmv.q2_group_qmv(x, (g0, g1))
+    exp_g0, exp_g1 = g0(x[None])[0], g1(x[None])[0]
+
+    gate = _make_q2(4096 if ternary else 2048)
+    up = _make_q2(4096 if ternary else 2048)
+    got_sw = q2_verify_qmv.q2_swiglu(x, gate, up)
+    exp_sw = nn.silu(gate(x[None])[0]) * up(x[None])[0]
+
+    mx.eval(got_single, exp_single, got_g0, exp_g0, got_g1, exp_g1, got_sw, exp_sw)
+    assert _close(got_single, exp_single)
+    assert _close(got_g0, exp_g0)
+    assert _close(got_g1, exp_g1)
+    assert _close(got_sw, exp_sw)
+
+

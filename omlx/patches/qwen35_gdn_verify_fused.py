@@ -334,7 +334,7 @@ def replay_eligible(layer, q, cache, length) -> bool:
         and layer.head_k_dim == 128
         and layer.head_v_dim == 128
         and layer.num_v_heads % layer.num_k_heads == 0
-        and layer.A_log.dtype == q.dtype
+        and layer.A_log.dtype in (q.dtype, mx.float32)
         and layer.dt_bias.dtype == q.dtype
         and (state is None or state.dtype == mx.float32)
         and (state is None or state.shape[0] == q.shape[0])

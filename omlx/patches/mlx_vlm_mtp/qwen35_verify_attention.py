@@ -178,7 +178,9 @@ def _cache_buffers(cache, keys, values):
 def verify_attention(queries, keys, values, *, cache, scale, mask):
     """Return bounded causal attention, or None for other contracts."""
     if (
-        not (
+        not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+        or not (
             type(cache) in (BatchKVCache, KVCache, LMBatchKVCache, LMKVCache)
             or getattr(type(cache), "_omlx_mtp_verify_attention_cache", False)
         )
