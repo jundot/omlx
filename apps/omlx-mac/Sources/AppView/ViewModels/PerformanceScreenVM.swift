@@ -26,6 +26,15 @@ final class PerformanceScreenVM {
     var ssdCacheMaxSize: String = ""
     var initialCacheBlocksText: String = ""
 
+    // Cache — Advanced (write-through, ANE compile cache, GDN cache policy)
+    var hotCacheWriteThrough: Bool = false
+    var aneCompileCache: Bool = false
+    /// "auto" | "ssd_sidecar" | "embedded"
+    var gdnSnapshotStorage: String = "auto"
+    var gdnSsdPendingMaxSize: String = "512MB"
+    /// "fp32" | "bf16" | "int8" | "rht_int8" | "rht_int16"
+    var gdnSidecarPrecision: String = "fp32"
+
     // Loaded baselines (everything that drives Apply's enabled state)
     private(set) var loadedMaxConcurrent: Int = 8
     private(set) var loadedEmbeddingBatchSize: Int = 32
@@ -43,6 +52,11 @@ final class PerformanceScreenVM {
     private(set) var loadedSsdCacheDir: String = ""
     private(set) var loadedSsdCacheMaxSize: String = ""
     private(set) var loadedInitialCacheBlocks: Int? = nil
+    private(set) var loadedHotCacheWriteThrough: Bool = false
+    private(set) var loadedAneCompileCache: Bool = false
+    private(set) var loadedGdnSnapshotStorage: String = "auto"
+    private(set) var loadedGdnSsdPendingMaxSize: String = "512MB"
+    private(set) var loadedGdnSidecarPrecision: String = "fp32"
 
     private(set) var isSaving: Bool = false
     @ObservationIgnored
@@ -75,6 +89,11 @@ final class PerformanceScreenVM {
             || trim(ssdCacheDir) != loadedSsdCacheDir
             || trim(ssdCacheMaxSize) != loadedSsdCacheMaxSize
             || parsedInitialCacheBlocks != loadedInitialCacheBlocks
+            || hotCacheWriteThrough != loadedHotCacheWriteThrough
+            || aneCompileCache != loadedAneCompileCache
+            || canonicalGdnSnapshotStorage(gdnSnapshotStorage) != loadedGdnSnapshotStorage
+            || trim(gdnSsdPendingMaxSize) != loadedGdnSsdPendingMaxSize
+            || canonicalGdnSidecarPrecision(gdnSidecarPrecision) != loadedGdnSidecarPrecision
     }
 
     func resetDefaults(client: OMLXClient) async {
@@ -97,6 +116,11 @@ final class PerformanceScreenVM {
             hotCacheMaxSize: hotCacheMaxSize,
             ssdCacheMaxSize: ssdCacheMaxSize,
             initialCacheBlocksText: initialCacheBlocksText,
+            hotCacheWriteThrough: hotCacheWriteThrough,
+            aneCompileCache: aneCompileCache,
+            gdnSnapshotStorage: gdnSnapshotStorage,
+            gdnSsdPendingMaxSize: gdnSsdPendingMaxSize,
+            gdnSidecarPrecision: gdnSidecarPrecision,
             lastError: lastError
         )
         do {
@@ -118,6 +142,11 @@ final class PerformanceScreenVM {
                 self.hotCacheMaxSize = previous.hotCacheMaxSize
                 self.ssdCacheMaxSize = previous.ssdCacheMaxSize
                 self.initialCacheBlocksText = previous.initialCacheBlocksText
+                self.hotCacheWriteThrough = previous.hotCacheWriteThrough
+                self.aneCompileCache = previous.aneCompileCache
+                self.gdnSnapshotStorage = previous.gdnSnapshotStorage
+                self.gdnSsdPendingMaxSize = previous.gdnSsdPendingMaxSize
+                self.gdnSidecarPrecision = previous.gdnSidecarPrecision
                 self.lastError = previous.lastError
             }
             if let sched = s.scheduler {
@@ -149,6 +178,11 @@ final class PerformanceScreenVM {
                 self.hotCacheMaxSize = hotCacheMaxSize
                 self.ssdCacheMaxSize = cache.ssdCacheMaxSize ?? ""
                 self.initialCacheBlocksText = cache.initialCacheBlocks.map { String($0) } ?? ""
+                self.hotCacheWriteThrough = cache.hotCacheWriteThrough ?? false
+                self.aneCompileCache = cache.aneCompileCache ?? false
+                self.gdnSnapshotStorage = canonicalGdnSnapshotStorage(cache.gdnSnapshotStorage)
+                self.gdnSsdPendingMaxSize = canonicalGdnSsdPendingMaxSize(cache.gdnSsdPendingMaxSize)
+                self.gdnSidecarPrecision = canonicalGdnSidecarPrecision(cache.gdnSidecarPrecision)
             }
 
             self.lastError = nil
@@ -221,6 +255,21 @@ final class PerformanceScreenVM {
                 self.loadedSsdCacheMaxSize = cache.ssdCacheMaxSize ?? ""
                 self.initialCacheBlocksText = cache.initialCacheBlocks.map { String($0) } ?? ""
                 self.loadedInitialCacheBlocks = cache.initialCacheBlocks
+                let writeThrough = cache.hotCacheWriteThrough ?? false
+                self.hotCacheWriteThrough = writeThrough
+                self.loadedHotCacheWriteThrough = writeThrough
+                let aneCache = cache.aneCompileCache ?? false
+                self.aneCompileCache = aneCache
+                self.loadedAneCompileCache = aneCache
+                let storage = canonicalGdnSnapshotStorage(cache.gdnSnapshotStorage)
+                self.gdnSnapshotStorage = storage
+                self.loadedGdnSnapshotStorage = storage
+                let pending = canonicalGdnSsdPendingMaxSize(cache.gdnSsdPendingMaxSize)
+                self.gdnSsdPendingMaxSize = pending
+                self.loadedGdnSsdPendingMaxSize = pending
+                let precision = canonicalGdnSidecarPrecision(cache.gdnSidecarPrecision)
+                self.gdnSidecarPrecision = precision
+                self.loadedGdnSidecarPrecision = precision
             }
             self.systemInfo = s.system
             self.lastError = nil
@@ -279,6 +328,25 @@ final class PerformanceScreenVM {
             }
             initBlocks = n
         }
+        // GDN cache policy. The server rejects a dedicated SSD sidecar while
+        // Hot Cache Only is on, and an empty or unparseable write buffer;
+        // catch both here so nothing is sent.
+        let gdnStorage = canonicalGdnSnapshotStorage(gdnSnapshotStorage)
+        if gdnStorage == "ssd_sidecar" && hotCacheOnly {
+            self.lastError = String(localized: "performance.error.gdn_sidecar_hot_cache_conflict",
+                                    defaultValue: "GDN SSD sidecar requires Hot Cache Only to be disabled.",
+                                    comment: "Performance screen error when the GDN SSD sidecar is chosen while Hot Cache Only is on")
+            return
+        }
+        let gdnPending = trim(gdnSsdPendingMaxSize)
+        if gdnPending.isEmpty {
+            self.lastError = String(localized: "performance.error.gdn_pending_size_invalid",
+                                    defaultValue: "SSD Write Buffer must be a size such as 512MB.",
+                                    comment: "Performance screen error when the GDN SSD write buffer field is empty")
+            return
+        }
+        let gdnPrecision = canonicalGdnSidecarPrecision(gdnSidecarPrecision)
+
         let tier = canonicalMemoryGuardTier(memoryGuardTier)
         let customCeiling = parsedMemoryGuardCustomCeiling
         if prefillMemoryGuard && tier == "custom" && customCeiling <= 0 {
@@ -334,6 +402,24 @@ final class PerformanceScreenVM {
         if initBlocks != loadedInitialCacheBlocks, let n = initBlocks {
             patch.initialCacheBlocks = n
         }
+        // Cache — Advanced. Any change here makes the server unload loaded
+        // models so they reload with the new cache settings (ANE compile
+        // cache excepted: it never unloads, and may need a restart).
+        if hotCacheWriteThrough != loadedHotCacheWriteThrough {
+            patch.hotCacheWriteThrough = hotCacheWriteThrough
+        }
+        if aneCompileCache != loadedAneCompileCache {
+            patch.aneCompileCache = aneCompileCache
+        }
+        if gdnStorage != loadedGdnSnapshotStorage {
+            patch.gdnSnapshotStorage = gdnStorage
+        }
+        if gdnPending != loadedGdnSsdPendingMaxSize {
+            patch.gdnSsdPendingMaxSize = gdnPending
+        }
+        if gdnPrecision != loadedGdnSidecarPrecision {
+            patch.gdnSidecarPrecision = gdnPrecision
+        }
 
         isSaving = true
         defer { isSaving = false }
@@ -361,6 +447,11 @@ final class PerformanceScreenVM {
             self.loadedSsdCacheDir = scd
             self.loadedSsdCacheMaxSize = scm
             if let n = initBlocks { self.loadedInitialCacheBlocks = n }
+            self.loadedHotCacheWriteThrough = hotCacheWriteThrough
+            self.loadedAneCompileCache = aneCompileCache
+            self.loadedGdnSnapshotStorage = gdnStorage
+            self.loadedGdnSsdPendingMaxSize = gdnPending
+            self.loadedGdnSidecarPrecision = gdnPrecision
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
@@ -416,6 +507,30 @@ final class PerformanceScreenVM {
             return "balanced"
         }
         return value
+    }
+
+    /// Server values are auto / ssd_sidecar / embedded; it also accepts the
+    /// legacy aliases ssd and hot. Anything unknown reads as auto.
+    private func canonicalGdnSnapshotStorage(_ value: String?) -> String {
+        let normalized = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "ssd", "ssd_sidecar": return "ssd_sidecar"
+        case "hot", "embedded": return "embedded"
+        default: return "auto"
+        }
+    }
+
+    private func canonicalGdnSidecarPrecision(_ value: String?) -> String {
+        let normalized = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "fp32", "bf16", "int8", "rht_int8", "rht_int16": return normalized
+        default: return "fp32"
+        }
+    }
+
+    private func canonicalGdnSsdPendingMaxSize(_ value: String?) -> String {
+        let normalized = trim(value ?? "")
+        return normalized.isEmpty ? "512MB" : normalized
     }
 
     private func canonicalMemoryGuardTier(_ value: String) -> String {

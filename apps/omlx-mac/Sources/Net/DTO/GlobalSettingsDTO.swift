@@ -88,6 +88,19 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let hotCacheOnly: Bool?
         let hotCacheMaxSize: String?
         let initialCacheBlocks: Int?
+        /// Keep blocks in RAM and also write them to SSD right away.
+        let hotCacheWriteThrough: Bool?
+        /// Reuse the ANE programs macOS compiles for Qwen prefill. Only
+        /// takes effect before the server's first ANE compile; after that
+        /// it needs a restart.
+        let aneCompileCache: Bool?
+        /// GDN snapshot storage: "auto" | "ssd_sidecar" | "embedded".
+        let gdnSnapshotStorage: String?
+        /// Write buffer for pending GDN sidecar writes, e.g. "512MB".
+        let gdnSsdPendingMaxSize: String?
+        /// GDN sidecar state precision: "fp32" (exact, default) | "bf16" |
+        /// "int8" | "rht_int8" | "rht_int16".
+        let gdnSidecarPrecision: String?
     }
 
     /// Mirrors the `memory.*` block of GET /admin/api/global-settings.
@@ -421,6 +434,13 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var ssdCacheMaxSize: String? = nil
     /// Starting cache block count. Requires server restart to take effect.
     var initialCacheBlocks: Int? = nil
+    var hotCacheWriteThrough: Bool? = nil
+    var aneCompileCache: Bool? = nil
+    /// "auto" | "ssd_sidecar" | "embedded". The server rejects
+    /// "ssd_sidecar" while hot-cache-only is on.
+    var gdnSnapshotStorage: String? = nil
+    var gdnSsdPendingMaxSize: String? = nil
+    var gdnSidecarPrecision: String? = nil
 
     /// Server-wide model auto-unload after N seconds idle. Server enforces
     /// `>= 60`. `nil` (default) leaves it unchanged, `.null` disables

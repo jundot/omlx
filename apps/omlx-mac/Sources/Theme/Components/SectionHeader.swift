@@ -52,6 +52,51 @@ extension SectionHeader where Trailing == EmptyView {
     }
 }
 
+/// Collapsible header for rarely changed settings (Server → Advanced,
+/// Performance → Advanced). Same type treatment as `SectionHeader`, with a
+/// chevron; the caller shows its rows only while `isExpanded` is true.
+struct DisclosureSectionHeader: View {
+    let title: String
+    var subtitle: String? = nil
+    @Binding var isExpanded: Bool
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        Button {
+            isExpanded.toggle()
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(theme.textSecondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(.easeOut(duration: 0.12), value: isExpanded)
+                    Text(title)
+                        .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
+                        .foregroundStyle(theme.textSecondary)
+                        .textCase(.uppercase)
+                        .kerning(0.6)
+                    Spacer()
+                }
+                if isExpanded, let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
+                        .foregroundStyle(theme.textTertiary)
+                        .multilineTextAlignment(.leading)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // Matches SectionHeader's indent (card gutter + row inset).
+        .padding(.horizontal, 28)
+        .padding(.top, 22)
+        .padding(.bottom, 8)
+    }
+}
+
 #Preview("SectionHeader") {
     VStack(alignment: .leading, spacing: 8) {
         SectionHeader("Network")

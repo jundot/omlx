@@ -233,3 +233,113 @@ final class PerformanceScreenVMTests: XCTestCase {
         XCTAssertEqual(balanced.binding, "dynamic")
     }
 }
+
+// MARK: - Advanced cache settings
+
+@MainActor
+final class PerformanceAdvancedCacheTests: XCTestCase {
+    private func load(cache: [String: Any]) async throws -> (PerformanceScreenVM, OMLXClient, URLSession) {
+        try PerformanceSettingsURLProtocol.reset(cache: cache)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PerformanceSettingsURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = OMLXClient(port: 18162, session: session)
+        let vm = PerformanceScreenVM()
+        await vm.load(client: client)
+        XCTAssertNil(vm.lastError)
+        return (vm, client, session)
+    }
+
+    func testSaveSendsOnlyChangedAdvancedCacheFields() async throws {
+        let (vm, client, session) = try await load(cache: [
+            "hot_cache_write_through": false, "gdn_sidecar_precision": "fp32",
+        ])
+        defer { session.invalidateAndCancel() }
+
+        vm.hotCacheWriteThrough = true
+        vm.gdnSidecarPrecision = "BF16"
+        await vm.save(client: client)
+
+        XCTAssertNil(vm.lastError)
+        let patch = try XCTUnwrap(PerformanceSettingsURLProtocol.patches.last)
+        XCTAssertEqual(patch.count, 2)
+        XCTAssertEqual(patch["hot_cache_write_through"] as? Bool, true)
+        XCTAssertEqual(patch["gdn_sidecar_precision"] as? String, "bf16")
+        XCTAssertFalse(vm.hasPendingChanges)
+    }
+
+    // The server rejects this combination; the app must not send it.
+    func testGdnSidecarWithHotCacheOnlyIsNotSent() async throws {
+        let (vm, client, session) = try await load(cache: ["hot_cache_only": true])
+        defer { session.invalidateAndCancel() }
+
+        vm.gdnSnapshotStorage = "ssd_sidecar"
+        await vm.save(client: client)
+
+        XCTAssertNotNil(vm.lastError)
+        XCTAssertTrue(PerformanceSettingsURLProtocol.patches.isEmpty)
+    }
+}
+
+/// Serves Fixtures/global-settings.json (with cache overrides) on GET and
+/// records the POST patch body.
+private final class PerformanceSettingsURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var settings: [String: Any] = [:]
+    nonisolated(unsafe) private static var recorded: [[String: Any]] = []
+
+    static var patches: [[String: Any]] { lock.withLock { recorded } }
+
+    static func reset(cache overrides: [String: Any]) throws {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/global-settings.json")
+        var json = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        var cache = json["cache"] as! [String: Any]
+        cache.merge(overrides) { _, new in new }
+        json["cache"] = cache
+        lock.withLock {
+            settings = json
+            recorded = []
+        }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.port == 18162 }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            let body: Any
+            if request.httpMethod == "POST" {
+                let patch = try JSONSerialization.jsonObject(with: try Self.body(of: request)) as! [String: Any]
+                Self.lock.withLock { Self.recorded.append(patch) }
+                body = ["success": true]
+            } else {
+                body = Self.lock.withLock { Self.settings }
+            }
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200,
+                                           httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: try JSONSerialization.data(withJSONObject: body))
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+
+    private static func body(of request: URLRequest) throws -> Data {
+        if let data = request.httpBody { return data }
+        let stream = try XCTUnwrap(request.httpBodyStream)
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            if count <= 0 { break }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        return data
+    }
+}

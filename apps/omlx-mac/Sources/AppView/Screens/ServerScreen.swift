@@ -698,35 +698,12 @@ private struct ServerAdvancedSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Custom disclosure header — DisclosureGroup's default styling
-            // doesn't match the rest of the screen (uses SF Pro vs omlxText,
-            // adds its own padding). Roll our own to stay consistent with
-            // SectionHeader.
-            Button {
-                expanded.toggle()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(theme.textSecondary)
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
-                        .animation(.easeOut(duration: 0.12), value: expanded)
-                    Text(String(localized: "server.section.advanced",
-                                defaultValue: "Advanced",
-                                comment: "Disclosure header for the advanced server settings"))
-                        .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
-                        .foregroundStyle(theme.textSecondary)
-                        .textCase(.uppercase)
-                        .kerning(0.6)
-                    Spacer()
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            // Matches SectionHeader's indent (card gutter + row inset).
-            .padding(.horizontal, 28)
-            .padding(.top, 22)
-            .padding(.bottom, 8)
+            DisclosureSectionHeader(
+                title: String(localized: "server.section.advanced",
+                              defaultValue: "Advanced",
+                              comment: "Disclosure header for the advanced server settings"),
+                isExpanded: $expanded
+            )
 
             if expanded {
                 ListGroup {
