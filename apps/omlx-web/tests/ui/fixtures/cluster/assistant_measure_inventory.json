@@ -1,0 +1,47 @@
+{
+  "_state": "assistant_recommending",
+  "_source": "omlx/cluster/assistant/models.py::AssistantMeasurementStatus",
+  "measurement_id": "msr-5f2a9c31",
+  "state": "ready",
+  "created_at": "2026-11-03T10:15:00Z",
+  "updated_at": "2026-11-03T10:15:41Z",
+  "measured_at": "2026-11-03T10:15:41Z",
+  "model": "/models/qwen3-32b",
+  "node_count": 2,
+  "nodes": [
+    {
+      "node_id": "node-a",
+      "admission_p05_gib": 61.4,
+      "endpoint_host": "172.16.1.13",
+      "endpoint_port": 8099,
+      "models": [
+        {
+          "model_id": "dev-v41-15L-real",
+          "model_path": "/models/dev-v41-15L-real",
+          "size_bytes": 34359738368
+        },
+        {
+          "model_id": "GLM-5.3-Flash-oQ2e-mtp",
+          "model_path": "/models/GLM-5.3-Flash-oQ2e-mtp",
+          "size_bytes": 115964575744
+        }
+      ]
+    },
+    {
+      "node_id": "node-b",
+      "admission_p05_gib": 118.7,
+      "endpoint_host": "172.16.1.11",
+      "endpoint_port": 8099,
+      "models": [
+        {
+          "model_id": "GLM-5.3-Flash-oQ2e-mtp",
+          "model_path": "/models/GLM-5.3-Flash-oQ2e-mtp",
+          "size_bytes": 115964575744
+        }
+      ]
+    }
+  ],
+  "warnings": [],
+  "error": null,
+  "_variant": "inventory"
+}

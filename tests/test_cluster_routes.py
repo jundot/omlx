@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for authenticated cluster admin route handlers."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -445,6 +446,240 @@ def test_cluster_plan_follows_the_saved_engram_ssd_offload_setting(monkeypatch):
     assert resident["assignments"][0]["ssd_weight_bytes"] == 0
     assert offloaded["placement_signature"] != resident["placement_signature"]
 
+
+def test_cluster_plan_prices_the_saved_moe_expert_offload_setting(
+    tmp_path, monkeypatch
+):
+    """The coordinator's own plan must not re-charge streamed experts.
+
+    The assistant elects from the same saved setting, so a coordinator plan
+    that priced every expert resident would refuse a placement the election
+    approved (or vice versa).
+    """
+
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(4 * gib,) * 4,
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+        lambda _path: (True, ""),
+    )
+    calls = []
+
+    def fake_plan(path, fraction, mtp_resident=False):
+        calls.append((str(path), fraction, mtp_resident))
+        # Half of each layer's experts stay resident, so half stream (2 GiB).
+        return SimpleNamespace(
+            count=8,
+            capacity=4,
+            layer_bytes={
+                f"language_model.layers.{index}.ffn.experts": gib
+                for index in range(4)
+            },
+        )
+
+    monkeypatch.setattr(
+        "omlx.patches.deepseek_v41.moe_offload._plan",
+        fake_plan,
+    )
+    saved = {
+        "v41": SimpleNamespace(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.5,
+            deepseek_v41_engram_ssd_offload=False,
+            mtp_enabled=False,
+        )
+    }
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "v41", "model_path": str(tmp_path), "model_type": "llm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: saved[model_id],
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    # Upstream's API refactor retired POST /plan in favour of /autoconfigure
+    # (which needs 2+ hosts). The intent here is the planner's pricing of the
+    # saved expert-offload setting, so drive the planner entry point directly.
+    request = routes.ClusterPlanRequest(
+        model_path=str(tmp_path),
+        layer_count=4,
+        nodes=[
+            routes.ClusterPlanNodeRequest(
+                node_id="local", capacity_bytes=128 * gib, reserve_bytes=2 * gib
+            )
+        ],
+    )
+
+    offloaded = routes._create_cluster_plan(request)
+    saved["v41"].moe_expert_offload_enabled = False
+    resident = routes._create_cluster_plan(request)
+
+    assignment = offloaded.assignments[0]
+    assert resident.assignments[0].moe_offload_weight_bytes == 0
+    assert assignment.moe_expert_offload_resident_fraction == 0.5
+    assert assignment.moe_offload_weight_bytes == 2 * gib
+    assert assignment.layer_weight_bytes == 16 * gib
+    assert assignment.planned_weight_bytes == gib + 16 * gib - 2 * gib
+    assert calls == [(str(tmp_path), 0.5, False)]
+
+    untouched = resident.assignments[0]
+    assert untouched.layer_weight_bytes == 16 * gib
+    assert untouched.planned_weight_bytes == gib + 16 * gib
+    assert untouched.moe_offload_weight_bytes == 0
+
+def test_moe_offload_allows_deepseek_v41_with_mtp(tmp_path, monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    monkeypatch.setattr(routes, "_saved_moe_offload", lambda _path: (True, 0.5))
+    monkeypatch.setattr(
+        "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+        lambda _path: (True, ""),
+    )
+    calls = []
+
+    def fake_plan(path, fraction, mtp_resident=False):
+        calls.append((str(path), fraction, mtp_resident))
+        return SimpleNamespace(
+            count=8,
+            capacity=4,
+            layer_bytes={"language_model.layers.0.ffn.experts": 2 * gib},
+        )
+
+    monkeypatch.setattr("omlx.patches.deepseek_v41.moe_offload._plan", fake_plan)
+    layout = ModelLayout(
+        source=str(tmp_path),
+        fixed_weight_bytes=1,
+        layer_weight_bytes=(2 * gib,),
+        mtp_weight_bytes=1,
+    )
+
+    fraction, layer_bytes = routes._moe_offload_for_plan(
+        str(tmp_path),
+        layout,
+        mtp=True,
+        tensor_parallel_size=1,
+    )
+
+    assert fraction == 0.5
+    # Half of the experts stay resident; the MTP head is not a routed expert,
+    # and the loader is told to keep it resident while experts stream.
+    assert layer_bytes == (gib,)
+    assert calls == [(str(tmp_path), 0.5, True)]
+
+def test_the_assistant_remote_coordinator_has_a_plan_route(tmp_path, monkeypatch):
+    """The assistant's apply asks the coordinator to plan over HTTP.
+
+    When the elected coordinator is another Mac, the origin posts the plan
+    request there and gets the signed placement back. The dashboard moved to
+    ``/autoconfigure``; this route is the assistant seam and must exist.
+    """
+
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(gib,) * 8,
+            supports_pipeline=True,
+        ),
+    )
+    body = {
+        "model_path": str(tmp_path),
+        "layer_count": 8,
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 128 * gib, "reserve_bytes": 2 * gib}
+        ],
+    }
+
+    response = _client().post("/admin/api/cluster/plan", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["placement_signature"]
+    assert payload["assignments"][0]["node_id"] == "local"
+
+
+def test_cluster_plan_follows_the_saved_qwen4_ple_ssd_offload_setting(monkeypatch):
+    """A Qwen4-Exp PLE table is the same planning problem as DeepSeek Engram.
+
+    Live, a 37 GiB PLE layer in a 117 GiB model made every Qwen4-Exp pipeline
+    split infeasible, because the planner only read the DeepSeek setting and
+    charged that table as resident.
+    """
+
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(4 * gib,) * 4,
+            tensor_parallel_ssd_layer_bytes=(0, 3 * gib, 0, 0),
+            supports_pipeline=True,
+        ),
+    )
+    saved = {"qwen": True}
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "qwen", "model_path": "/models/qwen", "model_type": "vlm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: SimpleNamespace(
+            deepseek_v41_engram_ssd_offload=False,
+            qwen4_ple_ssd_offload=saved[model_id],
+        ),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    # Upstream's API refactor retired POST /plan in favour of /autoconfigure
+    # (which needs 2+ hosts). The intent here is the planner's reading of the
+    # saved PLE switch, so drive the planner entry point directly.
+    request = routes.ClusterPlanRequest(
+        model_path="/models/qwen",
+        layer_count=4,
+        nodes=[
+            routes.ClusterPlanNodeRequest(
+                node_id="local", capacity_bytes=128 * gib, reserve_bytes=2 * gib
+            )
+        ],
+    )
+
+    offloaded = routes._create_cluster_plan(request)
+    saved["qwen"] = False
+    resident = routes._create_cluster_plan(request)
+
+    assert offloaded.assignments[0].ssd_weight_bytes == 3 * gib
+    assert resident.assignments[0].ssd_weight_bytes == 0
 
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
     from omlx.cluster.planner import ModelLayout
@@ -1437,6 +1672,7 @@ def test_forget_member_preserves_other_pairings_or_leaves_cluster(monkeypatch, n
 @pytest.mark.parametrize("status", [409, 503])
 def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, status):
     from fastapi import HTTPException
+
     from omlx.cluster import pairing_routes
 
     removed = []

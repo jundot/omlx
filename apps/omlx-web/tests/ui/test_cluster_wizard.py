@@ -20,11 +20,18 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from omlx_web import routes as webui
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests/ui/fixtures/cluster"
+
+# Copy assertions read the catalogue the wizard itself resolves through
+# ``window.t`` (the harness loads this same file), so a rewording cannot drift
+# the test away from the UI — it did once: the eyebrow was moved onto
+# ``cluster.deploy.status_saved_setup`` while the test still spelled the old
+# literal.
+CATALOGUE = json.loads((ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8"))
+SAVED_SETUP_EYEBROW = CATALOGUE["cluster.deploy.status_saved_setup"]
 
 TEMPLATE = "omlx_web/templates/dashboard/_cluster.html"
 JAVASCRIPT = "omlx_web/static/js/cluster.js"
@@ -78,6 +85,42 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/runtime",
     "/admin/api/cluster/deployments",
     "/admin/api/cluster/replan",
+    "/admin/api/cluster/diagnostics",
+    "/admin/api/cluster/join-keys",
+    "/admin/api/cluster/join-status",
+    "/admin/api/cluster/cuda-fabric/verify",
+    "/admin/api/cluster/rdma-links",
+    "/admin/api/cluster/rdma-links/verify",
+    # Cluster Assistant (the minimal-card contract): the entire browser surface
+    # for Screen 3. Nothing else in the tab may reach these.
+    "/admin/api/cluster/assistant/measure",
+    "/admin/api/cluster/assistant/status",
+    "/admin/api/cluster/assistant/recommend",
+    "/admin/api/cluster/assistant/plan",
+    "/admin/api/cluster/assistant/apply",
+    "/admin/api/cluster/assistant/start",
+    # The automatic constellation search (synchronous, minutes-long).
+    "/admin/api/cluster/assistant/search",
+    "/admin/api/cluster/assistant/operations",
+    # Screen 6: the stop relay to the elected coordinator's own unload route.
+    "/admin/api/cluster/assistant/stop",
+    # Reload resume: the last persisted deployment (read-only).
+    "/admin/api/cluster/assistant/session",
+    # The redacted support bundle (read-only).
+    "/admin/api/cluster/assistant/diagnostics",
+    # The read-only local network preflight.
+    "/admin/api/cluster/assistant/network-preflight",
+    # The in-app switch for the post-ready measurement.
+    "/admin/api/cluster/assistant/performance-probe",
+    # The free-space relay (the live-run notes): the only assistant route that
+    # changes another Mac's disk.
+    "/admin/api/cluster/assistant/models",
+    # Tuning: the quick sampler sweep and the minutes-long MTP depth sweep.
+    "/admin/api/cluster/assistant/tune",
+    "/admin/api/cluster/assistant/tune-redeploy",
+    "/admin/api/cluster/assistant/tune-local",
+    # Run on this Mac: single-node inference on the origin Mac, as an async job.
+    "/admin/api/cluster/assistant/run-local",
 }
 
 
@@ -1401,6 +1444,63 @@ def test_joiner_panel_renders_the_six_digit_code():
     assert fixture["error"] is None
 
 
+def test_incoming_join_opens_the_code_form_without_a_reload():
+    result = _run_wizard(
+        """
+component.devicesPayload = {
+  self: { node_id: 'node-a', friendly_name: 'Node A', caps: { ram_gb: 64 }, addrs: [] },
+  paired: [{ node_id: 'node-b', friendly_name: 'Node B', caps: { ram_gb: 64 }, addrs: [], paired: true }],
+  discovered: [{
+    node_id: 'node-c', friendly_name: 'Node C', caps: { ram_gb: 64 }, addrs: [],
+    paired: false, state: 'awaiting_approval',
+  }],
+};
+component.devicesLoaded = true;
+component.deploymentsLoaded = true;
+component.runtimeLoaded = true;
+component.runtimePayload = { jobs: [], launchers: [] };
+component.deploymentsPayload = [];
+// The wizard has already advanced past device_card; the incoming request
+// must still open the pairing section, otherwise only the label changes.
+component.stage = 'checks';
+const checks = component.wizardState();
+component.stage = 'purpose';
+const purpose = component.wizardState();
+component.stage = null;
+const idle = component.wizardState();
+// A configured deployment keeps its management panel; the membership panel
+// owns the approval there.
+component.deploymentsPayload = [{ deployment_id: 'pool-a', model: '/models/m' }];
+component.stage = 'checks';
+const active = component.wizardState();
+process.stdout.write(JSON.stringify({ checks, purpose, idle, active }));
+"""
+    )
+
+    assert result == {
+        "checks": "pairing",
+        "purpose": "pairing",
+        "idle": "pairing",
+        "active": "active",
+    }
+
+
+def test_pending_join_wins_over_stage_shortcuts_in_wizard_state():
+    javascript = _read(JAVASCRIPT)
+    state = javascript.split("wizardState() {", 1)[1].split("wizardSteps()", 1)[0]
+
+    pairing = state.index("this.pendingApprovals().length")
+    # checks/purpose/plan are shortcuts derived from local progress; an
+    # incoming request must not depend on a reload to become visible.
+    assert pairing < state.index("this.stage === 'checks'")
+    assert pairing < state.index("this.stage === 'purpose'")
+    assert pairing < state.index("this.choosingModel && this.stage === 'plan'")
+    # The active panel keeps its membership approval flow mounted.
+    assert state.index("this.configuredDeployment()") < pairing
+    assert "this.joinActive()" in state
+    assert "this.pairing.target" in state
+
+
 def test_joiner_poll_drives_approval_and_survives_reloads():
     javascript = _read(JAVASCRIPT)
 
@@ -1463,6 +1563,108 @@ def test_expired_join_offers_start_again_not_a_dead_end():
     assert "this.join.coordinator_addr" in javascript
 
 
+def test_a_device_card_identifies_the_mac_by_hardware_not_by_name():
+    """Address + C/G cores + UM + SSD, and a chassis pictogram from hw.model.
+
+    Measured 2026-11-16: two Mac Studios share the base name "MacStudio-von-
+    Andreas", so a card that only shows a friendly name cannot tell them apart.
+    The facts travel in the mDNS caps the peer already publishes.
+    """
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    # The grid, the Find-devices list, the join request and the membership
+    # candidates all print the same facts (2026-11-16: the discovery list still
+    # showed the old "chip · ram" line and looked unchanged).
+    assert template.count("data-cluster-device-spec") >= 6
+    assert template.count("deviceSpecLine(device)") >= 6
+    assert ':data-lucide="deviceIcon(device)"' in template
+
+    # The line is built from the address, the caps and the disk — in that order.
+    spec = javascript[javascript.index("deviceSpecLine(device) {"):][:700]
+    assert "bestDeviceAddr(device)" in spec
+    assert "deviceCoresLabel(device)" in spec
+    assert "`UM${ram}GB`" in spec
+    assert "deviceDiskLabel(device)" in spec
+
+    # Chassis families map to distinct pictograms, from hw.model.
+    icon = javascript[javascript.index("deviceIcon(device) {"):][:600]
+    for model, glyph in (
+        ("MacBookPro", "laptop"),
+        ("iMac", "monitor"),
+        ("Macmini", "box"),
+        ("MacPro", "server"),
+    ):
+        assert f"model.startsWith('{model}')" in icon
+        assert f"return '{glyph}'" in icon
+
+
+def test_the_rank0_pin_is_visible_in_the_plan_summary():
+    """The pin decides the endpoint host and the decode cadence — not buried.
+
+    Measured live 2026-11-16: with a compute profile the election put rank 0 on
+    the M2 Ultra (25.0 tok/s), without one it fell back to headroom and picked
+    the 128 GiB Max (22.6 tok/s). The pin is how that becomes explicit, so it
+    belongs next to Macs/Tier/Context rather than inside the collapsed advanced
+    block.
+    """
+    template = _read(TEMPLATE)
+
+    assert template.count("data-cluster-assistant-coordinator-row") == 1
+    assert "setAssistantCoordinator(" in template
+
+    # Above the advanced block, not inside it: the "Use all Macs" override and
+    # the raw operation JSON stay collapsed, the pin does not.
+    pin = template.index("data-cluster-assistant-coordinator-row")
+    advanced = template.index("data-cluster-assistant-use-all-macs")
+    assert pin < advanced
+
+
+def test_the_memory_tier_is_selectable_in_both_flows():
+    """A lever the user may name, and the plan still reports a raise.
+
+    Reported live 2026-11-16: the tier was visible in the plan card but nowhere
+    changeable, and the manual plan hard-coded 'balanced' per node.
+    """
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    # Both surfaces carry the control, bound to the same state.
+    assert template.count("data-cluster-assistant-tier-picker") == 1
+    assert template.count("data-cluster-plan-tier") == 1
+    assert template.count(':data-tier="option"') == 2
+    assert "setPlanMemoryTier(option)" in template
+
+    # The state feeds both plan payloads and re-plans on change.
+    assert "planMemoryTier: ''" in javascript
+    assert "memory_guard_tier: this.planMemoryTier || 'balanced'" in javascript
+    assert "memory_guard_tier: this.planMemoryTier || null" in javascript
+    assert "setPlanMemoryTier(tier) {" in javascript
+
+
+def test_the_selected_model_is_obvious_in_both_pickers():
+    """The chosen model must be unmistakable, not a tint nobody notices.
+
+    Reported live on 2026-11-16: after "Change model or context" the selected
+    row was a barely visible `bg-neutral-50` with a small check icon, so it was
+    hard to tell which model the plan would use.
+    """
+    template = _read(TEMPLATE)
+
+    # Plan screen picker: left accent + stronger tint + bold label + a11y marker.
+    assert "border-l-2 transition-colors" in template
+    assert "'border-neutral-900 bg-neutral-100'" in template
+    assert "'font-bold text-neutral-900'" in template
+    assert ':aria-current="selectedModelPath === model.model_path' in template
+
+    # Change-model screen: ring + tint + bold, and the same a11y marker.
+    assert "'border-neutral-900 bg-neutral-100 ring-1 ring-neutral-900'" in template
+    assert (
+        ':aria-current="assistantChooseDraft?.model_path === candidate.model_path'
+        in template
+    )
+
+
 def test_add_by_ip_validates_then_offers_the_join_flow():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
@@ -1473,7 +1675,8 @@ def test_add_by_ip_validates_then_offers_the_join_flow():
     assert "submitManualPeer" in javascript
     assert "/api/cluster/devices/manual" in javascript
     # Client-side validation before any request leaves: IPv4 + optional port.
-    assert re.search(r"\^\(\\d\{1,3\}\(\?:\\\.\\d\{1,3\}\)\{3\}", javascript)
+    assert re.search(r"\^\(\?<host>\\d\{1,3\}\(\?:\\\.\\d\{1,3\}\)\{3\}", javascript)
+    assert "match.groups.host" in javascript
     assert "port >= 1 && port <= 65535" in javascript
     # A verified address flows straight into the joiner code panel (one click).
     assert "beginJoinAddr(`${ip}:${port}`" in javascript
@@ -1598,7 +1801,8 @@ def test_fit_failure_banner_is_actionable_and_never_silent():
     assert "data-cluster-fit-switch-headless" in template
     assert "cluster.plan.switch_headless" in template
     assert "parseFitFailure" in javascript
-    assert r"at least (\d+) additional bytes" in javascript
+    assert r"at least (?<bytes>\d+) additional bytes" in javascript
+    assert "match.groups.bytes" in javascript
     assert "canFixWithHeadless" in javascript
     # The all-headless flip exists only as the click handler — runPlan parses
     # the failure but never mutates nodeRoles itself.
@@ -2851,7 +3055,12 @@ def test_membership_pairing_waits_for_the_selected_macs_request():
             const missing = {calls: calls.length, error: component.pairing.error};
             component.devicesPayload.discovered = [{node_id: 'other', state: 'awaiting_approval'}];
             await component.submitPairApproval(component.pairing.target);
-            console.log(JSON.stringify({missing, calls, open: component.membershipPanelOpen, target: component.pairing.target.node_id}));
+            console.log(JSON.stringify({
+                missing,
+                calls,
+                open: component.membershipPanelOpen,
+                target: component.pairing.target.node_id,
+            }));
         })();
     """)
     # Only the invite to that Mac; nothing is approved before its request.
@@ -2866,22 +3075,45 @@ def test_membership_pairing_keeps_the_active_model_until_explicit_replan():
     result = _run_wizard("""
         (async () => {
             const calls = [], probes = [];
-            const deployment = {deployment_id: 'existing', model: 'current-model', assignments: [{node_id: 'self'}, {node_id: 'old'}]};
+            const deployment = {
+                deployment_id: 'existing',
+                model: 'current-model',
+                assignments: [{node_id: 'self'}, {node_id: 'old'}],
+            };
             component.configuredDeployment = () => deployment;
-            component.devicesPayload = {paired: [{node_id: 'old', paired: true}], discovered: [{node_id: 'new', state: 'discovered'}]};
+            component.devicesPayload = {
+                paired: [{node_id: 'old', paired: true}],
+                discovered: [{node_id: 'new', state: 'discovered'}],
+            };
             component.executionProfile = 'custom';
             component.selectedModelPath = 'current-model';
             component.beginMembershipPairing({node_id: 'new'});
             component.pairing.code = '123456';
             component.devicesPayload.discovered = [{node_id: 'new', state: 'awaiting_approval'}];
-            component.apiFetch = async (url, options) => { calls.push({url, body: JSON.parse(options.body)}); return {}; };
+            component.apiFetch = async (url, options) => {
+                calls.push({url, body: JSON.parse(options.body)});
+                return {};
+            };
             component.notify = () => {};
-            component.refreshDevices = async () => { component.devicesPayload = {paired: [{node_id: 'old', paired: true}, {node_id: 'new', paired: true}], discovered: []}; };
+            component.refreshDevices = async () => {
+                component.devicesPayload = {
+                    paired: [{node_id: 'old', paired: true}, {node_id: 'new', paired: true}],
+                    discovered: [],
+                };
+            };
             component.probePeer = async (peer) => probes.push(peer.node_id);
             component.startChecks = () => { throw Error('must not leave active cluster'); };
             component.runPlan = async () => { throw Error('must not replan automatically'); };
             await component.submitPairApproval(component.pairing.target);
-            console.log(JSON.stringify({calls, probes, candidates: component.membershipCandidates().map(x => x.node_id), target: component.pairing.target, profile: component.executionProfile, model: component.selectedModelPath, deployment}));
+            console.log(JSON.stringify({
+                calls,
+                probes,
+                candidates: component.membershipCandidates().map(x => x.node_id),
+                target: component.pairing.target,
+                profile: component.executionProfile,
+                model: component.selectedModelPath,
+                deployment,
+            }));
         })();
     """)
     assert result["calls"] == [
@@ -2909,7 +3141,12 @@ def test_membership_pairing_failure_can_be_retried_or_cancelled():
             component.pairing.code = '123456';
             component.apiFetch = async () => { throw Object.assign(Error('Incorrect code'), {status: 403}); };
             await component.submitPairApproval(component.pairing.target);
-            const failed = {target: component.pairing.target.node_id, code: component.pairing.code, error: component.pairing.error, busy: component.pairing.busy};
+            const failed = {
+                target: component.pairing.target.node_id,
+                code: component.pairing.code,
+                error: component.pairing.error,
+                busy: component.pairing.busy,
+            };
             component.cancelPairing();
             console.log(JSON.stringify({failed, target: component.pairing.target}));
         })();
@@ -2942,7 +3179,13 @@ def test_forget_cleanup_requires_confirmation_and_ignores_old_poll():
             await component.forgetJoinCleanup();
             resolvePoll({state: 'approved', cleanup_pending: true});
             await poll;
-            console.log(JSON.stringify({before, calls, pending: component.join.cleanup_pending, state: component.join.state, busy: component.join.busy}));
+            console.log(JSON.stringify({
+                before,
+                calls,
+                pending: component.join.cleanup_pending,
+                state: component.join.state,
+                busy: component.join.busy,
+            }));
         })();
     """)
     assert result["before"] == 0
@@ -3155,3 +3398,1678 @@ def test_wizard_verified_address_selection_preserves_login_and_fallback(
         )
     )
     assert result == expected
+
+
+# --- Cluster Assistant (minimal Screen-3 slice) -------------------------------
+#
+# One card inside the plan step, driven by the assistant admin API. The states
+# are pinned by data-assistant-state; the wizard's 8-state machine is untouched.
+
+ASSISTANT_STATES = (
+    "idle",
+    "measuring",
+    "recommending",
+    "measuring_model",
+    "planning",
+    "applying",
+    "starting",
+    "loading",
+    "ready",
+    "failed",
+)
+
+ASSISTANT_ENDPOINTS = {
+    "/admin/api/cluster/assistant/measure",
+    "/admin/api/cluster/assistant/status",
+    "/admin/api/cluster/assistant/recommend",
+    "/admin/api/cluster/assistant/plan",
+    "/admin/api/cluster/assistant/apply",
+    "/admin/api/cluster/assistant/start",
+    # The automatic constellation search (synchronous, minutes-long).
+    "/admin/api/cluster/assistant/search",
+    "/admin/api/cluster/assistant/operations",
+    # Screen 6: the stop relay to the elected coordinator's own unload route.
+    "/admin/api/cluster/assistant/stop",
+    # Reload resume: the last persisted deployment (read-only).
+    "/admin/api/cluster/assistant/session",
+    # The redacted support bundle (read-only).
+    "/admin/api/cluster/assistant/diagnostics",
+    # The read-only local network preflight.
+    "/admin/api/cluster/assistant/network-preflight",
+    # The in-app switch for the post-ready measurement.
+    "/admin/api/cluster/assistant/performance-probe",
+    # The free-space relay (the live-run notes): the only assistant route that
+    # changes another Mac's disk.
+    "/admin/api/cluster/assistant/models",
+    # Tuning: the quick sampler sweep and the minutes-long MTP depth sweep.
+    "/admin/api/cluster/assistant/tune",
+    "/admin/api/cluster/assistant/tune-redeploy",
+    "/admin/api/cluster/assistant/tune-local",
+    # Run on this Mac: single-node inference on the origin Mac, as an async job.
+    "/admin/api/cluster/assistant/run-local",
+}
+
+ASSISTANT_ACTIONS = (
+    "measure",
+    "plan",
+    "apply",
+    "start",
+    "status",
+    "add_mac",
+    "pair_mac",
+    "copy_model",
+    "configure_endpoint",
+    "retry_coordinator",
+    "diagnostics",
+    "adjust_model_or_context",
+)
+
+
+def _assistant_card() -> str:
+    template = _read(TEMPLATE)
+    start = template.index("data-cluster-assistant>")
+    end = template.index("<!-- /Assistant -->", start)
+    return template[start:end]
+
+
+def test_assistant_states_are_guarded_and_separate_from_the_wizard():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    for state in ASSISTANT_STATES:
+        assert f'data-assistant-state="{state}"' in template, state
+        assert re.search(
+            rf'x-show="assistantState\(\) === \'{state}\'"[^>]*'
+            rf'data-assistant-state="{state}"',
+            template,
+        ), state
+
+    assert "assistantState() {" in javascript
+    # A UI state is never invented that the backend cannot report, and the
+    # existing 8-state contract is not rewritten: no shared identifier.
+    assert set(ASSISTANT_STATES).isdisjoint(WIZARD_STATES)
+    wizard_body = javascript.split("wizardState() {", 1)[1].split(
+        "wizardSteps()", 1
+    )[0]
+    assert "assistant" not in wizard_body
+
+
+def test_assistant_endpoints_are_only_in_the_api_map_and_allowlisted():
+    javascript = _read(JAVASCRIPT)
+    template = _read(TEMPLATE)
+
+    found = set(
+        re.findall(r"/admin/api/cluster/assistant(?:/[a-z_-]+)*", javascript)
+    )
+    assert found == ASSISTANT_ENDPOINTS
+
+    api_map = javascript.split("const ASSISTANT_API = {", 1)[1].split(
+        "};", 1
+    )[0]
+    declared = set(
+        re.findall(r"/admin/api/cluster/assistant(?:/[a-z_-]+)*", api_map)
+    )
+    assert declared == ASSISTANT_ENDPOINTS
+    # The template never names an endpoint; the component owns the network.
+    assert "/admin/api/cluster/assistant" not in template
+    assert ASSISTANT_ENDPOINTS <= ALLOWED_ENDPOINTS
+
+
+def test_assistant_strings_exist_in_the_english_catalog():
+    catalog = json.loads(
+        (ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8")
+    )
+    text = _read(TEMPLATE) + "\n" + _read(JAVASCRIPT)
+    keys = {
+        key
+        for key in re.findall(r"cluster\.assistant\.[A-Za-z0-9_.]+", text)
+        # The action label is a template literal built from the action name;
+        # the concrete keys are asserted below instead.
+        if not key.endswith(".")
+    }
+    assert keys
+    assert not sorted(key for key in keys if key not in catalog)
+    for action in ASSISTANT_ACTIONS:
+        assert f"cluster.assistant.action.{action}" in catalog
+    assert "cluster.assistant.action.unknown" in catalog
+    # English only: no translated copy is added. The repo's own
+    # normalize_i18n.py (`make web`) mirrors the key set into every locale with
+    # the English value as fallback, so the key sets stay identical and every
+    # cluster.assistant.* value is exactly the English one.
+    for path in sorted((ROOT / "omlx_web/i18n").glob("*.json")):
+        locale = json.loads(path.read_text(encoding="utf-8"))
+        assert set(locale) == set(catalog), path.name
+        for key, value in locale.items():
+            if key.startswith("cluster.assistant."):
+                assert value == catalog[key], (path.name, key)
+
+
+def test_assistant_primary_path_has_no_ip_ssh_rank_layer_or_model_path_field():
+    card = _assistant_card()
+
+    # The primary path is buttons and rendered values only. The one exception
+    # is the rank-0 pin (frozen decision, 2026-11-15): a single Mac picker for
+    # preferred_coordinator — never IP/SSH/rank/layer/model-path inputs.
+    assert "<input" not in card
+    assert card.count("<select") == 1
+    assert "data-cluster-assistant-coordinator" in card
+    assert "setAssistantCoordinator" in card
+    assert "x-model" not in card
+    assert "data-cluster-assistant-entry" in card
+    assert "data-cluster-assistant-start-setup" in card
+    # The plan-time inputs are the component's frozen object, not inputs.
+    assert "runAssistantApply()" in card
+    assert "assistantModelLabel()" in card
+    assert "assistantContextLabel()" in card
+
+
+def test_assistant_failure_renders_exactly_one_action_from_error_action():
+    card = _assistant_card()
+
+    assert "data-cluster-assistant-error" in card
+    assert card.count("data-cluster-assistant-action") == 1
+    assert "assistantActionHandler(assistant.error?.action)" in card
+    assert "assistantActionLabel(assistant.error?.action)" in card
+    # retry_coordinator shows the coordinator instruction next to the action.
+    assert "assistant.error?.action === 'retry_coordinator'" in card
+    assert "assistantCoordinatorInstruction()" in card
+
+
+def test_assistant_can_recover_from_a_recommendation_refusal():
+    """A refusal whose action the card did not know was a one-way door.
+
+    The recommendation answers with its own near-miss actions
+    (``choose_smaller_model``, ``choose_pipeline_model``, ``check_model_path``,
+    ``free_disk_space``). The card only knew the twelve frozen ones, so it
+    rendered "Continue" and the handler fell through to a toast: after changing
+    the model or what a Mac contributes there was no way back to the entry
+    button without reloading the page.
+    """
+
+    javascript = _read(JAVASCRIPT)
+    label_block = javascript.split("assistantActionLabel(action) {", 1)[1].split(
+        "assistantActionHandler(action) {", 1
+    )[0]
+    for action in (
+        "choose_smaller_model",
+        "choose_pipeline_model",
+        "check_model_path",
+        "free_disk_space",
+    ):
+        assert f"'{action}'" in label_block
+        assert f"cluster.assistant.action.{action}" not in label_block
+
+    handler_block = javascript.split("assistantActionHandler(action) {", 1)[1].split(
+        "resumeAssistantPolling() {", 1
+    )[0]
+    for action in (
+        "choose_smaller_model",
+        "choose_pipeline_model",
+        "check_model_path",
+        "free_disk_space",
+    ):
+        assert f"case '{action}':" in handler_block
+    assert "reopenAssistantPicker()" in handler_block
+
+    catalog = json.loads(_read("omlx_web/i18n/en.json"))
+    for action in (
+        "choose_smaller_model",
+        "choose_pipeline_model",
+        "check_model_path",
+        "free_disk_space",
+    ):
+        assert catalog[f"cluster.assistant.action.{action}"]
+
+
+def test_the_two_mac_fallback_is_explicit_and_signed():
+    """An incomplete line offers 2 Macs only through a deliberate click."""
+
+    javascript = _read(JAVASCRIPT)
+    template = _read(TEMPLATE)
+
+    assert "confirmAssistantTwoMacFallback()" in javascript
+    assert "function confirmAssistantTwoMacFallback" not in javascript
+    assert "confirm_two_mac_fallback" in javascript
+    inputs = javascript.split("assistantPlanInputs() {", 1)[1].split(
+        "async runAssistantPlan", 1
+    )[0]
+    assert "confirm_two_mac_fallback" in inputs
+    # The fallback is re-planned, never applied straight from the refusal body.
+    confirm = javascript.split("confirmAssistantTwoMacFallback() {", 1)[1].split(
+        "async runAssistantApply", 1
+    )[0]
+    assert "runAssistantPlan" in confirm
+    assert "topologyFallback" in confirm
+    assert "data-cluster-assistant-two-mac-fallback" in template
+    assert "topology_incomplete" in template
+    assert "assistant.missingLinks" in template
+
+
+def test_the_network_preflight_shows_commands_and_executes_nothing():
+    javascript = _read(JAVASCRIPT)
+    template = _read(TEMPLATE)
+
+    assert "runAssistantNetworkPreflight()" in javascript
+    assert "copyAssistantNetworkCommands()" in javascript
+    assert "data-cluster-assistant-network-preflight" in template
+    assert "data-cluster-assistant-network-commands" in template
+    assert "Nothing is executed" in template
+    block = javascript.split("runAssistantNetworkPreflight() {", 1)[1].split(
+        "copyAssistantNetworkCommands", 1
+    )[0]
+    for forbidden in ("exec(", "spawn(", "child_process", "osascript"):
+        assert forbidden not in block
+    # The response is only stored and rendered; there is no apply call.
+    assert "ASSISTANT_API.networkPreflight" in block
+    assert "assistant.networkPreflight = plan" in block
+
+
+def test_copy_diagnostics_is_one_block_without_secrets():
+    javascript = _read(JAVASCRIPT)
+    template = _read(TEMPLATE)
+
+    block = javascript.split("assistantDiagnosticsText() {", 1)[1].split(
+        "copyAssistantDiagnostics() {", 1
+    )[0]
+    for field in (
+        "measurement:",
+        "plan:",
+        "coordinator:",
+        "rank_order:",
+        "excluded:",
+        "table_offload:",
+        "admission:",
+        "observed:",
+        "warnings:",
+    ):
+        assert field in block
+    for forbidden in ("api_key", "password", "authorization", "ssh"):
+        assert forbidden not in block.lower()
+    assert "data-cluster-assistant-copy-diagnostics" in template
+    # The backend bundle is the source; the local block is the offline fallback.
+    assert "ASSISTANT_API.diagnostics" in javascript
+
+
+def test_copy_model_action_runs_the_assistant_flow():
+    """`copy_model` is not a toast any more: apply stages from a peer copy."""
+
+    javascript = _read(JAVASCRIPT)
+    handler_block = javascript.split("assistantActionHandler(action) {", 1)[1].split(
+        "resumeAssistantPolling() {", 1
+    )[0]
+    copy_block = handler_block.split("case 'copy_model':", 1)[1].split(
+        "default:", 1
+    )[0]
+    assert "startAssistantForModel" in copy_block
+    assert "assistantRecommendedCandidate" in copy_block
+    # The message-only fallback is gone: a copy is the real apply/stage flow.
+    assert "action.other" not in copy_block
+    assert "startAssistantForModel(modelPath) {" in javascript
+
+
+def test_assistant_plans_lightning_mtp_from_the_model_catalogue():
+    """MTP is a plan input, so the assistant must not hardcode it off.
+
+    The draft head occupies rank-0 space: planning ``mtp: false`` while the
+    model has an MTP head leaves the cluster decoding without speculative
+    tokens (the coordinator logs "no room for the draft head"), and planning
+    ``true`` for a model without a head would reserve space for weights that do
+    not exist. The catalogue's ``mtp_compatible`` is the fact either way.
+    """
+
+    javascript = _read(JAVASCRIPT)
+    block = javascript.split("// Assistant — the minimal Screen-3 slice", 1)[1]
+
+    assert "mtp: false" not in block
+    # The model-bound measurement, the frozen plan inputs and the single-node
+    # run-local request ask the question; the hardware-only entry measurement has
+    # no model to ask about (Phase C3: measure hardware, recommend, measure the
+    # chosen model).
+    assert block.count("mtp: this.assistantMtpFor(modelPath)") == 3
+
+    helper = javascript.split("assistantMtpFor(modelPath) {", 1)[1].split("},", 1)[0]
+    assert "mtp_compatible" in helper
+    assert "this.selectedModelPath" in helper
+
+
+def test_assistant_endpoint_is_unreachable_until_ready():
+    card = _assistant_card()
+    javascript = _read(JAVASCRIPT)
+
+    assert 'x-show="assistantState() === \'ready\'"' in card
+    assert 'x-show="assistantReady()"' in card
+    assert "assistantReady() ? assistant.endpoint.url : null" in card
+    assert "data-cluster-assistant-open-chat" in card
+    assert "data-cluster-assistant-connect-agent" in card
+
+    ready = javascript.split("assistantReady() {", 1)[1].split("},", 1)[0]
+    assert "state === 'ready'" in ready
+    assert "endpoint?.ready === true" in ready
+    assert "!this.assistant.stopped" in ready
+
+
+# --- Cluster Assistant: the automatic constellation search --------------------
+#
+# Search is an action on the existing card (plan stage), not a new wizard or
+# assistant state. The route is synchronous and minutes-long, so the UI is
+# single-flight + generation-guarded and only renders measured rates.
+
+
+def test_assistant_search_affordance_and_api_map_entry_exist():
+    javascript = _read(JAVASCRIPT)
+    card = _assistant_card()
+
+    # The route is declared in the assistant API map (the allowlist source) and
+    # in both contract allowlists.
+    assert "search: '/admin/api/cluster/assistant/search'" in javascript
+    assert "/admin/api/cluster/assistant/search" in ASSISTANT_ENDPOINTS
+    assert "/admin/api/cluster/assistant/search" in ALLOWED_ENDPOINTS
+
+    # The affordance lives inside the assistant card, gated to the plan stage.
+    assert "data-cluster-assistant-search" in card
+    assert "data-cluster-assistant-search-button" in card
+    assert "runAssistantSearch()" in card
+    assert "assistantSearchAvailable()" in card
+    assert "assistantState() === 'planning' && assistantSearchAvailable()" in card
+    # Priority + max-count controls (buttons, keeping the card input-free).
+    assert "data-cluster-assistant-search-priority" in card
+    assert "data-cluster-assistant-search-max-count" in card
+    assert "setAssistantSearchPriority(option.key)" in card
+    assert "setAssistantSearchMaxCount(count)" in card
+    # Result, busy and error surfaces.
+    assert "data-cluster-assistant-search-busy" in card
+    assert "data-cluster-assistant-search-best" in card
+    assert "data-cluster-assistant-search-results" in card
+    assert "data-cluster-assistant-search-errors" in card
+    assert "data-cluster-assistant-search-error" in card
+    # The card's primary path stays input-free; the rank-0 pin's Mac picker
+    # (preferred_coordinator, frozen decision 2026-11-15) is the only select.
+    assert card.count("<select") == 1
+    assert "data-cluster-assistant-coordinator" in card
+    assert "<input" not in card
+    assert "x-model" not in card
+
+
+def test_assistant_search_strings_exist_and_are_mirrored():
+    catalog = json.loads(
+        (ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8")
+    )
+    keys = [
+        "cluster.assistant.search.title",
+        "cluster.assistant.search.blurb",
+        "cluster.assistant.search.button",
+        "cluster.assistant.search.searching",
+        "cluster.assistant.search.priority_label",
+        "cluster.assistant.search.max_count_label",
+        "cluster.assistant.search.best_title",
+        "cluster.assistant.search.no_best",
+        "cluster.assistant.search.results_title",
+        "cluster.assistant.search.table.constellation",
+        "cluster.assistant.search.table.macs",
+        "cluster.assistant.search.table.measured",
+        "cluster.assistant.search.table.feasible",
+        "cluster.assistant.search.yes",
+        "cluster.assistant.search.no",
+        "cluster.assistant.search.not_measured",
+        "cluster.assistant.search.errors_title",
+        "cluster.assistant.search.failed",
+    ]
+    priorities = [
+        f"cluster.assistant.search.priority.{p}"
+        for p in ("balanced", "speed", "ttft", "quality", "context")
+    ]
+    for key in keys + priorities:
+        assert catalog.get(key), key
+    # Mirrored into every locale with the English fallback (no translation).
+    for path in sorted((ROOT / "omlx_web/i18n").glob("*.json")):
+        locale = json.loads(path.read_text(encoding="utf-8"))
+        assert set(locale) == set(catalog), path.name
+        for key in keys + priorities:
+            assert locale.get(key) == catalog[key], (path.name, key)
+
+
+def test_assistant_search_is_single_flight_generation_guarded_and_measured_only():
+    block = _assistant_method("runAssistantSearch")
+    # Busy guard prevents a double POST of the minutes-long request.
+    assert "this.assistant.search.busy" in block
+    assert "assistantRunning()" in block
+    # Generation guard mirrors the polls; a stale answer is dropped.
+    assert "this.assistant.generation += 1;" in block
+    assert "const generation = this.assistant.generation;" in block
+    assert "generation !== this.assistant.generation" in block
+    # The search is a background job: POST returns a handle, then the UI polls
+    # searchStatus(jobId) until the job completes (generation-guarded).
+    assert "ASSISTANT_API.search" in block
+    assert "ASSISTANT_API.searchStatus" in block
+    assert "job_id" in block
+    # The request carries the measurement and the chosen options.
+    assert "measurement_id: this.assistant.measurementId" in block
+    assert "priority: this.assistant.search.priority" in block
+    assert "max_count: this.assistant.search.maxCount" in block
+
+    # Rates are rendered only for a measured constellation (never invented).
+    measured = _assistant_method("assistantSearchMeasuredLabel")
+    assert "row.measured !== true" in measured
+
+    # No endpoint is offered from a search result: the endpoint stays gated on
+    # assistantReady(), and search never transitions the state machine.
+    card = _assistant_card()
+    search_block = card.split("data-cluster-assistant-search>", 1)[1].split(
+        'data-assistant-state="applying"', 1
+    )[0]
+    assert "assistant.endpoint" not in search_block
+    assert "assistantReady()" not in search_block
+    assert "assistant.state =" not in block
+
+
+# --- Screen 5: the handoff (the handoff notes) ------------------------------
+#
+# The ready surface opens the *existing* /chat with the cluster's model, and
+# Connect agent shows the base URL, the serving model ID and where the key is.
+# Both links are built from endpoint.url plus the catalogue's id; nothing is
+# derived and no secret is rendered.
+
+CHAT_TEMPLATE = "omlx_web/templates/chat.html"
+
+
+def _assistant_method(name: str) -> str:
+    javascript = _read(JAVASCRIPT)
+    for marker in (f"        {name}(", f"        async {name}("):
+        if marker in javascript:
+            start = javascript.index(marker)
+            break
+    else:
+        raise AssertionError(f"no method {name}")
+    depth = 0
+    index = start
+    while index < len(javascript):
+        if javascript[index] == "{":
+            depth += 1
+        elif javascript[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return javascript[start : index + 1]
+        index += 1
+    raise AssertionError(f"unterminated method {name}")
+
+
+def test_assistant_handoff_links_come_from_the_endpoint_and_the_serving_id():
+    card = _assistant_card()
+    javascript = _read(JAVASCRIPT)
+
+    # One URL each, built by the component, never typed into the markup.
+    assert "data-cluster-assistant-open-chat" in card
+    assert "data-cluster-assistant-connect-agent" in card
+    assert "data-cluster-assistant-agent-base-url" in card
+    assert "assistantAgentBaseUrl()" in card
+    assert "assistantAgentModelId()" in card
+    assert "assistantChatUrl()" in javascript
+
+    chat = _assistant_method("assistantChatUrl")
+    assert "assistantReady()" in chat
+    assert "assistantServingModelId()" in chat
+    assert "encodeURIComponent" in chat
+    # An unresolved id links without the parameter; it never guesses one.
+    assert "return modelId" in chat
+
+    base = _assistant_method("assistantChatBase")
+    assert "endpoint?.url" in base
+    # The web UI lives under /admin, so the chat page is /admin/chat there
+    # (a bare /chat is a 404 — measured 2026-11-16).
+    assert "assistantCoordinatorIsLocal()" in base
+    assert "? '/admin/chat'" in base
+    assert ": `${url}/admin/chat`" in base
+
+    serving = _assistant_method("assistantServingModelId")
+    assert "model_path === path" in serving
+    assert "model?.id" in serving
+    # The planner path is never presented as a serving id.
+    assert "selectedModelId" not in serving
+
+    agent = _assistant_method("assistantAgentBaseUrl")
+    assert "`${url}/v1`" in agent
+
+    open_chat = _assistant_method("openAssistantChat")
+    assert "assistantChatUrl()" in open_chat
+    assert "'/chat'" not in open_chat
+
+
+def test_assistant_handoff_is_ready_gated_and_carries_no_secret():
+    card = _assistant_card()
+    ready = card.index('x-show="assistantState() === \'ready\'"')
+    endpoint = card.index('x-show="assistantReady()"')
+    chat = card.index("data-cluster-assistant-open-chat")
+    agent = card.index("data-cluster-assistant-connect-agent")
+    assert ready < endpoint < chat < agent
+
+    # The endpoint stays null until the operation proves it, and no key, token
+    # or storage access is rendered in the card.
+    assert "assistantReady() ? assistant.endpoint.url : null" in card
+    for forbidden in ("api_key", "Authorization", "Bearer", "localStorage"):
+        assert forbidden not in card, forbidden
+
+
+def test_the_chat_page_preselection_is_the_only_new_behaviour():
+    template = _read(CHAT_TEMPLATE)
+
+    method = template.split("applyRequestedModelFromUrl() {", 1)[1].split(
+        "\n            },", 1
+    )[0]
+    assert "requestedModelApplied" in method
+    assert "isModelAvailableOnServer(requested)" in method
+    assert "resolveGatewayModelId(requested)" in method
+    # An unknown value falls through to the normal default selection.
+    assert "if (!requested || !this.isModelAvailableOnServer(requested)) return;" in method
+
+    reader = template.split("requestedModelFromUrl() {", 1)[1].split(
+        "\n            },", 1
+    )[0]
+    assert "URLSearchParams(window.location.search" in reader
+    assert "params.get('model')" in reader
+    # Reading the handoff parameter never writes history, fetches, redirects or
+    # carries a credential.
+    for forbidden in (
+        "history.",
+        "pushState",
+        "replaceState",
+        "fetch(",
+        "assign(",
+        "apiKey",
+        "endpoint",
+    ):
+        assert forbidden not in reader, forbidden
+        assert forbidden not in method, forbidden
+
+    # It runs once the model list is non-empty, after the normal default.
+    load_models = template.split("async loadModels() {", 1)[1]
+    load_models = load_models.split("\n            },\n", 1)[0]
+    assert "reconcileCurrentModelAfterLoad(defaultModel);" in load_models
+    assert "this.applyRequestedModelFromUrl();" in load_models
+
+
+def test_assistant_component_never_stages_deploys_or_launches():
+    javascript = _read(JAVASCRIPT)
+    start = javascript.index("// Assistant — the minimal Screen-3 slice")
+    end = javascript.index("// Feedback — toasts, never modals", start)
+    block = javascript[start:end]
+
+    for forbidden in (
+        "CLUSTER_API",
+        "/deployments",
+        "/stage",
+        "/replan",
+        "/autoconfigure",
+        "ssh-key",
+        "postActivation",
+        "activatePlan",
+        "run_remote_python",
+    ):
+        assert forbidden not in block, forbidden
+    assert "ASSISTANT_API" in block
+    # One poll loop per job, generation-guarded and single-flight.
+    assert block.count("setInterval(") == 2
+    assert "measurePollBusy" in block
+    assert "operationPollBusy" in block
+    assert "generation !== this.assistant.generation" in block
+
+
+def test_assistant_fixtures_pin_the_backend_payload_shapes():
+    fixtures = _fixtures()
+
+    running = fixtures["assistant_measure_running.json"]
+    ready = fixtures["assistant_measure_ready.json"]
+    status_fields = {
+        "measurement_id",
+        "state",
+        "created_at",
+        "updated_at",
+        "measured_at",
+        "model",
+        "node_count",
+        "nodes",
+        "warnings",
+        "error",
+    }
+    for payload in (running, ready):
+        assert status_fields <= set(payload)
+    assert running["state"] == "running"
+    assert ready["state"] == "ready"
+    assert ready["node_count"] == 2
+
+    recommendation = fixtures["assistant_recommendation.json"]
+    assert {
+        "selected_model",
+        "selected_context_tokens",
+        "candidates",
+        "hardware_only",
+        "feasible",
+        "target_context_tokens",
+    } <= set(recommendation)
+    # Chapter 3 still requires a model identity: model-less is not available.
+    assert recommendation["hardware_only"] is False
+    assert recommendation["selected_context_tokens"] > 0
+    assert {
+        "model_id",
+        "model_path",
+        "label",
+        "feasible",
+        "nodes_required",
+        "max_context_tokens",
+        "measured_speed",
+    } <= set(recommendation["candidates"][0])
+
+    plan = fixtures["assistant_plan.json"]
+    assert {
+        "plan_signature",
+        "coordinator_node",
+        "rank_order",
+        "stages",
+        "predicted",
+        "observed",
+        "endpoint",
+    } <= set(plan)
+    assert plan["observed"] is None
+    assert plan["predicted"]["measured"] is False
+    assert plan["predicted"]["critical_stage_seconds"] is None
+    assert plan["endpoint"]["ready"] is False
+    assert plan["coordinator_node"] in plan["rank_order"]
+
+    operation_fields = {
+        "operation_id",
+        "kind",
+        "state",
+        "measurement_id",
+        "plan_signature",
+        "coordinator_node",
+        "progress",
+        "endpoint",
+        "deployment_id",
+        "stopped",
+        "observed",
+        "warnings",
+        "error",
+    }
+    for name in (
+        "assistant_operation_applying.json",
+        "assistant_operation_loading.json",
+        "assistant_operation_ready.json",
+        # Screen 4: the row that is current has a payload per phase, plus the
+        # unknown phase and the free-space failure the card must survive.
+        "assistant_operation_starting.json",
+        "assistant_operation_unknown_phase.json",
+        "assistant_error_free_disk_space.json",
+    ):
+        assert operation_fields <= set(fixtures[name])
+    assert fixtures["assistant_operation_applying.json"]["state"] == "applying"
+    assert fixtures["assistant_operation_applying.json"]["endpoint"] is None
+    loading = fixtures["assistant_operation_loading.json"]
+    assert loading["state"] == "loading"
+    assert loading["endpoint"]["ready"] is False
+    ready_operation = fixtures["assistant_operation_ready.json"]
+    assert ready_operation["state"] == "ready"
+    assert ready_operation["endpoint"]["ready"] is True
+    assert ready_operation["observed"] is None
+    # Screen 5: a measured operation carries the one rate block, and nothing
+    # else in the payload does.
+    measured = fixtures["assistant_operation_ready_observed.json"]
+    assert measured["observed"]["decode_tok_per_s"] > 0
+    assert measured["observed"]["measured_at"]
+    # Screen 6: a ready operation knows its deployment; a stopped one says so
+    # while its state stays ready.
+    stopped = fixtures["assistant_operation_ready_stopped.json"]
+    assert stopped["state"] == "ready"
+    assert stopped["stopped"] is True
+    assert stopped["deployment_id"]
+
+    retry = fixtures["assistant_error_retry_coordinator.json"]
+    assert retry["state"] == "failed"
+    assert retry["error"]["action"] == "retry_coordinator"
+    assert retry["endpoint"]["ready"] is False
+
+    pair = fixtures["assistant_error_pair_mac.json"]
+    assert {"code", "message", "action"} <= set(pair)
+    assert pair["action"] == "pair_mac"
+
+
+def test_a_small_mac_is_forced_to_headless_and_says_so():
+    """A <64 GB Mac cannot hold a workstation reserve.
+
+    Live, a 32 GB Mac asking to be a workstation admitted 1.0 GiB and every
+    model was refused. The assistant sends it Headless and the card explains it;
+    the backend enforces the same rule from measured capacity.
+    """
+
+    javascript = _read(JAVASCRIPT)
+    card = _assistant_card()
+
+    assert "ASSISTANT_SMALL_MAC_RAM_GB = 64" in javascript
+    roles = javascript.split("assistantRoles(nodes) {", 1)[1].split("},", 1)[0]
+    assert "ASSISTANT_SMALL_MAC_RAM_GB" in roles
+    assert "'headless'" in roles
+
+    notes = javascript.split("assistantSmallMacNotes() {", 1)[1].split("},", 1)[0]
+    assert "cluster.assistant.small_mac_note" in notes
+    assert "data-cluster-assistant-small-mac" in card
+    assert "assistantSmallMacNotes()" in card
+
+
+# --- Cluster Assistant: Screen 4 (the progress surface) -----------------------
+#
+# the progress-row contract maps eight labels onto six observable rows. These tests
+# pin that mapping, the two combined pairs, the unknown-phase fallback, the
+# failure row and the absence of any invented progress. The behaviour of the
+# rows under a running flow is covered under Node in
+# tests/test_cluster_ui_integration_ui.py.
+
+SCREEN_4_ROWS = (
+    "checking",
+    "planning",
+    "preparing",
+    "starting",
+    "loading",
+    "ready",
+)
+
+
+def _row_table() -> str:
+    return _read(JAVASCRIPT).split("const ASSISTANT_PROGRESS_ROWS = [", 1)[1].split(
+        "];", 1
+    )[0]
+
+
+def test_screen_4_rows_are_six_labels_in_the_corrected_order():
+    javascript = _read(JAVASCRIPT)
+    card = _assistant_card()
+    table = _row_table()
+
+    keys = re.findall(r"key: '(\w+)'", table)
+    assert tuple(keys) == SCREEN_4_ROWS
+    # Planning precedes staging: the plan is what staging stages.
+    assert keys.index("planning") < keys.index("preparing")
+
+    # Every row is labelled, and the two pairs the backend cannot split are one
+    # row each — never a separate "Copying" or "Verifying" row.
+    catalog = json.loads(_read("omlx_web/i18n/en.json"))
+    labels = re.findall(r"label: '(cluster\.assistant\.progress\.\w+)'", table)
+    assert len(labels) == len(SCREEN_4_ROWS)
+    for key in labels:
+        assert catalog[key]
+    assert not {"copying", "verifying", "staged", "applied"} & set(keys)
+    assert "copying the model" in catalog["cluster.assistant.progress.preparing"]
+    assert "verifying the endpoint" in catalog["cluster.assistant.progress.loading"]
+
+    # The card renders the rows; the component owns the mapping.
+    assert "data-cluster-assistant-progress" in card
+    assert "assistantProgressRows()" in card
+    assert "ASSISTANT_PROGRESS_ROWS" in javascript
+
+
+def test_screen_4_each_row_is_driven_by_one_backend_value():
+    """Exactly one predicate per row, and no timer may ever advance one."""
+
+    javascript = _read(JAVASCRIPT)
+    reported = javascript.split("assistantReportedRow() {", 1)[1].split(
+        "assistantProgressRow() {", 1
+    )[0]
+
+    # 1–2 are the assistant's own states, which the poll sets from the job.
+    assert "state === 'measuring' || state === 'measuring_model'" in reported
+    assert "'checking'" in reported
+    assert "state === 'recommending' || state === 'planning'" in reported
+    assert "'planning'" in reported
+    # 3–5 are the operation's kind and state, never a guess.
+    assert "state === 'applying'" in reported
+    assert "'preparing'" in reported
+    assert "state === 'starting'" in reported
+    assert "'starting'" in reported
+    assert "state === 'loading'" in reported
+    assert "'loading'" in reported
+    # 6 needs both the ready operation and a proven endpoint.
+    assert "state === 'ready'" in reported
+    assert "this.assistantReady() ? 'ready' : 'loading'" in reported
+
+    for forbidden in ("setTimeout", "setInterval", "Date.now", "performance.now"):
+        assert forbidden not in reported
+        assert forbidden not in javascript.split(
+            "assistantProgressRows() {", 1
+        )[1].split("assistantRowMessage(rowKey) {", 1)[0]
+
+
+def test_screen_4_ready_row_is_unreachable_without_a_ready_endpoint():
+    card = _assistant_card()
+
+    # The endpoint block is still gated on assistantReady(), and the Ready row
+    # itself is only current when that same predicate is true.
+    assert 'x-show="assistantReady()"' in card
+    assert "assistantReady() ? assistant.endpoint.url : null" in card
+    javascript = _read(JAVASCRIPT)
+    ready = javascript.split("assistantReady() {", 1)[1].split("},", 1)[0]
+    assert "state === 'ready'" in ready
+    assert "endpoint?.ready === true" in ready
+    assert "!this.assistant.stopped" in ready
+
+
+def test_screen_4_unknown_phase_keeps_the_previous_row_and_shows_the_message():
+    javascript = _read(JAVASCRIPT)
+    fixture = _fixtures()["assistant_operation_unknown_phase.json"]
+
+    # The fixture is a real operation payload whose phase this build cannot map.
+    assert fixture["progress"]["phase"] == "future_phase"
+    assert fixture["state"] == "loading"
+    operation_fields = {
+        "operation_id",
+        "kind",
+        "state",
+        "progress",
+        "endpoint",
+        "error",
+    }
+    assert operation_fields <= set(fixture)
+
+    known = javascript.split("const ASSISTANT_KNOWN_PHASES = [", 1)[1].split(
+        "];", 1
+    )[0]
+    assert "staging" in known and "loading" in known
+    assert "future_phase" not in known
+    message = javascript.split("assistantRowMessage(rowKey) {", 1)[1].split(
+        "},", 1
+    )[0]
+    # An unknown phase narrates no row, so the row already shown stays and its
+    # raw message is rendered underneath. A known phase of another row never
+    # labels this one.
+    assert "ASSISTANT_KNOWN_PHASES.includes(phase)" in message
+    assert "progress.message" in message
+    # Nothing blanks the row list when the phase is unknown.
+    rows = javascript.split("assistantProgressRows() {", 1)[1].split(
+        "},", 1
+    )[0]
+    assert "const current = this.assistantProgressRow();" in rows
+
+
+def test_screen_4_failure_keeps_the_last_phase_and_one_action():
+    javascript = _read(JAVASCRIPT)
+    card = _assistant_card()
+    fixture = _fixtures()["assistant_error_free_disk_space.json"]
+
+    fail = javascript.split("failAssistant(code, message, action) {", 1)[1].split(
+        "failAssistantFrom(", 1
+    )[0]
+    # The row the backend last named is captured before the state becomes
+    # "failed", so a failure can say where it stopped.
+    assert "this.assistant.failedRow =" in fail
+    assert "this.assistantReportedRow() || this.assistant.failedRow" in fail
+    assert fail.index("failedRow") < fail.index("state = 'failed'")
+    assert "'failed'" in javascript.split("assistantProgressRows() {", 1)[1].split(
+        "},", 1
+    )[0]
+
+    assert fixture["state"] == "failed"
+    assert fixture["error"]["action"] == "free_disk_space"
+    assert fixture["progress"]["phase"] == "staging"
+    # The failure row keeps the staging row it stopped in.
+    assert fixture["progress"]["message"]
+
+    # Still exactly one action button, labelled from error.action.
+    assert card.count("data-cluster-assistant-action") == 1
+    assert "assistantActionHandler(assistant.error?.action)" in card
+
+
+def test_screen_4_never_renders_a_rate_a_percentage_or_an_eta():
+    # HTML comments are not rendered; the visible markup is what must stay free
+    # of invented progress.
+    card = re.sub(r"<!--.*?-->", "", _assistant_card(), flags=re.S)
+
+    for forbidden in (
+        "%",
+        "tok/s",
+        "token rate",
+        "ETA",
+        "percent",
+        "bytes copied",
+        "predicted.measured",
+    ):
+        assert forbidden not in card, forbidden
+    # A rate may only come from a measured `observed` block, so the ready card
+    # renders one line through this helper and the template carries no number.
+    assert "assistantObservedLabel()" in card
+    assert "cluster.assistant.observed.title" in card
+    # The only count is the one the backend reports, as "N of M Macs".
+    assert "cluster.assistant.progress_nodes" in _read(JAVASCRIPT)
+    assert "assistantProgressCount()" in _read(JAVASCRIPT)
+
+
+# --- Cluster Assistant: the free-space affordance ----------------------------
+#
+# the live-run notes (decision A): an insufficient_disk refusal keeps the one
+# action free_disk_space, and the card may then delete an unused model on the Mac
+# that is short — two-step confirm, never automatic, never the model the cluster
+# is about to run, and only a Mac the user picked.
+
+
+def test_free_space_panel_lists_only_the_mac_the_user_picked():
+    javascript = _read(JAVASCRIPT)
+    card = _assistant_card()
+
+    assert "data-cluster-assistant-free-space" in card
+    assert "data-cluster-assistant-free-space-node" in card
+    assert "data-cluster-assistant-free-space-model" in card
+    assert "data-cluster-assistant-free-space-delete" in card
+    assert "assistant.error?.action === 'free_disk_space'" in card
+    assert "assistant.freeSpaceOpen" in card
+
+    # The node list comes from the measurement; the model list is empty until a
+    # Mac is picked, so no other Mac's models are ever shown.
+    nodes = javascript.split("assistantFreeSpaceNodes() {", 1)[1].split("},", 1)[0]
+    assert "this.assistant.measurementNodes" in nodes
+    models = javascript.split("assistantFreeSpaceModels() {", 1)[1].split(
+        "async deleteAssistantModel(", 1
+    )[0]
+    assert "this.assistant.freeSpaceNode" in models
+    assert "model.size_bytes" in javascript
+    open_panel = javascript.split("openAssistantFreeSpace() {", 1)[1].split(
+        "},", 1
+    )[0]
+    # Nothing is preselected: the Mac the user did not pick is never listed.
+    assert "this.assistant.freeSpaceNode = '';" in open_panel
+
+
+def test_free_space_never_offers_the_model_the_cluster_will_run():
+    javascript = _read(JAVASCRIPT)
+    models = javascript.split("assistantFreeSpaceModels() {", 1)[1].split(
+        "async deleteAssistantModel(", 1
+    )[0]
+
+    assert "this.assistant.selectedModel" in models
+    assert "this.assistant.selectedModelId" in models
+    assert "this.selectedModelPath" in models
+    assert "!planned.has(model.model_id)" in models
+    assert "!planned.has(model.model_path)" in models
+
+
+def test_free_space_delete_is_a_two_step_confirm_then_a_remeasure():
+    javascript = _read(JAVASCRIPT)
+    card = _assistant_card()
+    delete = javascript.split("async deleteAssistantModel(model) {", 1)[1].split(
+        "// -----------------------------------------------------------------\n        // Ready-only",
+        1,
+    )[0]
+
+    # First click arms the row; only the second click sends the request.
+    assert "if (this.assistant.freeSpaceConfirm !== model.model_id)" in delete
+    assert delete.index("freeSpaceConfirm = model.model_id") < delete.index(
+        "await this.apiFetch("
+    )
+    assert "cluster.assistant.free_space.delete_confirm" in javascript
+    assert "assistantDeleteLabel(model)" in card
+    # The request is the ninth route, and it always names the measurement.
+    assert "ASSISTANT_API.models(nodeId, model.model_id)" in delete
+    assert "method: 'DELETE'" in delete
+    assert "measurement_id=" in delete
+    # After a delete the assistant measures again: the freed space is that Mac's
+    # number, not the card's assumption.
+    assert "await this.runAssistantMeasure();" in delete
+    assert "cluster.assistant.free_space.deleted" in delete
+    assert "data-cluster-assistant-free-space-error" in card
+
+
+def test_free_space_action_opens_the_panel_and_never_deletes_from_the_browser():
+    javascript = _read(JAVASCRIPT)
+    handler = javascript.split("assistantActionHandler(action) {", 1)[1].split(
+        "resumeAssistantPolling() {", 1
+    )[0]
+
+    assert "case 'free_disk_space':" in handler
+    assert "return this.openAssistantFreeSpace();" in handler
+
+    block = javascript.split("// Assistant — the minimal Screen-3 slice", 1)[1]
+    for forbidden in ("run_remote_python", "/admin/api/hf/models"):
+        assert forbidden not in block, forbidden
+    # The browser deletes through the assistant route, never a Mac's own admin
+    # route or an SSH call.
+    assert "ASSISTANT_API.models(" in block
+
+
+# --- Cluster Assistant: Screen 6 (state + stop/restart) ----------------------
+#
+# STOP is one assistant route that relays to the elected coordinator's own
+# unload route; Start again re-applies the frozen plan inputs. No re-planning,
+# no model/context edit, no Mac changes.
+
+SCREEN_6_STRINGS = (
+    "cluster.assistant.stop",
+    "cluster.assistant.stop.done",
+    "cluster.assistant.stop.failed",
+    "cluster.assistant.stopped",
+    "cluster.assistant.start_again",
+    "cluster.assistant.details.deployment",
+)
+
+
+def test_screen_6_stop_and_start_again_are_ready_gated():
+    card = _assistant_card()
+
+    assert "data-cluster-assistant-stop" in card
+    assert "data-cluster-assistant-stopped" in card
+    assert "data-cluster-assistant-start-again" in card
+    assert "stopAssistantCluster()" in card
+    assert "startAssistantAgain()" in card
+
+    ready = card.index('x-show="assistantState() === \'ready\'"')
+    stop = card.index("data-cluster-assistant-stop")
+    assert ready < stop
+    # The stopped block is hidden until the backend (or a successful stop)
+    # reports `stopped`; Start again lives only inside it.
+    assert 'x-show="assistant.stopped"' in card
+    stopped = card.index("data-cluster-assistant-stopped")
+    again = card.index("data-cluster-assistant-start-again")
+    assert stopped < again
+
+
+def test_screen_6_stop_relays_and_never_unloads_from_the_browser():
+    javascript = _read(JAVASCRIPT)
+
+    assert "stop: '/admin/api/cluster/assistant/stop'" in javascript
+    block = _assistant_method("stopAssistantCluster")
+    assert "ASSISTANT_API.stop" in block
+    assert "operation_id" in block
+    for forbidden in ("/deployments", "/unload", "fetch(", "ssh", "CLUSTER_V2_API"):
+        assert forbidden not in block, forbidden
+
+
+def test_screen_6_start_again_reuses_the_frozen_plan_inputs():
+    block = _assistant_method("startAssistantAgain")
+
+    assert "this.assistant.inputs" in block
+    assert "this.assistant.plan?.plan_signature" in block
+    assert "this.runAssistantApply()" in block
+    # No re-plan, no model/context edit, no Mac changes.
+    assert "runAssistantPlan" not in block
+    assert "selectedModelPath" not in block
+    assert "targetContextTokens" not in block
+
+
+def test_screen_6_a_stopped_ready_operation_does_not_regress_to_loading():
+    reported = _assistant_method("assistantReportedRow")
+
+    assert "if (this.assistant.stopped) return 'ready';" in reported
+
+
+def test_screen_6_strings_carry_the_english_copy():
+    catalog = json.loads(
+        (ROOT / "omlx_web/i18n/en.json").read_text(encoding="utf-8")
+    )
+    for key in SCREEN_6_STRINGS:
+        assert catalog.get(key), key
+
+
+# --- Cluster Assistant: review slice 1 (template safety + flow guards) -------
+#
+# REVIEW-2026-11-13.md U1/U3/U4/U5 and the small-Mac note: one character-class
+# bug shipped because the static tests only grep substrings, and three flow
+# guards were missing. These tests execute the shipped component/template.
+
+
+def test_assistant_template_binding_expressions_all_parse():
+    """Every Alpine binding in the template must be compilable JavaScript.
+
+    U1: a misplaced quote in one x-text threw on every dashboard load and
+    silently killed the network-preflight warnings. Substring tests cannot
+    catch that class; compiling every bound expression can.
+    """
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to parse the template expressions")
+    template = _read(TEMPLATE)
+    bindings = []
+    pattern = (
+        r'(?:^|\s)(x-[a-z][a-z0-9.:-]*|:[a-z][a-z0-9.:-]*|@[a-z][a-z0-9.:-]*)="([^"]*)"'
+    )
+    for match in re.finditer(pattern, template):
+        name, value = match.group(1), match.group(2)
+        # x-for is Alpine iteration syntax, not a JavaScript expression.
+        if name.startswith("x-for"):
+            continue
+        # x-transition:* values are CSS class lists, not expressions.
+        if name.startswith("x-transition"):
+            continue
+        value = (
+            value.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", '"')
+            .replace("&#39;", "'")
+            .replace("&amp;", "&")
+        )
+        bindings.append({"attr": name, "code": value})
+    script = """
+const bindings = %s;
+const broken = [];
+for (const {attr, code} of bindings) {
+  // Alpine evaluates value bindings as expressions and on/init handlers as
+  // statement bodies; compile each the way Alpine will.
+  const isStatement = attr.startsWith('@') || attr === 'x-init';
+  const body = isStatement ? code : 'return (' + code + ');';
+  try { new Function(body); } catch (e) { broken.push({attr, code, error: String(e)}); }
+}
+process.stdout.write(JSON.stringify({checked: bindings.length, broken}));
+""" % json.dumps(bindings)
+    result = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["checked"] > 100
+    assert payload["broken"] == []
+
+
+def test_assistant_session_endpoint_is_hidden_when_stopped():
+    """U5: a stopped session never offers its dead endpoint link (Screen 6)."""
+
+    result = _run_wizard(
+        """
+component.assistant.session = {
+  state: 'ready', stopped: false, endpoint: {ready: true, url: 'http://192.0.2.11:8099'},
+};
+const running = component.assistantSessionEndpoint();
+component.assistant.session.endpoint.ready = false;
+const notReady = component.assistantSessionEndpoint();
+component.assistant.session.endpoint.ready = true;
+component.assistant.session.stopped = true;
+const stopped = component.assistantSessionEndpoint();
+component.assistant.session = {
+  state: 'applied', stopped: false, endpoint: {ready: true, url: 'http://192.0.2.11:8099'},
+};
+const applied = component.assistantSessionEndpoint();
+process.stdout.write(JSON.stringify({running, notReady, stopped, applied}));
+"""
+    )
+    assert result == {
+        "running": "http://192.0.2.11:8099",
+        "notReady": "",
+        "stopped": "",
+        "applied": "",
+    }
+
+
+def test_assistant_small_mac_notes_render_for_a_32_gb_mac():
+    """The headless explanation uses the module constant, not this.constructor."""
+
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+component.devicesPayload.paired[0].caps.ram_gb = 32;
+const notes = component.assistantSmallMacNotes();
+process.stdout.write(JSON.stringify({count: notes.length, note: notes[0] || ''}));
+"""
+    )
+    assert result["count"] == 1
+    assert "Node B" in result["note"]
+    assert "32" in result["note"]
+
+
+def test_assistant_use_all_macs_is_guarded_and_generation_safe():
+    """U3: the override re-plans only at rest, and bumps the generation."""
+
+    result = _run_wizard(
+        """
+const planCalls = [];
+component.runAssistantPlan = async (gen) => { planCalls.push(gen); };
+component.assistant.measurementId = 'm1';
+component.assistant.state = 'planning';
+const genBefore = component.assistant.generation;
+component.toggleAssistantNodeSelection();
+const afterFirst = {
+  selection: component.assistant.nodeSelection,
+  calls: planCalls.length,
+  gen: component.assistant.generation,
+};
+component.assistant.state = 'ready';
+component.toggleAssistantNodeSelection();
+component.assistant.state = 'planning';
+component.assistant.busy = true;
+component.toggleAssistantNodeSelection();
+component.assistant.busy = false;
+component.assistant.stopped = true;
+component.toggleAssistantNodeSelection();
+component.assistant.stopped = false;
+component.assistant.measurementId = '';
+component.toggleAssistantNodeSelection();
+process.stdout.write(JSON.stringify({
+  afterFirst, genBefore,
+  finalSelection: component.assistant.nodeSelection,
+  totalCalls: planCalls.length,
+}));
+"""
+    )
+    assert result["afterFirst"] == {
+        "selection": "all",
+        "calls": 1,
+        "gen": result["genBefore"] + 1,
+    }
+    # ready, busy, stopped and unmeasured all refuse the override.
+    assert result["finalSelection"] == "all"
+    assert result["totalCalls"] == 1
+
+
+def test_assistant_candidates_are_capped_at_32_with_deterministic_priority():
+    """U4: a catalogue beyond the backend cap is narrowed, never refused."""
+
+    result = _run_wizard(
+        """
+const models = [];
+for (let i = 0; i < 40; i++) {
+  models.push({
+    model_path: '/models/m' + i, id: 'm' + i, display_name: 'M' + i,
+    estimated_size: (40 - i) * 1000, model_context_length: 8192,
+  });
+}
+models.push({
+  model_path: '/models/chosen', id: 'chosen', display_name: 'Chosen',
+  estimated_size: 999999, model_context_length: 8192,
+});
+component.modelOptions = models;
+component.selectedModelPath = '/models/chosen';
+component.assistant.measurementNodes = [
+  {node_id: 'node-b', model_paths: ['/models/m39']},
+];
+const candidates = component.assistantCandidates();
+component.modelOptions = models.slice(0, 32);
+component.assistant.measurementNodes = [];
+const exact = component.assistantCandidates().length;
+process.stdout.write(JSON.stringify({
+  count: candidates.length,
+  first: candidates[0].model_path,
+  second: candidates[1].model_path,
+  third: candidates[2].model_path,
+  exact,
+}));
+"""
+    )
+    assert result["count"] == 32
+    # chosen model first, then the peer-held model, then the smallest rest.
+    assert result["first"] == "/models/chosen"
+    assert result["second"] == "/models/m39"
+    assert result["third"] == "/models/m38"
+    assert result["exact"] == 32
+
+
+def test_assistant_action_handler_ignores_double_clicks_while_busy():
+    """A second click while busy must not post the same request again."""
+
+    result = _run_wizard(
+        """
+let fetches = 0;
+component.apiFetch = async () => { fetches++; return {measurement_id: 'm1'}; };
+component.assistant.busy = true;
+component.assistantActionHandler('measure');
+component.assistantActionHandler('plan');
+const whileBusy = fetches;
+component.assistant.busy = false;
+let starts = 0;
+component.startAssistant = async () => { starts++; };
+component.assistantActionHandler('measure');
+process.stdout.write(JSON.stringify({whileBusy, starts}));
+"""
+    )
+    assert result == {"whileBusy": 0, "starts": 1}
+
+
+def test_assistant_card_is_mounted_independently_of_the_wizard_state():
+    """B3: the card lives in its own always-mounted section, not in plan."""
+
+    template = _read(TEMPLATE)
+    assert "data-cluster-assistant-section" in template
+    assert re.search(
+        r'<section x-show="assistantSurfaceVisible\(\)"[^>]*'
+        r'data-cluster-assistant-section>',
+        template,
+    )
+    # The plan section no longer contains the assistant card.
+    plan_start = template.index("data-cluster-plan>")
+    plan_end = template.index("</section>", plan_start)
+    assert "data-cluster-assistant>" not in template[plan_start:plan_end]
+    # The assistant section is mounted before the plan section.
+    assert template.index("data-cluster-assistant-section>") < template.index(
+        "data-cluster-plan>"
+    )
+
+
+def test_assistant_card_announces_progress_and_failures_and_hides_spinners():
+    """L5: the progress rows are a polite live region, the failure banner is an
+    alert, and the decorative spinner SVGs are hidden from assistive tech (the
+    adjacent text already names the state)."""
+
+    card = _assistant_card()
+
+    progress = re.search(r"<div[^>]*data-cluster-assistant-progress>", card)
+    assert progress, "progress container missing"
+    assert 'aria-live="polite"' in progress.group(0)
+
+    banner = re.search(r"<div[^>]*data-cluster-assistant-error>", card)
+    assert banner, "failure banner missing"
+    assert 'role="alert"' in banner.group(0)
+
+    spinners = [
+        tag for tag in re.findall(r"<svg\b[^>]*>", card) if "animate-spin" in tag
+    ]
+    # One per Screen-4 current row plus the seven busy state sentences.
+    assert len(spinners) >= 8
+    for tag in spinners:
+        assert 'aria-hidden="true"' in tag, tag
+
+
+# --- Assistant UI spec 2026-11-16 (U1-U6) ------------------------------------
+#
+# The assistant card is a render-mode on the frozen state machine: exactly one
+# `data-assistant-screen` div per state, a mode split that keeps today's wizard
+# byte-identical behind `Manual setup`, failure screens that own the card, and a
+# client-side back/stale model. No backend state is added.
+
+ASSISTANT_SCREENS = (
+    "start",
+    "check",
+    "plan",
+    "launch",
+    "ready",
+    "stopped",
+    "failed",
+    "choose",
+)
+
+
+def test_assistant_renders_one_screen_per_backend_state():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    table = re.findall(r"const ASSISTANT_SCREENS = \[(.*?)\];", javascript, re.S)
+    assert table, "ASSISTANT_SCREENS missing"
+    assert tuple(re.findall(r"'(\w+)'", table[0])) == ASSISTANT_SCREENS
+
+    for name in ASSISTANT_SCREENS:
+        assert template.count(f'data-assistant-screen="{name}"') == 1, name
+        assert re.search(
+            rf"x-show=\"assistantScreen\(\) === '{name}'\"[^>]*"
+            rf'data-assistant-screen="{name}"',
+            template,
+        ), name
+
+    # One function decides the screen; it adds no state and calls no backend.
+    body = javascript.split("assistantScreen() {", 1)[1].split(
+        "assistantEyebrow() {", 1
+    )[0]
+    for screen in ASSISTANT_SCREENS:
+        assert f"'{screen}'" in body, screen
+    assert "apiFetch" not in body
+    assert "assistant.state =" not in body
+
+
+def test_the_assistant_is_the_default_flow_and_manual_setup_is_one_click():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "clusterMode: 'assistant'" in javascript
+    assert "const CLUSTER_MODE_KEY = 'clusterV2.mode';" in javascript
+    # The Node component tests construct the factory without localStorage; an
+    # unguarded read would break every one of them.
+    assert "typeof localStorage !== 'undefined'" in javascript
+    assert "setClusterMode(mode) {" in javascript
+
+    for marker in (
+        "data-cluster-mode",
+        "data-cluster-mode-assistant",
+        "data-cluster-mode-manual",
+        "data-cluster-assistant-manual-link",
+        "data-cluster-manual-progress",
+        "data-cluster-manual-sections>",
+        "data-cluster-manual-plan>",
+    ):
+        assert marker in template, marker
+
+    # The assistant section is the first thing after the header; the wizard
+    # tiles and both manual regions follow it.
+    assistant = template.index("data-cluster-assistant-section>")
+    for manual in (
+        "data-cluster-manual-progress>",
+        "data-cluster-manual-sections>",
+        "data-cluster-manual-plan>",
+    ):
+        assert assistant < template.index(manual), manual
+
+    # Manual content is shown in Manual mode, and in Assistant mode only when
+    # the assistant cannot render yet (a fresh Mac still has to pair/install).
+    assert "clusterMode === 'manual' || !this.assistantSurfaceVisible()" in javascript
+
+    # Manual mode keeps today's markup: every wizard state section still exists.
+    for state in (
+        "empty",
+        "discovering",
+        "device_card",
+        "pairing",
+        "purpose",
+        "helper",
+        "accelerator",
+        "checks",
+        "plan",
+        "active",
+    ):
+        assert template.count(f'data-cluster-state="{state}"') >= 1, state
+
+
+def test_the_choose_screen_re_measures_only_a_changed_model():
+    javascript = _read(JAVASCRIPT)
+
+    choose = _assistant_card().split('data-assistant-screen="choose"', 1)[1]
+    assert "<input" not in choose
+    assert "x-model" not in choose
+    assert "<select" not in choose
+    for marker in (
+        "data-cluster-assistant-choose-candidate",
+        "data-cluster-assistant-choose-context",
+        "data-cluster-assistant-choose-context-option",
+        "data-cluster-assistant-choose-back",
+        "data-cluster-assistant-choose-continue",
+    ):
+        assert marker in choose, marker
+
+    body = javascript.split("async assistantConfirmChoose() {", 1)[1].split(
+        "assistantInputsStale() {", 1
+    )[0]
+    assert body.count("runAssistantModelMeasure(") == 1
+    assert "assistant.selectedModel = draft.model_path" in body
+    assert "runAssistantPlan(" in body
+    assert "apiFetch" not in body
+    # The draft is the only thing the buttons change until Confirm.
+    assert "assistantChooseDraft.model_path = modelPath" in javascript
+    assert "assistantChooseDraft.context_tokens = value" in javascript
+
+
+def test_a_failure_owns_the_card_with_one_action_and_a_way_back():
+    card = _assistant_card()
+    failed = card.split('data-assistant-screen="failed"', 1)[1].split(
+        'data-assistant-screen="choose"', 1
+    )[0]
+
+    assert "data-cluster-assistant-error" in failed
+    assert failed.count("data-cluster-assistant-action") == 1
+    assert "assistantActionHandler(assistant.error?.action)" in failed
+    assert "data-cluster-assistant-retry" in failed
+    assert "data-cluster-assistant-back" in failed
+    assert "data-cluster-assistant-failure-details" in failed
+    assert "data-cluster-assistant-topology" in failed
+    assert "data-cluster-assistant-free-space" in failed
+    # No other screen's primary action lives inside the failure.
+    assert "data-cluster-assistant-start-setup" not in failed
+    assert "data-cluster-assistant-open-chat" not in failed
+
+    # Warnings are amber notes on the plan, never an error (A7).
+    warnings = re.search(
+        r"<div[^>]*data-cluster-assistant-plan-warnings", card
+    )
+    assert warnings, "plan warnings missing"
+    assert "amber" in warnings.group(0)
+
+
+def test_back_reaches_applied_and_retry_reenters_the_failed_step():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    back = javascript.split("assistantBackAllowed() {", 1)[1].split(
+        "assistantCanChoose() {", 1
+    )[0]
+    assert "!this.assistantRunning()" in back
+    assert "this.assistant.state !== 'ready'" in back
+    assert "!this.assistant.stopped" in back
+
+    retry = javascript.split("async retryAssistantStep() {", 1)[1].split(
+        "assistantFailureDetails() {", 1
+    )[0]
+    assert "runAssistantStart(generation)" in retry
+    assert "runAssistantApply()" in retry
+    assert "runAssistantPlan(generation)" in retry
+    assert "startAssistant()" in retry
+    # An applied deployment is retried in place, never re-applied.
+    step = javascript.split("assistantFailureStep() {", 1)[1].split(
+        "assistantRetryLabel() {", 1
+    )[0]
+    assert "applyState === 'applied'" in step
+    assert "return 'start'" in step
+
+    # Start setup re-plans a stale plan instead of applying it.
+    assert (
+        "assistantInputsStale() ? runAssistantPlan() : runAssistantApply()"
+        in template
+    )
+
+    stale = javascript.split("assistantInputsStale() {", 1)[1].split(
+        "assistantRowStale(rowKey) {", 1
+    )[0]
+    assert "this.assistant.inputs" in stale
+    assert "selectedModel" in stale
+    assert "selectedContextTokens" in stale
+    assert "preferred_coordinator" in stale
+
+    # Going back from a failure returns to the plan review, not to idle.
+    back_to_plan = javascript.split("assistantBackToPlan() {", 1)[1].split(
+        "assistantOpenChoose() {", 1
+    )[0]
+    assert "this.assistant.error = null" in back_to_plan
+    assert "this.assistant.state = 'planning'" in back_to_plan
+
+
+def test_assistant_screen_copy_exists_in_the_english_catalog():
+    catalog = json.loads(_read("omlx_web/i18n/en.json"))
+    for key in (
+        "cluster.assistant.mode.assistant",
+        "cluster.assistant.mode.manual",
+        "cluster.assistant.mode.manual_link",
+        "cluster.assistant.screen.check.title",
+        "cluster.assistant.screen.plan.title",
+        "cluster.assistant.screen.launch.title",
+        "cluster.assistant.screen.ready.title",
+        "cluster.assistant.screen.stopped.title",
+        "cluster.assistant.screen.failed.title",
+        "cluster.assistant.screen.choose.title",
+        "cluster.assistant.screen.choose.continue",
+        "cluster.assistant.back.plan",
+        "cluster.assistant.stale.banner",
+        "cluster.assistant.stale.step",
+        "cluster.assistant.retry.plan",
+        "cluster.assistant.retry.start",
+        "cluster.assistant.stepper.checking",
+        "cluster.assistant.stepper.ready",
+        "cluster.assistant.macs.combined",
+        "cluster.assistant.macs.measured_ago",
+        "cluster.assistant.performance.title",
+        "cluster.assistant.failure.topology",
+        "cluster.assistant.failure.wired",
+        "cluster.assistant.show_details",
+    ):
+        assert catalog.get(key), key
+
+
+def test_saved_setup_card_names_its_state_and_age():
+    """Fit-gap #5 (2026-11-16): an unloaded placement is a saved setup.
+
+    The eyebrow no longer claims "Cluster configured" while nothing runs,
+    and the age line appears only when the registry knows the moment —
+    never invented.
+    """
+
+    fixtures = _fixtures()
+    deployment = fixtures["deployments_active.json"]["deployments"][0]
+    result = _run_wizard(
+        f"""
+component.deploymentsPayload = {json.dumps([deployment])};
+component.runtimePayload = {json.dumps(fixtures['runtime_detached.json'])};
+component.runtimeLoaded = true;
+const dep = component.deploymentsPayload[0];
+const withoutStamp = component.deploymentStatus(dep);
+component.deploymentsSavedAt = {{ [dep.deployment_id]: 1794900000 }};
+const stamped = component.deploymentStatus(dep);
+process.stdout.write(JSON.stringify({{
+  without: {{ eyebrow: withoutStamp.eyebrow, label: withoutStamp.label, detail: withoutStamp.detail }},
+  stamped: {{ eyebrow: stamped.eyebrow, label: stamped.label, detail: stamped.detail }},
+}}));
+"""
+    )
+
+    assert result["without"]["eyebrow"] == SAVED_SETUP_EYEBROW
+    assert "configured" not in result["without"]["eyebrow"].lower()
+    assert result["without"]["label"] == "Not loaded"
+    assert "no model weights are resident" in result["without"]["detail"]
+    assert "Saved" not in result["without"]["detail"].replace("saved,", "")
+
+    assert result["stamped"]["eyebrow"] == SAVED_SETUP_EYEBROW
+    assert result["stamped"]["label"] == "Not loaded"
+    # The age line carries the formatted moment, not a promise about activity.
+    assert result["stamped"]["detail"].startswith(
+        result["without"]["detail"].rstrip(".") + "."
+    ) or "no model weights are resident" in result["stamped"]["detail"]
+    assert "Saved" in result["stamped"]["detail"]
+
+
+def test_assistant_card_headline_is_the_session_after_reload():
+    """Fit-gap #6 (2026-11-16): a persisted session owns the headline.
+
+    After a reload with a running (or stopped) cluster the card must not
+    say "Set up this cluster / Not started" above a live deployment.
+    """
+
+    result = _run_wizard(
+        """
+component.assistant.state = 'idle';
+component.assistant.session = {
+  state: 'ready', stopped: false, model_path: '/models/dev-1.5b',
+  context_tokens: 32768, coordinator_node: 'node-a',
+};
+const running = {
+  title: component.assistantScreenTitle(),
+  subtitle: component.assistantScreenSubtitle(),
+  stateLabel: component.assistantStateLabel(),
+};
+component.assistant.session.stopped = true;
+const stopped = {
+  title: component.assistantScreenTitle(),
+  stateLabel: component.assistantStateLabel(),
+};
+component.assistant.session = null;
+const fresh = {
+  title: component.assistantScreenTitle(),
+  subtitle: component.assistantScreenSubtitle(),
+  stateLabel: component.assistantStateLabel(),
+};
+process.stdout.write(JSON.stringify({ running, stopped, fresh }));
+"""
+    )
+
+    assert result["running"]["title"] == "Cluster running"
+    assert "dev-1.5b" in result["running"]["subtitle"]
+    assert "32,768" in result["running"]["subtitle"]
+    assert result["running"]["stateLabel"] == ""
+
+    assert result["stopped"]["title"] == "Cluster stopped"
+    assert result["stopped"]["stateLabel"] == ""
+
+    assert result["fresh"]["title"] == "Set up this cluster"
+    assert "measures these Macs" in result["fresh"]["subtitle"]
+    assert result["fresh"]["stateLabel"] == "Not started"

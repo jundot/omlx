@@ -919,6 +919,30 @@ def _register_cluster_routes() -> None:
             Depends(require_distributed_inference_enabled),
         ],
     )
+    # Cluster Assistant: measure-as-a-job, status, and the measurement-driven
+    # plan (POST /admin/api/cluster/assistant/measure, GET .../status,
+    # POST .../plan). Small, deliberate upstream patch — it is mounted with the
+    # same two gates as the cluster router, so the assistant surface cannot be
+    # reachable when the experimental cluster surface is off or the caller is
+    # not an admin. The getters supply the measurement store's base path and
+    # this Mac's own endpoint port; both are resolved lazily because the
+    # settings manager does not exist yet at registration time. Tracked in
+    # docs/cluster-assistant/UPSTREAM.md.
+    from .cluster.assistant.routes import router as cluster_assistant_router
+    from .cluster.assistant.routes import set_assistant_getters
+
+    set_assistant_getters(
+        lambda: _server_state.settings_manager,
+        lambda: _server_state.global_settings.server,
+        lambda: _server_state.global_settings,
+    )
+    app.include_router(
+        cluster_assistant_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
     # Cluster: /api/cluster/node_id is a deliberately unauthenticated,
     # rate-limited probe peers use to verify announced addresses before any
     # pairing trust exists; /api/cluster/devices requires admin per-route.
@@ -959,7 +983,22 @@ def _register_cluster_routes() -> None:
 
 @app.exception_handler(_RedirectToLogin)
 async def redirect_to_login_handler(request, exc):
-    """Redirect unauthenticated browser requests to the admin login page."""
+    """Redirect unauthenticated browser requests to the admin login page.
+
+    The originally requested page rides along as ``?next=`` so a deep link
+    (the assistant's Open Chat target ``/admin/chat?model=...`` is the one
+    that matters) survives the login round trip instead of stranding the
+    user on the dashboard.
+    """
+    target = request.url.path
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    if target.startswith("/") and not target.startswith("//"):
+        from urllib.parse import quote
+
+        return RedirectResponse(
+            url=f"/admin?next={quote(target, safe='')}", status_code=302
+        )
     return RedirectResponse(url="/admin", status_code=302)
 
 

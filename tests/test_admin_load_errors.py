@@ -27,6 +27,7 @@ from omlx.exceptions import (
 class _Pool:
     def __init__(self, error):
         self._error = error
+        self.calls = []
 
     def get_entry(self, model_id):
         entry = type("E", (), {})()
@@ -34,15 +35,16 @@ class _Pool:
         entry.is_loading = False
         return entry
 
-    async def get_engine(self, model_id):
+    async def get_engine(self, model_id, **kwargs):
+        self.calls.append((model_id, kwargs))
         raise self._error
 
 
-def _load(pool):
+def _load(pool, **kwargs):
     originals = admin_routes._get_engine_pool
     admin_routes._get_engine_pool = lambda: pool
     try:
-        return asyncio.run(admin_routes.load_model("m", is_admin=True))
+        return asyncio.run(admin_routes.load_model("m", is_admin=True, **kwargs))
     finally:
         admin_routes._get_engine_pool = originals
 
@@ -70,3 +72,24 @@ def test_load_error_maps_to_status(error, expected):
     assert excinfo.value.status_code == expected
     # The message carries the actionable detail; it must survive the mapping.
     assert str(excinfo.value.detail) == str(error)
+
+
+def test_local_only_load_is_forwarded_to_the_engine_pool():
+    """``?local_only=true`` must reach the pool, which then ignores a cluster
+    deployment for the same checkpoint (the run-local contract)."""
+    pool = _Pool(ModelTooLargeError("m", 100 << 30, 50 << 30, binding="final"))
+
+    with pytest.raises(HTTPException) as excinfo:
+        _load(pool, local_only=True)
+
+    assert excinfo.value.status_code == 507
+    assert pool.calls == [("m", {"local_only": True})]
+
+
+def test_a_normal_load_still_asks_the_pool_for_the_cluster_variant():
+    pool = _Pool(ModelTooLargeError("m", 100 << 30, 50 << 30, binding="final"))
+
+    with pytest.raises(HTTPException):
+        _load(pool)
+
+    assert pool.calls == [("m", {"local_only": False})]

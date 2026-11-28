@@ -1,0 +1,14 @@
+{
+  "_state": "assistant_measuring",
+  "_source": "omlx/cluster/assistant/models.py::AssistantMeasurementStatus",
+  "measurement_id": "msr-5f2a9c31",
+  "state": "running",
+  "created_at": "2026-11-03T10:15:00Z",
+  "updated_at": "2026-11-03T10:15:02Z",
+  "measured_at": "",
+  "model": "/models/qwen3-32b",
+  "node_count": 0,
+  "nodes": [],
+  "warnings": [],
+  "error": null
+}

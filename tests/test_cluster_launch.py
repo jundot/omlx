@@ -2458,3 +2458,65 @@ def test_supervisor_local_stop_skips_remote_reaping(tmp_path, monkeypatch):
     )
     supervisor.stop(local_only=True)
     assert supervisor.process is None
+
+
+def test_remote_preflight_falls_back_to_the_worker_shim_not_the_local_python(
+    monkeypatch,
+):
+    """A host without a recorded interpreter must not inherit sys.executable.
+
+    Measured live 2026-11-17 on .13: the coordinator's runtime-venv path
+    exists on the peer by accident (shared install location) but cannot
+    import oMLX without the PYTHONPATH only the worker shim sets, so the
+    manual activation died with ModuleNotFoundError while the assistant
+    path (which records the peer interpreter from the measurement) worked.
+    """
+
+    calls = []
+    versions = _local_runtime_versions()
+    monkeypatch.setattr(
+        memory_guard, "ceiling_breakdown", lambda tier: {"hard_limit": 1024**4}
+    )
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                versions
+                | {
+                    "cluster-protocol": CLUSTER_PROTOCOL_VERSION,
+                    "python": platform.python_version(),
+                    "model-exists": True,
+                    "admission-ceiling-bytes": 1024**4,
+                }
+            ),
+            stderr="",
+        )
+
+    preflight_remote_hosts(
+        _deployment(),
+        python_executable=sys.executable,
+        runner=runner,
+    )
+
+    assert len(calls) == 1
+    command = calls[0][-1]
+    assert "~/.omlx/bin/omlx-cluster-python" in command
+    assert sys.executable not in command
+
+
+def test_rank_launch_argv_falls_back_to_the_worker_shim():
+    """Ranks without a recorded interpreter launch through the shim too."""
+
+    argv = build_mlx_launch_argv(
+        _deployment(),
+        hostfile=Path("/tmp/hostfile.json"),
+        api_port=8000,
+        collective_port=9000,
+        python_executable=sys.executable,
+    )
+    worker_at = argv.index("--") + 1
+    assert argv[worker_at] == "~/.omlx/bin/omlx-cluster-python"
+    assert sys.executable not in argv[worker_at : worker_at + 4]

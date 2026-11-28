@@ -2894,6 +2894,11 @@
             // Model State
             availableModels: [],
             currentModel: null,
+            // The Cluster Assistant's handoff link: /chat?model=<serving id>.
+            // Read once, applied on the first loaded model list, and never
+            // written back into history or the URL.
+            requestedModelParam: null,
+            requestedModelApplied: false,
 
             // Streaming State
             streamSessions: {},
@@ -2937,6 +2942,12 @@
             micSeconds: 0,
             _micTimerInterval: null,
             realtimeSttMap: {},          // { modelId: bool } from /v1/models/status realtime_stt
+            // Which models are actually loaded, from /v1/models/status. The
+            // first row of /v1/models is often a checkpoint nobody loaded (a
+            // cluster deployment cannot load it at all), and picking it makes
+            // the very first message fail instead of answer (2026-11-16).
+            loadedModelIds: [],
+            loadedDistributedModelIds: [],
             isDragOver: false,           // drag-and-drop state
 
             // Image Modal State
@@ -3401,6 +3412,20 @@
                         return candidate;
                     }
                 }
+                // Prefer what is already loaded — a running distributed model
+                // first, then any loaded one. Only then fall back to the first
+                // row, which may need a load (or, on a cluster, cannot load).
+                const pickLoaded = (ids) => {
+                    for (const id of (ids || [])) {
+                        const gatewayId = this.resolveGatewayModelId(id);
+                        if (this.isModelAvailableOnServer(gatewayId)) return gatewayId;
+                    }
+                    return null;
+                };
+                const loaded =
+                    pickLoaded(this.loadedDistributedModelIds) ||
+                    pickLoaded(this.loadedModelIds);
+                if (loaded) return loaded;
                 return this.availableModels[0].id;
             },
 
@@ -3414,6 +3439,35 @@
                 } else {
                     this.currentModel = this.resolveGatewayModelId(this.currentModel);
                 }
+            },
+
+            /** The one query parameter the Cluster Assistant link carries. */
+            requestedModelFromUrl() {
+                if (this.requestedModelParam !== null) return this.requestedModelParam;
+                let value = '';
+                try {
+                    const params = new URLSearchParams(window.location.search || '');
+                    value = String(params.get('model') || '').trim();
+                } catch (e) {
+                    value = '';
+                }
+                this.requestedModelParam = value;
+                return value;
+            },
+
+            /**
+             * Select a known ?model= once the list is loaded. An unknown value
+             * leaves the normal default selection untouched, and a later reload
+             * is the only thing that applies it again (the parameter is in the
+             * URL; nothing is pushed into history here).
+             */
+            applyRequestedModelFromUrl() {
+                if (this.requestedModelApplied) return;
+                if (!this.availableModels?.length) return;
+                this.requestedModelApplied = true;
+                const requested = this.requestedModelFromUrl();
+                if (!requested || !this.isModelAvailableOnServer(requested)) return;
+                this.currentModel = this.resolveGatewayModelId(requested);
             },
 
             /** Keep messages through the user turn that precedes endIndex (drops assistant + tool rows). */
@@ -4409,12 +4463,20 @@
             const data = await resp.json();
             const map = {};
             const rtMap = {};
+            const loaded = [];
+            const loadedDistributed = [];
             for (const m of (data.models || [])) {
                 map[m.id] = m.model_type || 'llm';
                 rtMap[m.id] = Boolean(m.realtime_stt);
+                if (m.loaded) {
+                    loaded.push(m.id);
+                    if (m.distributed) loadedDistributed.push(m.id);
+                }
             }
             this.modelTypeMap = map;
             this.realtimeSttMap = rtMap;
+            this.loadedModelIds = loaded;
+            this.loadedDistributedModelIds = loadedDistributed;
             this._mirrorAliasModelTypes();
         } catch (e) {
             // Model status endpoint unavailable
@@ -5291,6 +5353,7 @@
             }
 
             this.reconcileCurrentModelAfterLoad(defaultModel);
+            this.applyRequestedModelFromUrl();
         } catch (error) {
             console.error('Error loading models:', error);
         }

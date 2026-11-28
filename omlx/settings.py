@@ -204,7 +204,10 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
-    distributed_inference_enabled: bool = False
+    # On by default (user decision, 2026-11-16): a fresh install must reach
+    # the Cluster Assistant without hunting for this switch. The Cluster tab,
+    # the cluster API routes and Bonjour advertising exist on first start.
+    distributed_inference_enabled: bool = True
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
@@ -223,6 +226,13 @@ class ServerSettings:
     # 5 minutes). A client that talks to the server less often than this pays
     # the first-command stall on every request; raise it to cover that gap.
     gpu_keep_warm_idle_window: float = 300.0
+    # Cluster Assistant: run one real completion after a cluster is ready and
+    # record its measured token rates as the operation's ``observed`` block.
+    # Off by default: the assistant never spends tokens on the user's cluster
+    # unless this Mac's own settings ask it to. It never rewrites ``predicted``
+    # and never changes the approved placement (the assistant keeps auto_tune
+    # off).
+    assistant_performance_probe: bool = False
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -265,7 +275,7 @@ class ServerSettings:
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
             distributed_inference_enabled=data.get(
                 "distributed_inference_enabled",
-                False,
+                True,
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
             max_image_upload_size=data.get("max_image_upload_size", "50MB"),
@@ -274,6 +284,9 @@ class ServerSettings:
             gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
             gpu_keep_warm_idle_window=float(
                 data.get("gpu_keep_warm_idle_window", 300.0)
+            ),
+            assistant_performance_probe=bool(
+                data.get("assistant_performance_probe", False)
             ),
         )
 

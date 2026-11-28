@@ -1,0 +1,8 @@
+{
+  "_state": "assistant_failed",
+  "_variant": "pair_mac",
+  "_source": "omlx/cluster/assistant/models.py::plan_error_payload",
+  "code": "node_not_paired",
+  "message": "node-a has no paired SSH target on this Mac; pair this Mac and retry",
+  "action": "pair_mac"
+}

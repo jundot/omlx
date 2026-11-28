@@ -60,6 +60,48 @@ def test_inspect_safetensors_layout_reads_headers_without_loading_tensors(tmp_pa
     assert layout.tensor_count == 5
 
 
+def test_inspect_safetensors_layout_recognises_qwen4_ple_tables(tmp_path):
+    """The PLE n-gram table is SSD-capable even without a DeepSeek table spec."""
+
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("language_model.model.embed_tokens.weight", 100),
+            ("language_model.model.layers.0.mlp.down_proj.weight", 200),
+            (
+                "language_model.model.layers.1.ple.ple_embedding."
+                "ngram_embedding.shards.0.weight",
+                4096,
+            ),
+            (
+                "language_model.model.layers.1.ple.ple_embedding."
+                "ngram_embedding.shards.0.scales",
+                128,
+            ),
+            ("language_model.model.layers.1.mlp.down_proj.weight", 300),
+        ],
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    # The bytes stay visible in the layer, and the table subset is what a plan
+    # with offload moves off the rank's wired budget.
+    assert layout.layer_weight_bytes == (200, 4524)
+    assert layout.tensor_parallel_ssd_layer_bytes == (0, 4224)
+    assert layout.tensor_parallel_layer_bytes == (200, 300)
+
+
+def test_qwen4_rank_prefixes_are_visible_to_a_cold_planner():
+    """Planning registers the adapter before reading its hidden-weight prefixes."""
+
+    from omlx.cluster import planner
+
+    config = {"model_type": "qwen4_exp"}
+
+    assert "vision_tower." in planner._cluster_unloaded_prefixes(config)
+    assert "mtp." in planner._cluster_mtp_prefixes(config)
+
+
 def test_inspect_safetensors_layout_rejects_offset_past_file(tmp_path):
     header = {
         "model.layers.0.weight": {
@@ -891,6 +933,44 @@ def test_offloaded_engram_tables_stay_out_of_pipeline_rank_memory():
     )
 
 
+def test_offloaded_experts_stay_out_of_pipeline_rank_memory():
+    layout = ModelLayout(
+        source="experts",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(100, 300, 100),
+        supports_pipeline=True,
+    )
+    small = [NodeBudget(node_id="mini", capacity_bytes=320, rank=0)]
+    offload = (0, 200, 0)
+
+    for planner in (plan_unequal_pipeline, plan_proportional_pipeline):
+        with pytest.raises(PlanningError):
+            planner(layout, small)
+        (assignment,) = planner(
+            layout,
+            small,
+            moe_offload_layer_bytes=offload,
+            moe_expert_offload_resident_fraction=0.125,
+        ).assignments
+        assert assignment.layer_weight_bytes == 500
+        assert assignment.ssd_weight_bytes == 0
+        assert assignment.moe_offload_weight_bytes == 200
+        assert assignment.moe_expert_offload_resident_fraction == 0.125
+        assert assignment.planned_weight_bytes == 300
+        assert _assignment_from_dict(assignment.to_dict()) == assignment
+
+    large = [NodeBudget(node_id="studio", capacity_bytes=1000, rank=0)]
+    assert (
+        plan_unequal_pipeline(
+            layout,
+            large,
+            moe_offload_layer_bytes=offload,
+            moe_expert_offload_resident_fraction=0.125,
+        ).plan_hash
+        != plan_unequal_pipeline(layout, large).plan_hash
+    )
+
+
 def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
     tmp_path, monkeypatch
 ):
@@ -1030,3 +1110,26 @@ def test_explicit_support_declaration_wins_over_vision_guard(monkeypatch):
     )
     config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 8}}
     assert planner._supports_pipeline(config) is True
+
+
+def test_qwen4_exp_is_pipeline_capable_after_registration():
+    """R1 decision: Qwen4-Exp (Qwen3.8) runs PP, not TP.
+
+    A cold planner only knows the adapter once registration ran, which is what
+    ``inspect_safetensors_layout`` does before capability detection. Pin that so
+    the family cannot silently fall back to "not pipeline-capable" and be
+    refused for a multi-Mac plan.
+    """
+
+    import sys
+
+    from omlx.cluster import planner
+
+    config = {"model_type": "qwen4_exp"}
+    module = planner._cluster_rank_module(config)
+
+    assert module is not None
+    assert getattr(module, "SUPPORTS_PIPELINE", None) is True
+    assert getattr(module, "HONORS_PIPELINE_ASSIGNMENT", None) is True
+    assert planner._supports_pipeline(config) is True
+    assert sys.modules.get("mlx_lm.models.qwen4_exp") is module
