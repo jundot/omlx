@@ -13,6 +13,7 @@ against the DeepSeek-V4.1-Flash-1017 reference.
 from functools import lru_cache
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from . import decode_layer as DL
@@ -82,17 +83,20 @@ def _woa_mxfp8(att):
     32-group: quantizing back is lossless (verified bitwise on all 40 layers of
     DeepSeek-V4.1-Flash and -1017), and the einsum's products are unchanged. Checked once per
     layer; a wo_a that does not round-trip exactly keeps the unfused path."""
-    cached = getattr(att, "_woa_mx", None)
-    if cached is None:
-        w = att.wo_a.weight
-        cached = False
-        if not isinstance(att.wo_a, QuantizedProjection) and w.dtype == mx.bfloat16 and w.shape[-1] % 32 == 0:
-            q, s = mx.quantize(w, group_size=32, bits=8, mode="mxfp8")[:2]
-            back = mx.dequantize(q, s, None, group_size=32, bits=8, mode="mxfp8", dtype=w.dtype)
-            if bool(mx.array_equal(back, w).item()):
-                cached = (q, s)
-        object.__setattr__(att, "_woa_mx", cached)
-    return cached or None
+    if isinstance(att.wo_a, nn.QuantizedLinear):
+        return att.wo_a.weight, att.wo_a.scales
+    w = att.wo_a.weight
+    if not isinstance(att.wo_a, QuantizedProjection) and w.dtype == mx.bfloat16 and w.shape[-1] % 32 == 0:
+        q, s = mx.quantize(w, group_size=32, bits=8, mode="mxfp8")[:2]
+        back = mx.dequantize(q, s, None, group_size=32, bits=8, mode="mxfp8", dtype=w.dtype)
+        if bool(mx.array_equal(back, w).item()):
+            mxfp8 = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+            nn.Module.__init__(mxfp8)
+            mxfp8.weight, mxfp8.scales = q, s
+            mxfp8.group_size, mxfp8.bits, mxfp8.mode = 32, 8, "mxfp8"
+            att.wo_a = mxfp8
+            return q, s
+    return None
 
 
 def _fused_projection(p):
@@ -886,10 +890,11 @@ def decode_block_verify_nb(blk, h, pre, caches, shareds, starts, c):
 
 
 def supported(blk, c):
-    """Static support check for a decoder block (cached on the block): the layouts the fused
+    """Support check for a decoder block (cached on the block): the layouts the fused
     kernels read (MXFP8 or affine attention projections with FP8-quantized inputs, an exactly
     MXFP8-representable bf16 wo_a, MXFP4 / MXFP8 / affine routed and MXFP8 / affine shared
-    experts) and the shapes they assume. Anything else keeps the unfused path."""
+    experts) and the shapes they assume. Anything else keeps the unfused path. A supported
+    block keeps its wo_a as MXFP8 only (see _woa_mxfp8)."""
     ok = getattr(blk, "_fused_decode_ok", None)
     if ok is None:
         att = blk.attn
