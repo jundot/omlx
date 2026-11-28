@@ -65,7 +65,7 @@ def test_external_prefill_resumes_without_replaying_tokens(
     scheduler._prefill_min_chunk_tokens = 4
     pause_at = cached_tokens + 4 * pause_after_chunks
 
-    def current_usage():
+    def current_usage(**_):
         return 60 if len(model.seen) >= pause_at else 0
 
     monkeypatch.setattr(scheduler, "_current_usage_bytes", current_usage)
