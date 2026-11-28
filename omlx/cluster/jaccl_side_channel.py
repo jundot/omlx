@@ -13,14 +13,17 @@ data path used after initialization.
 from __future__ import annotations
 
 import os
+import selectors
 import socket
 import struct
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
+
+from .coordinator_route import coordinator_addresses, listen_addresses
 
 _RANK_BYTES = struct.Struct("!I")
 _DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS = 20.0
@@ -33,7 +36,7 @@ _SYSTEM_PYTHON = "/usr/bin/python3"
 # tiny, standard-library-only helper owns only the one-time JACCL metadata
 # socket.  The parent still owns every RDMA queue pair and collective.
 _SIDECAR_PROGRAM = r"""
-import socket, struct, sys, time
+import select, socket, struct, sys, time
 
 RANK = struct.Struct("!I")
 
@@ -77,25 +80,37 @@ def connect(host, port, timeout):
             time.sleep(0.05)
     raise RuntimeError("side-channel could not reach coordinator: %s" % error)
 
-def bootstrap(host, port, rank, size, timeout):
+def accept(listeners, timeout):
+    for listener in select.select(listeners, [], [], timeout)[0]:
+        try:
+            return listener.accept()[0]
+        except BlockingIOError:
+            pass
+    return None
+
+def bootstrap(hosts, port, rank, size, timeout):
     if rank:
-        peer = connect(host, port, timeout)
+        peer = connect(hosts[0], port, timeout)
         peer.sendall(RANK.pack(rank))
         return peer
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listeners = []
     try:
-        listener.bind((host, port))
-        listener.listen(size)
-        listener.settimeout(timeout)
+        for host in hosts:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listeners.append(listener)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((host, port))
+            listener.listen(size)
+            listener.setblocking(False)
         peers = [None] * size
         deadline = time.monotonic() + timeout
         while any(peer is None for peer in peers[1:]):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("side-channel timed out waiting for ranks")
-            listener.settimeout(remaining)
-            peer, _ = listener.accept()
+            peer = accept(listeners, remaining)
+            if peer is None:
+                continue
             try:
                 peer.settimeout(timeout)
                 peer_rank = RANK.unpack(sock_recv_exact(peer, RANK.size))[0]
@@ -107,13 +122,14 @@ def bootstrap(host, port, rank, size, timeout):
             peers[peer_rank] = peer
         return peers
     finally:
-        listener.close()
+        for listener in listeners:
+            listener.close()
 
 def main():
-    host, port, rank, size, timeout = (
-        sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5])
+    hosts, port, rank, size, timeout = (
+        sys.argv[1].split(","), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5])
     )
-    peers = bootstrap(host, port, rank, size, timeout)
+    peers = bootstrap(hosts, port, rank, size, timeout)
     source, sink = sys.stdin.buffer, sys.stdout.buffer
     while True:
         header = recv_exact(source, RANK.size, allow_eof=True)
@@ -160,6 +176,37 @@ def _coordinator_endpoint() -> tuple[str, int]:
             "JACCL side channel currently requires an IPv4 coordinator"
         ) from exc
     return host, port
+
+
+def _coordinator_route(rank: int, size: int) -> tuple[tuple[str, ...], int]:
+    """Where rank zero listens, or the one address another rank connects to.
+
+    ``MLX_JACCL_COORDINATOR`` is the same for every rank. Macs cabled as a mesh
+    reach rank zero on a different address each, and rank zero then listens on
+    all of them.
+    """
+
+    host, port = _coordinator_endpoint()
+    addresses = coordinator_addresses(size, host)
+    if rank == 0:
+        return listen_addresses(addresses), port
+    return (addresses[rank],), port
+
+
+def _accept(listeners: Sequence[socket.socket], timeout: float) -> socket.socket | None:
+    """The next connection on any of ``listeners``, if one arrives in time."""
+
+    # selectors rather than select(): a rank that holds many open files can
+    # hand these sockets descriptors select() cannot address.
+    with selectors.DefaultSelector() as selector:
+        for listener in listeners:
+            selector.register(listener, selectors.EVENT_READ)
+        for key, _events in selector.select(timeout):
+            try:
+                return key.fileobj.accept()[0]
+            except BlockingIOError:
+                continue
+    return None
 
 
 def _recv_exact(sock: socket.socket, n_bytes: int) -> bytes:
@@ -209,19 +256,22 @@ class _SocketAllGather:
         self.timeout = _DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS
         self._lock = threading.Lock()
         self._peers: list[socket.socket] | socket.socket
-        host, port = _coordinator_endpoint()
+        hosts, port = _coordinator_route(rank, size)
         if rank == 0:
-            self._peers = self._accept_peers(host, port)
+            self._peers = self._accept_peers(hosts, port)
         else:
-            self._peers = self._connect(host, port)
+            self._peers = self._connect(hosts[0], port)
 
-    def _accept_peers(self, host: str, port: int) -> list[socket.socket]:
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    def _accept_peers(self, hosts: Sequence[str], port: int) -> list[socket.socket]:
+        servers: list[socket.socket] = []
         try:
-            server.bind((host, port))
-            server.listen(self.size)
-            server.settimeout(self.timeout)
+            for host in hosts:
+                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                servers.append(server)
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind((host, port))
+                server.listen(self.size)
+                server.setblocking(False)
             peers: list[socket.socket | None] = [None] * self.size
             deadline = time.monotonic() + self.timeout
             while any(peer is None for peer in peers[1:]):
@@ -230,8 +280,9 @@ class _SocketAllGather:
                     raise RuntimeError(
                         "JACCL side channel timed out waiting for every rank"
                     )
-                server.settimeout(remaining)
-                peer, _address = server.accept()
+                peer = _accept(servers, remaining)
+                if peer is None:
+                    continue
                 try:
                     peer.settimeout(self.timeout)
                     peer_rank = _RANK_BYTES.unpack(_recv_exact(peer, _RANK_BYTES.size))[
@@ -252,7 +303,8 @@ class _SocketAllGather:
                     peer.close()
             raise
         finally:
-            server.close()
+            for server in servers:
+                server.close()
 
     def _connect(self, host: str, port: int) -> socket.socket:
         deadline = time.monotonic() + self.timeout
@@ -312,7 +364,7 @@ class _SidecarAllGather:
     def __init__(self, rank: int, size: int) -> None:
         if not 0 <= rank < size or size < 2:
             raise RuntimeError("JACCL side channel received invalid rank metadata")
-        host, port = _coordinator_endpoint()
+        hosts, port = _coordinator_route(rank, size)
         self.rank = rank
         self.size = size
         self.timeout = _DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS
@@ -329,7 +381,7 @@ class _SidecarAllGather:
                 "-u",
                 "-c",
                 _SIDECAR_PROGRAM,
-                host,
+                ",".join(hosts),
                 str(port),
                 str(rank),
                 str(size),

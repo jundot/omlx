@@ -992,6 +992,57 @@ def test_a_thunderbolt_cable_the_cluster_cannot_use_is_named_before_activation(
     assert "self-assigned 169.254" in warning and "Wi-Fi" in warning
 
 
+def test_autoconfigure_gives_the_third_mac_of_a_mesh_its_own_route_to_rank_zero(
+    monkeypatch,
+):
+    # A Thunderbolt cable with RDMA between every pair of Macs, each cable
+    # its own subnet.
+    hosts = {
+        "127.0.0.1": ["10.0.1.1", "10.0.2.1"],
+        "studio.local": ["10.0.1.2", "10.0.3.2"],
+        "mini.local": ["10.0.2.3", "10.0.3.3"],
+    }
+    _readings(
+        monkeypatch,
+        {
+            host: _interfaces(
+                host, [("en4", ips[0], 24), ("en5", ips[1], 24)], rdma={"en4", "en5"}
+            )
+            for host, ips in hosts.items()
+        },
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+
+    proposal = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_size_bytes": 40 * 1024**3,
+                "layer_count": 32,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * 1024**3}
+                    for index in range(3)
+                ],
+                "hosts": [
+                    {"node_id": f"node-{index}", "ssh": host, "ips": [ips[0]]}
+                    for index, (host, ips) in enumerate(hosts.items())
+                ],
+            },
+        )
+        .json()
+    )
+
+    assert proposal["activation"]["backend"] == "jaccl"
+    # mlx.launch announces 10.0.1.1, rank zero's end of its cable to rank one.
+    # Rank one reaches it there; rank two only on the cable it shares with zero.
+    routes_by_rank = [
+        host.get("coordinator_ip") for host in proposal["activation"]["hosts"]
+    ]
+    assert routes_by_rank == [None, None, "10.0.2.1"]
+
+
 def test_autoconfigure_rejects_an_invalid_manual_ip_before_planning():
     response = _client().post(
         "/admin/api/cluster/autoconfigure",

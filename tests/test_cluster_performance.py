@@ -5,6 +5,7 @@ import importlib
 import json
 import subprocess
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -12,7 +13,7 @@ import pytest
 
 from omlx.cluster import runtime_optimizations
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
-from omlx.cluster.launch import run_cluster_performance_probe
+from omlx.cluster.launch import DistributedLaunchError, run_cluster_performance_probe
 from omlx.cluster.performance import (
     NodePerformanceProfile,
     execution_profile,
@@ -286,6 +287,51 @@ def test_cluster_performance_probe_never_passes_ring_connections_to_jaccl():
     assert report["ok"] is True
     assert report["backend"] == "jaccl"
     assert report["connections_per_ip"] == 1
+
+
+@pytest.mark.parametrize("coordinator_ip", [None, "10.0.2.1"])
+def test_ranks_learn_their_route_to_rank_zero_from_the_hostfile_alone(
+    monkeypatch, coordinator_ip
+):
+    # In the server's own environment. Rank zero, mlx.launch's child, would
+    # inherit it and name rank zero for the wrong cluster.
+    monkeypatch.setenv("OMLX_COORDINATOR_ADDRESSES", "10.9.0.1,10.9.0.1")
+    # Hosts as the deployment registry restores them. On a cabled mesh the
+    # third Mac reaches rank zero on a subnet rank one does not use.
+    hosts = (
+        {"node_id": "local", "ssh": "127.0.0.1", "ips": ["10.0.1.1"]},
+        {"node_id": "studio", "ssh": "studio.local", "ips": ["10.0.1.2"]},
+        {
+            "node_id": "mini",
+            "ssh": "mini.local",
+            "ips": ["10.0.2.3"],
+            "coordinator_ip": coordinator_ip,
+        },
+    )
+    deployment = replace(
+        _deployment(),
+        hosts=tuple(ClusterHost.from_dict(host) for host in hosts),
+        assignments=(
+            PipelineAssignment("local", 0, 4, 6, 20, 0, 0, 100),
+            PipelineAssignment("studio", 1, 2, 4, 20, 0, 0, 100),
+            PipelineAssignment("mini", 2, 0, 2, 20, 0, 0, 100),
+        ),
+    )
+    launched = {}
+
+    def runner(argv, *, timeout, env):
+        hostfile = json.loads(Path(argv[argv.index("--hostfile") + 1]).read_text())
+        exported = dict(item.split("=", 1) for item in hostfile["envs"])
+        launched["exported"] = exported.get("OMLX_COORDINATOR_ADDRESSES")
+        launched["inherited"] = env.get("OMLX_COORDINATOR_ADDRESSES")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    # No rank runs; what matters is what mlx.launch was handed.
+    with pytest.raises(DistributedLaunchError):
+        run_cluster_performance_probe(deployment, runner=runner)
+
+    exported = None if coordinator_ip is None else "10.0.1.1,10.0.1.1,10.0.2.1"
+    assert launched == {"exported": exported, "inherited": None}
 
 
 class _ValidatedPipeline:

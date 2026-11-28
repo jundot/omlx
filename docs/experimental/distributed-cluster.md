@@ -83,6 +83,13 @@ On every Mac:
 5. For JACCL, configure Thunderbolt RDMA outside oMLX and confirm `rdma_ctl
    status` and `ibv_devices` report the link.
 
+With three or more Macs, JACCL needs a direct RDMA link between every pair.
+The cables do not have to share a subnet. Each rank is launched with the
+address it shares with rank zero, and rank zero accepts the launch connections
+on every one of those addresses. Two Macs, and Macs that share one subnet, are
+launched as before. The TCP ring still addresses each Mac by one IP, so it
+needs a subnet every Mac can reach.
+
 Rank zero is the Mac whose dashboard activates the deployment. It owns the
 late pipeline layers and the private inference coordinator. For a 256 GiB Mac
 paired with a 128 GiB Mac, rank zero should normally be the larger machine.
