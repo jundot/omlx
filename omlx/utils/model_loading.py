@@ -885,6 +885,16 @@ def maybe_apply_pre_load_patches(
         if apply_inkling2_patch():
             logger.info("Inkling 2 pre-load patch applied for %s", model_name)
 
+    # SenseNova-Loop (VLM engine): apply the DFlash2 VLM adaptation so the
+    # 5-feature drafter and 56-slot execution plan are registered before the
+    # VLM engine binds the DFlash drafter. The MTP side is routed through
+    # mlx_vlm_mtp (see _RUNTIME_PATCHES_BY_TYPE in patches/mlx_vlm_mtp).
+    if for_vlm and model_type in _SENSENOVA_LOOP_MODEL_TYPES:
+        from ..patches.sensenova_loop_dflash_vlm import apply as _sl_dflash_apply
+
+        if _sl_dflash_apply():
+            logger.info("SenseNova-Loop DFlash2 VLM patch applied for %s", model_name)
+
     text_config = config.get("text_config")
     text_model_type = (
         text_config.get("model_type") if isinstance(text_config, dict) else None
@@ -1463,6 +1473,9 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
 
 
 # Model types whose engine runs DFlash as a block drafter, by engine type.
+_SENSENOVA_LOOP_MODEL_TYPES = ("sensenova_loop",)
+
+
 _DFLASH_BATCHED_MODEL_TYPES = {
     "vlm": (
         "qwen3_5",
@@ -1472,6 +1485,11 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         "gemma4",
         "gemma4_unified",
         "muse_glimmer",
+        # SenseNova-Loop (5-feature DFlash2 drafter) on the VLM engine.  The
+        # VLM adaptation lives in patches/sensenova_loop_dflash_vlm.py +
+        # patches/mlx_vlm_mtp/sensenova_loop_vlm_mtp.py, both applied at
+        # runtime so mlx-vlm core stays stock.
+        "sensenova_loop",
     ),
     "batched": (
         "qwen3_5",
@@ -1566,6 +1584,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type == "step3p7"
         or model_type == "bailing_hybrid"
         or model_type in ("hy_v4_vl", "hy_v4_flash")
+        or model_type in _SENSENOVA_LOOP_MODEL_TYPES
     )
 
 
