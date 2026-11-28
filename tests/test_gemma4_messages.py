@@ -296,6 +296,18 @@ class TestExtractGemma4Messages:
         assert "tool_calls" in result[0]
         assert result[0]["tool_calls"][0]["function"]["name"] == "search"
 
+    def test_tool_call_step_keeps_thought_as_reasoning_content(self):
+        """Per Gemma 4 docs: thoughts must not be removed between function
+        calls, so a tool-call step keeps its thought as reasoning_content."""
+        msg = Message(
+            role="assistant",
+            content="<think>\nplanning\n</think>\n",
+            tool_calls=[_tool_call_dict("c1", "search")],
+        )
+        result = extract_gemma4_messages([msg])
+        assert result[0]["content"] == ""
+        assert result[0]["reasoning_content"] == "planning"
+
     def test_stray_tool_call_close_marker_stripped_from_content(self):
         """Stray ``<tool_call|>`` in content is stripped; tool_calls are preserved."""
         msg = Message(
