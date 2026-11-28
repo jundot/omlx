@@ -8662,6 +8662,77 @@ class Scheduler:
     # Fewest re-prefill tokens a branch point must save to get a shared tail:
     # below it the re-prefill costs less than the snapshot and its two SSD files.
     _JUNCTION_MIN_TOKENS = 512
+    # A paragraph tail is only planned in the last this many tokens before the
+    # generation prompt: a question appended to a long document.
+    _PARAGRAPH_TAIL_WINDOW = 4096
+
+    def _paragraph_break_token_ids(self) -> frozenset[int]:
+        """Token ids that are a run of two or more newlines (paragraph breaks)."""
+        cached = getattr(self, "_paragraph_breaks", None)
+        if cached is not None:
+            return cached
+        breaks: set[int] = set()
+        try:
+            for n in range(2, 7):
+                ids = self.tokenizer.encode("\n" * n, add_special_tokens=False)
+                if len(ids) == 1:
+                    breaks.add(ids[0])
+                ids = self.tokenizer.encode("x:" + "\n" * n, add_special_tokens=False)
+                if not ids:
+                    continue
+                # A run split as ["\n" * 4, "\n"] ends in a single newline: skip it.
+                decoded = self.tokenizer.decode([ids[-1]])
+                if len(decoded) >= 2 and decoded.strip("\n") == "":
+                    breaks.add(ids[-1])
+        except Exception:  # noqa: BLE001
+            breaks = set()
+        self._paragraph_breaks = frozenset(breaks)
+        return self._paragraph_breaks
+
+    def _resolve_paragraph_end(self, request: "Request") -> None:
+        """Plan a shared tail at the last paragraph break before the question.
+
+        A hybrid model resumes only at a block boundary or at a stored tail, so
+        the first new question on a cached document re-prefills from the last
+        block boundary (up to a block of document plus the question) until a
+        second question records the branch point. A prompt with neither a
+        branch point nor a system prefix stop keeps a tail at its last run of
+        newlines in the last ``_PARAGRAPH_TAIL_WINDOW`` tokens before the
+        generation prompt, where a different question on the same document
+        usually starts.
+        """
+        if getattr(request, "junction_end", 0) or getattr(
+            request, "system_prefix_end", 0
+        ):
+            return
+        block_size = self.config.paged_cache_block_size
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if (
+            block_size <= 0
+            or not token_ids
+            or not self._detect_boundary_snapshot_need()
+        ):
+            return
+        breaks = self._paragraph_break_token_ids()
+        if not breaks:
+            return
+        limit = getattr(request, "generation_prompt_start", 0) or len(token_ids) - 1
+        cached = request.cached_tokens or 0
+        lowest = max(
+            cached + self._JUNCTION_MIN_TOKENS, limit - self._PARAGRAPH_TAIL_WINDOW
+        )
+        for i in range(limit - 2, lowest - 1, -1):
+            if token_ids[i] in breaks:
+                end = i + 1
+                if end % block_size:
+                    request.junction_end = end
+                    logger.info(
+                        "prefix cache: request %s keeps a shared tail at its last "
+                        "paragraph break, token %d",
+                        request.request_id,
+                        end,
+                    )
+                return
 
     def _resolve_junction_end(self, request: "Request") -> None:
         """Plan a shared tail where this prompt leaves a recently stored sequence.
@@ -11595,6 +11666,7 @@ class Scheduler:
         # triage), decoded token context at DEBUG (issue #1003).
         self._log_prefix_divergence(request)
         self._resolve_junction_end(request)
+        self._resolve_paragraph_end(request)
 
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
