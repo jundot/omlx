@@ -83,6 +83,7 @@ _OQ_DEFAULT_GROUP_SIZE = 64
 _GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 _GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
 _MINIMAX_INDEXER_PROJECTIONS = ("index_q_proj", "index_k_proj")
+_NEMOTRON_H_MODEL_TYPES = ("nemotron_h", "nemotron_h_puzzle")
 _HY_V4_MODEL_TYPES = ("hy_v4_vl", "hy_v4_flash")
 _HY_V4_INDEXER_PROJECTIONS = (
     ".self_attn.indexer.wq_b",
@@ -742,6 +743,7 @@ def _is_token_embedding_tensor(path: str) -> bool:
             ".tok_embeddings.weight",
             ".word_embeddings.weight",
             ".wte.weight",
+            "backbone.embeddings.weight",
             f"{inkling2_layout.EMBED_PATH}.weight",
         )
     )
@@ -1022,6 +1024,9 @@ def universal_quant_predicate(
 
 def _is_vision_tensor(name: str) -> bool:
     """Check if a tensor belongs to the vision encoder/projector."""
+    if name.startswith("mlp1."):
+        # InternVL-style projector (Nemotron-H Omni).
+        return True
     return any(
         p in name
         for p in (
@@ -6452,6 +6457,14 @@ def _source_imatrix_signature(
         # GLM-5.3 needs its mHC-expanded layer walk plus the untied output-head
         # capture. Older caches completed without either and must not be reused.
         signature["layer_walk"] = "glm5_next_hc_moe_lm_head_v4"
+    elif model_type in _NEMOTRON_H_MODEL_TYPES or (
+        isinstance(config.get("llm_config"), dict)
+        and str(config["llm_config"].get("model_type", "")).lower()
+        in _NEMOTRON_H_MODEL_TYPES
+    ):
+        # The generic walk used attention masks for Mamba and omitted the
+        # norm_f-normalized LM head. Bolt's source still uses llm_config here.
+        signature["layer_walk"] = "nemotron_h_ssm_mask_lm_head_v1"
     else:
         # The first layer input from the model's own forward, blocks bound by
         # parameter name, boolean and sliding-window masks, per-row position
@@ -8922,6 +8935,13 @@ def _find_model_layers(model):
     elif hasattr(model, "backbone") and hasattr(model.backbone, "embeddings"):
         embed_fn = model.backbone.embeddings
         layers = model.layers
+    elif (
+        getattr(getattr(model, "language_model", None), "model_type", None)
+        in _NEMOTRON_H_MODEL_TYPES
+    ):
+        # Omni's text wrapper inherits its model_type from the text config.
+        embed_fn = model.language_model.backbone.embeddings
+        layers = model.language_model.layers
 
     return embed_fn, layers
 
@@ -9510,7 +9530,8 @@ def _is_recurrent_layer(layer) -> bool:
         return not bool(layer.is_global)
     if hasattr(layer, "is_attention_layer"):
         return not bool(layer.is_attention_layer)
-    return False
+    # Nemotron-H's Mamba blocks use a padding mask; unpadded prompts need none.
+    return getattr(layer, "block_type", None) == "M"
 
 
 # Layer or attention attributes that mark a sliding-window layer.
@@ -10114,6 +10135,8 @@ class OQImatrixCollector:
 def _collect_untied_lm_head_imatrix(core, hidden, collector, name) -> bool:
     """Capture normalized head inputs without materializing vocabulary logits."""
     norm = getattr(core, "norm", None)
+    if norm is None:
+        norm = getattr(core, "norm_f", None)
     if core is None or norm is None:
         return False
     module = collector._original_modules.get(name)
@@ -10128,6 +10151,12 @@ def _collect_untied_lm_head_imatrix(core, hidden, collector, name) -> bool:
 
 
 def _collect_language_model_lm_head_imatrix(model, hidden, collector) -> bool:
+    text_model = getattr(model, "language_model", model)
+    if getattr(text_model, "model_type", None) in _NEMOTRON_H_MODEL_TYPES:
+        name = "language_model.lm_head" if text_model is not model else "lm_head"
+        return _collect_untied_lm_head_imatrix(
+            getattr(text_model, "backbone", None), hidden, collector, name
+        )
     model_type = str(getattr(model, "model_type", ""))
     if model_type not in ("glm5_next", "flint", *_HY_V4_MODEL_TYPES):
         return False
