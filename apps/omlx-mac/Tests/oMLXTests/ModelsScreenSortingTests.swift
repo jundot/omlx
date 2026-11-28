@@ -75,6 +75,28 @@ final class ModelsScreenSortingTests: XCTestCase {
         XCTAssertEqual(sortModelsByName(Array(models.reversed())).map(\.id), ["first", "second"])
     }
 
+    func testFilterModelsByNameMatchesIDDisplayNameAndAliasInInputOrder() throws {
+        let models = try [
+            makeModel("alias-match", displayName: "Zulu", settings: ["model_alias": "My-QWEN"]),
+            makeModel("unrelated"),
+            makeModel("qwen-id", displayName: "Alpha"),
+            makeModel("display-match", displayName: "Vendor/Qwen"),
+        ]
+
+        XCTAssertEqual(
+            filterModelsByName(models, query: " \nQwEn \t").map(\.id),
+            ["alias-match", "qwen-id", "display-match"]
+        )
+    }
+
+    func testFilterModelsByNameHandlesEmptyAndUnmatchedQueries() throws {
+        let models = try [makeModel("Qwen"), makeModel("Llama")]
+
+        XCTAssertEqual(filterModelsByName(models, query: ""), models)
+        XCTAssertEqual(filterModelsByName(models, query: " \n\t"), models)
+        XCTAssertTrue(filterModelsByName(models, query: "missing").isEmpty)
+    }
+
     private func makeModel(
         _ id: String, displayName: String? = nil, settings: Any? = nil
     ) throws -> ModelDTO {
