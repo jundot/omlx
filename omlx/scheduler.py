@@ -124,8 +124,9 @@ from .utils.hardware import format_bytes
 from .utils.metal_sync import (
     _default_generation_stream,
     _mx_buffer_access_lock,
-    background_store_holds_lock,
     _sync_and_clear_cache,
+    _try_sync_and_clear_cache,
+    background_store_holds_lock,
     clear_thread_streams,
     set_chunk_memory_limit,
     unreleased_graphics_bytes,
@@ -6312,11 +6313,8 @@ class Scheduler:
         # release, so a footprint delta read here can miss the whole pool.
         pooled = int(mx.get_cache_memory())
         residual = _graphics_residual() if pooled > 0 else None
-        if defer_to_background_store:
-            if (
-                _sync_and_clear_cache(self._stream, defer_to_background_store=True)
-                is False
-            ):
+        if defer_to_background_store and background_store_holds_lock.is_set():
+            if not _try_sync_and_clear_cache(self._stream):
                 self._pool_clear_deferred = True
                 return
         else:
@@ -7805,12 +7803,12 @@ class Scheduler:
                 self._emit_prefill_tail_snapshot(
                     state.request, state.cache, total_tokens
                 )
-        elif more and self.config.paged_cache_block_size > 0:
+        elif more and state.block_size > 0:
             total_tokens = state.base_size + state.tokens_processed
             self._maybe_incremental_store(
                 state.request,
                 state.cache,
-                total_tokens - total_tokens % self.config.paged_cache_block_size,
+                total_tokens - total_tokens % state.block_size,
                 False,
             )
 

@@ -19,7 +19,7 @@ from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.utils.metal_sync import (
     _mx_buffer_access_lock,
     _sync_and_clear_cache,
-    background_store_holds_lock,
+    _try_sync_and_clear_cache,
     mx_buffer_lock_released,
 )
 
@@ -495,20 +495,14 @@ def test_the_routine_clear_is_deferred_while_a_store_holds_the_lock():
     """Between prefill chunks the clear does not wait for a store that holds
     the lock: it reports that it did not run, and runs once the lock is free."""
     result = {}
-    background_store_holds_lock.set()
-    try:
-        with _mx_buffer_access_lock:
-            worker = threading.Thread(
-                target=lambda: result.setdefault(
-                    "cleared", _sync_and_clear_cache(defer_to_background_store=True)
-                )
-            )
-            worker.start()
-            worker.join(5)
-        assert result == {"cleared": False}
-        assert _sync_and_clear_cache(defer_to_background_store=True) is True
-    finally:
-        background_store_holds_lock.clear()
+    with _mx_buffer_access_lock:
+        worker = threading.Thread(
+            target=lambda: result.setdefault("cleared", _try_sync_and_clear_cache())
+        )
+        worker.start()
+        worker.join(5)
+    assert result == {"cleared": False}
+    assert _try_sync_and_clear_cache() is True
 
 
 def test_chunk_sizing_leaves_out_the_pool_of_a_deferred_clear(monkeypatch):
@@ -523,14 +517,15 @@ def test_chunk_sizing_leaves_out_the_pool_of_a_deferred_clear(monkeypatch):
         _current_usage_bytes=lambda: 9_000,
         _incremental_copy_bytes_in_flight=lambda: 0,
     )
-    monkeypatch.setattr(sch, "_sync_and_clear_cache", lambda *a, **k: False)
+    monkeypatch.setattr(sch.background_store_holds_lock, "is_set", lambda: True)
+    monkeypatch.setattr(sch, "_try_sync_and_clear_cache", lambda stream: False)
     sch.Scheduler._clear_cache(sched, defer_to_background_store=True)
     assert sched._pool_clear_deferred is True
     assert sched._prefill_chunk_pool is not None
     assert sch.Scheduler._prefill_sizing_usage_bytes(sched) == 6_000
     sched._last_mlx_cache_memory_bytes = 8_000
     assert sch.Scheduler._prefill_sizing_usage_bytes(sched) == 4_000
-    monkeypatch.setattr(sch, "_sync_and_clear_cache", lambda *a, **k: True)
+    monkeypatch.setattr(sch, "_try_sync_and_clear_cache", lambda stream: True)
     sch.Scheduler._clear_cache(sched, defer_to_background_store=True)
     assert sched._pool_clear_deferred is False
     assert sched._prefill_chunk_pool is None
