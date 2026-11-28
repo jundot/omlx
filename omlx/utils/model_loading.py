@@ -853,6 +853,11 @@ def maybe_apply_pre_load_patches(
         if apply_raon1_mini_patch():
             logger.info("Raon-1 mini pre-load patch applied for %s", model_name)
 
+    if model_type == "ricursive":
+        from ..patches.ripple import apply_ripple_patch
+
+        apply_ripple_patch()
+
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured
         # parser during ``lm_load_compat``; register both before that load starts.
@@ -1477,6 +1482,7 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         "muse_glimmer",
     ),
     "batched": (
+        "ricursive",
         "qwen3_5",
         "qwen3_5_moe",
         "qwen3",
@@ -1500,7 +1506,7 @@ def dflash_compatibility(
     if dflash_batched_supported(model_type, engine_type):
         return True, ""
     return False, (
-        "DFlash supports Qwen3, Qwen3.5/3.6, Laguna, MiMo V2, GLM-5.3, Gemma 4, "
+        "DFlash supports Qwen3, Qwen3.5/3.6, Laguna, Ripple, MiMo V2, GLM-5.3, Gemma 4, "
         "Muse Glimmer and MiniCPM-V 4.7 models "
         f"(model_type='{model_type or ''}', "
         f"engine='{engine_type}')"

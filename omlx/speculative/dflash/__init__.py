@@ -66,6 +66,19 @@ def resolve_verify_mode(mode: str | None) -> bool:
     raise ValueError(f"unknown dflash_verify_mode {mode!r}")
 
 
+# The official Ripple server uses a 16K draft window, the training row length.
+_RIPPLE_DRAFT_WINDOW = 16384
+
+
+def _ripple_draft_layout(config: dict) -> bool:
+    return (
+        config.get("architectures") == ["DFlash2DraftModel"]
+        and config.get("no_rope_layers") == [4]
+        and config.get("layer_types") == ["sliding_attention"] * 4 + ["full_attention"]
+        and config.get("num_target_layers") == 80
+    )
+
+
 def context_bytes_per_row(config: dict, window: int | None = None) -> int:
     """Bytes one request's drafter context can hold, from the draft config.
 
@@ -87,6 +100,7 @@ def context_bytes_per_row(config: dict, window: int | None = None) -> int:
         window
         or dflash_config.get("draft_window_size")
         or config.get("draft_window_size")
+        or (_RIPPLE_DRAFT_WINDOW if _ripple_draft_layout(config) else None)
         or config.get("sliding_window")
         or 2048
     )
@@ -136,9 +150,7 @@ def match_target_dtype(model: nn.Module, target_model: Any) -> int:
     """
     if _target_float_dtype(target_model) != mx.float16:
         return 0
-    params = [
-        p for _, p in tree_flatten(model.parameters()) if p.dtype == mx.bfloat16
-    ]
+    params = [p for _, p in tree_flatten(model.parameters()) if p.dtype == mx.bfloat16]
     if not params:
         return 0
     peak = mx.max(mx.stack([mx.abs(p).max().astype(mx.float32) for p in params]))
@@ -149,9 +161,11 @@ def match_target_dtype(model: nn.Module, target_model: Any) -> int:
         return 0
     model.update(
         tree_map(
-            lambda p: p.astype(mx.float16)
-            if isinstance(p, mx.array) and p.dtype == mx.bfloat16
-            else p,
+            lambda p: (
+                p.astype(mx.float16)
+                if isinstance(p, mx.array) and p.dtype == mx.bfloat16
+                else p
+            ),
             model.parameters(),
         )
     )
@@ -230,6 +244,14 @@ def load_dflash_drafter(
         value_scale=(config.get("dflash_config") or {}).get("attention_value_scale"),
         mask_embedding=mask_embedding,
     )
+    if getattr(target_model, "model_type", None) == "ricursive":
+        if not _ripple_draft_layout(config):
+            raise ValueError("Ripple requires the Ripple-65B-Preview DFlash2 drafter")
+        if window_size and window_size < _RIPPLE_DRAFT_WINDOW:
+            raise ValueError("Ripple requires a draft window of at least 16384 tokens")
+        drafter.no_rope_layers = frozenset(config["no_rope_layers"])
+        drafter._window_size = window_size or _RIPPLE_DRAFT_WINDOW
+
     logger.info(
         "DFlash drafter loaded: path=%s kind=%s block=%d adaptive=%s target_layers=%s",
         path,
