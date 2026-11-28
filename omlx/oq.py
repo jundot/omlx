@@ -7523,6 +7523,12 @@ def quantize_oq_streaming(
         raise ValueError(
             f"oQh does not support model_type {config.get('model_type')!r}"
         )
+    oqh_cap = hadamard and oqh_targets.scheme_for(config).max_level
+    if oqh_cap and oq_level >= oqh_cap:
+        raise ValueError(
+            f"oQh for model_type {config.get('model_type')!r} takes levels "
+            f"below oQ{oqh_cap:g}"
+        )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
@@ -8118,7 +8124,11 @@ def quantize_oq_streaming(
     oqh_plan: dict[str, int] = {}
     if hadamard:
         oqh_plan = _plan_oqh_bits(
-            _budgeted_shapes(named_shapes, config), config, oq_level, group_size
+            _budgeted_shapes(named_shapes, config),
+            config,
+            oq_level,
+            group_size,
+            all_weights.source_quant_info,
         )
         oqh_group = oqh_targets.scheme_for(config).group_size(oq_level)
         logger.info(
@@ -12519,7 +12529,11 @@ def _refine_oqe_output(
 
 
 def _plan_oqh_bits(
-    shapes: dict[str, tuple], config: dict, oq_level, group_size: int
+    shapes: dict[str, tuple],
+    config: dict,
+    oq_level,
+    group_size: int,
+    source_quant_info,
 ) -> dict[str, int]:
     """{path: bits} of the oQh targets within the bytes of their affine plan."""
     scheme = oqh_targets.scheme_for(config)
@@ -12530,6 +12544,9 @@ def _plan_oqh_bits(
         bits, gs, mode = _get_predicate_bits(
             f"{path}.weight", config, oq_level, group_size
         )
+        source = source_quant_info(f"{path}.weight")
+        if source is not None and bits is not None and bits >= source["bits"]:
+            continue
         if bits is not None and mode == "affine" and shape[-1] % gs == 0:
             planned[path] = {"bits": bits, "group_size": gs, "mode": mode}
     return oqh_targets.reinvest(
@@ -12589,15 +12606,18 @@ def _write_oqh_output(
             f"oQh quantization, layer {done}/{total}",
         )
 
-    walk = _refine_oqe_streamed if streamed else _refine_oqe_resident
-    walk(
-        str(source),
-        config,
-        writer,
-        stats,
-        trust_remote_code=trust_remote_code,
-        progress=progress,
-    )
+    if config.get("model_type") == "ernie5_5_moe":
+        ernie5_5_oq.write_oqh(source, writer, stats, progress)
+    else:
+        walk = _refine_oqe_streamed if streamed else _refine_oqe_resident
+        walk(
+            str(source),
+            config,
+            writer,
+            stats,
+            trust_remote_code=trust_remote_code,
+            progress=progress,
+        )
     writer.finish()
     mx.synchronize()
     mx.clear_cache()

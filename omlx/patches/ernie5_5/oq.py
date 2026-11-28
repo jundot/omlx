@@ -206,7 +206,13 @@ def measure_sensitivity(
     return scores
 
 
-def _expert_grams(model, tokens, layers):
+def _expert_grams(source, layers):
+    model, tokens = _calibration(
+        source,
+        oq._OQE_REFINE_CALIB_DATASET,
+        oq._OQE_REFINE_SAMPLES,
+        oq._OQE_REFINE_SEQ_LENGTH,
+    )
     language = model.language_model
     hidden = _embedded(language, tokens)
     for index, layer in enumerate(language.layers):
@@ -226,23 +232,27 @@ def _expert_grams(model, tokens, layers):
         mx.clear_cache()
 
 
+def write_oqh(source, writer, stats, progress):
+    """oQh pass over the routed experts, against source Grams."""
+    layers = {oq._extract_layer_index(name) for name in writer.target_bits}
+    grams = _expert_grams(source, layers)
+    for done, (index, modules, collector) in enumerate(grams, start=1):
+        writer.process(collector, modules, stats)
+        writer.layer_done(index)
+        progress(done, len(layers))
+
+
 def refine_experts(source, output, weight_map, quantization, *, progress):
     """oQe code refinement of the affine routed experts, against source Grams."""
     names = {match[1] for key in weight_map if (match := _AFFINE_EXPERT.fullmatch(key))}
     if not names:
         return {"status": "skipped", "reason": "no affine routed experts"}
-    model, tokens = _calibration(
-        source,
-        oq._OQE_REFINE_CALIB_DATASET,
-        oq._OQE_REFINE_SAMPLES,
-        oq._OQE_REFINE_SEQ_LENGTH,
-    )
     layers = {oq._extract_layer_index(name) for name in names}
     return oq._refine_expert_grams(
         output,
         weight_map,
         quantization,
         names,
-        _expert_grams(model, tokens, layers),
+        _expert_grams(source, layers),
         progress,
     )
