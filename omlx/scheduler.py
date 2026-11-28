@@ -2438,6 +2438,13 @@ class Scheduler:
         # at a time until they leave the scheduler.
         self._pending_memory_requeue = False
         self._memory_requeue_ids: set[str] = set()
+        # Requeues promised to the enforcer that the inference thread has not
+        # carried out, per request; at the cap the enforcer aborts instead.
+        self._memory_requeue_stalls: dict[str, int] = {}
+        # How many requests step() is storing and requeueing right now, else 0.
+        # A poll that lands then is being served: it is answered with this
+        # count, because the queues it would read are being emptied.
+        self._memory_requeue_running_count: int = 0
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
@@ -12607,13 +12614,25 @@ class Scheduler:
         requeued, or 0 when they cannot all be kept, in which case the caller
         aborts as before. Only flags and GIL-atomic reads happen here.
         """
-        if self._pending_memory_requeue:
-            return len(self.running) + len(self.prefilling)
-        if not self._memory_requeue_storage_ready():
-            return 0
+        running_requeue = self._memory_requeue_running_count
+        if running_requeue:
+            # step() is carrying the last ask out right now. The live queues
+            # are being moved to waiting, so reading them here would answer 0
+            # and the enforcer would abort the requests being requeued.
+            return running_requeue
         try:
             live = [*self.running.values(), *self.prefilling]
         except RuntimeError:  # The inference thread changed a queue mid-read.
+            return 0
+        if self._pending_memory_requeue:
+            # step() has not acted on the last ask. Keeping the promise open
+            # forever would hold the memory the enforcer is trying to free.
+            self._note_memory_requeue_stall(live)
+            if any(self._memory_requeue_blocker(r) for r in live):
+                self._pending_memory_requeue = False
+                return 0
+            return len(live)
+        if not self._memory_requeue_storage_ready():
             return 0
         # A lone request is re-admitted at once and needs the same memory.
         if len(live) < 2 or any(self._memory_requeue_blocker(r) for r in live):
@@ -12974,13 +12993,21 @@ class Scheduler:
 
     def _refresh_generation_overflow_recovery_ids(self) -> None:
         """Drop serial-retry markers once the affected requests leave the scheduler."""
-        if not (self._generation_overflow_recovery_ids or self._memory_requeue_ids):
+        if not (
+            self._generation_overflow_recovery_ids
+            or self._memory_requeue_ids
+            or self._memory_requeue_stalls
+        ):
             return
         active_ids = set(self.running)
         active_ids.update(request.request_id for request in self.waiting)
         active_ids.update(request.request_id for request in self.prefilling)
         self._generation_overflow_recovery_ids.intersection_update(active_ids)
         self._memory_requeue_ids.intersection_update(active_ids)
+        # The enforcer thread adds entries; tuple() is one atomic copy.
+        for request_id in tuple(self._memory_requeue_stalls):
+            if request_id not in active_ids:
+                self._memory_requeue_stalls.pop(request_id, None)
 
     def _effective_max_num_seqs(self) -> int:
         """Current admission cap, narrowed for models that require serial decode."""
@@ -15809,6 +15836,10 @@ class Scheduler:
 
     # Requeues per request before a memory-pressure abort.
     _MAX_MEMORY_REQUEUES = 2
+    # Asks that may go unfulfilled per request (a row still in the prefill
+    # batch, or a long step that never drains the flag) before the enforcer
+    # is told to abort. A promise it keeps hearing frees nothing.
+    _MAX_MEMORY_REQUEUE_STALLS = 3
     # Serialized blocks a requeue store may queue ahead of the SSD writer, so
     # it never buffers a whole request in host RAM while memory is short.
     _MEMORY_REQUEUE_PENDING_WRITES = 2
@@ -15821,11 +15852,21 @@ class Scheduler:
             and getattr(self, "_unreconstructible_cache_model", None) is False
         )
 
+    def _note_memory_requeue_stall(self, live: list["Request"]) -> None:
+        for request in live:
+            stalls = self._memory_requeue_stalls
+            stalls[request.request_id] = stalls.get(request.request_id, 0) + 1
+
     def _memory_requeue_blocker(self, request: "Request") -> str | None:
         """Why ``request`` cannot be requeued, or None. Safe on any thread."""
         request_id = request.request_id
         if request.memory_requeues >= self._MAX_MEMORY_REQUEUES:
             return "requeue budget spent"
+        if (
+            self._memory_requeue_stalls.get(request_id, 0)
+            >= self._MAX_MEMORY_REQUEUE_STALLS
+        ):
+            return "requeue stalled"
         if (
             self._specprefill_active_request_id == request_id
             or request.specprefill_indices is not None
@@ -15867,6 +15908,13 @@ class Scheduler:
         return 0
 
     def _process_pending_memory_requeue(self) -> None:
+        """Carry out a pending memory requeue at the start of step()."""
+        try:
+            self._store_and_requeue_live()
+        finally:
+            self._memory_requeue_running_count = 0
+
+    def _store_and_requeue_live(self) -> None:
         """Store every live request to the paged SSD cache and requeue it.
 
         Runs at the start of step() on the inference thread. The batch is
@@ -15883,15 +15931,26 @@ class Scheduler:
             return
         rows: dict[str, tuple[Any, int]] = {}
         for request in live:
-            if self._memory_requeue_blocker(request) is not None:
+            reason = self._memory_requeue_blocker(request)
+            if reason is None and request.request_id not in self._prefill_states:
+                row = self._memory_requeue_row(
+                    self.request_id_to_uid[request.request_id]
+                )
+                if row is None:
+                    # Still in the batch generator's prefill batch.
+                    reason = "no generation row"
+                else:
+                    rows[request.request_id] = row
+            if reason is not None:
+                self._note_memory_requeue_stall(live)
+                logger.warning(
+                    "Memory requeue skipped for %s: %s", request.request_id[:8], reason
+                )
                 return
-            if request.request_id in self._prefill_states:
-                continue
-            row = self._memory_requeue_row(self.request_id_to_uid[request.request_id])
-            if row is None:
-                return
-            rows[request.request_id] = row
 
+        # Committed: polls are answered with this count from here until
+        # _process_pending_memory_requeue() resets it, after the cache clear.
+        self._memory_requeue_running_count = len(live)
         started = time.perf_counter()
         _safe_sync_stream(self._stream)
         kept: list[str] = []
@@ -15931,6 +15990,8 @@ class Scheduler:
         for request in reversed(live):
             self.waiting.appendleft(request)
         self._memory_requeue_ids.update(r.request_id for r in live)
+        for request in live:
+            self._memory_requeue_stalls.pop(request.request_id, None)
         Scheduler._clear_cache(self)
         logger.warning(
             "Memory pressure: requeued %d request(s) in %.1fs; tokens kept in the "
@@ -16561,6 +16622,8 @@ class Scheduler:
         self.uid_to_request_id.clear()
         self._generation_overflow_recovery_ids.clear()
         self._memory_requeue_ids.clear()
+        self._memory_requeue_stalls.clear()
+        self._memory_requeue_running_count = 0
         self._pending_memory_requeue = False
         # Async store_cache bookkeeping. shutdown() drains these before us,
         # but clear here too so reset() is safe to call standalone (e.g. tests
