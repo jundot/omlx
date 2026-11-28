@@ -1909,8 +1909,9 @@ def _ceil_to_contended_grid(tokens: int) -> int:
 
 
 # Model types whose caches cannot join a multi-row batch yet: Llama 4's
-# ChunkedKVCache and Unlimited-OCR's R-SWA ring and DASH caches.
-_SERIAL_MODEL_TYPES = frozenset({"llama4", "unlimited-ocr"})
+# ChunkedKVCache, Unlimited-OCR's R-SWA ring and DASH caches, and
+# SenseNova Loop's hybrid recurrent/convolution state.
+_SERIAL_MODEL_TYPES = frozenset({"llama4", "unlimited-ocr", "sensenova_loop"})
 
 
 def _serial_model_type(model: Any) -> str | None:

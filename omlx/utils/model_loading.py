@@ -629,6 +629,7 @@ def maybe_apply_pre_load_patches(
       ``deepseek_v4*`` model_type.
     - Step 3.7 Flash text-only wrapper (PR 1325) when ``config.json``
       declares ``model_type == "step3p7"``.
+    - SenseNova Loop registration when ``model_type == "sensenova_loop"``.
     - MiMo V2.5 text backbone (PR 1219) when ``config.json`` declares
       ``model_type == "mimo_v2"``. The vendored model intentionally ignores
       the base checkpoint's vision, audio, speech, and MTP weights.
@@ -834,6 +835,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
+
+    if model_type == "sensenova_loop":
+        from ..patches.sensenova_loop import apply_sensenova_loop_patch
+
+        if apply_sensenova_loop_patch():
+            logger.info("SenseNova Loop pre-load patch applied for %s", model_name)
 
     if model_type in {"mimo_v2", "mimo_v2_flash"}:
         from ..patches.mimo_v2 import apply_mimo_v2_patch

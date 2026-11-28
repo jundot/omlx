@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Modified 2026-11-19: defer realtime voice backend imports until requested.
 """
 VLM (Vision-Language Model) engine with continuous batching.
 
@@ -34,7 +35,7 @@ import itertools
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -104,18 +105,42 @@ from .base import (
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
-from .lfm3_realtime import LFM3VoiceBackend
 from .lfm3_speech import SPEECH_MODEL_TYPES, LFM3Speech
-from .qwen3_omni_realtime import Qwen3OmniVoiceBackend
 from .realtime_voice import RealtimeVoiceError, RealtimeVoiceSession
 
 logger = logging.getLogger(__name__)
 
-_VOICE_BACKENDS = {
-    "lfm3_audio": LFM3VoiceBackend,
-    "lfm3_omni": LFM3VoiceBackend,
-    "qwen3_omni_moe": Qwen3OmniVoiceBackend,
+_VOICE_BACKEND_PATHS = {
+    "lfm3_audio": (".lfm3_realtime", "LFM3VoiceBackend"),
+    "lfm3_omni": (".lfm3_realtime", "LFM3VoiceBackend"),
+    "qwen3_omni_moe": (".qwen3_omni_realtime", "Qwen3OmniVoiceBackend"),
 }
+
+
+class _VoiceBackends(Mapping):
+    """Resolve real backend classes on lookup, not on text-engine import."""
+
+    def __getitem__(self, model_type):
+        module, name = _VOICE_BACKEND_PATHS[model_type]
+        return getattr(importlib.import_module(module, __package__), name)
+
+    def __iter__(self):
+        return iter(_VOICE_BACKEND_PATHS)
+
+    def __len__(self):
+        return len(_VOICE_BACKEND_PATHS)
+
+
+_VOICE_BACKENDS = _VoiceBackends()
+
+
+def __getattr__(name):
+    # Preserve explicit imports of the formerly eager public class names.
+    if name == "LFM3VoiceBackend":
+        return _VOICE_BACKENDS["lfm3_audio"]
+    if name == "Qwen3OmniVoiceBackend":
+        return _VOICE_BACKENDS["qwen3_omni_moe"]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def realtime_voice_names(config: dict) -> list[str]:

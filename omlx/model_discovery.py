@@ -116,6 +116,7 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
 MLX_LM_TEXT_ONLY_MODEL_TYPES = {
     "mimo_v2",
     "mimo_v2_flash",
+    "sensenova_loop",
 }
 
 _MIMO_VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
