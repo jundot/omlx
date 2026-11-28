@@ -824,7 +824,10 @@ def manual_rope(x, positions, dims, base=10000.0, scale=1.0):
     rotated = mx.concatenate(
         [x1 * cos_a - x2 * sin_a, x1 * sin_a + x2 * cos_a], axis=-1
     )
-    return mx.concatenate([rotated, x_pass], axis=-1)
+    # cos/sin are float32; without this cast a bf16/fp16 input comes back
+    # float32, the sparse-prefilled K cache is stored float32, and every
+    # decode activation after it is promoted to float32.
+    return mx.concatenate([rotated, x_pass], axis=-1).astype(x.dtype)
 
 
 def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
@@ -868,7 +871,8 @@ def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
     rotated = mx.concatenate(
         [x1 * cos_a - x2 * sin_a, x1 * sin_a + x2 * cos_a], axis=-1
     )
-    return mx.concatenate([rotated, x_pass], axis=-1)
+    # Same cast as manual_rope: keep the input dtype.
+    return mx.concatenate([rotated, x_pass], axis=-1).astype(x.dtype)
 
 
 # ---------------------------------------------------------------------------
