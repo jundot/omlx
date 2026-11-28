@@ -21,6 +21,8 @@ final class ServerScreenVM {
     /// Live switch; commits through `saveUsageHistory()` like the other
     /// auto-apply rows rather than the Apply button.
     var usageHistoryEnabled: Bool = true
+    /// Live switch for per-client attribution; off by default.
+    var usageByClientEnabled: Bool = false
     private(set) var hasPendingDefaults = false
     @ObservationIgnored
     private var restoreBeforeReset: (() -> Void)?
@@ -83,6 +85,7 @@ final class ServerScreenVM {
             serverAliasesText: serverAliasesText,
             hfCacheEnabled: hfCacheEnabled,
             usageHistoryEnabled: usageHistoryEnabled,
+            usageByClientEnabled: usageByClientEnabled,
             samplingContextText: samplingContextText,
             samplingMaxTokensText: samplingMaxTokensText,
             samplingTemperatureText: samplingTemperatureText,
@@ -105,6 +108,7 @@ final class ServerScreenVM {
                 self.serverAliasesText = previous.serverAliasesText
                 self.hfCacheEnabled = previous.hfCacheEnabled
                 self.usageHistoryEnabled = previous.usageHistoryEnabled
+                self.usageByClientEnabled = previous.usageByClientEnabled
                 self.samplingContextText = previous.samplingContextText
                 self.samplingMaxTokensText = previous.samplingMaxTokensText
                 self.samplingTemperatureText = previous.samplingTemperatureText
@@ -123,6 +127,7 @@ final class ServerScreenVM {
             self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
             self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
             self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
+            self.usageByClientEnabled = dto.usage?.usageByClient ?? false
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -175,6 +180,7 @@ final class ServerScreenVM {
             }
             self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
             self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
+            self.usageByClientEnabled = dto.usage?.usageByClient ?? false
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -249,6 +255,7 @@ final class ServerScreenVM {
             patch.sseKeepaliveMode = sseKeepaliveMode
             patch.autoStartOnLaunch = autoStartOnLaunch
             patch.usageHistory = usageHistoryEnabled
+            patch.usageByClient = usageByClientEnabled
         }
 
         if t(portText) != baselinePortText {
@@ -697,6 +704,10 @@ final class ServerScreenVM {
 
     func saveUsageHistory() {
         Task { await commit(GlobalSettingsPatch(usageHistory: usageHistoryEnabled)) }
+    }
+
+    func saveUsageByClient() {
+        Task { await commit(GlobalSettingsPatch(usageByClient: usageByClientEnabled)) }
     }
 
     func saveAutoStartOnLaunch(services: AppServices) {

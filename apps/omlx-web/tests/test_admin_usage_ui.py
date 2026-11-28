@@ -25,6 +25,19 @@ USAGE_HISTORY_I18N_KEYS = {
     "settings.usage.history_hint",
     "usage.disabled",
     "usage.open_settings",
+    "settings.usage.by_client",
+    "settings.usage.by_client_hint",
+    "usage.clients",
+    "usage.client",
+    "usage.client_main_key",
+    "usage.client_sub_key",
+    "usage.clients_all",
+    "usage.clients_by_key",
+    "usage.clients_by_ip",
+    "usage.client_key",
+    "usage.client_ip_address",
+    "usage.client_no_key",
+    "usage.clients_paused",
 }
 
 
@@ -79,8 +92,13 @@ def test_dashboard_renders_usage_history_switch_and_disabled_notice(client):
     assert "Usage history is off. Turn it on in Settings" in html
     assert "setSettingsTab('global')" in html
     javascript = (ROOT / "omlx_web/static/js/dashboard.js").read_text(encoding="utf-8")
-    assert "usage: { usage_history: true }" in javascript
+    assert "usage: { usage_history: true, usage_by_client: false }" in javascript
     assert "usage_history: this.globalSettings.usage.usage_history" in javascript
+    assert "globalSettings.usage.usage_by_client" in html
+    assert "Track usage per client" in html
+    assert 'x-for="row in clientRows()"' in html
+    assert "usage.clients_by_ip" in html
+    assert "usage_by_client: this.globalSettings.usage.usage_by_client" in javascript
 
 
 def test_usage_history_i18n_keys_present_in_every_locale():

@@ -170,7 +170,7 @@ def test_global_settings_toggle_applies_at_runtime(client, tmp_path, monkeypatch
     monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
 
     current = asyncio.run(admin_routes.get_global_settings(is_admin=True))
-    assert current["usage"] == {"usage_history": True}
+    assert current["usage"] == {"usage_history": True, "usage_by_client": False}
 
     result = asyncio.run(
         admin_routes.update_global_settings(
@@ -211,6 +211,63 @@ def test_global_settings_toggle_applies_at_runtime(client, tmp_path, monkeypatch
     )
     assert "usage_history" not in untouched["runtime_applied"]
     assert gs.usage.usage_history is True
+
+
+def test_usage_by_client_toggle_applies_at_runtime(client, tmp_path, monkeypatch):
+    from omlx.admin import routes as admin_routes
+    from omlx.settings import GlobalSettings
+
+    client, metrics = client
+    gs = GlobalSettings(base_path=tmp_path / "settings")
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+    assert client.get("/admin/api/usage").json()["by_client"] is False
+
+    result = asyncio.run(
+        admin_routes.update_global_settings(
+            request=admin_routes.GlobalSettingsRequest(usage_by_client=True),
+            is_admin=True,
+        )
+    )
+    assert "usage_by_client" in result["runtime_applied"]
+    assert "usage_history" not in result["runtime_applied"]
+    assert gs.usage.usage_by_client is True
+    loaded = GlobalSettings.load(base_path=tmp_path / "settings")
+    assert loaded.usage.usage_by_client is True
+    assert metrics.usage_history.by_client is True
+
+    from omlx import client_identity
+
+    slot = client_identity._ClientSlot("10.0.0.5")
+    slot.key_kind, slot.key_label = "sub_key", "CLI"
+    token = client_identity._current.set(slot)
+    try:
+        metrics.record_request_complete(10, 5, 0, 0.1, 0.2, "canonical-model", 0.3)
+    finally:
+        client_identity._current.reset(token)
+    metrics.usage_history.flush()
+    data = client.get("/admin/api/usage").json()
+    assert data["by_client"] is True
+    assert data["clients"][0]["key_kind"] == "sub_key"
+    assert data["clients"][0]["key_id"] == "CLI"
+    assert data["clients"][0]["client_ip"] == "10.0.0.5"
+    assert data["clients_by_key"][0]["key_id"] == "CLI"
+    assert data["clients_by_ip"] == [
+        {**data["clients_by_ip"][0], "client_ip": "10.0.0.5", "total_tokens": 15}
+    ]
+    assert data["clients"][0]["total_tokens"] == 15
+    # The key itself and request content never appear; only the label.
+    assert "api_key" not in data["clients"][0]
+
+    asyncio.run(
+        admin_routes.update_global_settings(
+            request=admin_routes.GlobalSettingsRequest(usage_by_client=False),
+            is_admin=True,
+        )
+    )
+    assert metrics.usage_history.by_client is False
+    data = client.get("/admin/api/usage").json()
+    assert data["by_client"] is False
+    assert data["clients"][0]["key_id"] == "CLI"
 
 
 @pytest.mark.parametrize("model", ["", "canonical-model", "missing"])

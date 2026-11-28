@@ -139,10 +139,20 @@ struct ServerScreen: View {
                                   comment: "Row label for the switch that records local hourly usage history"),
                     sublabel: String(localized: "server.row.usage_history.sub",
                                      defaultValue: "Stores hourly per-model token totals in usage.sqlite3. Turning this off keeps existing history.",
-                                     comment: "Sublabel explaining the usage history switch"),
-                    isLast: true
+                                     comment: "Sublabel explaining the usage history switch")
                 ) {
                     RowSwitch(isOn: vm.bind($vm.usageHistoryEnabled, save: vm.saveUsageHistory))
+                }
+                Row(
+                    label: String(localized: "server.row.usage_by_client",
+                                  defaultValue: "Track usage per client",
+                                  comment: "Row label for the switch that attributes usage history to API keys or client IPs"),
+                    sublabel: String(localized: "server.row.usage_by_client.sub",
+                                     defaultValue: "Also stores which API sub key made each request, or the client IP when no key was used. Off by default.",
+                                     comment: "Sublabel explaining the per-client usage history switch"),
+                    isLast: true
+                ) {
+                    RowSwitch(isOn: vm.bind($vm.usageByClientEnabled, save: vm.saveUsageByClient))
                 }
             }
 

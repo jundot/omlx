@@ -302,10 +302,11 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         let json = """
         {
             "server": {"host": "127.0.0.1", "port": 8080, "log_level": "info", "server_aliases": []},
-            "usage": {"usage_history": false}
+            "usage": {"usage_history": false, "usage_by_client": true}
         }
         """.data(using: .utf8)!
         XCTAssertEqual(try decoder.decode(GlobalSettingsDTO.self, from: json).usage?.usageHistory, false)
+        XCTAssertEqual(try decoder.decode(GlobalSettingsDTO.self, from: json).usage?.usageByClient, true)
 
         let legacy = """
         {
@@ -328,6 +329,20 @@ final class GlobalSettingsSamplingTests: XCTestCase {
             with: try encoder.encode(GlobalSettingsPatch())
         ) as! [String: Any]
         XCTAssertNil(empty["usage_history"])
+    }
+
+    func testPatchEncodesUsageByClientAsSnakeCaseFlatKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.usageByClient = true
+
+        let json = try JSONSerialization.jsonObject(with: try encoder.encode(patch)) as! [String: Any]
+        XCTAssertEqual(json["usage_by_client"] as? Bool, true)
+        XCTAssertNil(json["usage_history"])
+
+        let empty = try JSONSerialization.jsonObject(
+            with: try encoder.encode(GlobalSettingsPatch())
+        ) as! [String: Any]
+        XCTAssertNil(empty["usage_by_client"])
     }
 
     func testServerDecodesAudioUploadSize() throws {
