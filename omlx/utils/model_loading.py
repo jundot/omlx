@@ -784,7 +784,13 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
-    if for_vlm and model_type in {"qwen3_5", "qwen3_5_moe", "qwen4_exp"}:
+    if for_vlm and model_type in {
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen4_exp",
+        "wemm_qwen3_5",
+        "wemm_qwen3_5_moe",
+    }:
         from ..patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
 
         apply_qwen35_ssm_mask_patch()
@@ -967,6 +973,21 @@ def maybe_apply_pre_load_patches(
                 "Muse Glimmer mlx-vlm compatibility patch applied for %s",
                 model_name,
             )
+
+    if for_vlm:
+        from ..patches.mlx_vlm_wemm_compat import (
+            apply_mlx_vlm_wemm_compat_patch,
+            is_wemm_config,
+            normalize_wemm_model_type,
+        )
+
+        if is_wemm_config(config):
+            model_type = normalize_wemm_model_type(config) or model_type
+            if apply_mlx_vlm_wemm_compat_patch():
+                logger.info(
+                    "WeMM-Video mlx-vlm compatibility patch applied for %s",
+                    model_name,
+                )
 
     if for_vlm and model_type == "qwen4_exp":
         from ..patches.mlx_vlm_qwen4_exp_compat import (

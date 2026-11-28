@@ -5038,6 +5038,12 @@ def _build_model_sanitizer(
                     )
 
                     apply_mlx_vlm_muse_glimmer_compat_patch()
+                if model_type in ("wemm_qwen3_5", "wemm_qwen3_5_moe"):
+                    from omlx.patches.mlx_vlm_wemm_compat import (
+                        apply_mlx_vlm_wemm_compat_patch,
+                    )
+
+                    apply_mlx_vlm_wemm_compat_patch()
                 if model_type in _HY_V4_MODEL_TYPES:
                     from omlx.patches.hy_v4 import apply_patch as apply_hy_v4_patch
 

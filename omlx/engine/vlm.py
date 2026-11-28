@@ -1345,6 +1345,8 @@ def _uses_mrope(vlm_model) -> bool:
 _QWEN_VISION_MODELS = {
     "qwen3_5",
     "qwen3_5_moe",
+    "wemm_qwen3_5",
+    "wemm_qwen3_5_moe",
     "prism_hadamard_qwen35",  # Ternary Bonsai 2 keeps the Qwen3.5 vision tower.
     "qwen3_vl",
     "qwen3_vl_moe",
