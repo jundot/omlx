@@ -5,8 +5,8 @@ When batch rows accept different draft counts, the stock rollback rolls every
 lagging row over the whole logical width so all rows end at ``_idx`` again.
 Here a rollback on a marked cache records a per-row *tail* instead: row ``r``
 keeps its keys in ``[left_padding[r], _idx - tail[r])`` and writes its next
-block at ``_idx - tail[r]``. Only the padded-row attention reads tails, so it
-marks the full-attention caches it serves.
+block at ``_idx - tail[r]``. The padded-row attention (which marks the caches
+it serves) and Inkling 2's flash decode read tails.
 
 The bank is realigned (the stock roll, all tails at once) when a tail exceeds
 ``_MAX_TAIL`` or before anything else touches the cache: ``filter``,

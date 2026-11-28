@@ -38,6 +38,11 @@ from . import expert_mma, fused, kernels, loopcd, verify_experts
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
+try:
+    from .. import qwen35_deferred_realign as deferred
+except ImportError:
+    deferred = None
+
 _NVFP4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 _MXFP8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 # ModelOpt NVFP4 tensor scale: amax / (FP8 E4M3 max * FP4 E2M1 max).
@@ -688,6 +693,20 @@ def _row_slice(proj: nn.QuantizedLinear, start: int, end: int | None):
     return sub
 
 
+def _kv_tails(kv):
+    return deferred.tails(kv) if deferred else None
+
+
+def _trim_kv_rows(kv, extra) -> None:
+    ends = [t + e for t, e in zip(_kv_tails(kv) or [0] * len(extra), extra)]
+    common = min(ends)
+    kv._idx -= common
+    kv.offset = kv.offset - mx.array(extra, dtype=kv.offset.dtype)
+    kv.__dict__[deferred.TAIL] = [end - common for end in ends]
+    if max(ends) - common > deferred._MAX_TAIL:
+        deferred.realign(kv)
+
+
 class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -852,12 +871,18 @@ class Inkling2Attention(nn.Module):
         )
 
     def attend(self, q, k, v, rel, sink, kv, state=None):
-        left_padding = None
+        left_padding = tails = None
         if kv is not None:
+            if _kv_tails(kv) is not None and not kernels.flash_decode_ok(q, k):
+                deferred.realign(kv)
             k, v = kv.update_and_fetch(k, v)
             left_padding = getattr(kv, "left_padding", None)
+            tails = _kv_tails(kv)
         elif state is not None:
+            if windows.tails(state) is not None and not kernels.flash_decode_ok(q, k):
+                windows.realign(state)
             k, v, left_padding = windows.append(state, k, v)
+            tails = windows.tails(state)
         out = self._long_attention(q, k, v, rel, sink, left_padding)
         if out is not None:
             return out
@@ -870,6 +895,7 @@ class Inkling2Attention(nn.Module):
             scale=self.scale,
             window=self.window,
             left_padding=left_padding,
+            tails=tails,
         )
 
     def _long_attention(self, q, k, v, rel, sink, left_padding):
@@ -1361,6 +1387,8 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         quant = args.quantization
+        if deferred is not None:
+            deferred.apply_qwen35_deferred_realign_patch()
         self.model = Inkling2TextModel(args.text, quant)
         self.lm_head = nn.Linear(
             args.text.hidden_size, args.text.vocab_size, bias=False
@@ -1541,8 +1569,7 @@ class Model(nn.Module):
             elif kv.trim(common) != common:
                 return False
             elif any(extra):
-                kv.prepare(right_padding=extra)
-                kv.finalize()
+                _trim_kv_rows(kv, extra)
             base = windows.CONV if kv is None else 0
             for slot, xp in padded.items():
                 conv[base + slot] = _rows_from(xp, picks, width)
