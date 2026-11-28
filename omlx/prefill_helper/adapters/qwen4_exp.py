@@ -128,8 +128,13 @@ def _ple_reader(table: Any, language: Any) -> Callable[[np.ndarray], tuple]:
             plan = table._plan(rows)
             if plan is None:
                 raise RuntimeError("PLE shards with mixed formats are not supported")
+            _, _, _, _, families, dtypes, bits, group_size, mode = plan
+            if mode == "nvfp4":
+                # The helper decodes affine rows only (see _HostPLERows.__call__).
+                raise RuntimeError(
+                    "The prefill helper does not support nvfp4 PLE tables"
+                )
             buffers = table._assemble(rows, plan)
-            _, _, _, _, families, dtypes, bits, group_size = plan
             arrays = [
                 (buffers[f], _SAFETENSORS_DTYPES.get(dtypes[f], dtypes[f].lower()))
                 for f in families

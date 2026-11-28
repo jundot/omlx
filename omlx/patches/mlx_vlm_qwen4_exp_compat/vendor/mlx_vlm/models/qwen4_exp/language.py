@@ -3435,6 +3435,7 @@ class _SafeTensorMMap:
             "F16": (np.dtype("<f2"), 2),
             "F32": (np.dtype("<f4"), 4),
             "U32": (np.dtype("<u4"), 4),
+            "U8": (np.dtype("u1"), 1),
             "F8_E4M3": (np.dtype("u1"), 1),
         }.get(dtype)
         if dtype_info is None:
@@ -3620,7 +3621,8 @@ class DiskBackedShardedEmbedding(nn.Module):
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
         self._shard_specs: dict[
-            int, tuple[str, str | None, str | None, int | None, int | None]
+            int,
+            tuple[str, str | None, str | None, int | None, int | None, str | None],
         ] = {}
 
         register_ple_resource(self, priority=1)
@@ -3694,6 +3696,35 @@ class DiskBackedShardedEmbedding(nn.Module):
                     None,
                     None,
                     None,
+                    None,
+                )
+                continue
+
+            if scales_key in weight_map and biases_key not in weight_map:
+                # nvfp4: E2M1 values packed in U32, E4M3 block scales as U8,
+                # group 16, no biases.
+                # The table-level tensor scale stays in self.weight_scale.
+                scales_reader = register_reader(scales_key)
+                scales_shape = scales_reader.tensor_shape(scales_key)
+                scales_dtype = scales_reader.tensor_dtype(scales_key)
+                if (
+                    weight_dtype != "U32"
+                    or scales_dtype != "U8"
+                    or weight_shape[1] * 8 != dims
+                    or tuple(scales_shape) != (shard_size, dims // 16)
+                ):
+                    raise ValueError(
+                        f"Unsupported nvfp4 PLE layout for {base}: weight "
+                        f"{weight_dtype}{tuple(weight_shape)}, scales "
+                        f"{scales_dtype}{tuple(scales_shape)}, dims={dims}"
+                    )
+                self._shard_specs[shard_index] = (
+                    weight_key,
+                    scales_key,
+                    None,
+                    4,
+                    16,
+                    "nvfp4",
                 )
                 continue
 
@@ -3750,6 +3781,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                 biases_key,
                 bits,
                 group_size,
+                "affine",
             )
 
     def _plan(self, host: np.ndarray):
@@ -3760,22 +3792,28 @@ class DiskBackedShardedEmbedding(nn.Module):
         touched = [int(index) for index in np.unique(shard)]
         specs = [self._shard_specs[index] for index in touched]
         bits, group_size = specs[0][3], specs[0][4]
-        families = [0] if bits is None else [0, 1, 2]
+        if bits is None:
+            families = [0]
+        elif specs[0][2] is None:
+            families = [0, 1]
+        else:
+            families = [0, 1, 2]
         dtypes = {
             family: self._tensor_readers[specs[0][family]].tensor_dtype(specs[0][family])
             for family in families
         }
-        if any(spec[3:] != (bits, group_size) for spec in specs) or any(
+        if any(spec[3:] != specs[0][3:] for spec in specs) or any(
             self._tensor_readers[spec[family]].tensor_dtype(spec[family]) != dtypes[family]
             for spec in specs
             for family in families
         ):
             return None
-        return shard, local, touched, specs, families, dtypes, bits, group_size
+        mode = specs[0][5]
+        return shard, local, touched, specs, families, dtypes, bits, group_size, mode
 
     def _assemble(self, host: np.ndarray, plan) -> dict[int, np.ndarray]:
         """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
-        shard, local, touched, specs, families, _, _, _ = plan
+        shard, local, touched, specs, families, _, _, _, _ = plan
         slices = []
         for shard_index, spec in zip(touched, specs):
             positions = np.flatnonzero(shard == shard_index)
@@ -3857,7 +3895,7 @@ class DiskBackedShardedEmbedding(nn.Module):
             if plan is None:
                 return self._gather_per_shard([int(index) for index in host], shape)
             buffers = self._assemble(host, plan)
-        _, _, touched, _, families, dtypes, bits, group_size = plan
+        _, _, touched, _, families, dtypes, bits, group_size, mode = plan
         self.last_touched_shards = tuple(touched)
         self.rows_read = int(host.size)
         arrays = [_SafeTensorMMap.to_mx(buffers[family], dtypes[family]) for family in families]
@@ -3867,10 +3905,10 @@ class DiskBackedShardedEmbedding(nn.Module):
             values = mx.dequantize(
                 values,
                 arrays[1],
-                arrays[2],
+                arrays[2] if len(arrays) > 2 else None,
                 group_size=group_size,
                 bits=bits,
-                mode="affine",
+                mode=mode,
             )
         # Decode in the checkpoint's scale dtype. bf16 rows times an fp16
         # scale promote to fp32.
@@ -3896,23 +3934,25 @@ class DiskBackedShardedEmbedding(nn.Module):
             local = [
                 host_indices[i] - self.shard_offsets[shard_index] for i in positions
             ]
-            weight_key, scales_key, biases_key, bits, group_size = self._shard_specs[
-                shard_index
-            ]
+            spec = self._shard_specs[shard_index]
+            weight_key, scales_key, biases_key, bits, group_size, mode = spec
             values = self._tensor_readers[weight_key].rows(weight_key, local)
             if bits is not None:
                 assert scales_key is not None
-                assert biases_key is not None
                 assert group_size is not None
                 scales = self._tensor_readers[scales_key].rows(scales_key, local)
-                biases = self._tensor_readers[biases_key].rows(biases_key, local)
+                biases = (
+                    self._tensor_readers[biases_key].rows(biases_key, local)
+                    if biases_key is not None
+                    else None
+                )
                 values = mx.dequantize(
                     values,
                     scales,
                     biases,
                     group_size=group_size,
                     bits=bits,
-                    mode="affine",
+                    mode=mode,
                 )
             values = values.astype(self.weight_scale.dtype) * self.weight_scale
             self.rows_read += len(local)

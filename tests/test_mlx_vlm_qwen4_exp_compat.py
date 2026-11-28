@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 from mlx.utils import tree_map
 from mlx_lm.models.rope_utils import initialize_rope
@@ -1824,7 +1825,7 @@ def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
     assert mx.allclose(values, expected, atol=2e-2, rtol=2e-2).item()
     assert embedding.last_touched_shards == (0, 1)
     assert embedding.rows_read == 2
-    assert embedding._shard_specs[0][3:] == (bits, 32)
+    assert embedding._shard_specs[0][3:] == (bits, 32, "affine")
     embedding.close()
 
 
@@ -1870,6 +1871,110 @@ def test_disk_backed_ple_advises_a_decode_tokens_pages_before_copying(tmp_path):
     events.clear()
     embedding(mx.array([list(range(ple._PLE_POOL_PREFETCH_ROWS + 1))], dtype=mx.int32))
     assert [event[0] for event in events] == ["copy"] * 3
+    embedding.close()
+
+
+def _write_nvfp4_ple(tmp_path, stored_prefix, amax, scales_dtype=mx.uint8):
+    tensors, dense_rows = {}, []
+    for shard_index in range(2):
+        dense = (
+            (
+                mx.arange(4 * 160, dtype=mx.float32).reshape(4, 160) / 97
+                - 3
+                + shard_index
+            )
+            * amax
+            / 4
+        )
+        weight, scales = mx.quantize(
+            dense, group_size=16, bits=4, mode="nvfp4", global_scale=amax
+        )
+        base = f"{stored_prefix}.shards.{shard_index}"
+        tensors[f"{base}.weight"] = weight
+        tensors[f"{base}.scales"] = scales.astype(scales_dtype)
+        dense_rows.append(
+            mx.dequantize(
+                weight,
+                scales,
+                group_size=16,
+                bits=4,
+                mode="nvfp4",
+                global_scale=amax,
+                dtype=mx.float32,
+            )
+        )
+    filename = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: filename for key in tensors}}),
+        encoding="utf-8",
+    )
+    return dense_rows
+
+
+def test_disk_backed_nvfp4_ple_with_table_scale(tmp_path):
+    """modelopt NVFP4 PLE: U32 weight + U8 E4M3 scales (g16, no biases) + one table scale."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
+
+    source_prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    stored_prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+    amax = mx.array(0.3, dtype=mx.float32)
+    expected_rows = _write_nvfp4_ple(tmp_path, stored_prefix, amax)
+    embedding = DiskBackedShardedEmbedding(
+        tmp_path, source_prefix, num_embeddings=8, dims=160, num_shards=2
+    )
+    # The table scale holds the raw weight_scale_2 (amax / 2688), as in the checkpoint.
+    embedding.weight_scale = (amax / 2688).reshape(1)
+    assert embedding._shard_specs[0][3:] == (4, 16, "nvfp4")
+    assert embedding._shard_specs[0][2] is None
+
+    expected = mx.stack([expected_rows[0][1], expected_rows[1][2]])[None]
+    values = embedding(mx.array([[1, 6]], dtype=mx.int32))
+    fallback = embedding._gather_per_shard([1, 6], (1, 2))
+    mx.eval(values, fallback)
+    assert values.dtype == mx.float32
+    # Same products, different fp32 rounding order: equal to within one ulp.
+    assert mx.allclose(values, expected, atol=0, rtol=2**-23).item()
+    assert mx.array_equal(values, fallback).item()
+    assert embedding.last_touched_shards == (0, 1)
+    embedding.close()
+
+
+def test_disk_backed_nvfp4_ple_rejects_wrong_scale_dtype(tmp_path):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
+
+    source_prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    stored_prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+    _write_nvfp4_ple(
+        tmp_path,
+        stored_prefix,
+        mx.array(0.3, dtype=mx.float32),
+        scales_dtype=mx.float16,
+    )
+    with pytest.raises(ValueError, match="Unsupported nvfp4 PLE layout"):
+        DiskBackedShardedEmbedding(
+            tmp_path, source_prefix, num_embeddings=8, dims=160, num_shards=2
+        )
+
+
+def test_prefill_helper_refuses_nvfp4_disk_ple(tmp_path):
+    """The prefill helper decodes affine rows only, so an nvfp4 table stops loudly."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language
+
+    from omlx.prefill_helper.adapters.qwen4_exp import _ple_reader
+
+    source_prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    stored_prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+    _write_nvfp4_ple(tmp_path, stored_prefix, mx.array(0.3, dtype=mx.float32))
+    embedding = language.DiskBackedShardedEmbedding(
+        tmp_path, source_prefix, num_embeddings=8, dims=160, num_shards=2
+    )
+    read = _ple_reader(embedding, language)
+    with pytest.raises(RuntimeError, match="does not support nvfp4 PLE"):
+        read(np.array([1, 6], dtype=np.int64))
     embedding.close()
 
 
