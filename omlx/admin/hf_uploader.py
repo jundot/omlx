@@ -20,7 +20,12 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from ..model_discovery import CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS
+from ..model_discovery import (
+    AUTOTRUST_JEV_HEAD_WEIGHTS,
+    CLEF_HEAD_WEIGHTS,
+    D3_READOUT_WEIGHTS,
+    autotrust_jev_adapter_subfolder,
+)
 from ..oq import (
     _is_audio_tensor,
     _is_mtp_tensor,
@@ -102,6 +107,7 @@ _COMPONENT_ORDER = (
     "MTP head",
     "Joint schema head",
     "Decision readout",
+    "Decision head",
 )
 _REDOWNLOAD_NOTICE = (
     "> [!NOTE]\n"
@@ -190,13 +196,19 @@ def _storage_summary(model_path: Path, config: dict) -> tuple[dict, dict]:
             start, end = info["data_offsets"]
             tensors[key] = {**info, "bytes": end - start, "shard": shard.name}
     default, modules = _quantization_specs(config)
+    # head.safetensors is a generic name; it is a decision head only in an
+    # autotrust JEV bundle.
+    autotrust_jev = autotrust_jev_adapter_subfolder(model_path) is not None
     formats: dict[str, list] = {}  # label -> [weights, bytes, bits]
     components: dict[str, list] = {}  # component -> [weights, bytes]
     for key, info in tensors.items():
         module = key.rsplit(".", 1)[0]
         if key.endswith((".scales", ".biases")) and module + ".weight" in tensors:
             continue
-        component = _card_component(key, info["shard"], config)
+        if autotrust_jev and info["shard"] == AUTOTRUST_JEV_HEAD_WEIGHTS:
+            component = "Decision head"
+        else:
+            component = _card_component(key, info["shard"], config)
         scales = tensors.get(module + ".scales")
         if key.endswith(".weight") and scales is not None:
             biases = tensors.get(module + ".biases")

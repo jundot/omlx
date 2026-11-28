@@ -5705,6 +5705,94 @@ class TestQuantizeOqStreamingPassthroughDtypes:
         config = json.loads((out / "config.json").read_text())
         assert "_oq_noncausal_attention" not in config
 
+    def test_autotrust_jev_sidecars_are_copied_unchanged_and_stay_out_of_the_shards(
+        self, tmp_path
+    ):
+        """An autotrust JEV bundle keeps its judge config, calibration, head and adapter
+        folder byte-identical, and the generic head name stays out of the
+        backbone shards and index."""
+        from safetensors.numpy import save_file as np_save
+
+        from omlx.model_discovery import decision_kind
+
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        np_save(
+            {
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+        np_save(
+            {
+                "proj.weight": np.ones((24, hidden), dtype=np.float32),
+                "proj.bias": np.zeros(24, dtype=np.float32),
+            },
+            str(src / "head.safetensors"),
+        )
+        (src / "judge_config.json").write_text(
+            json.dumps(
+                {
+                    "adapter_subfolder": "adapter",
+                    "slots": {
+                        "ranges": {"noul": [0, 2]},
+                        "template_version": "bare-v1",
+                    },
+                    "verbalizer_ids": [1, 2],
+                }
+            )
+        )
+        (src / "calibration.json").write_text('{"per_kind": {"noul": 1.0}}')
+        adapter = src / "adapter"
+        adapter.mkdir()
+        (adapter / "adapter_config.json").write_text('{"peft_type": "LORA"}')
+        np_save(
+            {"x.lora_A.weight": np.ones((4, hidden), dtype=np.float32)},
+            str(adapter / "adapter_model.safetensors"),
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_passthrough",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+        assert [f.name for f in _source_weight_files(src)] == ["model.safetensors"]
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        index = json.loads((out / "model.safetensors.index.json").read_text())
+        assert set(index["weight_map"].values()) == {"model.safetensors"}
+        assert not any(key.startswith("proj.") for key in index["weight_map"])
+        for name in (
+            "head.safetensors",
+            "judge_config.json",
+            "calibration.json",
+            "adapter/adapter_config.json",
+            "adapter/adapter_model.safetensors",
+        ):
+            assert (out / name).read_bytes() == (src / name).read_bytes()
+        # Detection reads the backbone type, which the test model does not
+        # have; with a Qwen3.5 type the copy is an autotrust JEV bundle again.
+        config = json.loads((out / "config.json").read_text())
+        decision_config = {**config, "model_type": "qwen3_5_text"}
+        assert decision_kind(out, decision_config) == "autotrust-jev"
+
     def test_d3_rejects_text_only_output(self, tmp_path):
         src = self._d3_source(tmp_path)
         with pytest.raises(ValueError, match="vision tower"):

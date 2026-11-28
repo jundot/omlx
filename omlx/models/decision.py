@@ -23,7 +23,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx_vlm.utils import load as vlm_load
 
-from ..model_discovery import DECISION_SIDECAR_WEIGHTS, _vision_weight_bytes
+from ..model_discovery import _vision_weight_bytes, decision_sidecar_weights
 from ..utils.image import load_image
 from ..utils.model_loading import (
     lm_load_compat,
@@ -59,7 +59,7 @@ def _backbone_files(path: Path) -> Iterator[Path]:
     Without an index mlx-vlm loads every ``*.safetensors`` file, so a head next
     to a single backbone shard would be loaded into the backbone (d3-nano).
     """
-    heads = {name for name in DECISION_SIDECAR_WEIGHTS if (path / name).is_file()}
+    heads = {name for name in decision_sidecar_weights(path) if (path / name).is_file()}
     if not heads or (path / "model.safetensors.index.json").is_file():
         yield path
         return

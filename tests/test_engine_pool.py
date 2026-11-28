@@ -2444,6 +2444,49 @@ class TestEnginePoolAsync:
         )
 
     @pytest.mark.asyncio
+    async def test_autotrust_jev_bundle_loads_through_the_decision_engine(
+        self, tmp_path, monkeypatch
+    ):
+        """A discovered autotrust JEV bundle is a decision entry whose size
+        includes the adapter folder, and it starts AutoTrustJevModel."""
+        from omlx.engine.decision import DecisionEngine
+        from omlx.model_discovery import estimate_model_size
+        from omlx.models.autotrust_jev import AutoTrustJevModel
+
+        bundle = tmp_path / "models" / "JEV-9B"
+        (bundle / "adapter").mkdir(parents=True)
+        (bundle / "config.json").write_text(json.dumps({"model_type": "qwen3_5_text"}))
+        (bundle / "model.safetensors").write_bytes(b"\0" * 4096)
+        (bundle / "head.safetensors").write_bytes(b"\0" * 64)
+        (bundle / "judge_config.json").write_text(
+            json.dumps(
+                {
+                    "slots": {"ranges": {}, "template_version": "bare-v1"},
+                    "verbalizer_ids": [],
+                }
+            )
+        )
+        (bundle / "adapter" / "adapter_config.json").write_text("{}")
+        (bundle / "adapter" / "adapter_model.safetensors").write_bytes(b"\0" * 1000)
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(tmp_path / "models"))
+        entry = pool.get_entry("JEV-9B")
+        loads = []
+        monkeypatch.setattr(AutoTrustJevModel, "load", lambda self: loads.append(self))
+
+        engine = await pool.get_engine("JEV-9B")
+
+        assert (entry.model_type, entry.engine_type) == ("decision", "decision")
+        # The backbone estimate (shards and head, plus its overhead) and the adapter.
+        assert entry.estimated_size == estimate_model_size(bundle) + 1000
+        assert isinstance(engine, DecisionEngine)
+        assert len(loads) == 1 and isinstance(loads[0], AutoTrustJevModel)
+        info = engine.get_model_info()
+        assert info["decision_kind"] == "autotrust-jev"
+        assert info["vision"] is False
+        await pool.shutdown()
+
+    @pytest.mark.asyncio
     async def test_apply_embedding_batch_size_updates_loaded_embedding_engines(self):
         """Runtime setting changes should update pool config and loaded embedding engines."""
         from omlx.engine.embedding import EmbeddingEngine

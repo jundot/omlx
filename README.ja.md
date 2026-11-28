@@ -280,7 +280,9 @@ mlx-lmで利用可能なすべての関数呼び出し形式、JSONスキーマ�
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
 | エンベディング | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | リランカー | ModernBERT、XLM-RoBERTa |
-| Decision | Clef、Clef-Flash、OpenJev、Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
+| Decision | Clef、Clef-Flash、OpenJev、Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge)、autotrust JEV (JEV-27B, JEV-9B) |
+
+autotrust JEV バンドルは LoRA アダプターをマージせずに適用するため、oQ で量子化したベースモデルでも動作します。JEV-9B では、oQ5 以上が元の精度に最も近くなります。
 
 ## CLI 設定
 

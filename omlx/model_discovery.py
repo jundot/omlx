@@ -12,7 +12,8 @@ Supports:
 - Reranker models: Use RerankerEngine for document reranking
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
-- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, d3, d1)
+- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, d3, d1,
+  autotrust JEV)
 """
 
 import contextlib
@@ -36,7 +37,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev", "d3", "d1"]
+DecisionKind = Literal["clef", "openjev", "d3", "d1", "autotrust-jev"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -138,6 +139,17 @@ DECISION_SIDECAR_FILES = (
     CLEF_HEAD_CONFIG,
     D3_DECISION_CONFIG,
 )
+# The autotrust JEV bundles (JEV-27B, JEV-9B) keep an unchanged Qwen3.5-family
+# backbone and add a PEFT LoRA adapter in a subfolder, a decision head and its
+# calibration, all described by the judge config. The head has a generic file
+# name, so it only counts as a decision file inside an autotrust JEV bundle.
+AUTOTRUST_JEV_JUDGE_CONFIG = "judge_config.json"
+AUTOTRUST_JEV_CALIBRATION = "calibration.json"
+AUTOTRUST_JEV_HEAD_WEIGHTS = "head.safetensors"
+_AUTOTRUST_JEV_TEMPLATE_VERSIONS = frozenset({"bare-v1"})
+# Backbones the autotrust JEV decision model runs on. The same bundle layout on another
+# backbone (the Gemma-4 GEV variant) is not an autotrust JEV decision model here.
+_AUTOTRUST_JEV_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_text"})
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
@@ -513,14 +525,86 @@ def _is_d3_decision_config(path: Path) -> bool:
         return False
 
 
+def autotrust_jev_adapter_subfolder(model_path: Path) -> str | None:
+    """Return the adapter subfolder of an autotrust JEV bundle, or None.
+
+    An autotrust JEV bundle has a judge config with slot ranges, a known prompt template
+    and verbalizer ids, a decision head, and a PEFT adapter in the subfolder
+    the judge config names. The subfolder must be a plain folder name inside
+    the bundle.
+    """
+    try:
+        with open(model_path / AUTOTRUST_JEV_JUDGE_CONFIG) as f:
+            judge = json.load(f)
+        slots = judge["slots"]
+        valid = (
+            isinstance(slots["ranges"], dict)
+            and slots["template_version"] in _AUTOTRUST_JEV_TEMPLATE_VERSIONS
+            and isinstance(judge["verbalizer_ids"], list)
+        )
+        subfolder = judge.get("adapter_subfolder", "adapter")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if (
+        not valid
+        or not isinstance(subfolder, str)
+        or subfolder in ("", ".", "..")
+        or Path(subfolder).name != subfolder
+    ):
+        return None
+    if not (model_path / AUTOTRUST_JEV_HEAD_WEIGHTS).is_file():
+        return None
+    if not (model_path / subfolder / "adapter_config.json").is_file():
+        return None
+    return subfolder
+
+
+def _autotrust_jev_adapter_bytes(model_path: Path) -> int:
+    """Size of an autotrust JEV bundle's adapter files, 0 for other folders.
+
+    The adapter sits in a subfolder, which the size estimate does not read.
+    The files hold float32 weights, so this over-counts the copy the model
+    keeps in the backbone's dtype.
+    """
+    subfolder = autotrust_jev_adapter_subfolder(model_path)
+    if subfolder is None:
+        return 0
+    return sum(f.stat().st_size for f in (model_path / subfolder).glob("*.safetensors"))
+
+
+def decision_sidecar_weights(model_path: Path) -> tuple[str, ...]:
+    """Decision-head weight files that may sit beside the backbone shards.
+
+    Backbone loaders and quantizers must not read them as backbone weights.
+    """
+    if autotrust_jev_adapter_subfolder(model_path) is None:
+        return DECISION_SIDECAR_WEIGHTS
+    return (*DECISION_SIDECAR_WEIGHTS, AUTOTRUST_JEV_HEAD_WEIGHTS)
+
+
+def decision_sidecar_files(model_path: Path) -> tuple[str, ...]:
+    """Decision-head files and folders that quantizers copy unchanged."""
+    subfolder = autotrust_jev_adapter_subfolder(model_path)
+    if subfolder is None:
+        return DECISION_SIDECAR_FILES
+    return (
+        *DECISION_SIDECAR_FILES,
+        AUTOTRUST_JEV_HEAD_WEIGHTS,
+        AUTOTRUST_JEV_JUDGE_CONFIG,
+        AUTOTRUST_JEV_CALIBRATION,
+        subfolder,
+    )
+
+
 def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
     """Return the decision-model family of a checkpoint, or None.
 
-    Clef is identified by its joint head files and Decision 3.0 by its
-    readout and decision config. LiquidAI d1 declares ``D1Model`` on an
-    LFM3-VL or LFM3-Omni config. OpenJev is a plain Qwen3.5 checkpoint, so it
-    is identified by its helper directory or, for MLX conversions without the
-    helper, by the directory name.
+    Clef is identified by its joint head files, Decision 3.0 by its readout
+    and decision config, and autotrust JEV by its judge config, head and adapter on a
+    ``qwen3_5`` or ``qwen3_5_text`` backbone. LiquidAI d1 declares ``D1Model``
+    on an LFM3-VL or LFM3-Omni config. OpenJev is a plain Qwen3.5 checkpoint,
+    so it is identified by its helper directory or, for MLX conversions
+    without the helper, by the directory name.
     """
     if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
         model_path / CLEF_HEAD_CONFIG
@@ -542,6 +626,10 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
         or str((config.get("auto_map") or {}).get("AutoModel", "")).endswith("D1Model")
     ):
         return "d1"
+    if model_type in _AUTOTRUST_JEV_MODEL_TYPES and autotrust_jev_adapter_subfolder(
+        model_path
+    ):
+        return "autotrust-jev"
     if model_type != "qwen3_5":
         return None
     if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
@@ -1782,6 +1870,8 @@ def _register_model(
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
+        if model_type == "decision":
+            estimated_size += _autotrust_jev_adapter_bytes(model_dir)
         text_only_size = (
             estimate_text_only_model_size(model_dir) if model_type == "vlm" else 0
         )

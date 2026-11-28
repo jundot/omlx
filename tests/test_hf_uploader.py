@@ -169,6 +169,35 @@ class TestGenerateModelCard:
         assert "| Language model |" in card
         assert "| Decision readout | 0.000B | 0.000 GB / 0.000 GiB |" in card
 
+    def test_head_is_a_decision_head_only_in_an_autotrust_jev_bundle(self, tmp_path):
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {"model.layers.0.mlp.up_proj.weight": mx.ones((64, 64), mx.bfloat16)},
+        )
+        mx.save_safetensors(
+            str(tmp_path / "head.safetensors"),
+            {"proj.weight": mx.ones((24, 64), dtype=mx.float32)},
+        )
+        config = {"model_type": "qwen3_5_text"}
+
+        # Without the autotrust JEV sidecars, head.safetensors is an ordinary shard.
+        card = _generate_model_card("Plain-oQ4e", tmp_path, config)
+        assert "| Decision head |" not in card
+
+        (tmp_path / "judge_config.json").write_text(
+            json.dumps(
+                {
+                    "slots": {"ranges": {}, "template_version": "bare-v1"},
+                    "verbalizer_ids": [],
+                }
+            )
+        )
+        (tmp_path / "adapter").mkdir()
+        (tmp_path / "adapter" / "adapter_config.json").write_text("{}")
+        card = _generate_model_card("JEV-oQ4e", tmp_path, config)
+        assert "| Decision head |" in card
+        assert "| Language model |" in card
+
     def test_bundled_dspark_draft_is_reported_with_the_model(self, tmp_path):
         mx.save_safetensors(
             str(tmp_path / "model.safetensors"),

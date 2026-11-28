@@ -313,7 +313,9 @@ mlx-lm에서 사용 가능한 모든 함수 호출 형식, JSON 스키마 검증
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | 임베딩 | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | 리랭커 | ModernBERT, XLM-RoBERTa |
-| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
+| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge), autotrust JEV (JEV-27B, JEV-9B) |
+
+autotrust JEV 번들은 LoRA 어댑터를 병합하지 않고 적용하므로 oQ로 양자화한 베이스 모델에서도 동작합니다. JEV-9B는 oQ5 이상에서 원래 정확도에 가장 가깝습니다.
 
 ## CLI 설정
 

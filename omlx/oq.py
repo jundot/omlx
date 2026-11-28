@@ -64,12 +64,12 @@ except ImportError:
 
 from omlx.model_discovery import (
     D3_DECISION_CONFIG,
-    DECISION_SIDECAR_FILES,
-    DECISION_SIDECAR_WEIGHTS,
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
     decision_kind,
+    decision_sidecar_files,
+    decision_sidecar_weights,
 )
 
 logger = logging.getLogger(__name__)
@@ -4528,11 +4528,8 @@ def _is_inkling2_dir(path: str | Path) -> bool:
 
 def _source_weight_files(model_path: str | Path) -> list[Path]:
     source = Path(model_path)
-    files = sorted(
-        f
-        for f in source.glob("*.safetensors")
-        if f.name not in DECISION_SIDECAR_WEIGHTS
-    )
+    sidecars = decision_sidecar_weights(source)
+    files = sorted(f for f in source.glob("*.safetensors") if f.name not in sidecars)
     if inkling2_layout.has_bundled_draft(source) and _is_inkling2_dir(source):
         files = [f for f in files if not inkling2_layout.is_draft_file(f)]
     sidecar = source / "mtp" / "model_mtp.safetensors"
@@ -8451,7 +8448,7 @@ def quantize_oq_streaming(
     # Without an index, mlx-vlm loads every *.safetensors file, which would
     # include a decision head copied next to the shards.
     has_decision_head = any(
-        (source / name).is_file() for name in DECISION_SIDECAR_WEIGHTS
+        (source / name).is_file() for name in decision_sidecar_weights(source)
     )
     if total_shards > 1 or has_decision_head:
         total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
@@ -8545,8 +8542,10 @@ def quantize_oq_streaming(
     _copy_model_sidecars(
         source, output, text_only=text_only, model_type=config.get("model_type", "")
     )
-    for name in DECISION_SIDECAR_FILES:
-        if (source / name).is_file():
+    for name in decision_sidecar_files(source):
+        if (source / name).is_dir():
+            _copy_sidecar_tree(source / name, output / name)
+        elif (source / name).is_file():
             shutil.copy(source / name, output / name)
     if not text_only:
         _copy_bundled_drafts(source, output)

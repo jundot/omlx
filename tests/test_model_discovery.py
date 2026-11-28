@@ -21,6 +21,8 @@ from omlx.model_discovery import (
     _resolve_hf_cache_entry,
     _vision_weight_bytes,
     decision_kind,
+    decision_sidecar_files,
+    decision_sidecar_weights,
     detect_model_type,
     discover_models,
     discover_models_from_dirs,
@@ -699,6 +701,123 @@ class TestDetectModelType:
         assert decision_kind(renamed) == "openjev"
         assert detect_model_type(mlx_copy) == "decision"
         assert detect_model_type(other_family) == "llm"
+
+    @staticmethod
+    def _autotrust_jev_bundle(path, model_type="qwen3_5_text", **judge_overrides):
+        """An autotrust JEV bundle: backbone config, judge config, head, adapter."""
+        path.mkdir()
+        config = {"model_type": model_type, "architectures": ["Qwen3_5ForCausalLM"]}
+        (path / "config.json").write_text(json.dumps(config))
+        judge = {
+            "adapter_subfolder": "adapter",
+            "hidden_size": 4096,
+            "slots": {
+                "num_slots": 24,
+                "ranges": {"noul": [0, 2], "score": [2, 8], "choice": [8, 24]},
+                "template_version": "bare-v1",
+            },
+            "verbalizer_ids": list(range(24)),
+            **judge_overrides,
+        }
+        (path / "judge_config.json").write_text(json.dumps(judge))
+        (path / "calibration.json").write_text(json.dumps({"per_kind": {}}))
+        (path / "head.safetensors").write_bytes(b"")
+        (path / "adapter").mkdir()
+        (path / "adapter" / "adapter_config.json").write_text("{}")
+        return path
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5"])
+    def test_detect_autotrust_jev_bundle_by_judge_config_head_and_adapter(
+        self, tmp_path, model_type
+    ):
+        bundle = self._autotrust_jev_bundle(tmp_path / "bundle", model_type)
+
+        assert detect_model_type(bundle) == "decision"
+        assert decision_kind(bundle) == "autotrust-jev"
+        assert decision_sidecar_weights(bundle)[-1] == "head.safetensors"
+        assert decision_sidecar_files(bundle)[-4:] == (
+            "head.safetensors",
+            "judge_config.json",
+            "calibration.json",
+            "adapter",
+        )
+
+    def test_autotrust_jev_adapter_is_not_listed_as_a_lora_adapter(self, tmp_path):
+        # The adapter belongs to the bundle; it is not an adapter of its own
+        # that a chat model's settings could pick.
+        bundle = self._autotrust_jev_bundle(tmp_path / "bundle")
+        (bundle / "model.safetensors").write_bytes(b"0" * 1000)
+        adapters = {}
+
+        models = discover_models(tmp_path, adapters=adapters)
+
+        assert models["bundle"].engine_type == "decision"
+        assert adapters == {}
+
+    def test_autotrust_jev_bundle_on_a_vision_backbone_is_detected(self, tmp_path):
+        """A quantized Qwen3.8 chat checkpoint plus the autotrust JEV sidecars."""
+        bundle = self._autotrust_jev_bundle(tmp_path / "openjev-named", "qwen3_5")
+        config = json.loads((bundle / "config.json").read_text())
+        config["vision_config"] = {"depth": 27, "hidden_size": 1152}
+        (bundle / "config.json").write_text(json.dumps(config))
+
+        assert decision_kind(bundle) == "autotrust-jev"
+
+    @pytest.mark.parametrize(
+        ("broken", "change"),
+        [
+            ("no adapter", lambda p: (p / "adapter" / "adapter_config.json").unlink()),
+            ("no head", lambda p: (p / "head.safetensors").unlink()),
+            ("bad json", lambda p: (p / "judge_config.json").write_text("{")),
+            ("not a dict", lambda p: (p / "judge_config.json").write_text("[]")),
+        ],
+    )
+    def test_incomplete_autotrust_jev_bundle_is_a_plain_model(
+        self, tmp_path, broken, change
+    ):
+        bundle = self._autotrust_jev_bundle(tmp_path / "bundle")
+        change(bundle)
+
+        assert decision_kind(bundle) is None
+        assert detect_model_type(bundle) == "llm"
+        assert decision_sidecar_weights(bundle) == (
+            "joint_head.safetensors",
+            "readout.safetensors",
+        )
+
+    @pytest.mark.parametrize(
+        "judge",
+        [
+            {"slots": {"ranges": {}, "template_version": "bare-v2"}},
+            {"verbalizer_ids": None},
+            {"adapter_subfolder": "../elsewhere"},
+            {"adapter_subfolder": ".."},
+            {"adapter_subfolder": "/tmp/adapter"},
+        ],
+    )
+    def test_autotrust_jev_judge_config_must_be_known_and_stay_inside(
+        self, tmp_path, judge
+    ):
+        bundle = self._autotrust_jev_bundle(tmp_path / "bundle", **judge)
+
+        assert decision_kind(bundle) is None
+
+    def test_autotrust_jev_layout_on_another_backbone_is_not_detected(self, tmp_path):
+        """The same layout on Gemma-4 (the GEV variant) is not autotrust JEV."""
+        bundle = self._autotrust_jev_bundle(tmp_path / "bundle", "gemma4")
+
+        assert decision_kind(bundle) is None
+
+    def test_a_head_file_alone_beside_a_model_changes_nothing(self, tmp_path):
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5_text"}))
+        (model / "head.safetensors").write_bytes(b"")
+
+        assert decision_kind(model) is None
+        assert detect_model_type(model) == "llm"
+        assert "head.safetensors" not in decision_sidecar_weights(model)
+        assert "head.safetensors" not in decision_sidecar_files(model)
 
     def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
         """Qwen3 with CausalLM architecture should be LLM, not embedding."""
