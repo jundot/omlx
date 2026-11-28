@@ -232,6 +232,25 @@ def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, plan, K):
 
 
 @needs_nax
+@pytest.mark.parametrize("bits", [2, 3, 4])
+@pytest.mark.parametrize("plan", _PLANS[:6], ids=_plan_id)
+def test_oqh_row_scales_match_fp32_reference(bits, plan):
+    E, N, K = len(_COUNTS), 128, 256
+    wq, _, _, _ = _quantized(E, N, K, "affine", bits, 64, mx.bfloat16)
+    rscale = mx.random.uniform(0.01, 0.05, (E, N), key=mx.random.key(3))
+    rscale = rscale.astype(mx.bfloat16)
+    x, idx = _rows(_COUNTS, K, mx.bfloat16)
+    out = _nax(x, wq, rscale, None, idx, "oqh", bits, 64, plan)
+    ones = mx.ones((E, N, K // 64), dtype=mx.bfloat16)
+    center = -((2**bits - 1) / 2)
+    codes = mx.dequantize(wq, ones, ones * center, group_size=64, bits=bits)
+    wd = rscale[..., None].astype(mx.float32) * codes.astype(mx.float32)
+    ref = _fp32_ref(x, wd.astype(mx.bfloat16), idx)
+    err = mx.abs(out.astype(mx.float32) - ref)
+    assert (err <= mx.abs(ref) / 128 + 1e-3).all().item()
+
+
+@needs_nax
 @pytest.mark.parametrize("mode,gs", [("affine", 64), ("mxfp4", 32), ("nvfp4", 16)])
 @pytest.mark.parametrize("skew", [0.0, 1.2])
 def test_routed_rows_match_stock(mode, gs, skew):

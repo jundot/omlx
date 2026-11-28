@@ -486,7 +486,18 @@ class Attention(nn.Module):
         grouped = rope(
             out, rope_positions, c, bool(ratio), inverse=True, quantize=True, heads_major=heads_major
         ).reshape(1, length, c.o_groups, -1)
-        weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
+        weight = self.wo_a.weight
+        if isinstance(self.wo_a, nn.QuantizedLinear):
+            weight = mx.dequantize(
+                weight,
+                self.wo_a.scales,
+                None,
+                group_size=self.wo_a.group_size,
+                bits=self.wo_a.bits,
+                mode=self.wo_a.mode,
+                dtype=mx.bfloat16,
+            )
+        weight = weight.reshape(c.o_groups, c.o_lora_rank, -1)
         return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
 
 

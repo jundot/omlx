@@ -146,6 +146,20 @@ def test_gather_gemv_rows_match_one_row_decode():
     assert mx.array_equal(verify.reshape(batched.shape), batched)
 
 
+def test_sorted_small_route_sets_use_the_gather_gemv():
+    m = _switch(128, 512, 1024, "s", 1)
+    idx = mx.sort(mx.random.randint(0, 128, (40,))).astype(mx.uint32)
+    x = mx.random.normal((40, 1, 1024)).astype(mx.bfloat16)
+    mx.eval(m.parameters(), idx, x)
+    mx.synchronize()
+    mx.clear_cache()
+    base = mx.get_active_memory()
+    mx.reset_peak_memory()
+    out = m.matmul_rotated(x, idx, sorted_indices=True)
+    mx.eval(out)
+    assert mx.get_peak_memory() - base < 4 * out.nbytes
+
+
 def test_fused_switch_glu_serves_mlx_vlm_and_weighted_sum_callers():
     from mlx_vlm.models.switch_layers import SwitchGLU
 

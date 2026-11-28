@@ -2351,6 +2351,29 @@ class EnginePool:
             )
         return min(room, self._splash_wanted_bytes(entry, model_settings, target, room))
 
+    async def _fit_splash_context(
+        self, entry: EngineEntry, model_settings: object | None, engine: SplashEngine
+    ) -> None:
+        if get_global_settings().integrations.splash_max_memory_gb:
+            return
+        target, _ = self.splash_target(entry.model_id, model_settings)
+        context = self._splash_sizing_context(entry, model_settings, target)
+        budget = engine.budget_for_context(context) if context else None
+        if budget is None:
+            return
+        limit = self._splash_admission_target()
+        if 0 < limit < self._current_model_memory + budget:
+            return
+        logger.info(
+            "Splash: a %.1fGB budget does not keep the %d-token context of %s in "
+            "memory; restarting it with %.1fGB",
+            engine.reserved_bytes() / 1024**3,
+            context,
+            entry.model_id,
+            budget / 1024**3,
+        )
+        await engine.restart(budget)
+
     async def _check_splash_launcher(
         self, model_id: str, runtime_settings: object | None
     ) -> None:
@@ -4476,10 +4499,11 @@ class EnginePool:
             ) and self._start_prefill_helper_early(entry, model_settings)
             try:
                 await self._start_engine(engine)
+                if isinstance(engine, SplashEngine):
+                    await self._fit_splash_context(entry, model_settings, engine)
             except Exception as start_error:
                 if isinstance(engine, SplashEngine):
-                    # start() already stopped Splash; its error carries the
-                    # tail of the Splash log. There is no MLX fallback.
+                    await engine.stop()
                     raise
                 if hy4_engram_on_ssd:
                     raise
