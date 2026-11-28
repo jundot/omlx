@@ -14714,6 +14714,13 @@ class Scheduler:
                         output.tool_calls = final_result.tool_calls
                     if final_result.finish_reason:
                         output.finish_reason = final_result.finish_reason
+                    elif (
+                        final_result.tool_call_failed
+                        and is_stop
+                        and stop_prefix_chars is None
+                        and request.tools
+                    ):
+                        output.finish_reason = "tool_calls"
                     output.output_text = request.output_text
                 else:
                     # Standard finalization without a protocol parser
