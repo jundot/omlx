@@ -80,6 +80,8 @@ from ..reasoning_effort import (
 )
 from ..specprefill.draft import attach_specprefill_draft
 from ..speculative.dflash import attach_drafter, detach_drafter
+from ..utils.prefix_tokens import MIN_CHARS as PREFIX_TOKENS_MIN_CHARS
+from ..utils.prefix_tokens import encode_prompt, prefix_token_cache_for
 from ..utils.image import (
     compute_per_image_hashes,
     extract_images_from_messages,
@@ -1756,6 +1758,7 @@ class VLMBatchedEngine(BaseEngine):
         # Set after load for checkpoints that take native video input.
         self._native_video = False
         self._tokenizer = None
+        self._prefix_tokens = None
         self._adapter = None
         self._engine = None
         self._loaded = False
@@ -2538,6 +2541,7 @@ class VLMBatchedEngine(BaseEngine):
             raise RuntimeError(
                 f"VLM processor for {self._model_name} did not provide a usable tokenizer"
             )
+        self._prefix_tokens = prefix_token_cache_for(self._tokenizer)
 
         if self.is_diffusion_model:
             self._inject_tool_calling(self._tokenizer)
@@ -4365,14 +4369,31 @@ class VLMBatchedEngine(BaseEngine):
             # one image per prompt. A single prompt string keeps every page.
             if model_type == "unlimited-ocr" and isinstance(prompt, str):
                 prompts = prompt
-            # Tokenize text and preprocess images and audio
-            inputs = prepare_inputs(
-                self._processor,
-                images=images if images else None,
-                audio=audio if audio else None,
-                videos=videos if videos else None,
-                prompts=prompts,
-            )
+            prefix_tokens = getattr(self, "_prefix_tokens", None)
+            if (
+                prefix_tokens is not None
+                and not images
+                and not audio
+                and not videos
+                and isinstance(prompt, str)
+                and len(prompt) >= PREFIX_TOKENS_MIN_CHARS
+            ):
+                # mlx-vlm's text-only path is tokenizer(prompts,
+                # add_special_tokens=False); one prompt needs no padding.
+                ids = prefix_tokens.encode(prompt)
+                inputs = {
+                    "input_ids": mx.array([ids], dtype=mx.int32),
+                    "attention_mask": mx.ones((1, len(ids)), dtype=mx.int32),
+                }
+            else:
+                # Tokenize text and preprocess images and audio
+                inputs = prepare_inputs(
+                    self._processor,
+                    images=images if images else None,
+                    audio=audio if audio else None,
+                    videos=videos if videos else None,
+                    prompts=prompts,
+                )
 
         input_ids = inputs["input_ids"]
         pixel_values = inputs.get("pixel_values")
@@ -6196,7 +6217,7 @@ class VLMBatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return prompt, list(self._tokenizer.encode(prompt))
+        return prompt, encode_prompt(self._tokenizer, getattr(self, "_prefix_tokens", None), prompt)
 
     async def tokenize_chat(
         self,
