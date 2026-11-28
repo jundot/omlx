@@ -1475,6 +1475,9 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         "gemma4",
         "gemma4_unified",
         "muse_glimmer",
+        # Spark X2.5/X2.6 text-only loaded via mlx-vlm with its own
+        # SparkDSpark batched drafter (capture_layer_ids patched).
+        "spark2_5",
     ),
     "batched": (
         "qwen3_5",
@@ -1484,6 +1487,7 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         "laguna",
         "mimo_v2",
         "mimo_v2_flash",
+        "spark2_5",
     ),
 }
 
