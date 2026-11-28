@@ -151,6 +151,15 @@ def apply_mlx_lm_mtp_patch() -> bool:
     except Exception:
         logger.debug("verify qmm patch not applied", exc_info=True)
 
+    # Multi-row verify attention on 8x8 matrices (head width 128, plain
+    # KVCache); same arming as the qmm kernels, stock SDPA otherwise.
+    try:
+        from ..verify_mma_attention import apply as apply_verify_mma_attention
+
+        apply_verify_mma_attention()
+    except Exception:
+        logger.debug("verify mma attention patch not applied", exc_info=True)
+
     from ..deepseek_v4.decode_consistency import apply as apply_ds_consistency
 
     apply_ds_consistency()
