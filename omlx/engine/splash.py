@@ -1772,9 +1772,13 @@ class SplashEngine(BaseEngine):
     async def chat(self, messages: list[dict[str, Any]], **kwargs) -> GenerationOutput:
         return await self._collect(self.stream_chat(messages, **kwargs))
 
-    def count_chat_tokens(
-        self, messages, tools=None, chat_template_kwargs=None, is_partial=None
-    ) -> int:
+    def _chat_prompt_ids(
+        self,
+        messages,
+        tools=None,
+        chat_template_kwargs=None,
+        add_generation_prompt: bool = True,
+    ) -> list[int] | None:
         # The local template can reject a later system message that Splash
         # renders in place; the folded form has the same text.
         messages = _consolidate_system_messages(messages)
@@ -1788,17 +1792,51 @@ class SplashEngine(BaseEngine):
                 ids = self._tokenizer.apply_chat_template(
                     messages,
                     tools=tools,
-                    add_generation_prompt=True,
+                    add_generation_prompt=add_generation_prompt,
                     tokenize=True,
                     **attempt,
                 )
                 # Newer transformers return a BatchEncoding, not a list of ids.
-                return len(ids["input_ids"] if hasattr(ids, "keys") else ids)
+                return ids["input_ids"] if hasattr(ids, "keys") else ids
             except Exception:  # an effort value this template rejects
-                logger.debug("Splash: chat template token count failed", exc_info=True)
+                logger.debug("Splash: chat template tokenize failed", exc_info=True)
+        return None
+
+    async def tokenize_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> list[int]:
+        if self._tokenizer is None:
+            await self.start()
+        ids = self._chat_prompt_ids(
+            messages,
+            tools,
+            chat_template_kwargs,
+            add_generation_prompt=(
+                True if add_generation_prompt is None else add_generation_prompt
+            ),
+        )
+        if ids is None:
+            raise NotImplementedError(
+                "Splash: the chat template could not render token IDs"
+            )
+        return ids
+
+    def count_chat_tokens(
+        self, messages, tools=None, chat_template_kwargs=None, is_partial=None
+    ) -> int:
+        ids = self._chat_prompt_ids(messages, tools, chat_template_kwargs)
+        if ids is not None:
+            return len(ids)
         # Count the text only: an image's base64 payload is not prompt text.
         return sum(
-            len(self._tokenizer.encode(_text_of(m.get("content")))) for m in messages
+            len(self._tokenizer.encode(_text_of(m.get("content"))))
+            for m in _consolidate_system_messages(messages)
         )
 
     # -- plain completions -----------------------------------------------------------

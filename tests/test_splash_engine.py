@@ -2924,6 +2924,7 @@ class TestLaterSystem:
                     raise ValueError("System message must be at the beginning.")
                 return list("".join(f"<{m['role']}>{m['content']}" for m in messages))
 
+
         engine = _engine(tmp_path)
         engine._tokenizer = StrictTemplate()
         messages = [
@@ -2933,3 +2934,46 @@ class TestLaterSystem:
         ]
 
         assert engine.count_chat_tokens(messages) == len("<system>lead\n\nnote<user>hi")
+
+    async def test_tokenize_chat_returns_rendered_ids(self, tmp_path):
+        engine = _engine(tmp_path)
+        engine._tokenizer = SimpleNamespace(
+            apply_chat_template=lambda messages, **kwargs: list(
+                range(len(messages) + (1 if kwargs["add_generation_prompt"] else 0))
+            )
+        )
+        messages = [{"role": "user", "content": "hi"}]
+
+        assert await engine.tokenize_chat(messages) == [0, 1]
+        assert (
+            await engine.tokenize_chat(messages, add_generation_prompt=False)
+            == [0]
+        )
+
+    async def test_tokenize_chat_loads_the_tokenizer(self, tmp_path):
+        engine = _engine(tmp_path)
+        engine._tokenizer = None
+        started = asyncio.Event()
+
+        async def fake_start():
+            started.set()
+            engine._tokenizer = SimpleNamespace(
+                apply_chat_template=lambda messages, **kwargs: [1, 2, 3]
+            )
+
+        engine.start = fake_start
+        assert await engine.tokenize_chat([{"role": "user", "content": "hi"}]) == [
+            1,
+            2,
+            3,
+        ]
+        assert started.is_set()
+
+    async def test_tokenize_chat_propagates_template_failure(self, tmp_path):
+        engine = _engine(tmp_path)
+        engine._tokenizer = SimpleNamespace(
+            apply_chat_template=MagicMock(side_effect=ValueError("bad template"))
+        )
+        with pytest.raises(NotImplementedError):
+            await engine.tokenize_chat([{"role": "user", "content": "hi"}])
+
