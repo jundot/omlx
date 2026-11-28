@@ -270,3 +270,75 @@ def test_detect_reasoning_effort_reads_the_accepted_levels(tmp_path, template, l
     tc = {"chat_template": template}
     (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
     assert detect_reasoning_effort(tmp_path) == levels
+
+
+# ---------------------------------------------------------------------------
+# _merge_chat_template_kwargs pins the discovered thinking default
+# ---------------------------------------------------------------------------
+
+
+def _patched_server_state(thinking_default):
+    """Server state whose pool resolves any model id to an entry with the default."""
+    from types import SimpleNamespace
+
+    from omlx.server import ServerState
+
+    entry = SimpleNamespace(thinking_default=thinking_default)
+    state = ServerState()
+    state.engine_pool = SimpleNamespace(
+        resolve_model_id=lambda model_id, settings_manager=None: model_id,
+        get_entry=lambda model_id: entry,
+    )
+    return state
+
+
+@pytest.mark.parametrize("thinking_default", [True, False])
+def test_merge_pins_discovered_thinking_default(thinking_default, monkeypatch):
+    """Omitted enable_thinking falls back to the detected default."""
+    import omlx.server as server_module
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.server import _merge_chat_template_kwargs
+
+    monkeypatch.setattr(
+        server_module, "_server_state", _patched_server_state(thinking_default)
+    )
+
+    request = ChatCompletionRequest(model="qwen3", messages=[])
+    merged, budget = _merge_chat_template_kwargs(request, ModelSettings())
+
+    assert merged == {"enable_thinking": thinking_default}
+    assert budget is None
+
+
+def test_merge_leaves_unknown_thinking_default_unset(monkeypatch):
+    """No detected default keeps the template's internal default."""
+    import omlx.server as server_module
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.server import _merge_chat_template_kwargs
+
+    monkeypatch.setattr(
+        server_module, "_server_state", _patched_server_state(None)
+    )
+
+    request = ChatCompletionRequest(model="mystery", messages=[])
+    merged, _ = _merge_chat_template_kwargs(request, ModelSettings())
+
+    assert merged == {}
+
+
+def test_merge_request_kwarg_beats_discovered_default(monkeypatch):
+    """Explicit request enable_thinking still wins over the default."""
+    import omlx.server as server_module
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.server import _merge_chat_template_kwargs
+
+    monkeypatch.setattr(
+        server_module, "_server_state", _patched_server_state(True)
+    )
+
+    request = ChatCompletionRequest(
+        model="qwen3", messages=[], chat_template_kwargs={"enable_thinking": False}
+    )
+    merged, _ = _merge_chat_template_kwargs(request, ModelSettings())
+
+    assert merged == {"enable_thinking": False}

@@ -22,6 +22,12 @@ from omlx.api.shared_models import (
     get_unix_timestamp,
 )
 
+# Template kwargs that are booleans in every known thinking-capable chat
+# template. Kept small and explicit; extend only when a new template adds one.
+BOOLEAN_THINKING_TEMPLATE_KWARGS = frozenset(
+    {"enable_thinking", "thinking", "preserve_thinking"}
+)
+
 # =============================================================================
 # Content Types
 # =============================================================================
@@ -415,6 +421,23 @@ class ChatCompletionRequest(BaseModel):
     def check_top_logprobs(self) -> "ChatCompletionRequest":
         if self.top_logprobs and not self.logprobs:
             raise ValueError("top_logprobs requires logprobs to be true")
+        return self
+
+    @model_validator(mode="after")
+    def coerce_string_bool_thinking_kwargs(self) -> "ChatCompletionRequest":
+        """Coerce bool-ish strings in known thinking kwargs.
+
+        String values like "false" are truthy in Jinja, so a client sending
+        ``{"enable_thinking": "false"}`` would silently turn thinking ON.
+        The top-level ``enable_thinking`` alias is unaffected: it is already
+        strictly typed ``Optional[bool]``.
+        """
+        if not self.chat_template_kwargs:
+            return self
+        for key in BOOLEAN_THINKING_TEMPLATE_KWARGS:
+            value = self.chat_template_kwargs.get(key)
+            if isinstance(value, str) and value.lower() in ("true", "false"):
+                self.chat_template_kwargs[key] = value.lower() == "true"
         return self
 
     @model_validator(mode="after")

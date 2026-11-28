@@ -4941,6 +4941,22 @@ def _merge_chat_template_kwargs(
         and "enable_thinking" not in merged_ct_kwargs
     ):
         merged_ct_kwargs["enable_thinking"] = True
+
+    # Pin the checkpoint's detected thinking default. Without an
+    # explicit enable_thinking the template's internal default decides, and
+    # that drifts across checkpoint revisions; discovery already recorded the
+    # answer on the model entry. A positive thinking budget injected True
+    # above, so reaching this point means the request stayed silent.
+    if "enable_thinking" not in merged_ct_kwargs and request.model:
+        pool = _server_state.engine_pool
+        entry = (
+            pool.get_entry(resolve_model_id(request.model))
+            if pool is not None
+            else None
+        )
+        thinking_default = getattr(entry, "thinking_default", None)
+        if thinking_default is not None:
+            merged_ct_kwargs["enable_thinking"] = thinking_default
     return merged_ct_kwargs, thinking_budget
 
 
