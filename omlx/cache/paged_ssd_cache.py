@@ -3937,6 +3937,10 @@ class PagedSSDCacheManager(CacheManager):
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
+                # The bytes are copied out: a pool clear waiting for the lock
+                # can run here instead of after the whole block.
+                with mx_buffer_lock_released():
+                    pass
 
             # Estimate file size: raw tensor bytes + safetensors header.
             # The header is JSON-encoded per tensor (name + dtype + shape +

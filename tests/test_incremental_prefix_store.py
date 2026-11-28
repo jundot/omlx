@@ -5,6 +5,7 @@ import concurrent.futures
 import threading
 import time
 import types
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -356,6 +357,48 @@ def test_lock_is_let_go_while_a_store_waits_on_io():
     assert not _mx_buffer_access_lock._is_owned()
     with mx_buffer_lock_released():  # not held: a no-op
         pass
+
+
+def test_a_store_lets_the_lock_go_between_tensors(tmp_path, monkeypatch):
+    """A pool clear waiting for the lock gets it after each tensor of a block
+    is copied out, not only after the whole block."""
+    import omlx.cache.paged_ssd_cache as ssd
+
+    events = []
+    extract = ssd._extract_tensor_bytes
+    released = ssd.mx_buffer_lock_released
+
+    def recording_extract(arr):
+        events.append("copy")
+        return extract(arr)
+
+    @contextmanager
+    def probing_release():
+        with released():
+            got = []
+            t = threading.Thread(
+                target=lambda: got.append(_mx_buffer_access_lock.acquire(timeout=1))
+                or _mx_buffer_access_lock.release()
+            )
+            t.start()
+            t.join(2)
+            events.append("free" if got == [True] else "held")
+            yield
+
+    monkeypatch.setattr(ssd, "_extract_tensor_bytes", recording_extract)
+    monkeypatch.setattr(ssd, "mx_buffer_lock_released", probing_release)
+    manager = PagedSSDCacheManager(
+        cache_dir=tmp_path,
+        max_size_bytes=20 * 1024**2,
+        hot_cache_max_bytes=0,
+    )
+    kv = mx.zeros((1, 2, BLOCK, 8))
+    with _mx_buffer_access_lock:
+        assert manager.save_block(
+            b"block", [(kv, kv)], token_count=BLOCK, layer_cache_types=["KVCache"]
+        )
+    manager.close()
+    assert events[:4] == ["copy", "free", "copy", "free"]
 
 
 def test_turboquant_blocks_match_the_converted_cache(tmp_path):
