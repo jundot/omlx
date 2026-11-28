@@ -8407,6 +8407,36 @@ class TestStopStringOutputBuffer:
             assert not outputs[-1].tool_calls
             assert outputs[-1].output_text == "".join(pieces)
 
+    def test_inkling_malformed_call_reports_tool_call_finish(
+        self, mock_model, monkeypatch
+    ):
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = []
+        request.tools = [{"type": "function", "function": {"name": "get"}}]
+        tokenizer = scheduler.tokenizer
+        tokenizer.pieces = {
+            **tokenizer.pieces,
+            100: "<|message_model|><|content_thinking|>Check the value.<|end_message|>",
+            101: "<|message_model|>get<|content_invoke_tool_json|>",
+            102: '{"name":"get","args":{"key":"value",}}<|end_message|>',
+        }
+        scheduler._build_state_machine(request)
+        monkeypatch.setattr(
+            output_parser_module,
+            "create_streaming_detokenizer",
+            lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
+        )
+        session = output_parser_module.InklingOutputParserSession(tokenizer)
+        scheduler._get_output_parser_session = lambda request_id: session
+        responses = [self._response(token) for token in (100, 101, 102)]
+        responses.append(self._response(tokenizer.eos_token_id, "stop"))
+
+        outputs, _ = scheduler._process_batch_responses(responses)
+
+        assert outputs[-1].finish_reason == "tool_calls"
+        assert outputs[-1].tool_calls is None
+
     def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
         scheduler = self._setup(mock_model)
         responses = [

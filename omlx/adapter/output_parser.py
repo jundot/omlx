@@ -61,6 +61,7 @@ class OutputParserFinalizeResult:
     output_text_prefix: str = ""
     tool_calls: list[dict[str, str]] = field(default_factory=list)
     finish_reason: str | None = None
+    tool_call_failed: bool = False
 
 
 class OutputParserSession(Protocol):
@@ -1151,6 +1152,8 @@ class InklingOutputParserSession:
             visible_text=visible_text,
             tool_calls=tool_calls,
             finish_reason="tool_calls" if tool_calls else None,
+            tool_call_failed=not tool_calls
+            and _INKLING_CONTENT_TOOL_JSON in self._raw_text,
         )
 
 
