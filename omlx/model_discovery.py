@@ -70,6 +70,7 @@ VLM_MODEL_TYPES = {
     "unlimited_ocr",
     "dots_ocr",
     "glm_ocr",
+    "nemotron_parse_v3_5",
     "minimax_m3_vl",
     "minicpmv",
     "minicpmv4_7",
@@ -858,14 +859,17 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
     # Text-only quants won't carry a vision sub-config. gemma4_unified,
-    # diffusion_gemma, lfm3_audio and qwen3_omni_moe are exceptions: they are
-    # served by mlx-vlm regardless of vision_config presence in config.json.
+    # diffusion_gemma, lfm3_audio, qwen3_omni_moe and nemotron_parse_v3_5 are
+    # exceptions: they are served by mlx-vlm regardless of vision_config
+    # presence in config.json (Nemotron 3.5 Parse carries encoder/decoder
+    # sections, and mlx-vlm supplies the vision defaults itself).
     if normalized_type in VLM_MODEL_TYPES:
         if normalized_type in {
             "gemma4_unified",
             "diffusion_gemma",
             "lfm3_audio",
             "qwen3_omni_moe",
+            "nemotron_parse_v3_5",
         }:
             logger.info(
                 f"{model_type} detected as VLM (mlx-vlm native model)"

@@ -946,6 +946,17 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type == "nemotron_parse_v3_5":
+        from ..patches.mlx_vlm_nemotron_parse_compat import (
+            apply_mlx_vlm_nemotron_parse_compat_patch,
+        )
+
+        if apply_mlx_vlm_nemotron_parse_compat_patch():
+            logger.info(
+                "Nemotron 3.5 Parse mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     if for_vlm and model_type in ("inkling", "inkling_mm_model"):
         from ..patches.mlx_vlm_inkling_compat import (
             apply_mlx_vlm_inkling_compat_patch,
