@@ -30,7 +30,7 @@ from .tensor_strategies import (
 )
 
 _MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024 * 1024
-_MAX_SAFETENSORS_INDEX_BYTES = 16 * 1024 * 1024
+_MAX_SAFETENSORS_INDEX_BYTES = 64 * 1024 * 1024
 _MAX_METADATA_FILE_BYTES = 256 * 1024 * 1024
 _MAX_PIPELINE_LAYERS = 2048
 _LAYER_PATTERNS = (re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)"),)
