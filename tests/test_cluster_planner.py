@@ -60,6 +60,48 @@ def test_inspect_safetensors_layout_reads_headers_without_loading_tensors(tmp_pa
     assert layout.tensor_count == 5
 
 
+def test_inspect_safetensors_layout_recognises_qwen4_ple_tables(tmp_path):
+    """The PLE n-gram table is SSD-capable even without a DeepSeek table spec."""
+
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("language_model.model.embed_tokens.weight", 100),
+            ("language_model.model.layers.0.mlp.down_proj.weight", 200),
+            (
+                "language_model.model.layers.1.ple.ple_embedding."
+                "ngram_embedding.shards.0.weight",
+                4096,
+            ),
+            (
+                "language_model.model.layers.1.ple.ple_embedding."
+                "ngram_embedding.shards.0.scales",
+                128,
+            ),
+            ("language_model.model.layers.1.mlp.down_proj.weight", 300),
+        ],
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    # The bytes stay visible in the layer, and the table subset is what a plan
+    # with offload moves off the rank's wired budget.
+    assert layout.layer_weight_bytes == (200, 4524)
+    assert layout.tensor_parallel_ssd_layer_bytes == (0, 4224)
+    assert layout.tensor_parallel_layer_bytes == (200, 300)
+
+
+def test_qwen4_rank_prefixes_are_visible_to_a_cold_planner():
+    """Planning registers the adapter before reading its hidden-weight prefixes."""
+
+    from omlx.cluster import planner
+
+    config = {"model_type": "qwen4_exp"}
+
+    assert "vision_tower." in planner._cluster_unloaded_prefixes(config)
+    assert "mtp." in planner._cluster_mtp_prefixes(config)
+
+
 def test_inspect_safetensors_layout_rejects_offset_past_file(tmp_path):
     header = {
         "model.layers.0.weight": {
@@ -1030,3 +1072,26 @@ def test_explicit_support_declaration_wins_over_vision_guard(monkeypatch):
     )
     config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 8}}
     assert planner._supports_pipeline(config) is True
+
+
+def test_qwen4_exp_is_pipeline_capable_after_registration():
+    """R1 decision: Qwen4-Exp (Qwen3.8) runs PP, not TP.
+
+    A cold planner only knows the adapter once registration ran, which is what
+    ``inspect_safetensors_layout`` does before capability detection. Pin that so
+    the family cannot silently fall back to "not pipeline-capable" and be
+    refused for a multi-Mac plan.
+    """
+
+    import sys
+
+    from omlx.cluster import planner
+
+    config = {"model_type": "qwen4_exp"}
+    module = planner._cluster_rank_module(config)
+
+    assert module is not None
+    assert getattr(module, "SUPPORTS_PIPELINE", None) is True
+    assert getattr(module, "HONORS_PIPELINE_ASSIGNMENT", None) is True
+    assert planner._supports_pipeline(config) is True
+    assert sys.modules.get("mlx_lm.models.qwen4_exp") is module
