@@ -2020,6 +2020,7 @@ def served_vlm_engine(monkeypatch):
         think_start="<think>",
         think_start_id=7,
     )
+    engine._processor = SimpleNamespace(tokenizer=engine._tokenizer)
     engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler))
     engine.start = AsyncMock()
     output = GenerationOutput(
@@ -2088,6 +2089,15 @@ def test_vlm_chat_routes_tokenize_prompt_once_off_the_event_loop(
     assert served.generated[0]["_prepared_prompt"] == (
         "canonical prompt",
         [11, 12, 13],
+    )
+    # Generation gets the very request the prompt was prepared from, which is
+    # what lets the executor skip rendering it again.
+    generated = served.generated[0]
+    assert generated["_prepared_prompt"].matches(
+        generated["messages"],
+        generated.get("tools"),
+        generated.get("chat_template_kwargs"),
+        generated.get("is_partial"),
     )
 
 
