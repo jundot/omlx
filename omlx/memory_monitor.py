@@ -24,7 +24,10 @@ if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
 
 from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
-from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
+from omlx.patches.deepseek_v4.indexer_dispatch import (
+    native_indexer_available,
+    native_indexer_eligible,
+)
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,11 @@ try:
 except ImportError:
     HAS_MLX_METAL = False
     mx = None
+
+try:
+    from omlx.custom_kernels.attention import fast as attention_fast
+except ImportError:
+    attention_fast = None
 
 # Mirrors MLX Metal ScaledDotProductAttention::use_fallback for the
 # generation/inference path. Full prefill and short vector kernels support
@@ -1434,6 +1442,8 @@ class _Qwen4ExpPrefillMemoryProfile:
 
 # Match the sparse-MLA threshold in Glm5NextSparseAttention.__call__.
 _GLM5_NEXT_SPARSE_MLA_MIN_KV = 4096
+_GLM5_NEXT_BATCHED_TILE_MIN_ROWS = 32
+_GLM5_NEXT_GATHERED_ATTENTION_MAX_ROWS = 8
 
 # FP32 projection outputs can coexist with their FP16/BF16 kernel inputs.
 _GLM5_NEXT_EXACT_BLOCK_PROMOTION_DTYPE_SIZE = 4
@@ -1462,6 +1472,7 @@ class _GLM5NextPrefillMemoryProfile:
     hidden_size: int
     dtype_size: float
     score_dtype_size: float
+    fused_sparse_kernels: bool
 
     def estimate_resident_kv_bytes(
         self, num_tokens: int, *, chunk_tokens: int = 1
@@ -1520,8 +1531,25 @@ class _GLM5NextPrefillMemoryProfile:
             sparse = core + kv_expand + moe
         else:
             pooled = max(kv_len // max(self.index_kpool, 1), 1)
+            if self.fused_sparse_kernels:
+                padded_rows = -(-query_tokens // 64) * 64
+                padded_keys = -(-pooled // 64) * 64
+                row_chunks = -(-query_tokens // 512)
+                tile_scores = (
+                    padded_rows * padded_keys * (2 * self.score_dtype_size + 2)
+                    + row_chunks * padded_keys * self.index_head_dim * self.dtype_size
+                )
+                batched_tail_scores = (
+                    self.index_n_heads
+                    * min(query_tokens, _GLM5_NEXT_BATCHED_TILE_MIN_ROWS - 1)
+                    * pooled
+                    * 4
+                )
+                scores = max(tile_scores, batched_tail_scores)
+            else:
+                scores = self.index_n_heads * query_tokens * pooled * 4
             indexer = (
-                self.index_n_heads * query_tokens * pooled * 4
+                scores
                 + query_tokens * (self.index_n_heads + 1) * self.index_head_dim * self.dtype_size
             )
             q_latent = (
@@ -1534,6 +1562,22 @@ class _GLM5NextPrefillMemoryProfile:
                     * (self.qk_nope_head_dim + self.v_head_dim)
                     * (self.dtype_size + _GLM5_NEXT_EXACT_BLOCK_PROMOTION_DTYPE_SIZE)
                 )
+            elif self.fused_sparse_kernels:
+                selected = query_tokens * (self.index_topk + self.index_kpool - 1) * 16
+                projected = (
+                    2
+                    * query_tokens
+                    * self.num_attention_heads
+                    * self.v_head_dim
+                    * self.dtype_size
+                )
+                short_gather = (
+                    min(query_tokens, _GLM5_NEXT_GATHERED_ATTENTION_MAX_ROWS)
+                    * self.index_topk
+                    * self.kv_lora_rank
+                    * self.dtype_size
+                )
+                core = q_latent + selected + projected + short_gather
             else:
                 core = (
                     query_tokens
@@ -1616,6 +1660,14 @@ def _make_glm5_next_prefill_memory_profile(
         hidden_size=int(hidden_size),
         dtype_size=float(compute_dtype_size),
         score_dtype_size=float(compute_dtype_size),
+        fused_sparse_kernels=compute_dtype_size == 2
+        and int(num_attention_heads) in (32, 64)
+        and int(index_n_heads) == 32
+        and int(index_head_dim) == 128
+        and int(index_topk) // int(index_kpool) == 512
+        and int(kv_lora_rank) == 512
+        and native_indexer_available()
+        and attention_fast.has_symbol("sparse_mla_attention"),
     )
 
 
