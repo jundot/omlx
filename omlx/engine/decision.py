@@ -2,7 +2,8 @@
 """
 Decision engine for oMLX.
 
-Serves decision models (Clef, OpenJev, Decision 3.0, d1) through
+Serves decision models (Clef, OpenJev, Decision 3.0, d1, Mammoth-1 and
+Elephant-1) through
 ``/v1/systemone``. A request runs prompt forwards and no decoding. The engine
 steps the model's generator one chunk per executor call, so active chat
 decodes get the GPU between chunks.
@@ -20,6 +21,7 @@ import mlx.core as mx
 
 from ..engine_core import get_mlx_executor
 from ..model_discovery import decision_kind
+from ..models.baselabs import BaseLabsModel
 from ..models.clef import ClefModel
 from ..models.d1 import D1Model
 from ..models.d3 import D3Model
@@ -35,8 +37,9 @@ _MODEL_CLASSES = {
     "openjev": OpenJevModel,
     "d3": D3Model,
     "d1": D1Model,
+    "baselabs": BaseLabsModel,
 }
-DecisionModel = ClefModel | OpenJevModel | D3Model | D1Model
+DecisionModel = ClefModel | OpenJevModel | D3Model | D1Model | BaseLabsModel
 
 
 class DecisionEngine(BaseNonStreamingEngine):
@@ -82,7 +85,7 @@ class DecisionEngine(BaseNonStreamingEngine):
         if kind is None:
             raise ValueError(
                 f"{self._model_name} is not a supported decision model "
-                "(Clef, OpenJev, Decision 3.0 or d1)"
+                "(Clef, OpenJev, Decision 3.0, d1, Mammoth-1 or Elephant-1)"
             )
         logger.info(f"Starting decision engine ({kind}): {self._model_name}")
         model = _MODEL_CLASSES[kind](
