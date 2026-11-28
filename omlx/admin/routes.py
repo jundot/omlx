@@ -2958,9 +2958,16 @@ async def _require_admin_or_bearer(request: Request) -> bool:
 @router.post("/api/models/{model_id}/load")
 async def load_model(
     model_id: str,
+    local_only: bool = False,
     is_admin: bool = Depends(_require_admin_or_bearer),
 ):
-    """Manually load a model into memory."""
+    """Manually load a model into memory.
+
+    ``local_only=true`` loads it on *this* Mac alone: a registered cluster
+    deployment for the same checkpoint is ignored, so the load either fits the
+    local memory ceiling or is refused (507) here. It never starts remote ranks.
+    The cluster assistant's "Run on this Mac" flow uses it.
+    """
     engine_pool = _get_engine_pool()
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
@@ -2968,7 +2975,7 @@ async def load_model(
     entry = engine_pool.get_entry(model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
-    if entry.engine is not None:
+    if entry.engine is not None and not local_only:
         return {
             "status": "ok",
             "model_id": model_id,
@@ -2980,7 +2987,7 @@ async def load_model(
         )
 
     try:
-        await engine_pool.get_engine(model_id)
+        await engine_pool.get_engine(model_id, local_only=local_only)
     except ModelNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except (ModelTooLargeError, InsufficientMemoryError) as e:
