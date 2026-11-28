@@ -61,6 +61,8 @@ from ..model_settings import (
 from ..models.vlm import VLMModelAdapter
 from ..oqh.format import is_oqh_checkpoint
 from ..patches import qwen35_packed_linear
+from ..patches.ernie5_5 import loading as ernie5_5_loading
+from ..patches.ernie5_5.processing import TokenizedPrompt
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
@@ -71,7 +73,11 @@ from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
-from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..reasoning_effort import (
+    _fallback_candidate,
+    _harmony_effort,
+    apply_chat_template_with_reasoning_effort_fallback,
+)
 from ..specprefill.draft import attach_specprefill_draft
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
@@ -175,6 +181,7 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
+_TEXT_ONLY_MODEL_NAMES = {"flint": "Flint", "ernie5_5_moe": "ERNIE 5.5"}
 QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
@@ -324,6 +331,28 @@ def _apply_inkling2_reasoning_mode(
         template_kwargs["reasoning_effort"] = "none"
 
 
+def _apply_ernie5_5_reasoning_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    if model_type != "ernie5_5_moe":
+        return
+    effort = template_kwargs.pop("reasoning_effort", None)
+    if effort is None:
+        return
+    level = str(effort).strip().lower()
+    if level in ("none", "off"):
+        template_kwargs["enable_thinking"] = False
+    elif (mapped := _harmony_effort(level)) is not None:
+        template_kwargs["reasoning_effort"] = mapped
+    elif _fallback_candidate(level) is None:
+        raise InvalidRequestError(
+            "ERNIE 5.5 reasoning_effort must be low, medium, high, or none; "
+            f"got {effort!r}.",
+            field="reasoning_effort",
+        )
+
+
 def _apply_template_thinking_mode(
     model_type: str | None,
     template_kwargs: dict[str, Any],
@@ -332,6 +361,7 @@ def _apply_template_thinking_mode(
     _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
     _apply_hy_v4_reasoning_mode(model_type, template_kwargs)
     _apply_inkling2_reasoning_mode(model_type, template_kwargs)
+    _apply_ernie5_5_reasoning_mode(model_type, template_kwargs)
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
@@ -2083,6 +2113,11 @@ class VLMBatchedEngine(BaseEngine):
                         a8_prefill_min_tokens=int(
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
+                    )
+                if model_type == "ernie5_5_moe":
+                    return ernie5_5_loading.load(
+                        self._model_name,
+                        trust_remote_code=self._trust_remote_code,
                     )
                 if model_type in INKLING2_MODEL_TYPES:
                     loaded = inkling2_vlm.load(
@@ -4116,9 +4151,10 @@ class VLMBatchedEngine(BaseEngine):
         num_videos = len(videos) if videos else 0
 
         model_type = self.model_type or _read_config_model_type(self._model_name) or ""
-        if model_type == "flint" and (num_images or num_audios or num_videos):
+        text_only_name = _TEXT_ONLY_MODEL_NAMES.get(model_type)
+        if text_only_name and (num_images or num_audios or num_videos):
             raise InvalidRequestError(
-                "Flint is a text-only model and does not support "
+                f"{text_only_name} is a text-only model and does not support "
                 "image, audio, or video input.",
                 field="messages",
             )
@@ -4298,6 +4334,8 @@ class VLMBatchedEngine(BaseEngine):
             if fast is not None:
                 fast_cached_features = fast.pop("cached_image_features", None)
                 inputs = fast
+        if inputs is None and isinstance(prompt, TokenizedPrompt):
+            inputs = {"input_ids": mx.array([prompt.token_ids])}
         if inputs is None:
             prompts = [prompt] if isinstance(prompt, str) else prompt
             # A text-only chat template renders images as prose, and the

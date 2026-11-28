@@ -14,6 +14,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
+from ..patches.deepseek_v4 import apply_pooling_cache_support
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2.loader import is_mlx_vlm_quantization, mlx_vlm_quantization
 from ..patches.inkling2.loopcd import apply_loopcd
@@ -810,6 +811,8 @@ def maybe_apply_pre_load_patches(
         from ..patches.deepseek_v41 import apply_patch
 
         apply_patch()
+    if model_type == "ernie5_5_moe":
+        apply_pooling_cache_support()
     if not for_vlm and model_type == "deepseek_v41":
         # Cluster ranks are mlx-lm servers; see the patch docstring.
         from ..patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
@@ -1566,6 +1569,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type == "step3p7"
         or model_type == "bailing_hybrid"
         or model_type in ("hy_v4_vl", "hy_v4_flash")
+        or model_type == "ernie5_5_moe"
     )
 
 

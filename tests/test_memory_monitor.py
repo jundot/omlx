@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 
+from omlx import memory_monitor
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
@@ -15,9 +16,11 @@ from omlx.memory_monitor import (
     _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
     MemoryInfo,
     MemoryMonitor,
+    make_prefill_memory_profile,
     raise_if_prefill_exceeds,
     set_model_info_from_model,
 )
+from omlx.patches.ernie5_5.config import ModelConfig as Ernie55Config
 from omlx.utils.hardware import format_bytes
 
 
@@ -1128,6 +1131,42 @@ class TestDeepSeekV4PrefillMemoryProfile:
         config = self._config()
         config.model_type = "llama"
         assert make_prefill_memory_profile(config, compute_dtype_size=2) is None
+
+
+def test_ernie55_profile_prices_pooled_and_latent_caches(monkeypatch):
+    profile = make_prefill_memory_profile(Ernie55Config(), compute_dtype_size=2)
+    tokens = 1 << 20
+    assert profile.estimate_resident_kv_bytes(tokens, chunk_tokens=2048) == (
+        37 * (tokens // 128 + 128 + 2047) * 1024 + 8448 * tokens
+    )
+    routes = (
+        "ernie55_sparse_prefill_available",
+        "wsdpa_prefill_route_active",
+        "nax_sparse_attention_ready",
+    )
+    for route in routes:
+        monkeypatch.setattr(memory_monitor, route, lambda: True)
+    sparse = [
+        profile.estimate_prefill_transient_bytes(2048, kv) for kv in (8192, tokens)
+    ]
+    assert sparse[0] < 1 << 30 and sparse[1] - sparse[0] < 2 << 30
+    monkeypatch.setattr(memory_monitor, "wsdpa_prefill_route_active", lambda: False)
+    assert profile.estimate_prefill_transient_bytes(2048, tokens) == sparse[1]
+    for route in routes:
+        monkeypatch.setattr(memory_monitor, route, lambda: False)
+    assert profile.estimate_prefill_transient_bytes(2048, 2048) == (
+        2048 * 64 * 448 * 2 + 256 * 2048 * 2048
+    )
+    assert profile.estimate_prefill_transient_bytes(2048, 8192) == (
+        8192 * 64 * 448 * 2 + 384 * 2048 * 8192
+    )
+    mla_only = make_prefill_memory_profile(
+        Ernie55Config(num_hidden_layers=1, compress_ratios=[-2]),
+        compute_dtype_size=2,
+    )
+    assert mla_only.estimate_prefill_transient_bytes(2048, 2048) == (
+        2048 * 64 * 448 * 2 + 256 * 2048 * 2048
+    )
 
 
 class TestQwen4ExpPrefillMemoryProfile:

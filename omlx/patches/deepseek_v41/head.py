@@ -51,7 +51,6 @@ def project_logits(x, weight):
         or not 1 <= x.size // width <= MAX_ROWS
         or width % 4
         or width < 256
-        or rows < 4096
         or mx.default_device() == mx.cpu
     ):
         return x.astype(mx.float32) @ weight.astype(mx.float32).T

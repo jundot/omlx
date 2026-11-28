@@ -179,6 +179,7 @@ _ALIGNED = [
     ("mxfp4", 4, 32, mx.bfloat16),
     ("mxfp4", 4, 32, mx.float16),
     ("nvfp4", 4, 16, mx.bfloat16),
+    ("mxfp8", 8, 32, mx.bfloat16),
 ]
 
 
@@ -248,7 +249,12 @@ def test_routed_rows_match_stock(mode, gs, skew):
 @needs_nax
 @pytest.mark.parametrize(
     "mode,bits,dtype",
-    [("affine", 4, mx.bfloat16), ("affine", 8, mx.float16), ("mxfp4", 4, mx.bfloat16)],
+    [
+        ("affine", 4, mx.bfloat16),
+        ("affine", 8, mx.float16),
+        ("mxfp4", 4, mx.bfloat16),
+        ("mxfp8", 8, mx.bfloat16),
+    ],
 )
 @pytest.mark.parametrize("K", [32, 96, 544])
 def test_ragged_k_matches_fp32_reference(mode, bits, dtype, K, forced_plan):

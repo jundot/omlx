@@ -379,7 +379,11 @@ class TestDetectModelType:
 
     @pytest.mark.parametrize(
         "model_type,architecture",
-        [("cohere2_moe", "Cohere2MoeForCausalLM"), ("flint", "FlintForCausalLM")],
+        [
+            ("cohere2_moe", "Cohere2MoeForCausalLM"),
+            ("flint", "FlintForCausalLM"),
+            ("ernie5_5_moe", "Ernie5_5_MoeForCausalLM"),
+        ],
     )
     def test_detect_native_text_model_as_vlm(self, tmp_path, model_type, architecture):
         """Text-only families implemented by mlx-vlm route to the VLM engine."""

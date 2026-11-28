@@ -156,16 +156,19 @@ def capture_prompt(
     inputs: mx.array,
     aux_hidden: mx.array,
     target_cache: Optional[list[Any]],
+    *,
+    schedule: bool = True,
 ) -> None:
     """Stream target-layer hidden states into the owning request's context."""
     if target_cache is None or inputs.ndim != 2 or inputs.shape[0] != 1:
         return
     prompt_priming.owned_capture(
-        host, lambda: _capture_prompt(host, inputs, aux_hidden, target_cache)
+        host,
+        lambda: _capture_prompt(host, inputs, aux_hidden, target_cache, schedule),
     )
 
 
-def _capture_prompt(host, inputs, aux_hidden, target_cache):
+def _capture_prompt(host, inputs, aux_hidden, target_cache, schedule):
     offset_after = _target_cache_offset(target_cache)
     if offset_after is None:
         return
@@ -196,7 +199,7 @@ def _capture_prompt(host, inputs, aux_hidden, target_cache):
     for cache in ctx.caches:
         if cache.keys is not None:
             arrays.append(cache.keys)
-    if arrays:
+    if arrays and schedule:
         mx.async_eval(arrays)
 
 

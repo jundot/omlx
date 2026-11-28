@@ -1372,6 +1372,54 @@ def _k2_horizon_marker_ids(tokenizer: Any) -> dict[str, int]:
     return marker_ids
 
 
+_ERNIE55_THINK_START = "<ernie:think>"
+_ERNIE55_THINK_END = "</ernie:think>"
+
+
+class Ernie55OutputParserSession:
+    """Normalize ERNIE 5.5 think markers; leave tool parsing to the shared API path."""
+
+    def __init__(self, tokenizer: Any, model_path: str | None = None):
+        self._tokenizer = tokenizer
+        self._open_id = _token_id_for_text(tokenizer, _ERNIE55_THINK_START)
+        self._close_id = _token_id_for_text(tokenizer, _ERNIE55_THINK_END)
+        self._in_reasoning = False
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
+        if self._detokenizer is not None:
+            self._detokenizer.reset()
+
+    def notify_prefilled_thought(self) -> None:
+        self._in_reasoning = True
+
+    def _flush(self) -> str:
+        if self._detokenizer is None:
+            return ""
+        self._detokenizer.finalize()
+        text = self._detokenizer.last_segment
+        self._detokenizer.reset()
+        return text
+
+    def _emit(self, text: str) -> OutputParserTokenResult:
+        return OutputParserTokenResult(
+            stream_text=text, visible_text=text, record_token=True
+        )
+
+    def process_token(self, token_id: int) -> OutputParserTokenResult:
+        if token_id in (self._open_id, self._close_id):
+            opens = token_id == self._open_id
+            if opens == self._in_reasoning:
+                return OutputParserTokenResult(record_token=True)
+            self._in_reasoning = opens
+            return self._emit(self._flush() + ("<think>\n" if opens else "</think>"))
+        return self._emit(
+            _decode_output_token(self._tokenizer, self._detokenizer, token_id)
+        )
+
+    def finalize(self) -> OutputParserFinalizeResult:
+        text = self._flush()
+        return OutputParserFinalizeResult(stream_text=text, visible_text=text)
+
+
 def detect_output_parser(
     model_name: str,
     tokenizer: Any,
@@ -1432,6 +1480,17 @@ def detect_output_parser(
             thinking_end_text=_K2_THINK_MARKERS[0][1],
             thinking_marker_pairs=_K2_THINK_MARKERS,
             protocol_marker_texts=_K2_MARKERS,
+        )
+
+    if model_type == "ernie5_5_moe":
+        return OutputParserFactory(
+            kind="ernie5_5",
+            create_session=lambda session_tokenizer: Ernie55OutputParserSession(
+                session_tokenizer, model_path=session_model_path
+            ),
+            thinking_start_text=_ERNIE55_THINK_START,
+            thinking_start_output_text="<think>\n",
+            thinking_end_text=_ERNIE55_THINK_END,
         )
 
     if is_harmony_model(model_name, model_config):

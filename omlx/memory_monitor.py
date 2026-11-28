@@ -25,6 +25,12 @@ if TYPE_CHECKING:
 
 from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
 from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
+from omlx.patches.deepseek_v4.sparse_attention_nax import nax_sparse_attention_ready
+from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill_route_active
+from omlx.patches.ernie5_5 import (
+    sparse_prefill_available as ernie55_sparse_prefill_available,
+)
+from omlx.patches.glm_moe_dsa.indexer_nax import max_rows_per_call
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
@@ -1826,6 +1832,78 @@ def _make_deepseek_v41_prefill_memory_profile(
     )
 
 
+@dataclass(frozen=True)
+class _Ernie55PrefillMemoryProfile:
+    config: Any
+    dtype_size: float
+
+    def estimate_resident_kv_bytes(
+        self, num_tokens: int, *, chunk_tokens: int = 1
+    ) -> int:
+        c = self.config
+        window = min(num_tokens, c.sliding_window + chunk_tokens - 1)
+        pooled = sum(num_tokens // r + window for r in c.compress_ratios if r != -2)
+        latent = c.compress_ratios.count(-2) * num_tokens
+        width = c.hybrid_mla_kv_lora_rank + c.hybrid_mla_qk_rope_head_dim
+        return int(
+            (pooled * c.head_dim + latent * (width + c.index_head_dim))
+            * self.dtype_size
+        )
+
+    def estimate_prefill_transient_bytes(self, query_tokens: int, kv_len: int) -> int:
+        return int(
+            max(
+                self._mla_bytes(query_tokens, kv_len),
+                self._hca_bytes(query_tokens, kv_len),
+            )
+        )
+
+    def _mla_bytes(self, query_tokens: int, kv_len: int) -> float:
+        c = self.config
+        heads = c.hybrid_mla_num_attention_heads
+        if ernie55_sparse_prefill_available():
+            latent = c.hybrid_mla_kv_lora_rank
+            queries = heads * (
+                c.hybrid_mla_qk_nope_head_dim + c.hybrid_mla_qk_rope_head_dim
+            )
+            latent_queries_and_outputs = 2 * heads * latent
+            values_and_gates = 3 * heads * c.hybrid_mla_v_head_dim
+            index_queries = 3 * c.index_n_heads * c.index_head_dim
+            scores = min(query_tokens, max_rows_per_call(kv_len)) * kv_len
+            cache_growth = kv_len * (
+                latent + c.hybrid_mla_qk_rope_head_dim + c.index_head_dim
+            )
+            per_row = (
+                queries + latent_queries_and_outputs + values_and_gates + index_queries
+            )
+            return (query_tokens * per_row + scores + cache_growth) * self.dtype_size
+        scores = query_tokens * kv_len
+        dense_kv = (
+            kv_len
+            * heads
+            * (c.hybrid_mla_qk_nope_head_dim + c.hybrid_mla_v_head_dim)
+            * self.dtype_size
+        )
+        rope_and_sdpa_scores = 2 * self.dtype_size * heads * scores
+        ranks_keys = kv_len > c.index_topk + c.sliding_window
+        bf16_and_fp32_index_scores = (2 + 4) * c.index_n_heads * scores
+        return dense_kv + max(
+            rope_and_sdpa_scores, bf16_and_fp32_index_scores if ranks_keys else 0
+        )
+
+    def _hca_bytes(self, query_tokens: int, kv_len: int) -> float:
+        c = self.config
+        ratios = [r for r in c.compress_ratios if r != -2]
+        if not ratios:
+            return 0
+        rows = query_tokens * c.num_attention_heads
+        if wsdpa_prefill_route_active() or nax_sparse_attention_ready():
+            return 6 * rows * c.head_dim * self.dtype_size
+        pooled = kv_len // min(ratios)
+        hca_keys = c.sliding_window - 1 + query_tokens + pooled
+        return 2 * self.dtype_size * rows * hca_keys
+
+
 def make_prefill_memory_profile(
     config: Any,
     *,
@@ -1834,6 +1912,8 @@ def make_prefill_memory_profile(
 ) -> PrefillMemoryProfile | None:
     """Build a model-specific prefill strategy when the uniform formulas fail."""
     model_type = str(_cfg_get(config, "model_type", "") or "")
+    if model_type == "ernie5_5_moe":
+        return _Ernie55PrefillMemoryProfile(config, float(compute_dtype_size))
     if model_type.startswith("qwen4_exp"):
         return _make_qwen4_exp_prefill_memory_profile(
             config, compute_dtype_size=compute_dtype_size

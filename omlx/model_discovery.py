@@ -98,6 +98,7 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     "lfm3",
     # mlx-lm ships its own deepseek_v41 without the oMLX cache and kernels.
     "deepseek_v41",
+    "ernie5_5_moe",
     "glm5_next",
     # Hy4 and Hy4-flash: text-only conversions have no mlx-lm module either.
     "hy_v4_vl",

@@ -78,7 +78,9 @@ def restore_bonsai_quantized_modules(model: nn.Module) -> int:
 
 
 # Language models whose forward accepts ``skip_logits`` for cache-only prefill.
-_SKIP_LOGITS_MODEL_TYPES = frozenset({"qwen4_exp", "hy_v4_vl", "hy_v4_flash"})
+_SKIP_LOGITS_MODEL_TYPES = frozenset(
+    {"qwen4_exp", "hy_v4_vl", "hy_v4_flash", "ernie5_5_moe"}
+)
 
 # M-RoPE language models whose layer caches are CacheLists (the position offset
 # lives on the first child) and whose rope parameters nest per attention kind.

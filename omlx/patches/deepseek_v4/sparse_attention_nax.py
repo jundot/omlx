@@ -385,6 +385,11 @@ def nax_sparse_attention_available() -> bool:
         return False
 
 
+def nax_sparse_attention_ready(q_token_major: bool = False, p_lo: bool = True) -> bool:
+    """True once that kernel instantiation has run in this process."""
+    return (q_token_major, p_lo) in _READY
+
+
 def sparse_topk_attention_nax(
     q: mx.array,
     kv: mx.array,
