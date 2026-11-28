@@ -1437,6 +1437,7 @@ def test_forget_member_preserves_other_pairings_or_leaves_cluster(monkeypatch, n
 @pytest.mark.parametrize("status", [409, 503])
 def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, status):
     from fastapi import HTTPException
+
     from omlx.cluster import pairing_routes
 
     removed = []
@@ -1487,3 +1488,44 @@ def test_forget_member_maps_pairing_errors(monkeypatch):
     response = TestClient(app).delete("/admin/api/cluster/forget?node_id=busy")
     assert response.status_code == 404
     assert response.json()["detail"] == "approval is already in progress"
+
+
+def test_cluster_mtp_is_refused_by_name_for_an_unproven_family():
+    """A cluster-MTP deadlock became a named refusal.
+
+    GLM (glm5_next) claims the MTP chain marker but two ranks arm it and the
+    follower then waits ~120 s inside ``_share_object`` while the canary never
+    completes (two runs, identical). Refusing up front names the cause and the
+    way out instead of hanging. qwen4_exp stays allowed (live: 57.1 tok/s in a
+    two-Mac pipeline against 49.0 with MTP off).
+    """
+
+    from types import SimpleNamespace
+
+    from omlx.cluster.inference_worker import _arm_cluster_mtp
+    from omlx.cluster.mtp_sync import (
+        CLUSTER_MTP_FAMILIES,
+        cluster_mtp_family_supported,
+    )
+
+    assert "qwen4_exp" in CLUSTER_MTP_FAMILIES
+    assert cluster_mtp_family_supported("qwen4_exp") is True
+    # A text-only load reports the family with a ``_text`` suffix; it is the
+    # same architecture and must not be refused by accident.
+    assert cluster_mtp_family_supported("qwen4_exp_text") is True
+    assert cluster_mtp_family_supported("qwen3_5_moe_text") is True
+    assert cluster_mtp_family_supported("glm5_next") is False
+    assert cluster_mtp_family_supported("glm5_next_text") is False
+    assert cluster_mtp_family_supported(None) is False
+
+    model = SimpleNamespace(
+        language_model=SimpleNamespace(model_type="glm5_next", mtp=None),
+        args=SimpleNamespace(model="/models/GLM-5.3-Flash-oQ2e-mtp"),
+    )
+    with pytest.raises(RuntimeError) as exc:
+        _arm_cluster_mtp(model, object(), 0, None)
+
+    message = str(exc.value)
+    assert "not wired" in message
+    assert "glm5_next" in message
+    assert "without MTP" in message

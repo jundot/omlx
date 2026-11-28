@@ -38,7 +38,7 @@ from .memory_guard import (
     guard_rank_load,
     watch_rank_load,
 )
-from .mtp_sync import ClusterMtpSync
+from .mtp_sync import CLUSTER_MTP_FAMILIES, ClusterMtpSync, cluster_mtp_family_supported
 from .performance import ExecutionSettings
 from .pipeline_compat import (
     install_pipeline_compatibility,
@@ -216,6 +216,27 @@ def _arm_cluster_mtp(model: Any, group: Any, rank: int, mx: Any) -> Any:
     """
 
     host = getattr(model, "language_model", model)
+    # A family whose cluster chain is not proven must not arm MTP at all: GLM
+    # (glm5_next) claims the chain marker but deadlocks — both ranks arm, then
+    # rank 1 waits ~120 s inside ``_share_object`` and the deployment dies with
+    # a timeout that says nothing about the cause. Refuse by name so the
+    # operator can plan the same nodes without MTP or run on one Mac.
+    model_type = str(getattr(host, "model_type", "") or "")
+    if not model_type:
+        try:
+            model_type = _distributed_model_type(
+                getattr(getattr(model, "args", None), "model", "")
+            )
+        except Exception:  # noqa: BLE001 - an unreadable model means "unknown"
+            model_type = ""
+    if not cluster_mtp_family_supported(model_type):
+        raise RuntimeError(
+            "cluster Lightning MTP is not wired for this architecture "
+            f"({model_type or 'unknown'}); the MTP chain deadlocks across "
+            "ranks. Plan the same nodes without MTP or run the model on one "
+            "Mac. Families proven in a cluster: "
+            f"{', '.join(sorted(CLUSTER_MTP_FAMILIES))}"
+        )
     if rank == 0:
         ready = bool(getattr(host, "_omlx_mtp_decode_enabled", False)) and (
             getattr(host, "mtp", None) is not None
