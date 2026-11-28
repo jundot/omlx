@@ -4977,6 +4977,10 @@ def _build_model_sanitizer(
     # the arch-only heuristic dropped them to the mlx-lm sanitize path (which
     # can't resolve their model_type) and shipped unsanitized vision weights.
     model_type = str(config.get("model_type", "")).lower().replace("-", "_")
+    if model_type == "ricursive":
+        from omlx.patches.ripple import apply_ripple_patch
+
+        apply_ripple_patch()
     mlx_lm_text_only = model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
     is_vlm = (
         any("ForConditionalGeneration" in a for a in architectures)

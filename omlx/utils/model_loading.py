@@ -853,6 +853,11 @@ def maybe_apply_pre_load_patches(
         if apply_raon1_mini_patch():
             logger.info("Raon-1 mini pre-load patch applied for %s", model_name)
 
+    if model_type == "ricursive":
+        from ..patches.ripple import apply_ripple_patch
+
+        apply_ripple_patch()
+
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured
         # parser during ``lm_load_compat``; register both before that load starts.
