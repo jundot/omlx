@@ -638,7 +638,7 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
-            oqPreserveNgram: false,
+            oqEngramPrecision: 'auto',
             oqMtpAssistantPath: '',
             oqEnhanced: false,
             oqHadamard: false,
@@ -8419,7 +8419,7 @@
                     preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp,
                     mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
                         ? this.oqMtpAssistantPath : '',
-                    preserve_ngram_table: this.oqPreservesNgram(),
+                    engram_precision: this.oqSelectedEngramPrecision(),
                 };
             },
 
@@ -8580,8 +8580,25 @@
                 return model?.model_type || '';
             },
 
-            oqPreservesNgram() {
-                return this.oqSelectedModelType() === 'deepseek_v41' && this.oqPreserveNgram;
+            oqEngramPrecisionChoices() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                const table = model?.engram_precision;
+                const source = table?.source_precision;
+                const autoBits = table?.auto_bits?.[this.oqLevel];
+                const suffix16 = {bf16: 'BF16', fp16: 'FP16'}[source];
+                const labels = {
+                    auto: autoBits
+                        ? window.t('models.oq.engramPrecisionAutoBits').replace('{bits}', autoBits)
+                        : window.t('models.oq.engramPrecisionAuto'),
+                    8: window.t('models.oq.engramPrecision8') + (source === 'fp8' ? ' (FP8)' : ' (MLX affine)'),
+                    16: window.t('models.oq.engramPrecision16') + (suffix16 ? ' (' + suffix16 + ')' : ''),
+                };
+                return (table?.available || ['auto']).map(value => ({value, label: labels[value]}));
+            },
+
+            oqSelectedEngramPrecision() {
+                return this.oqEngramPrecisionChoices().some(choice => choice.value === this.oqEngramPrecision)
+                    ? this.oqEngramPrecision : 'auto';
             },
 
             oqAvailableLevels() {
@@ -8590,6 +8607,10 @@
             },
 
             oqApplyModelPolicy() {
+                if (this._oqEngramModelPath !== this.oqSelectedModelPath) {
+                    this._oqEngramModelPath = this.oqSelectedModelPath;
+                    this.oqEngramPrecision = 'auto';
+                }
                 if (this.oqSelectedModelType() !== 'deepseek_v41') return;
                 if (!this.oqAvailableLevels().includes(this.oqLevel)) this.oqLevel = 4;
                 this.oqDtype = 'bfloat16';

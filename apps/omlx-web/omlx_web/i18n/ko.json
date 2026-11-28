@@ -2476,5 +2476,11 @@
   "cluster.cuda_guide.windows_firewall": "관리자 권한 PowerShell에서 이 Mac이 헬퍼에 연결할 수 있게 허용합니다.",
   "cluster.cuda_guide.windows_run": "PowerShell에서 헬퍼를 시작합니다. 헬퍼가 이 Mac에 페어링을 요청하면 헬퍼 로그의 코드를 이 화면에 입력하세요. 이 Mac의 주소가 여러 개면 PC에서 닿는 주소로 바꾸세요.",
   "cluster.cuda_guide.spark_run": "DGX OS에는 Docker와 NVIDIA Container Toolkit이 들어 있습니다. 헬퍼를 시작합니다. 이 화면에 나타나면 Pair를 누르고 헬퍼 로그의 코드를 입력하세요.",
-  "cluster.device_card.helper_ready": "{name}에서 이 Mac 모델의 긴 프롬프트를 빠르게 처리할 수 있습니다."
+  "cluster.device_card.helper_ready": "{name}에서 이 Mac 모델의 긴 프롬프트를 빠르게 처리할 수 있습니다.",
+  "models.oq.engram_precision": "Engram 테이블 정밀도",
+  "models.oq.engramPrecisionAuto": "자동",
+  "models.oq.engramPrecisionAutoBits": "자동 ({bits}비트)",
+  "models.oq.engramPrecisionHelp": "Engram 및 N-gram PLE 테이블에만 적용됩니다. 자동은 기존 oQ 규칙을 따릅니다.",
+  "models.oq.engramPrecision8": "8비트",
+  "models.oq.engramPrecision16": "16비트"
 }

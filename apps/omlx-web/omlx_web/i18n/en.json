@@ -2476,5 +2476,11 @@
   "cluster.cuda_guide.windows_firewall": "In PowerShell as administrator, let this Mac reach the helper.",
   "cluster.cuda_guide.windows_run": "Start the helper in PowerShell. It asks this Mac to pair: type the code from its log on this page. If this Mac has more than one address, use the one the PC can reach.",
   "cluster.cuda_guide.spark_run": "DGX OS comes with Docker and the NVIDIA Container Toolkit. Start the helper. It appears on this page: press Pair on it and type the code from its log.",
-  "cluster.device_card.helper_ready": "{name} can speed up long prompts for models on this Mac."
+  "cluster.device_card.helper_ready": "{name} can speed up long prompts for models on this Mac.",
+  "models.oq.engram_precision": "Engram table precision",
+  "models.oq.engramPrecisionAuto": "Auto",
+  "models.oq.engramPrecisionAutoBits": "Auto ({bits}-bit)",
+  "models.oq.engramPrecisionHelp": "Applies only to Engram and N-gram PLE tables. Auto uses the existing oQ policy.",
+  "models.oq.engramPrecision8": "8-bit",
+  "models.oq.engramPrecision16": "16-bit"
 }

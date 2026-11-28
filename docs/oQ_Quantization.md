@@ -112,7 +112,7 @@ Sample selection uses a fixed seed, so repeated runs on the same model see the s
 | Enhanced quantization (oQe) | Uses the imatrix when rounding. Recommended |
 | Text Only | Leaves out the vision encoder of a vision-language model and writes a text-only model |
 | Preserve MTP weights | Keeps the MTP heads so Lightning MTP works after quantization. Adds `-mtp` to the name |
-| Keep original Engram tables | DeepSeek V4.1 only. Copies the Engram tables in their original FP8 storage instead of 4-bit. The output is larger on disk, and memory use with SSD N-gram Offload stays the same. Adds `-ngram` to the name |
+| Engram table precision | `Auto` follows the existing oQ policy. Where supported by the source and loader, `8-bit` writes MLX affine from floating-point tables or copies the source FP8 values and scales. `16-bit` copies source BF16 or FP16 bytes. Explicit choices add `-engram8` or `-engram16` to the output name. DeepSeek V4.1 FP8 copies use the existing `-ngram` suffix |
 | Combine other model's MTP head | Grafts an MTP head from another checkpoint of the same architecture, or a Gemma 4 assistant model, into the output |
 | Non-quant weight dtype | bfloat16 (default) or float16 for unquantized weights and quantization scales. float16 adds `-fp16` to the name |
 | Sensitivity Model | Measures sensitivity on an already quantized copy of the model to use about 4x less memory |
@@ -137,9 +137,19 @@ oQ works with models that mlx-lm or mlx-vlm can load, including MoE and vision-l
 
 Models that are already MLX-quantized cannot be used as a source.
 
+In the web quantizer, **Engram table precision** controls the offloaded
+Engram or N-gram PLE tables independently of the model's oQ level.
+**Auto** follows the existing oQ policy and shows the table bit width for
+the selected level. For example, Hy4 Flash at oQ3.5e shows **Auto (4-bit)**.
+The output-size preview includes the selected table precision. The 8-bit
+and 16-bit choices appear only when supported by the source checkpoint
+and its SSD loader.
+
 Some models have their own rules:
 
-- **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit unless Keep original Engram tables is on.
+- **DeepSeek V4.1:** oQ2, oQ2.5, oQ2.7, oQ3 and oQ4 with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision. Engram tables are 4-bit at `Auto`. The legacy API parameter `preserve_ngram_table=true` still copies the original tables and keeps the `-ngram` suffix.
+- **Hy4 Flash:** BF16 Engram can be copied with 16-bit, independently of the backbone output dtype. Explicit 8-bit affine uses BF16 scales and biases for the SSD loader.
+- **Qwen Flash-Next:** The 8-bit option on a source FP8 N-gram PLE copies the table shards and their shared weight scale. The 16-bit option preserves BF16 or FP16 table storage.
 - **DeepSeek V4:** float16 output is not supported.
 
 ## Benchmarks

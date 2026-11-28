@@ -2476,5 +2476,11 @@
   "cluster.cuda_guide.windows_firewall": "In PowerShell come amministratore, consenti a questo Mac di raggiungere l'helper.",
   "cluster.cuda_guide.windows_run": "Avvia l'helper in PowerShell. Chiede a questo Mac di abbinarsi: digita in questa pagina il codice dal suo log. Se questo Mac ha più di un indirizzo, usa quello che il PC riesce a raggiungere.",
   "cluster.cuda_guide.spark_run": "DGX OS include Docker e NVIDIA Container Toolkit. Avvia l'helper. Compare in questa pagina: premi Abbina e digita il codice dal suo log.",
-  "cluster.device_card.helper_ready": "{name} può accelerare i prompt lunghi per i modelli su questo Mac."
+  "cluster.device_card.helper_ready": "{name} può accelerare i prompt lunghi per i modelli su questo Mac.",
+  "models.oq.engram_precision": "Precisione della tabella Engram",
+  "models.oq.engramPrecisionAuto": "Automatico",
+  "models.oq.engramPrecisionAutoBits": "Automatico ({bits} bit)",
+  "models.oq.engramPrecisionHelp": "Si applica solo alle tabelle Engram e PLE n-gram. La modalità automatica segue le regole attuali di oQ.",
+  "models.oq.engramPrecision8": "8 bit",
+  "models.oq.engramPrecision16": "16 bit"
 }

@@ -24,6 +24,8 @@ import mlx.nn as nn
 import numpy as np
 
 RESIDENT_READ_BYTES = 8 * 1024 * 1024
+ENGRAM_FP8_WEIGHT_DTYPES = frozenset(("F8_E4M3", "F8_E4M3FN"))
+ENGRAM_FP8_SCALE_DTYPES = frozenset(("F8_E8M0", "F8_E8M0FNU"))
 # safetensors dtype tag -> numpy transport dtype (bf16 travels as raw uint16).
 SAFETENSORS_NUMPY_DTYPES = {
     "BF16": "<u2",

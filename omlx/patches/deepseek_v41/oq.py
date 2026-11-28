@@ -44,7 +44,12 @@ from .oqh import (
     write_experts,
 )
 from .sharding import ShardWriter
-from .storage import TensorFile, decode_array
+from .storage import (
+    ENGRAM_FP8_SCALE_DTYPES,
+    ENGRAM_FP8_WEIGHT_DTYPES,
+    TensorFile,
+    decode_array,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +143,31 @@ def source_budget(
         with (source / filename).open("rb") as f:
             size = struct.unpack("<Q", f.read(8))[0]
             headers[filename] = json.loads(f.read(size))
-    params = output_bytes = draft_tensors = 0
+    tables = source_engram_tables(mapping, config)
     engram_params = engram_bytes = 0
+    engram_keys = set()
+    for table in tables.values():
+        weight_key = table["weight_key"]
+        info = headers[mapping[weight_key]][weight_key]
+        shape, dtype = info["shape"], info["dtype"]
+        count = math.prod(shape) * (2 if dtype in ("I8", "U8") else 1)
+        engram_params += count
+        if engram_bits is None:
+            for field in ("weight_key", "scale_key", "bias_key"):
+                key = table[field]
+                if key is not None:
+                    start, end = headers[mapping[key]][key]["data_offsets"]
+                    engram_bytes += end - start
+        else:
+            if len(shape) != 2 or shape[-1] % 32:
+                raise ValueError("Engram rows must divide into 32-channel groups")
+            engram_bytes += count * engram_bits // 8 + count // 32 * 4
+        engram_keys.update(
+            weight_key.removesuffix(".weight") + suffix
+            for suffix in (".weight", ".scale", ".scales", ".biases")
+        )
+
+    params = output_bytes = draft_tensors = 0
     for name, filename in mapping.items():
         if name.startswith("mtp."):
             if not preserve_mtp:
@@ -148,21 +176,10 @@ def source_budget(
         if text_only and name.startswith(("vision.", "aligner.", "image_")):
             continue
         info = headers[filename][name]
-        if ".engram.embed." in name and engram_bits is None:
-            engram_bytes += info["data_offsets"][1] - info["data_offsets"][0]
-            if name.endswith(".weight"):
-                engram_params += math.prod(info["shape"])
-            continue
-        if name.endswith(".scale"):
+        if name in engram_keys or name.endswith(".scale"):
             continue
         shape, dtype = info["shape"], info["dtype"]
         count = math.prod(shape) * (2 if dtype in ("I8", "U8") else 1)
-        if ".engram.embed." in name:
-            if len(shape) != 2 or shape[-1] % 32:
-                raise ValueError("Engram rows must divide into 32-channel groups")
-            engram_params += count
-            engram_bytes += count * engram_bits // 8 + count // 32 * 4
-            continue
         params += count
         if dtype.startswith("F8_E4M3"):
             output_bytes += (
@@ -336,12 +353,14 @@ def copy_engram(
         scales = located[1][2]
         rows, width = weight["shape"]
         if (
-            not weight["dtype"].startswith("F8_E4M3")
-            or not scales["dtype"].startswith("F8_E8M0")
+            weight["dtype"] not in ENGRAM_FP8_WEIGHT_DTYPES
+            or scales["dtype"] not in ENGRAM_FP8_SCALE_DTYPES
             or scales["shape"] != [rows, width // 32]
         ):
             raise ValueError("Only FP8 Engram tables with E8M0 block scales copy")
         mode = "mxfp8"
+    elif weight["dtype"] not in {"BF16", "F16", "F32"}:
+        raise ValueError("Only dense floating-point Engram tables copy without a scale")
     header, offset = {}, 0
     for name, _, entry, _, length in located:
         header[f"{module_name}.{name}"] = {
@@ -490,13 +509,14 @@ def quantize(
     imatrix_seq_length=512,
     preserve_ngram_table=False,
     hadamard=False,
+    engram_mode="auto",
 ):
     from ...oq import (
         _OQ_BPW_TARGETS,
         _emit_progress,
+        _engram_output_bits,
         _get_predicate_bits,
         _lookup_imatrix_importance,
-        _offload_table_bits,
         _validate_v41_oq_settings,
     )
 
@@ -508,7 +528,9 @@ def quantize(
         )
     # Engram sits outside the bit budget and calibration reads the source
     # checkpoint, so keeping it at source precision changes no other tensor.
-    engram_bits = None if preserve_ngram_table else _offload_table_bits(oq_level)
+    if preserve_ngram_table:
+        engram_mode = "preserve"
+    engram_bits = _engram_output_bits(engram_mode, oq_level)
     if oq_level == 4 and (sensitivity_model_path or sensitivity_map_override):
         raise ValueError(
             "V4.1 original-precision oQ4 does not use sensitivity overrides"
@@ -616,7 +638,7 @@ def quantize(
     projection_start = engram_start + engram_span
     for i, (name, table) in enumerate(tables.items()):
         if engram_bits is not None and _get_predicate_bits(
-            name + ".weight", config, oq_level, 64
+            name + ".weight", config, oq_level, 64, engram_mode
         ) != (engram_bits, 32, "affine"):
             raise ValueError("V4.1 Engram policy differs from Qwen4-Exp")
         filename = f".model-engram-{i:02d}.safetensors"

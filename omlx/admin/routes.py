@@ -996,6 +996,7 @@ class OQStartRequest(BaseModel):
     mtp_assistant_model_path: str = ""
     preserve_ngram_table: bool = False
     hadamard: bool = False
+    engram_precision: str = "auto"
 
 
 class HFUploadRequest(BaseModel):
@@ -1081,9 +1082,9 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
         cfg = json.loads(cfg_path.read_text())
     except Exception:
         return False, ""
-    qcfg = cfg.get("quantization_config") or {}
-    method = (qcfg.get("quant_method") or "").lower()
-    if method == "paroquant":
+    qcfg = cfg.get("quantization_config") if isinstance(cfg, dict) else None
+    method = qcfg.get("quant_method") if isinstance(qcfg, dict) else None
+    if isinstance(method, str) and method.lower() == "paroquant":
         return True, _PAROQUANT_REASON
     return False, ""
 
@@ -10182,6 +10183,8 @@ async def estimate_oq(
     text_only: bool = False,
     dtype: str = "bfloat16",
     mtp_assistant_model_path: str = "",
+    engram_precision: str = "auto",
+    group_size: int = 64,
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -10192,11 +10195,13 @@ async def estimate_oq(
             estimate_bpw_and_size,
             model_path,
             oq_level,
+            group_size=group_size,
             preserve_mtp=preserve_mtp,
             preserve_ngram_table=preserve_ngram_table,
             text_only=text_only,
             dtype=dtype,
             mtp_assistant_model_path=mtp_assistant_model_path,
+            engram_precision=engram_precision,
         )
         return result
     except Exception as e:
@@ -10262,6 +10267,7 @@ async def start_oq_quantization(
             mtp_assistant_model_path=request.mtp_assistant_model_path,
             preserve_ngram_table=request.preserve_ngram_table,
             hadamard=request.hadamard,
+            engram_precision=request.engram_precision,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
