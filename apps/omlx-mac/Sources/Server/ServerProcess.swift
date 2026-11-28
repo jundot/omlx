@@ -13,6 +13,13 @@
 //   crashes : auto-restart with 5s/10s/20s backoff, max 3 attempts, counter
 //             resets after 60s of stable .running
 //
+// Adoption: start() hitting a port already held by a verified oMLX server
+// (PortConflict.isOMLX) does NOT fail silently — it returns .portConflict
+// and the caller (MenubarController) may call adoptExternal(_:) to treat
+// that pid as this instance's managed process. stop()/forceRestart() then
+// signal it via PortConflictResolver.killExternal(_:) instead of an owned
+// Process handle. We never adopt a non-oMLX or unverified process.
+//
 // Spawn invocation:
 //   <python> -m omlx.cli serve --base-path <base> --port <port>
 //   stdout+stderr → ~/Library/Application Support/oMLX/logs/server.log
@@ -165,6 +172,11 @@ final class ServerProcess: @unchecked Sendable {
     private var lastAuxiliaryHealthyAt: Date?
     private var expectingExit       = false   // set by stop()/forceRestart() so terminationHandler doesn't trigger auto-restart
     private let logURL: URL
+    /// Set by `adoptExternal(_:)` when `.running`/`.unresponsive` refers to a
+    /// process we didn't spawn (`process` stays nil). `stop()`/`forceRestart()`
+    /// fall back to killing this pid via the resolver instead of signalling
+    /// an owned `Process` handle.
+    private var adoptedPID: Int32?
 
     init(
         runtime: PythonRuntime,
@@ -191,8 +203,31 @@ final class ServerProcess: @unchecked Sendable {
         return process?.isRunning == true
     }
 
-    var pid: Int32? { process?.processIdentifier }
+    var pid: Int32? { process?.processIdentifier ?? adoptedPID }
     var serverLogURL: URL { logURL }
+
+    /// Adopt an already-running, externally-started oMLX server instead of
+    /// spawning a new one. Called after `start()` returns `.portConflict`
+    /// with `conflict.isOMLX == true` — we never adopt an unverified or
+    /// non-oMLX process. Health polling and `stop()`/`forceRestart()` work
+    /// against the adopted pid exactly as they would against a spawned one.
+    @discardableResult
+    func adoptExternal(_ conflict: PortConflict) -> Bool {
+        guard conflict.isOMLX, let pid = conflict.pid else { return false }
+        switch state {
+        case .running, .starting, .stopping, .unresponsive:
+            return false
+        default:
+            break
+        }
+        adoptedPID = pid
+        process = nil
+        consecutiveFailures = 0
+        lastAuxiliaryHealthyAt = nil
+        update(.running(pid: pid))
+        startHealthCheckLoop()
+        return true
+    }
 
     /// Start the server. Returns .started on success, .alreadyRunning if
     /// already up, or .portConflict if the port is busy. Throws on invalid
@@ -253,6 +288,9 @@ final class ServerProcess: @unchecked Sendable {
                 kill(proc.processIdentifier, SIGKILL)
                 try? await Task.sleep(for: .seconds(0.5))
             }
+        } else if let externalPID = adoptedPID {
+            // No owned Process handle — this is an adopted external server.
+            _ = await resolver.killExternal(externalPID, timeout: timeout)
         }
 
         // terminationHandler updates state to .stopped; force in case it
@@ -262,6 +300,7 @@ final class ServerProcess: @unchecked Sendable {
         }
         expectingExit = false
         process = nil
+        adoptedPID = nil
         lastAuxiliaryHealthyAt = nil
         closeLog()
     }
@@ -278,8 +317,11 @@ final class ServerProcess: @unchecked Sendable {
             while proc.isRunning && Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(50))
             }
+        } else if let externalPID = adoptedPID {
+            _ = await resolver.killExternal(externalPID, timeout: 2)
         }
         process = nil
+        adoptedPID = nil
         closeLog()
         autoRestartBudget.reset()
         consecutiveFailures = 0
@@ -296,13 +338,21 @@ final class ServerProcess: @unchecked Sendable {
     @MainActor
     func recordAuxiliaryHealthSuccess(at date: Date = Date()) {
         // A recent response from an exited child is not evidence of a live server.
-        guard let process, process.isRunning else { return }
+        let livePID: Int32?
+        if let process, process.isRunning {
+            livePID = process.processIdentifier
+        } else if let externalPID = adoptedPID, kill(externalPID, 0) == 0 {
+            livePID = externalPID
+        } else {
+            livePID = nil
+        }
+        guard let livePID else { return }
         lastAuxiliaryHealthyAt = date
         autoRestartBudget.recordHealthy(at: date)
         consecutiveFailures = 0
         switch state {
         case .starting, .unresponsive:
-            update(.running(pid: process.processIdentifier))
+            update(.running(pid: livePID))
         default:
             break
         }
@@ -509,17 +559,42 @@ final class ServerProcess: @unchecked Sendable {
 
         presentStartupNotice()
         // .starting also covers restart backoff, when no child exists yet.
-        guard let probedProcess = process, probedProcess.isRunning else { return }
+        let probedProcess = process
+        let probedAdoptedPID = adoptedPID
+        let activePID: Int32
+        if let probedProcess {
+            guard probedProcess.isRunning else { return }
+            activePID = probedProcess.processIdentifier
+        } else if let probedAdoptedPID {
+            guard kill(probedAdoptedPID, 0) == 0 else {
+                adoptedPID = nil
+                cancelHealthLoop()
+                update(.stopped)
+                return
+            }
+            activePID = probedAdoptedPID
+        } else {
+            return
+        }
         let probe = await resolver.probeHealth()
-        // The child may have exited or been replaced while the probe was pending.
-        guard !Task.isCancelled,
-              process === probedProcess,
-              probedProcess.isRunning else { return }
+        // The child or adopted external server may have exited or been replaced while the probe was pending.
+        guard !Task.isCancelled else { return }
+        if let probedProcess {
+            guard process === probedProcess, probedProcess.isRunning else { return }
+        } else if let probedAdoptedPID {
+            guard process == nil, adoptedPID == probedAdoptedPID else { return }
+            guard kill(probedAdoptedPID, 0) == 0 else {
+                adoptedPID = nil
+                cancelHealthLoop()
+                update(.stopped)
+                return
+            }
+        }
         let now = Date()
         switch state {
         case .starting:
             if probe.ok || hasRecentAuxiliaryHealth(now: now) {
-                markHealthy(pid: probedProcess.processIdentifier, at: now)
+                markHealthy(pid: activePID, at: now)
             } else {
                 logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: false)
             }
