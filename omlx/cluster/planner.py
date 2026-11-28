@@ -136,12 +136,35 @@ class ModelLayout:
     # architecture only splits evenly.
     tensor_parallel_split_units: tuple[int, ...] = ()
     tensor_parallel_split_bytes: tuple[int, ...] = ()
+    # The checkpoint's declared maximum context (``max_position_embeddings``),
+    # or 0 when the config does not declare one. The assistant never plans past
+    # it, and never silently drops below the documented floor.
+    max_context_tokens: int = 0
+    # Which SSD-resident table this checkpoint carries: ``engram`` (DeepSeek
+    # V4.1), ``ple`` (Qwen4-Exp) or ``""``. The per-layer bytes are already in
+    # ``tensor_parallel_ssd_layer_bytes``; this only names the switch the
+    # assistant must write and the plan must show.
+    table_offload_kind: str = ""
 
     def __post_init__(self) -> None:
         if self.fixed_weight_bytes < 0:
             raise ValueError("fixed_weight_bytes must be non-negative")
         if self.mtp_weight_bytes < 0:
             raise ValueError("mtp_weight_bytes must be non-negative")
+        if self.max_context_tokens < 0:
+            raise ValueError("max_context_tokens must be non-negative")
+        if self.table_offload_kind not in ("", "engram", "ple"):
+            raise ValueError(
+                f"unknown table offload kind: {self.table_offload_kind!r}"
+            )
+        if not self.layer_weight_bytes:
+            raise ValueError("at least one layer is required")
+        if len(self.layer_weight_bytes) > _MAX_PIPELINE_LAYERS:
+            raise ValueError(
+                f"layer count exceeds the {_MAX_PIPELINE_LAYERS} layer limit"
+            )
+        if any(size < 0 for size in self.layer_weight_bytes):
+            raise ValueError("layer weights must be non-negative")
         if not self.layer_weight_bytes:
             raise ValueError("at least one layer is required")
         if len(self.layer_weight_bytes) > _MAX_PIPELINE_LAYERS:
@@ -254,6 +277,10 @@ class ModelLayout:
             payload["tensor_parallel_split_bytes"] = list(
                 self.tensor_parallel_split_bytes
             )
+        if self.max_context_tokens:
+            payload["max_context_tokens"] = self.max_context_tokens
+        if self.table_offload_kind:
+            payload["table_offload_kind"] = self.table_offload_kind
         return payload
 
     @classmethod
@@ -314,6 +341,8 @@ class ModelLayout:
                     int(value)
                     for value in payload.get("tensor_parallel_split_bytes", ())
                 ),
+                max_context_tokens=int(payload.get("max_context_tokens", 0)),
+                table_offload_kind=str(payload.get("table_offload_kind", "")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanningError(f"model layout is malformed: {exc}") from exc
@@ -1459,6 +1488,17 @@ def _model_weight_files(
     return files, side
 
 
+def _is_ssd_table_tensor(name: str, engram_names: frozenset[str]) -> bool:
+    """Whether this tensor belongs to a lookup table that can live on SSD.
+
+    DeepSeek V4.1 names its tables in the converted config; Qwen4-Exp keeps
+    the PLE n-gram table inline with the shard under ``ngram_embedding``. Both
+    are gathered row-by-row, so a rank can mmap them instead of wiring them.
+    """
+
+    return name in engram_names or ".ngram_embedding." in name
+
+
 def _engram_tables(config: dict[str, Any]) -> tuple[frozenset[str], tuple[str, ...]]:
     """DeepSeek V4.1 Engram table tensors and the files that hold them.
 
@@ -1484,13 +1524,86 @@ def _engram_tables(config: dict[str, Any]) -> tuple[frozenset[str], tuple[str, .
     return frozenset(names), tuple(sorted(files))
 
 
+def _qwen4_ple_layer_ids(config: dict[str, Any]) -> tuple[int, ...]:
+    """The zero-based layers whose Qwen4-Exp PLE n-gram table can live on SSD.
+
+    The checkpoint declares ``ple_layer_ids`` one-based inside ``text_config``
+    (Qwen4-Exp builds ``ple_layer_ids.index(layer_idx + 1)``). Missing or
+    malformed declarations mean "no PLE table", never an estimate.
+    """
+
+    text = config.get("text_config")
+    source = text if isinstance(text, dict) else config
+    raw = source.get("ple_layer_ids")
+    if not isinstance(raw, list) or not raw:
+        return ()
+    layers: set[int] = set()
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return ()
+        index = value - 1
+        if index < 0:
+            return ()
+        layers.add(index)
+    return tuple(sorted(layers))
+
+
+def _is_qwen4_ple_tensor(name: str, layers: tuple[int, ...]) -> bool:
+    if not layers:
+        return False
+    lowered = name.lower()
+    if "ple" not in lowered or "ngram" not in lowered:
+        return False
+    index = _tensor_layer_index(name)
+    return index is not None and index in layers
+
+
+def _declared_context_tokens(config: dict[str, Any]) -> int:
+    """The checkpoint's own context limit, from any of its nested configs."""
+
+    for candidate in (
+        config,
+        config.get("text_config"),
+        config.get("language_config"),
+        config.get("llm_config"),
+    ):
+        if not isinstance(candidate, dict):
+            continue
+        value = candidate.get("max_position_embeddings")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return 0
+
+
 def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
-    """Read only safetensors headers and total weights by transformer layer."""
+    """Read only safetensors headers and total weights by transformer layer.
+
+    Applies oMLX's pre-load architecture patches first, so capability
+    detection describes the architecture a rank will actually load (see the
+    note at the patch site below).
+    """
 
     root = Path(model_path).expanduser()
     if not root.is_dir():
         raise PlanningError(f"model path is not a directory: {root}")
 
+    # Capability detection must see the architecture patches oMLX registers
+    # immediately before loading (DeepSeek V4, GLM, MiniMax). Without this,
+    # ``supports_pipeline`` depends on whether some earlier call happened to
+    # apply them; a measurement could then report a pipeline-capable model as
+    # unsplittable, or the reverse.
+    #
+    # The patches carry process-global side effects — set_mtp_active(False),
+    # the Qwen3.5 YaRN window, wrapped mlx-lm loaders — and applying them at
+    # inspection time is intentional (frozen decision: "pipeline capability is
+    # part of the plan"). The plan must describe the patched architecture the
+    # rank loads; a checkpoint that cannot pipeline after patching must never
+    # be planned as PP.
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    maybe_apply_pre_load_patches(str(root))
+
+    fixed_bytes = 0
     fixed_bytes = 0
     mtp_bytes = 0
     layer_sizes: dict[int, int] = {}
@@ -1504,6 +1617,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     unloaded = _VISION_WEIGHT_PREFIXES + _cluster_unloaded_prefixes(config)
     mtp_prefixes = _cluster_mtp_prefixes(config)
     engram_names, engram_files = _engram_tables(config)
+    ple_layers = _qwen4_ple_layer_ids(config)
     weight_files, table_files = _model_weight_files(root, engram_files)
     for weight_file in (*weight_files, *table_files):
         # A table file outside the index may hold other source tensors too.
@@ -1511,7 +1625,11 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         header, payload_bytes = _safetensors_header(weight_file)
         intervals: list[tuple[int, int, str]] = []
         for name, spec in header.items():
-            if name == "__metadata__" or (tables_only and name not in engram_names):
+            if name == "__metadata__" or (
+                tables_only
+                and name not in engram_names
+                and not _is_qwen4_ple_tensor(name, ple_layers)
+            ):
                 continue
             if name in tensor_names:
                 raise PlanningError(f"duplicate tensor name: {name}")
@@ -1547,7 +1665,9 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                 layer_sizes[layer_index] = (
                     layer_sizes.get(layer_index, 0) + tensor_bytes
                 )
-                if name in engram_names:
+                if _is_ssd_table_tensor(name, engram_names) or _is_qwen4_ple_tensor(
+                    name, ple_layers
+                ):
                     ssd_sizes[layer_index] = (
                         ssd_sizes.get(layer_index, 0) + tensor_bytes
                     )
@@ -1625,6 +1745,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             )
             if split_units and split_sizes
             else ()
+        ),
+        max_context_tokens=_declared_context_tokens(config),
+        table_offload_kind=(
+            "engram"
+            if engram_names
+            else ("ple" if ple_layers and any(ssd_sizes.values()) else "")
         ),
     )
 

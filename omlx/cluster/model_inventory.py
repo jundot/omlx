@@ -18,16 +18,46 @@ from typing import Any
 from .staging import DEFAULT_REMOTE_PYTHON, run_remote_python
 
 _REMOTE_MODEL_INVENTORY_SNIPPET = (
-    "import json;"
-    "from dataclasses import asdict;"
-    "from omlx.model_discovery import discover_models_from_dirs;"
-    "from omlx.settings import GlobalSettings;"
-    "s=GlobalSettings.load();"
-    "m=discover_models_from_dirs(s.get_effective_model_dirs());"
-    "print(json.dumps([asdict(v) for v in m.values()]))"
+    "import json\n"
+    "from dataclasses import asdict\n"
+    "from omlx.model_discovery import discover_models_from_dirs\n"
+    "from omlx.settings import GlobalSettings\n"
+    # A stock-oMLX peer predates this fork's MTP helper. Losing that one fact
+    # must not lose the peer's whole inventory, so the import is guarded and
+    # the fallback answers fail-closed (False) per model.
+    "try:\n"
+    "    from omlx.cluster.model_inventory import mtp_compatible_for_model\n"
+    "except ImportError:\n"
+    "    def mtp_compatible_for_model(model_path):\n"
+    "        return False\n"
+    "s=GlobalSettings.load()\n"
+    "m=discover_models_from_dirs(s.get_effective_model_dirs())\n"
+    "print(json.dumps([{**d, 'mtp_compatible': mtp_compatible_for_model(d.get('model_path', ''))} for d in (asdict(v) for v in m.values())]))"
 )
 
 _CLUSTER_MODEL_TYPES = {"llm", "vlm"}
+
+
+def mtp_compatible_for_model(model_path: str) -> bool:
+    """Whether this checkpoint can take oMLX's Lightning MTP draft head.
+
+    The admin model list already computes this from the config and the weight
+    index. The cluster inventory needs the same fact so the assistant's
+    ``assistantMtpFor`` does not read a missing key and plan every MTP-capable
+    model with ``mtp: false``. Importing the admin helper lazily keeps the
+    cluster module free of an import cycle; any read failure is fail-closed.
+    """
+
+    path = str(model_path or "").strip()
+    if not path:
+        return False
+    try:
+        from ..admin.routes import _mtp_compat_for_model
+
+        compatible, _reason = _mtp_compat_for_model({"model_path": path})
+        return bool(compatible)
+    except Exception:
+        return False
 
 
 def remote_model_inventory(
@@ -84,6 +114,10 @@ def remote_model_inventory(
                 "is_loading": False,
                 "is_default": False,
                 "is_favorite": False,
+                # Carried so the assistant can decide MTP from the same model
+                # list it already loads. Missing/failed reads are false, never
+                # an invented true.
+                "mtp_compatible": bool(item.get("mtp_compatible", False)),
             }
         )
     return models
@@ -129,6 +163,10 @@ def engine_pool_model_inventory(pool: Any) -> list[dict[str, Any]]:
                 "is_loading": bool(item.get("is_loading", False)),
                 "is_default": bool(item.get("is_default", False)),
                 "is_favorite": bool(item.get("is_favorite", False)),
+                "mtp_compatible": (
+                    bool(item.get("mtp_compatible"))
+                    or mtp_compatible_for_model(model_path)
+                ),
             }
         )
     return models
@@ -204,6 +242,10 @@ def merge_model_inventories(
                 "is_favorite": any(
                     bool(model.get("is_favorite")) for _, _, model in locations
                 ),
+                "mtp_compatible": any(
+                    bool(model.get("mtp_compatible"))
+                    for _, _, model in locations
+                ),
             }
         )
         merged.append(result)
@@ -213,5 +255,42 @@ def merge_model_inventories(
 __all__ = [
     "engine_pool_model_inventory",
     "merge_model_inventories",
+    "mtp_compatible_for_model",
     "remote_model_inventory",
 ]
+
+
+_REMOTE_MODEL_LAYOUT_SNIPPET = (
+    "import json,sys;"
+    "from omlx.cluster.planner import inspect_safetensors_layout;"
+    "print(json.dumps(inspect_safetensors_layout(sys.argv[1]).to_dict()))"
+)
+
+
+def remote_model_layout(
+    ssh_target: str,
+    model_path: str,
+    *,
+    python_executable: str = DEFAULT_REMOTE_PYTHON,
+    timeout: float = 120.0,
+) -> dict[str, Any]:
+    """The planner layout of a checkpoint read *on the Mac that holds it*.
+
+    A model that lives only on a peer cannot be read locally, and planning from
+    a guess would split a model that does not exist. The peer answers with the
+    same ``inspect_safetensors_layout`` this node would run, so the measurement
+    records the shape of the real checkpoint and the plan, apply and start can
+    all use it (``MeasurementRecord.layout``).
+    """
+
+    payload = run_remote_python(
+        ssh_target,
+        _REMOTE_MODEL_LAYOUT_SNIPPET,
+        model_path,
+        description="read the model layout",
+        python_executable=python_executable,
+        timeout=timeout,
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"invalid model layout from {ssh_target}")
+    return payload

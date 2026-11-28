@@ -1192,6 +1192,39 @@ def test_vlm_left_padded_decode_keeps_padding_masked(bits):
     _assert_rows_match(out, batch, queries, ks, vs, pads, 1e-2)
 
 
+def test_tq_verify_seam_is_reinstalled_after_a_later_patch_displaces_it():
+    """A later seam patch replaces ``_qwen3_5_left_padded_attention``. The
+    TurboQuant wrapper has to go back on top even though its flag is still set,
+    otherwise a TurboQuant cache reaches the foreign wrapper and gets ``None``
+    (the plain-cache answer) instead of an attended tensor.
+
+    This is the worker-order failure the CI's ``pytest -n 3 --dist loadgroup``
+    produced: the verify-split and padded-row patches wrap the same seam, so
+    which one is outermost depended on the order the tests were distributed.
+    """
+    pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    tq_attention._patch_vlm_target_verify_attention()
+    ours = q35_lang._qwen3_5_left_padded_attention
+    assert ours is getattr(q35_lang, "_omlx_tq_target_verify_wrapper", None)
+
+    def later_patch(queries, keys, values, *, cache, scale, mask):
+        return ours(queries, keys, values, cache=cache, scale=scale, mask=mask)
+
+    q35_lang._qwen3_5_left_padded_attention = later_patch
+    tq_attention._patch_vlm_target_verify_attention()
+
+    assert q35_lang._qwen3_5_left_padded_attention is not later_patch
+    assert q35_lang._qwen3_5_left_padded_attention is getattr(
+        q35_lang, "_omlx_tq_target_verify_wrapper", None
+    )
+
+
 # ---------------------------------------------------------------------------
 # Codec rebuild tests (SSD cache reconstruction, issue #577)
 # ---------------------------------------------------------------------------

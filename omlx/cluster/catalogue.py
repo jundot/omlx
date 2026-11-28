@@ -39,9 +39,11 @@ from .planner import (
     plan_hybrid,
 )
 
-# Contexts worth reporting. Bisection lands on one of these rather than an
-# arbitrary token count, because "fits at 32768" is actionable and "fits at
-# 41297" only looks precise.
+# Contexts worth reporting. ``largest_context_that_fits`` below bisects this
+# ladder; the assistant's policy solver descends the same ladder linearly,
+# largest first. Both land on one of these presets rather than an arbitrary
+# token count, because "fits at 32768" is actionable and "fits at 41297" only
+# looks precise.
 _CONTEXT_LADDER = (
     2048,
     4096,
