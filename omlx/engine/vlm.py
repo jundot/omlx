@@ -61,6 +61,7 @@ from ..model_settings import (
 from ..models.vlm import VLMModelAdapter
 from ..oqh.format import is_oqh_checkpoint
 from ..patches import qwen35_packed_linear
+from ..patches.gemma3_prefill_linear import apply_gemma3_prefill_linear_patch
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
@@ -2514,6 +2515,11 @@ class VLMBatchedEngine(BaseEngine):
         # mlx-vlm models now handle per-sequence mx.array offsets natively
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
+
+        if self.model_type == "gemma3":
+            patched = apply_gemma3_prefill_linear_patch(self._vlm_model)
+            if patched:
+                logger.info("Gemma 3 dense prefill enabled for %d projections", patched)
 
         # Create scheduler config
         scheduler_config = (

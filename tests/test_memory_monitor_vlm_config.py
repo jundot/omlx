@@ -24,6 +24,7 @@ from omlx.memory_monitor import (
     collect_kv_layer_specs,
     estimate_mla_kv_bytes_per_token,
     estimate_qwen4_exp_kv_bytes_per_token,
+    set_model_info_from_model,
 )
 from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -175,6 +176,37 @@ def test_qwen4_prefill_profile_gathered_core_caps_score_matrix():
 class TestSetModelInfoForMonitorVLMWalk:
     """``_set_model_info_for_monitor`` must prefer LM dimensions from a
     nested sub-config when one exists, otherwise fall back to top-level."""
+
+    @pytest.mark.parametrize("wrapper", [None, "language_model", "_language_model"])
+    def test_prefill_scratch_reaches_both_estimators_and_resets(self, wrapper):
+        language_model = SimpleNamespace(config=_LMConfig(), layers=[])
+        model = language_model
+        if wrapper is not None:
+            model = SimpleNamespace(
+                config=_VLMConfigWithTextConfig(),
+                layers=[],
+                **{wrapper: language_model},
+            )
+        shared = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        scheduler = _make_scheduler()
+        scheduler.model = model
+        set_model_info_from_model(shared, model)
+        baseline = shared.estimate_chunk_transient_bytes(512, 32768)
+        language_model._omlx_prefill_scratch_bytes = 225 * 1024**2
+        language_model._omlx_prefill_scratch_min_tokens = 512
+
+        set_model_info_from_model(shared, model)
+        scheduler._set_model_info_for_monitor()
+        for monitor in (shared, scheduler.memory_monitor):
+            assert monitor.estimate_chunk_transient_bytes(512, 32768) == (
+                baseline + 225 * 1024**2
+            )
+
+        scheduler.model = SimpleNamespace(config=_LMConfig(), layers=[])
+        set_model_info_from_model(shared, scheduler.model)
+        scheduler._set_model_info_for_monitor()
+        for monitor in (shared, scheduler.memory_monitor):
+            assert monitor.estimate_chunk_transient_bytes(512, 32768) == baseline
 
     def test_picks_text_config_over_top_level_vision_dims(self):
         sched = _make_scheduler()

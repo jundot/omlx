@@ -343,6 +343,39 @@ class TestEstimatePrefillPeakBytes:
         output = n_q * query_tokens * head_dim * 4
         return scores + output
 
+    @pytest.mark.parametrize("cached", [0, 32768])
+    def test_prefill_scratch_reserve_reaches_chunk_and_peak_estimates(self, cached):
+        monitor = self._make_monitor()
+        rows = (511, 512, 2048, 2049, 4096)
+        chunks = [monitor.estimate_chunk_transient_bytes(n, cached + n) for n in rows]
+        peaks = [
+            monitor.estimate_prefill_peak_bytes(n, 4096, cached_tokens=cached)
+            for n in rows
+        ]
+        reserve = 225 * 1024**2
+        monitor.set_model_info(
+            num_layers=62,
+            num_kv_heads=4,
+            head_dim=128,
+            num_attention_heads=32,
+            prefill_scratch_bytes=reserve,
+            prefill_scratch_min_tokens=512,
+        )
+        for n, chunk, peak in zip(rows, chunks, peaks):
+            expected = 0 if n == 511 else reserve
+            assert monitor.estimate_chunk_transient_bytes(n, cached + n) == (
+                chunk + expected
+            )
+            assert (
+                monitor.estimate_prefill_peak_bytes(n, 4096, cached_tokens=cached)
+                == peak + expected
+            )
+
+        monitor.set_model_info(
+            num_layers=62, num_kv_heads=4, head_dim=128, num_attention_heads=32
+        )
+        assert monitor.estimate_chunk_transient_bytes(512, cached + 512) == chunks[1]
+
     def test_returns_zero_when_model_info_missing(self):
         m = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
         assert m.estimate_prefill_peak_bytes(32768, 2048) == 0
@@ -824,6 +857,31 @@ class TestRaiseIfPrefillExceeds:
         monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
         set_model_info_from_model(monitor, SimpleNamespace(config=_Cfg()))
         return monitor
+
+    @pytest.mark.parametrize("cached", [0, 32768])
+    def test_prefill_scratch_is_reserved_before_the_first_chunk(self, cached):
+        monitor = self._monitor()
+        reserve = 225 * 1024**2
+        base_peak = monitor.estimate_prefill_peak_bytes(512, 2048, cached_tokens=cached)
+        arguments = dict(
+            prefill_memory_guard=True,
+            hard_limit_bytes=base_peak + reserve // 2,
+            current_usage_bytes=0,
+            prefill_step_size=2048,
+            num_prompt_tokens=cached + 512,
+            cached_tokens=cached,
+        )
+        raise_if_prefill_exceeds(monitor, **arguments)
+        monitor.set_model_info(
+            num_layers=32,
+            num_kv_heads=8,
+            head_dim=192,
+            num_attention_heads=32,
+            prefill_scratch_bytes=reserve,
+            prefill_scratch_min_tokens=512,
+        )
+        with pytest.raises(PrefillMemoryExceededError):
+            raise_if_prefill_exceeds(monitor, **arguments)
 
     def test_noop_when_fully_cached(self):
         raise_if_prefill_exceeds(
