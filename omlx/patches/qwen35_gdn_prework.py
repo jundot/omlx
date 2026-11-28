@@ -1435,6 +1435,95 @@ def _qwen4_decode_static_check(module) -> bool:
     )
 
 
+def _linear_ids(linears):
+    return tuple(
+        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
+    )
+
+
+def fused_linear_cache(linears):
+    """The row-concatenated weights of quantized projections that read one input.
+
+    Built once and kept on the first projection as ``_fused_decode_linears``,
+    the cache mlx-vlm's one-row fused decode also reads. The projections are
+    then rebound to row slices of the concatenated arrays (views, no copy), so
+    the weights are held once instead of twice (about 4 GiB of GDN
+    in-projections on Qwen3.8-27B).
+    """
+    first = linears[0]
+    cached = getattr(first, "_fused_decode_linears", None)
+    if cached is not None and cached[0] == _linear_ids(linears):
+        return cached
+    weights = mx.concatenate([linear.weight for linear in linears], axis=0)
+    scales = mx.concatenate([linear.scales for linear in linears], axis=0)
+    biases = mx.concatenate([linear.biases for linear in linears], axis=0)
+    mx.eval(weights, scales, biases)
+    split_indices = []
+    offset = 0
+    for linear in linears:
+        rows = int(linear.weight.shape[0])
+        linear.weight = weights[offset : offset + rows]
+        linear.scales = scales[offset : offset + rows]
+        linear.biases = biases[offset : offset + rows]
+        offset += rows
+        split_indices.append(offset)
+    split_indices.pop()
+    mx.eval([(linear.weight, linear.scales, linear.biases) for linear in linears])
+    # The original arrays are free now; return them to the system instead of
+    # leaving them in the buffer cache.
+    mx.clear_cache()
+    cached = (_linear_ids(linears), weights, scales, biases, split_indices)
+    first._fused_decode_linears = cached
+    return cached
+
+
+def _install_fused_linear_cache() -> bool:
+    """Route mlx-vlm's one-row fused decode through the shared cache."""
+    try:
+        from mlx_vlm.speculative.ops import linear as vlm_linear
+    except ImportError:
+        return False
+    if getattr(vlm_linear, "_omlx_fused_cache", False):
+        return True
+
+    def _decode_quantized_linears_fused(linears, x):
+        if (
+            x.ndim != 3
+            or x.shape[1] != 1
+            or len(linears) != 4
+            or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
+        ):
+            return None
+        first = linears[0]
+        if not all(
+            linear.bits == first.bits
+            and linear.group_size == first.group_size
+            and linear.mode == first.mode
+            and linear.biases is not None
+            and linear.scales.dtype == x.dtype
+            and linear.biases.dtype == x.dtype
+            and "bias" not in linear
+            for linear in linears
+        ):
+            return None
+        _, weights, scales, biases, split_indices = fused_linear_cache(linears)
+        output = mx.quantized_matmul(
+            x,
+            weights,
+            scales=scales,
+            biases=biases,
+            transpose=True,
+            group_size=first.group_size,
+            bits=first.bits,
+            mode=first.mode,
+        )
+        return tuple(mx.split(output, split_indices, axis=-1))
+
+    vlm_linear._decode_quantized_linears_fused = _decode_quantized_linears_fused
+    vlm_linear._omlx_fused_cache = True
+    return True
+
+
 def _one_row_fused_projections(linears, dtype):
     """Operands of mlx-vlm's one-row fused in-projection, or None when it keeps four.
 
@@ -1458,22 +1547,7 @@ def _one_row_fused_projections(linears, dtype):
         for linear in linears
     ):
         return None
-    cache_key = tuple(
-        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
-    )
-    cached = getattr(first, "_fused_decode_linears", None)
-    if cached is None or cached[0] != cache_key:
-        weights = mx.concatenate([linear.weight for linear in linears], axis=0)
-        scales = mx.concatenate([linear.scales for linear in linears], axis=0)
-        biases = mx.concatenate([linear.biases for linear in linears], axis=0)
-        split_indices = []
-        offset = 0
-        for linear in linears[:-1]:
-            offset += linear.weight.shape[0]
-            split_indices.append(offset)
-        mx.eval(weights, scales, biases)
-        cached = (cache_key, weights, scales, biases, split_indices)
-        first._fused_decode_linears = cached
+    cached = fused_linear_cache(linears)
     _, weights, scales, biases, split_indices = cached
     return (
         weights,
@@ -1979,6 +2053,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         return True
     if not mx.metal.is_available():
         return False
+    _install_fused_linear_cache()
 
     from mlx_vlm.models.qwen3_5 import language as q35
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
