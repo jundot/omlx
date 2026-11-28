@@ -226,9 +226,15 @@ def _patch_loop_validate_speculation() -> None:
         for index, record in transaction["records"].items():
             count = mv.get(index)
             if count and count > 1:
-                # Scale accepted tokens by the visit count so the cumulative
-                # state index is correct. Clip to total (fully accepted).
-                sel = [min(k * count, total) for k in raw]
+                # Multi-visit SSM slot: intermediate holds ``count``
+                # concatenated segments (one per visit, each of length
+                # ``block_len``). ``raw`` (accepted tokens) is a global
+                # prefix <= block_len, all inside the first visit. So a
+                # partial accept indexes ``intermediate[:, raw - 1]``
+                # directly; a full accept (raw == block_len) must return
+                # ``final``, which requires ``keep == slot_total``.
+                block_len = total // count
+                sel = [total if k >= block_len else k for k in raw]
                 slot_total = total
             else:
                 sel = raw
