@@ -35,7 +35,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -285,6 +285,8 @@ SPLASH_DRAFT_REPOS = {
 _DRAFT_LOAD_RATIO = 1 / 3
 # Scratch Splash plans beside the weights: prefill, decode and lane states.
 _RUNTIME_RESERVE_BYTES = 3 * 1024**3
+_KV_SLOTS_PAST_CONTEXT = 15
+_LOOKUP_INDEX_BYTES_PER_TOKEN = 89
 # Content parts Splash takes beside text: images (it also reads PDFs, which
 # oMLX's request models do not carry).
 _SPLASH_MEDIA_TYPES = frozenset({"image_url", "input_image", "image"})
@@ -1925,6 +1927,27 @@ class SplashEngine(BaseEngine):
         """The Metal budget Splash planned at start, which it may grow into."""
         budget = ((self._status or {}).get("memory_plan") or {}).get("budget") or {}
         return int(budget.get("hard_budget_bytes") or 0)
+
+    def budget_for_context(self, context: int) -> int | None:
+        """The budget that keeps ``context`` tokens of KV in memory, or None when
+        the planned budget already does."""
+        budget = ((self._status or {}).get("memory_plan") or {}).get("budget") or {}
+        bounds = budget.get("context_bounds") or {}
+        tokens = min(context, bounds.get("window", 0))
+        if bounds.get("resident", 0) >= tokens:
+            return None
+        extent_pages = budget["kv_extent_pages"]
+        extent_tokens = extent_pages * budget["kv_page_tokens"]
+        extent_bytes = budget["kv_extent_bytes"]
+        extent_bytes += extent_tokens * _LOOKUP_INDEX_BYTES_PER_TOKEN
+        extents = -(-(tokens + _KV_SLOTS_PAST_CONTEXT) // extent_tokens)
+        missing = extents - budget["kv_capacity_pages"] // extent_pages
+        return budget["hard_budget_bytes"] + missing * extent_bytes
+
+    async def restart(self, max_memory_bytes: int) -> None:
+        await self.stop()
+        self._options = replace(self._options, max_memory_bytes=max_memory_bytes)
+        await self.start()
 
     def _group_pids(self) -> list[int]:
         if self._process is None or self._process.poll() is not None:
