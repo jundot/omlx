@@ -273,6 +273,70 @@ final class AppConfigTests: XCTestCase {
         XCTAssertTrue(AppConfig.default.modelDir.hasSuffix("/models"))
     }
 
+    // MARK: remote backend
+
+    func testRemoteSliceRoundTripsThroughSaveAndRead() throws {
+        let config = AppConfig(
+            bindAddress: "127.0.0.1", port: 8000, apiKey: "local",
+            basePath: tempBase, modelDir: "\(tempBase!)/models", hfEndpoint: "",
+            remoteEnabled: true, remoteAddress: "studio.local:9000", remoteAPIKey: " sk-remote \n"
+        )
+        try config.save()
+        let slice = try AppConfig.readSettingsForTests(basePath: tempBase)
+        XCTAssertEqual(slice.remoteEnabled, true)
+        XCTAssertEqual(slice.remoteAddress, "studio.local:9000")
+        XCTAssertEqual(slice.remoteAPIKey, "sk-remote", "the key is stored trimmed")
+
+        // The CLI reads the same section (omlx/settings.py RemoteSettings).
+        let json = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: AppConfig.settingsURL(basePath: tempBase))) as! [String: Any]
+        let remote = try XCTUnwrap(json["remote"] as? [String: Any])
+        XCTAssertEqual(remote["enabled"] as? Bool, true)
+        XCTAssertEqual(remote["url"] as? String, "studio.local:9000")
+        XCTAssertEqual(remote["api_key"] as? String, "sk-remote")
+    }
+
+    func testSaveRemoteBackendPreservesOtherKeys() throws {
+        let url = AppConfig.settingsURL(basePath: tempBase)
+        let original = Data(#"{"server":{"port":8000,"host":"127.0.0.1"},"auth":{"api_key":"keep"},"remote":{"enabled":false,"url":"","api_key":"","extra":1},"unknown":{"x":1}}"#.utf8)
+        try original.write(to: url)
+        try AppConfig.saveRemoteBackend(basePath: tempBase, enabled: true, address: "https://omlx.example.com", apiKey: "  ")
+        var expected = try JSONSerialization.jsonObject(with: original) as! [String: Any]
+        expected["remote"] = ["enabled": true, "url": "https://omlx.example.com", "api_key": "", "extra": 1]
+        let actual = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! NSDictionary
+        XCTAssertEqual(actual, expected as NSDictionary)
+    }
+
+    func testEndpointFollowsTheRemoteBackend() throws {
+        var config = AppConfig(bindAddress: "0.0.0.0", port: 8123, apiKey: "local-key",
+                               basePath: "/tmp/omlx-test", modelDir: "/tmp/omlx-test/models",
+                               hfEndpoint: "")
+        XCTAssertFalse(config.isRemote)
+        XCTAssertFalse(config.endpoint.isRemote)
+        XCTAssertEqual(config.endpoint.apiKey, "local-key")
+        XCTAssertEqual(config.httpURL(path: "/health")?.absoluteString, "http://127.0.0.1:8123/health")
+
+        config.remoteEnabled = true
+        config.remoteAddress = "https://omlx.example.com"
+        config.remoteAPIKey = "remote-key"
+        XCTAssertTrue(config.isRemote)
+        XCTAssertTrue(config.endpoint.isRemote)
+        XCTAssertEqual(config.endpoint.apiKey, "remote-key", "the local key never goes to the other Mac")
+        XCTAssertEqual(config.httpURL(path: "/health")?.absoluteString, "https://omlx.example.com:443/health")
+        XCTAssertEqual(config.webSocketURL(path: "/v1/realtime")?.absoluteString,
+                       "wss://omlx.example.com:443/v1/realtime")
+        XCTAssertEqual(config.endpoint.displayAddress, "https://omlx.example.com:443")
+
+        // Enabled but not an address: still remote mode (no server is
+        // spawned) and no quiet fallback to the local server; nothing can be
+        // reached until the address is fixed.
+        config.remoteAddress = "studio.local/v1"
+        XCTAssertTrue(config.isRemote)
+        XCTAssertNil(config.remoteEndpoint)
+        XCTAssertTrue(config.endpoint.isRemote)
+        XCTAssertNil(config.httpURL(path: "/health"))
+    }
+
     // MARK: bootstrap file
 
     func testBootstrapRoundTrips() throws {

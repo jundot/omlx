@@ -157,72 +157,6 @@ enum AskAIServerMode: String, Codable, Equatable, Sendable, CaseIterable {
     case remote
 }
 
-/// Where Ask AI sends its requests: the server this app runs, or another oMLX server.
-struct AskAIEndpoint: Equatable, Sendable {
-    /// Port a bare remote address uses: oMLX's default, or 443 for `https`.
-    static let defaultPort = 8000
-    static let defaultSecurePort = 443
-
-    var scheme: String
-    var host: String
-    var port: Int
-    var apiKey: String?
-    var isRemote: Bool
-
-    init(local config: AppConfig) {
-        scheme = "http"
-        host = config.host
-        port = config.port
-        apiKey = config.apiKey
-        isRemote = false
-    }
-
-    /// Parses `host`, `host:port`, or `http(s)://host[:port]`. Nil when the
-    /// text is empty or not an address this app can reach.
-    init?(remoteAddress: String, apiKey: String?) {
-        let trimmed = remoteAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let text = trimmed.contains("://") ? trimmed : "http://" + trimmed
-        guard let parts = URLComponents(string: text),
-              let scheme = parts.scheme?.lowercased(), scheme == "http" || scheme == "https",
-              // Foundation keeps the brackets of an IPv6 literal; the app stores bare hosts.
-              let host = parts.host?.trimmingCharacters(in: CharacterSet(charactersIn: "[]")), !host.isEmpty,
-              parts.path.isEmpty || parts.path == "/"
-        else { return nil }
-        self.scheme = scheme
-        self.host = host
-        self.port = parts.port ?? (scheme == "https" ? Self.defaultSecurePort : Self.defaultPort)
-        let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.apiKey = (key?.isEmpty ?? true) ? nil : key
-        self.isRemote = true
-    }
-
-    func httpURL(path: String) -> URL? {
-        AppConfig.httpURL(host: host, port: port, path: path, scheme: scheme)
-    }
-
-    func webSocketURL(path: String, query: [URLQueryItem] = []) -> URL? {
-        AppConfig.webSocketURL(host: host, port: port, path: path, query: query, scheme: scheme)
-    }
-
-    /// The model list of a remote server. `/v1/models/status` also accepts
-    /// sub keys; the admin model list accepts only the main key.
-    func remoteModels() async throws -> [ModelDTO] {
-        guard let url = httpURL(path: "/v1/models/status") else { throw OMLXClientError.invalidURL }
-        var request = URLRequest(url: url, timeoutInterval: 15)
-        if let apiKey { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw OMLXClientError.invalidResponse }
-        if http.statusCode == 401, apiKey == nil { throw OMLXClientError.unauthenticated }
-        guard 200..<300 ~= http.statusCode else {
-            throw OMLXClientError.http(status: http.statusCode, body: String(data: data, encoding: .utf8))
-        }
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return try decoder.decode(ListModelsResponse.self, from: data).models
-    }
-}
-
 struct AskAIPrefs: Codable, Equatable, Sendable {
     static let defaultPanelWidth: Double = 680
     static let defaultPrompt = """
@@ -313,18 +247,20 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
                      tools: defaultTools)
     }
 
-    /// The server Ask AI should use, or nil when "another server" is chosen
-    /// but its address is empty or invalid. `remoteKey` is the Keychain value.
-    func endpoint(local config: AppConfig, remoteKey: String?) -> AskAIEndpoint? {
+    /// The server Ask AI should use: the app's own backend (the server on
+    /// this Mac, or the remote backend the install points at), or nil when
+    /// "another server" is chosen but its address is empty or invalid.
+    /// `remoteKey` is the Keychain value.
+    func endpoint(local config: AppConfig, remoteKey: String?) -> OMLXEndpoint? {
         switch serverMode {
-        case .thisMac: AskAIEndpoint(local: config)
-        case .remote: AskAIEndpoint(remoteAddress: remoteAddress, apiKey: remoteKey)
+        case .thisMac: config.endpoint
+        case .remote: OMLXEndpoint(remoteAddress: remoteAddress, apiKey: remoteKey)
         }
     }
 
     /// `endpoint(local:remoteKey:)`, reading the remote key from the Keychain
     /// only when another server is chosen.
-    func currentEndpoint(local config: AppConfig) -> AskAIEndpoint? {
+    func currentEndpoint(local config: AppConfig) -> OMLXEndpoint? {
         endpoint(local: config, remoteKey: serverMode == .remote ? Keychain.read(.askAIRemoteKey) : nil)
     }
 }

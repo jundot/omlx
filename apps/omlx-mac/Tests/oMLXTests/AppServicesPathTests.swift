@@ -12,6 +12,25 @@ import XCTest
 
 final class AppServicesPathTests: XCTestCase {
 
+    // MARK: remote backend
+
+    @MainActor
+    func testApplyServerEndpointLeavesLocalFieldsAloneWithRemoteBackend() async throws {
+        let config = AppConfig(bindAddress: "127.0.0.1", port: 8000, apiKey: "local",
+                               basePath: "/tmp/omlx-remote-test", modelDir: "/tmp/omlx-remote-test/models",
+                               hfEndpoint: "", remoteEnabled: true,
+                               remoteAddress: "studio.local:9000", remoteAPIKey: "remote")
+        let services = AppServices(config: config)
+        XCTAssertFalse(services.canSaveSettingsOffline, "a remote backend is edited over HTTP, never as an offline file")
+
+        try await services.applyServerEndpoint(host: "0.0.0.0", port: 9999)
+
+        XCTAssertEqual(services.config.bindAddress, "127.0.0.1")
+        XCTAssertEqual(services.config.port, 8000)
+        XCTAssertEqual(services.config.endpoint.port, 9000)
+        XCTAssertEqual(services.client.port, 9000)
+    }
+
     // MARK: relocate(path:oldBase:newBase:)
 
     func testRelocateInsidePrefix() {

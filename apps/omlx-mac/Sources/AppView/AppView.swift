@@ -708,8 +708,87 @@ private struct ContentScaffold<Content: View>: View {
         }
         .navigationTitle(titleText)
         .navigationSubtitle(detailSubtitle ?? "")
+        .toolbar {
+            // Every screen says so when this install manages a server on
+            // another Mac: the data on screen is that server's.
+            if services.isRemoteBackend {
+                ToolbarItem(placement: .primaryAction) {
+                    RemoteBackendBadge()
+                }
+            }
+        }
         .modifier(ToolbarHeightKeeper())
         .background(theme.windowBg)
+    }
+}
+
+/// Top-right capsule shown on every screen while the app uses a remote
+/// backend: a status dot, "Remote server" and the address. Clicking it
+/// opens the Server screen where the backend is configured.
+private struct RemoteBackendBadge: View {
+    @Environment(\.omlxTheme) private var theme
+    @Environment(AppServices.self) private var services
+
+    private var address: String {
+        services.config.remoteEndpoint?.displayAddress ?? services.config.remoteAddress
+    }
+
+    private var dotColor: Color {
+        switch services.remoteState {
+        case .reachable:                       return theme.greenDot
+        case .checking, .idle:                 return theme.textSecondary
+        case .unauthorized:                    return theme.amberDot
+        case .unreachable, .invalidAddress:    return theme.redDot
+        }
+    }
+
+    private var stateText: String {
+        switch services.remoteState {
+        case .reachable:
+            return String(localized: "remote.badge.state.reachable", defaultValue: "reachable",
+                          comment: "Remote server badge tooltip state: the server answers")
+        case .checking, .idle:
+            return String(localized: "remote.badge.state.checking", defaultValue: "being checked",
+                          comment: "Remote server badge tooltip state: the server is being probed")
+        case .unauthorized:
+            return String(localized: "remote.badge.state.unauthorized", defaultValue: "rejecting the API key",
+                          comment: "Remote server badge tooltip state: the server rejects the API key")
+        case .unreachable:
+            return String(localized: "remote.badge.state.unreachable", defaultValue: "unreachable",
+                          comment: "Remote server badge tooltip state: the server does not answer")
+        case .invalidAddress:
+            return String(localized: "remote.badge.state.invalid", defaultValue: "not a valid address",
+                          comment: "Remote server badge tooltip state: the address cannot be parsed")
+        }
+    }
+
+    var body: some View {
+        Button {
+            services.requestedSection = .server
+        } label: {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 7, height: 7)
+                Text(String(localized: "remote.badge.title", defaultValue: "Remote server",
+                            comment: "Label of the badge shown on every screen while the app uses a server on another Mac"))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
+                    .foregroundStyle(theme.text)
+                Text(address)
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
+                    .foregroundStyle(theme.textSecondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(theme.groupBg, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(String(localized: "remote.badge.help",
+                     defaultValue: "This app manages the oMLX server at \(address), which is \(stateText). Click to change it.",
+                     comment: "Tooltip of the remote server badge; the arguments are the address and its state"))
+        .accessibilityLabel(String(localized: "remote.badge.title", defaultValue: "Remote server",
+                                   comment: "Label of the badge shown on every screen while the app uses a server on another Mac"))
     }
 }
 

@@ -45,6 +45,30 @@ curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8000/admin/api/st
 | `GET /admin/api/device-info` | Chip, GPU cores, and memory |
 | `POST /admin/api/ssd-cache/clear`, `POST /admin/api/hot-cache/clear` | Clear the SSD or in-memory KV cache |
 
+`GET /api/system-metrics` (outside `/admin/api/`, same auth as `GET /api/status`, so sub keys work) returns the resource use of the Mac the server runs on. The macOS app reads it in remote-backend mode to fill the System Stats menu and status items with the server's numbers instead of the local Mac's.
+
+```json
+{
+  "timestamp": 1793803000.5,
+  "uptime_seconds": 12345.6,
+  "cpu": {
+    "total_percent": 23.4, "efficiency_percent": 10.0, "performance_percent": 30.0,
+    "efficiency_cores": 4, "performance_cores": 8, "load_averages": [1.2, 1.1, 0.9]
+  },
+  "gpu": { "utilization_percent": 45.0, "memory_in_use_bytes": 123456789 },
+  "memory": {
+    "total_bytes": 0, "wired_bytes": 0, "active_bytes": 0, "inactive_bytes": 0,
+    "compressed_bytes": 0, "free_bytes": 0
+  },
+  "thermal_state": "nominal"
+}
+```
+
+- Percentages run 0 to 100. Every value is `null` when the host cannot report it (non-macOS server, missing tool); the endpoint still returns 200.
+- CPU percentages are averages since the previous request, so the first request after a server start returns `null` for them. Requests less than 0.5 s apart share one sample. The efficiency cluster is the first `hw.perflevel1` logical CPUs, the same split the macOS app uses locally; without it `efficiency_percent` is `null`.
+- `free_bytes` is `total - (wired + active + compressed)`, so the rows sum to the total. GPU values come from the accelerator's `PerformanceStatistics` (`ioreg`, cached for 1 s).
+- `thermal_state` is `nominal`, `fair`, `serious`, or `critical`.
+
 Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`) carry the engine request id in the `X-oMLX-Request-ID` header. Streaming responses send it before prefill starts, so a client can find its request in the `waiting` and `prefilling` rows of `activity` by `request_id` while it waits. A `/v1/completions` request with a list of prompts has no single id and gets no header.
 
 The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The request still reuses any cached prefix, but its own prompt and output are not stored in the hot or SSD cache, so one-shot calls such as summaries do not evict prefixes that other requests reuse. Other values, or no header, keep the default behavior. Anthropic `cache_control` blocks and HTTP `Cache-Control` headers do not change what the engine stores.
