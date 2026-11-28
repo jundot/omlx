@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional, Union
@@ -3681,6 +3682,40 @@ class _DiscoveredPlan:
         self._plan = plan  # output_key -> {sources, transform, ...}
         self._lazy = lazy_index
         self._cache = {}  # output_key -> mx.array (for multi-consumer sources)
+        # src_key -> [_LazyTensor, raw bytes or mx.array, consumers left]
+        self._staged = {}
+
+    def source_reads(self, keys) -> dict:
+        """{src_key: [_LazyTensor, consumers]} for the plain on-disk sources
+        of ``keys``. Virtual and fp8-paired sources are left out; pop() keeps
+        reading those itself."""
+        virtual = getattr(self._lazy, "_virtual", None) or {}
+        fp8 = getattr(self._lazy, "_fp8_pairs", None) or {}
+        index = getattr(self._lazy, "_index", None) or {}
+        reads = {}
+        for key in keys:
+            for src in self._plan[key]["sources"]:
+                if src in virtual or src in fp8 or src not in index:
+                    continue
+                if src in reads:
+                    reads[src][1] += 1
+                else:
+                    reads[src] = [_LazyTensor(*index[src]), 1]
+        return reads
+
+    def stage(self, reads: dict, raw: dict) -> None:
+        """Serve the next pops of these sources from ``raw`` instead of disk.
+
+        A source with several consumers (the gate and up halves of a fused
+        expert tensor) is converted once and shared, so it is read once and
+        both halves view one buffer.
+        """
+        self._staged = {
+            src: [lt, raw[src], consumers] for src, (lt, consumers) in reads.items()
+        }
+
+    def clear_staged(self) -> None:
+        self._staged = {}
 
     def keys(self):
         return self._plan.keys()
@@ -3820,6 +3855,17 @@ class _DiscoveredPlan:
 
     def _materialize_source(self, src_key):
         """Load a single source tensor from the lazy index."""
+        staged = self._staged.get(src_key)
+        if staged is not None:
+            lt, value, left = staged
+            if not isinstance(value, mx.array):
+                value = lt.load(raw=value)
+                mx.eval(value)
+            if left <= 1:
+                del self._staged[src_key]
+            else:
+                staged[1], staged[2] = value, left - 1
+            return value
         virtual = getattr(self._lazy, "_virtual", None)
         if virtual and src_key in virtual:
             return self._lazy.materialize_virtual(src_key)
@@ -6237,15 +6283,24 @@ class _LazyTensor:
     def _np_view_dtype(self):
         return self._SF_TO_NP.get(self._dtype, _np.uint16)
 
-    def _load_rows(self, r0, r1):
+    def _read_bytes(self, b0, b1):
+        """Raw bytes [b0, b1) of this tensor. File IO only, no MLX calls, so
+        the streamed loader's prefetch thread may call it."""
+        with open(self._sf_path, "rb") as f:
+            f.seek(self._data_offset + self._start + b0)
+            raw = f.read(b1 - b0)
+        if len(raw) != b1 - b0:
+            raise OSError(
+                f"short read from {self._sf_path}: {len(raw)} of {b1 - b0} bytes"
+            )
+        return raw
+
+    def _load_rows(self, r0, r1, raw=None):
         n = r1 - r0
         if n <= 0:
             return mx.zeros((0, *self.shape[1:]), dtype=self._mlx_dtype())
-        b0 = self._start + r0 * self._bpr
-        b1 = self._start + r1 * self._bpr
-        with open(self._sf_path, "rb") as f:
-            f.seek(self._data_offset + b0)
-            raw = f.read(b1 - b0)
+        if raw is None:
+            raw = self._read_bytes(r0 * self._bpr, r1 * self._bpr)
         arr = _np.frombuffer(raw, dtype=self._np_view_dtype())
         chunk_shape = (n, *self.shape[1:])
         # Two ceilings: device buffer bytes, and MLX's int32 element count.
@@ -6271,18 +6326,18 @@ class _LazyTensor:
         mx.eval(result)
         return result
 
-    def load(self):
+    def load(self, raw=None):
         """Read the whole tensor. Unlike ``[:]``, also handles 0-dim scalars
-        (e.g. Gemma 4's audio-tower clamp bounds)."""
+        (e.g. Gemma 4's audio-tower clamp bounds). ``raw`` takes bytes that
+        ``_read_bytes(0, nbytes)`` already returned."""
         if self.ndim == 0:
-            with open(self._sf_path, "rb") as f:
-                f.seek(self._data_offset + self._start)
-                raw = f.read(self._end - self._start)
+            if raw is None:
+                raw = self._read_bytes(0, self.nbytes)
             arr = _np.frombuffer(raw, dtype=self._np_view_dtype())
             t = mx.array(arr).view(self._mlx_dtype()).reshape(())
             mx.eval(t)
             return t
-        return self._load_rows(0, self.shape[0])
+        return self._load_rows(0, self.shape[0], raw=raw)
 
     def __getitem__(self, idx):
         if len(self.shape) == 0:
@@ -10720,21 +10775,56 @@ def _streamed_layer_items(dp: "_DiscoveredPlan", layer_idx: int, skip_key=None) 
     whole table every round and spike process memory by the table's size.
     """
     prefix = f"{_STREAM_TEXT_LAYER_PREFIX}{layer_idx}."
+    keys, dropped = _streamed_layer_keys(dp, layer_idx, skip_key)
+    if dropped:
+        logger.info(
+            "streamed layer %d: skipped %d tensors before sourcing "
+            "(mmap-mode PLE reads them straight from the checkpoint)",
+            layer_idx,
+            dropped,
+        )
+    return [(k[len(prefix) :], dp.pop(k)) for k in keys]
+
+
+def _streamed_layer_keys(dp, layer_idx: int, skip_key=None) -> tuple[list, int]:
+    """Plan keys of one text layer after ``skip_key``, and how many it dropped."""
+    prefix = f"{_STREAM_TEXT_LAYER_PREFIX}{layer_idx}."
     keys = sorted(k for k in dp if k.startswith(prefix))
     if not keys:
         raise KeyError(f"no checkpoint tensors for text layer {layer_idx}")
-    if skip_key is not None:
-        kept = [k for k in keys if not skip_key(k[len(prefix) :])]
-        dropped = len(keys) - len(kept)
-        if dropped:
-            logger.info(
-                "streamed layer %d: skipped %d tensors before sourcing "
-                "(mmap-mode PLE reads them straight from the checkpoint)",
-                layer_idx,
-                dropped,
-            )
-        keys = kept
-    return [(k[len(prefix) :], dp.pop(k)) for k in keys]
+    if skip_key is None:
+        return keys, 0
+    kept = [k for k in keys if not skip_key(k[len(prefix) :])]
+    return kept, len(keys) - len(kept)
+
+
+def _stream_prefetch_enabled() -> bool:
+    """``OMLX_OQ_STREAM_PREFETCH=1`` reads layer N+1 while layer N computes.
+
+    Off by default: on a local SSD the read is a small fraction of the layer
+    compute, so overlapping it saves nothing measurable. It pays off on slow
+    sources such as a network share, where reading a layer takes about as
+    long as computing it.
+    """
+    value = os.environ.get("OMLX_OQ_STREAM_PREFETCH", "0").strip().lower()
+    return value in ("1", "on", "true", "yes")
+
+
+def _read_streamed_sources(reads: dict) -> tuple[dict, float]:
+    """Raw bytes of every staged source, one read per tensor, and the seconds
+    taken. File IO only: runs on the prefetch thread, MLX stays on the caller's."""
+    started = _time.perf_counter()
+    raw = {src: lt._read_bytes(0, lt.nbytes) for src, (lt, _) in reads.items()}
+    return raw, _time.perf_counter() - started
+
+
+def _stream_prefetch_admitted(nbytes: int) -> bool:
+    """One more layer of raw bytes must fit the streaming ceiling and the live
+    calibration budget (the share of available memory a resident model may
+    take), measured while the current layer is resident."""
+    if int(mx.get_active_memory()) + nbytes > _OQE_STREAM_ACTIVE_LIMIT_BYTES:
+        return False
+    return nbytes <= _calibration_memory_budget()["model_limit_bytes"]
 
 
 def _load_streamed_block_weights(block, items, layer_idx: int) -> str:
@@ -10784,6 +10874,14 @@ def _iter_streamed_layer_blocks(
     private sanitize plan and evaluated before the yield. The caller owns
     the block; the generator drops its own reference before popping the
     next layer so at most one layer's weights are ever resident here.
+
+    Each source tensor of a layer is read once (``_DiscoveredPlan.stage``).
+    With prefetch on (``OMLX_OQ_STREAM_PREFETCH=1``, default off), a background
+    thread reads layer N+1's raw bytes while the caller computes on layer N;
+    conversion to MLX arrays stays on this thread. At most one layer is read
+    ahead, and only if ``_stream_prefetch_admitted`` allows it.
+    ``OMLX_OQ_STREAM_TIMING=1`` logs read, wait, convert and compute seconds
+    per layer at INFO (DEBUG otherwise).
     """
     is_qwen4_exp = _stream_source_model_type(config) == "qwen4_exp"
     args, layer_cls = _streamed_text_args(
@@ -10798,35 +10896,132 @@ def _iter_streamed_layer_blocks(
         if lang_module is not None and lang_module.get_ple_runtime_mode() == "mmap"
         else None
     )
-    for layer_idx in range(args.num_hidden_layers):
-        items = _streamed_layer_items(dp, layer_idx, skip_key=skip_key)
-        if _is_muse_spark(config):
-            items = muse_spark_layout.calibration_items(items, layer_idx, config)
-        block = layer_cls(args, layer_idx)
-        # Freshly constructed modules default to training mode; loaded models
-        # run in eval mode. Layer implementations may branch on the flag
-        # (Qwen3.5-family GDN picks its fused kernel with
-        # use_kernel=not self.training), so a bare block left in training
-        # mode computes the scan on a different code path than the resident
-        # collector and serving do — measured as one-ulp bf16 divergence
-        # that flips borderline MoE routing choices.
-        block.eval()
-        mode = _load_streamed_block_weights(block, items, layer_idx)
-        del items
-        mx.eval(block.parameters())
-        is_moe = bool(
-            getattr(
-                block,
-                "is_moe_layer",
-                "SparseMoeBlock" in type(getattr(block, "mlp", None)).__name__,
+    num_layers = args.num_hidden_layers
+    pool = (
+        ThreadPoolExecutor(1, thread_name_prefix="oq-stream-prefetch")
+        if _stream_prefetch_enabled()
+        else None
+    )
+    log_timing = (
+        logger.info if os.environ.get("OMLX_OQ_STREAM_TIMING") else logger.debug
+    )
+    pending = None  # (layer_idx, reads, future): at most one layer ahead
+    try:
+        for layer_idx in range(num_layers):
+            started = _time.perf_counter()
+            wait_s = 0.0
+            if pending is not None and pending[0] == layer_idx:
+                _, reads, future = pending
+                pending = None
+                raw, read_s = future.result()  # re-raises read errors here
+                del future  # it holds the bytes too
+                wait_s = _time.perf_counter() - started
+                how = "prefetched"
+            else:
+                keys, _ = _streamed_layer_keys(dp, layer_idx, skip_key)
+                reads = dp.source_reads(keys)
+                raw, read_s = _read_streamed_sources(reads)
+                how = "read"
+            nbytes = sum(len(b) for b in raw.values())
+            dp.stage(reads, raw)
+            del raw, reads
+            try:
+                block, is_moe = _load_streamed_block(
+                    dp, layer_idx, args, layer_cls, config, skip_key
+                )
+            finally:
+                # Drop the staged raw bytes even when the block build fails,
+                # so a traceback does not pin a whole layer of source bytes.
+                dp.clear_staged()
+            load_s = _time.perf_counter() - started
+            if pool is not None and layer_idx + 1 < num_layers:
+                pending = _start_streamed_prefetch(pool, dp, layer_idx + 1, skip_key)
+            yielded = _time.perf_counter()
+            yield layer_idx, block, is_moe
+            compute_s = _time.perf_counter() - yielded
+            local_read_s = 0.0 if how == "prefetched" else read_s
+            log_timing(
+                "streamed layer %d timing: %s %.0f MB in %.2f s (%.1f MB/s), "
+                "wait %.2f s, convert %.2f s, compute %.2f s",
+                layer_idx,
+                how,
+                nbytes / 1e6,
+                read_s,
+                nbytes / 1e6 / max(read_s, 1e-9),
+                wait_s,
+                load_s - wait_s - local_read_s,
+                compute_s,
+                extra={
+                    "oq_stream_timing": {
+                        "layer": layer_idx,
+                        "prefetched": how == "prefetched",
+                        "bytes": nbytes,
+                        "read_s": read_s,
+                        "wait_s": wait_s,
+                        "convert_s": load_s - wait_s - local_read_s,
+                        "compute_s": compute_s,
+                    }
+                },
             )
+            del block  # delete-L before load-L+1: never two layers resident here
+            mx.clear_cache()
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _start_streamed_prefetch(pool, dp, layer_idx: int, skip_key):
+    """Submit the raw read of one layer, or return None if it is not admitted.
+
+    The read list is built here, on the caller's thread, because pop()
+    mutates the plan; the worker only touches files.
+    """
+    try:
+        keys, _ = _streamed_layer_keys(dp, layer_idx, skip_key)
+    except KeyError:
+        return None  # the synchronous path raises it when the layer is due
+    reads = dp.source_reads(keys)
+    nbytes = sum(lt.nbytes for lt, _ in reads.values())
+    if not _stream_prefetch_admitted(nbytes):
+        logger.info(
+            "streamed layer %d: %.1f GB prefetch not admitted by the memory "
+            "budget; reading it when it is due",
+            layer_idx,
+            nbytes / 1e9,
         )
-        logger.debug(
-            "streamed layer %d sourced (%s load, moe=%s)", layer_idx, mode, is_moe
+        return None
+    return layer_idx, reads, pool.submit(_read_streamed_sources, reads)
+
+
+def _load_streamed_block(dp, layer_idx: int, args, layer_cls, config, skip_key):
+    """Build one bare decoder block and fill it from the plan (staged bytes
+    first). Returns (block, is_moe) with the parameters evaluated."""
+    items = _streamed_layer_items(dp, layer_idx, skip_key=skip_key)
+    if _is_muse_spark(config):
+        items = muse_spark_layout.calibration_items(items, layer_idx, config)
+    block = layer_cls(args, layer_idx)
+    # Freshly constructed modules default to training mode; loaded models
+    # run in eval mode. Layer implementations may branch on the flag
+    # (Qwen3.5-family GDN picks its fused kernel with
+    # use_kernel=not self.training), so a bare block left in training
+    # mode computes the scan on a different code path than the resident
+    # collector and serving do — measured as one-ulp bf16 divergence
+    # that flips borderline MoE routing choices.
+    block.eval()
+    mode = _load_streamed_block_weights(block, items, layer_idx)
+    del items
+    mx.eval(block.parameters())
+    is_moe = bool(
+        getattr(
+            block,
+            "is_moe_layer",
+            "SparseMoeBlock" in type(getattr(block, "mlp", None)).__name__,
         )
-        yield layer_idx, block, is_moe
-        del block  # delete-L before load-L+1: never two layers resident here
-        mx.clear_cache()
+    )
+    logger.debug(
+        "streamed layer %d sourced (%s load, moe=%s)", layer_idx, mode, is_moe
+    )
+    return block, is_moe
 
 
 def _streamed_embed_weight(source, config: dict):

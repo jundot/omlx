@@ -9623,6 +9623,172 @@ class TestStreamedCalibration:
                 two[key].in_sum2, 2 * entry.in_sum2, rtol=1e-6, err_msg=key
             )
 
+    @pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5"])
+    def test_prefetch_matches_synchronous_reads(
+        self, tmp_path, monkeypatch, model_type
+    ):
+        """Reading layer N+1 in the background gives bit-identical statistics.
+
+        Prefetch off still reads each source once per layer; on, every layer
+        after the first is read off the main thread.
+        """
+        import threading
+
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        config = _qwen3_5_stream_source(source, model_type, vlm=True, mtp=False)
+        tokens = (mx.arange(16).reshape(4, 4) * 7 % 120 + 1).astype(mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        read_bytes = oq._LazyTensor._read_bytes
+        threads = []
+
+        def recording(self, b0, b1):
+            threads.append(threading.current_thread() is threading.main_thread())
+            return read_bytes(self, b0, b1)
+
+        monkeypatch.setattr(oq._LazyTensor, "_read_bytes", recording)
+        runs = {}
+        for prefetch in ("0", "1"):
+            monkeypatch.setenv("OMLX_OQ_STREAM_PREFETCH", prefetch)
+            threads.clear()
+            runs[prefetch] = oq._collect_imatrix_streaming(
+                source,
+                object(),
+                json.loads(json.dumps(config)),
+                num_samples=4,
+                seq_length=4,
+                calib_data=tokens,
+                measure_sensitivity=True,
+                sensitivity_oq_level=4,
+                sensitivity_num_samples=4,
+                sensitivity_seq_length=4,
+            )
+            off_main = threads.count(False)
+            assert (off_main > 0) == (prefetch == "1"), (prefetch, off_main)
+        (sync, sync_meta), (ahead, ahead_meta) = runs["0"], runs["1"]
+        assert sync.keys() == ahead.keys() and sync
+        for key, entry in sync.items():
+            np.testing.assert_array_equal(ahead[key].counts, entry.counts, key)
+            np.testing.assert_array_equal(ahead[key].in_sum2, entry.in_sum2, key)
+        assert sync_meta["sensitivity_map"] == ahead_meta["sensitivity_map"]
+
+    def test_fused_expert_source_is_read_once(self, tmp_path, monkeypatch):
+        """The gate and up halves of experts.gate_up_proj share one read."""
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        config = _qwen3_5_stream_source(source, "qwen3_5_moe", vlm=True, mtp=False)
+        monkeypatch.setenv("OMLX_OQ_STREAM_PREFETCH", "0")
+        read_bytes = oq._LazyTensor._read_bytes
+        reads = []
+
+        def recording(self, b0, b1):
+            reads.append((self._sf_path, self._start))
+            return read_bytes(self, b0, b1)
+
+        monkeypatch.setattr(oq._LazyTensor, "_read_bytes", recording)
+        for _ in oq._iter_streamed_layer_blocks(source, json.loads(json.dumps(config))):
+            pass
+        assert reads and len(reads) == len(set(reads))
+
+    @pytest.mark.parametrize("admitted", [True, False])
+    def test_prefetch_reads_at_most_one_layer_ahead(
+        self, tmp_path, monkeypatch, admitted
+    ):
+        import re
+        import threading
+
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        config = _qwen3_5_stream_source(source, "qwen3_5_moe", vlm=True, mtp=False)
+        monkeypatch.setenv("OMLX_OQ_STREAM_PREFETCH", "1")
+        monkeypatch.setattr(oq, "_stream_prefetch_admitted", lambda nbytes: admitted)
+        read_layers = oq._read_streamed_sources
+        started = []
+        ahead = threading.Event()
+
+        def recording(reads):
+            (layer,) = {int(re.search(r"layers\.(\d+)\.", k)[1]) for k in reads}
+            started.append(
+                (layer, threading.current_thread() is threading.main_thread())
+            )
+            if not started[-1][1]:
+                ahead.set()
+            return read_layers(reads)
+
+        monkeypatch.setattr(oq, "_read_streamed_sources", recording)
+        held = []
+        for layer_idx, _block, _moe in oq._iter_streamed_layer_blocks(
+            source, json.loads(json.dumps(config))
+        ):
+            if layer_idx < 3 and admitted:
+                assert ahead.wait(10), "no prefetch started while a layer was held"
+                ahead.clear()
+            # While the caller holds layer N, nothing past N+1 has been read.
+            assert max(layer for layer, _ in started) <= layer_idx + 1
+            held.append(layer_idx)
+        assert held == [0, 1, 2, 3]
+        assert sorted(layer for layer, _ in started) == held
+        background = [layer for layer, on_main in started if not on_main]
+        assert background == ([1, 2, 3] if admitted else [])
+
+    def test_prefetch_read_error_surfaces(self, tmp_path, monkeypatch):
+        import threading
+
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        config = _qwen3_5_stream_source(source, "qwen3_5", vlm=True, mtp=False)
+        monkeypatch.setenv("OMLX_OQ_STREAM_PREFETCH", "1")
+        read_bytes = oq._LazyTensor._read_bytes
+
+        def failing_off_main(self, b0, b1):
+            if threading.current_thread() is not threading.main_thread():
+                raise OSError("share went away")
+            return read_bytes(self, b0, b1)
+
+        monkeypatch.setattr(oq._LazyTensor, "_read_bytes", failing_off_main)
+        held = []
+        with pytest.raises(OSError, match="share went away"):
+            for layer_idx, _block, _moe in oq._iter_streamed_layer_blocks(
+                source, json.loads(json.dumps(config))
+            ):
+                held.append(layer_idx)
+        assert held == [0]
+
+    @pytest.mark.parametrize(
+        "vlm", [pytest.param(True, id="vlm"), pytest.param(False, id="text")]
+    )
+    def test_qwen3_5_streamed_imatrix_covers_quantized_mtp(
+        self, tmp_path, monkeypatch, vlm
+    ):
+        """Streamed MTP entries carry the names quantization looks up."""
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        _qwen3_5_stream_source(source, "qwen3_5_moe", vlm=vlm, mtp=True)
+        tokens = (mx.arange(32).reshape(4, 8) * 7 % 120 + 1).astype(mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        output = tmp_path / "output"
+        oq.quantize_oq_streaming(
+            str(source),
+            str(output),
+            4,
+            group_size=32,
+            enhanced=True,
+            stream_calibration=True,
+            imatrix_num_samples=2,
+            imatrix_seq_length=8,
+            sensitivity_map_override={i: 1.0 for i in range(4)},
+            preserve_mtp=True,
+        )
+        report = json.loads((output / "oq_imatrix_report.json").read_text())
+        assert any(".mtp." in name for name in report["applied"])
+        assert report["missing"] == ["language_model.lm_head"]
+        assert not report["mismatched"]
+
 
 # Tiny Inkling 2 source in the original layout. Layers 0-3 hold NVFP4 experts and
 # layers 4-5 MXFP8 ones; layer 5 is the only full-attention layer.
