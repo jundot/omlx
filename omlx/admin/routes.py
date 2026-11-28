@@ -808,6 +808,7 @@ class GlobalSettingsRequest(BaseModel):
     model_dirs: list[str] | None = None
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     model_fallback: bool | None = None
+    model_fallback_target: Literal["default", "loaded"] | None = None
     hide_helper_models: bool | None = None
 
     # Memory enforcement
@@ -5034,6 +5035,7 @@ def _global_settings_response(global_settings):
                 str(d) for d in global_settings.get_effective_model_dirs()
             ],
             "model_fallback": global_settings.model.model_fallback,
+            "model_fallback_target": global_settings.model.model_fallback_target,
             "hide_helper_models": global_settings.model.hide_helper_models,
         },
         "memory": {
@@ -5428,6 +5430,9 @@ async def update_global_settings(
     if request.model_fallback is not None:
         global_settings.model.model_fallback = request.model_fallback
         runtime_applied.append("model_fallback")
+    if request.model_fallback_target is not None:
+        global_settings.model.model_fallback_target = request.model_fallback_target
+        runtime_applied.append("model_fallback_target")
     if request.hide_helper_models is not None:
         global_settings.model.hide_helper_models = request.hide_helper_models
         runtime_applied.append("hide_helper_models")
