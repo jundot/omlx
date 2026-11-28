@@ -4,7 +4,6 @@ import os
 import struct
 import subprocess
 import sys
-import zlib
 
 # MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
 # the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
@@ -18,7 +17,7 @@ This module provides common fixtures used across test files.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from unittest.mock import MagicMock
 
 import mlx.core as mx
@@ -256,52 +255,10 @@ def cluster_home(tmp_path, monkeypatch):
     return home
 
 
-class MockTokenizer:
-    """Mock tokenizer for testing without loading real models."""
-
-    def __init__(self, vocab_size: int = 32000):
-        self.vocab_size = vocab_size
-        self.eos_token_id = 2
-        self.pad_token_id = 0
-        self.bos_token_id = 1
-
-    def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
-        """Encode text to token ids (simple simulation)."""
-        # Simple simulation: each word becomes a token
-        tokens = []
-        if add_special_tokens:
-            tokens.append(self.bos_token_id)
-        # Simulate tokenization by splitting on spaces
-        for i, word in enumerate(text.split()):
-            # crc32, unlike hash(), is stable across processes.
-            token_id = (zlib.crc32(word.encode()) % (self.vocab_size - 10)) + 10
-            tokens.append(token_id)
-        return tokens
-
-    def decode(
-        self,
-        token_ids: List[int],
-        skip_special_tokens: bool = True,
-    ) -> str:
-        """Decode token ids to text (simple simulation)."""
-        if skip_special_tokens:
-            token_ids = [
-                t
-                for t in token_ids
-                if t not in (self.eos_token_id, self.pad_token_id, self.bos_token_id)
-            ]
-        # Return a placeholder string representing the token count
-        return f"<decoded:{len(token_ids)} tokens>"
-
-    def __call__(
-        self,
-        text: str,
-        return_tensors: Optional[str] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Tokenize text and return dict with input_ids."""
-        input_ids = self.encode(text)
-        return {"input_ids": input_ids}
+# ``MockTokenizer`` lives in a uniquely named module: pytest imports every
+# conftest.py as the module ``conftest``, so a nested conftest could shadow the
+# root one and break a plain ``from conftest import MockTokenizer``.
+from tests._tokenizer_support import MockTokenizer  # noqa: E402
 
 
 class MockModelConfig:
