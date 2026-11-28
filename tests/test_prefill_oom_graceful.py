@@ -2434,6 +2434,31 @@ def test_v41_flat_overhead_charges_pool_once_and_releases_on_reclaim():
     assert charged == pytest.approx(static * 1.3 + flat, rel=1e-6)
 
 
+def test_v41_flat_overhead_ignores_pool_the_chunk_did_not_fill():
+    monitor = _v41_monitor()
+    clean = _throttle_ctx(current=0, hard=int(123.5 * _GB), monitor=monitor)
+    mixed = _throttle_ctx(current=0, hard=int(123.5 * _GB), monitor=monitor)
+    for ns, post, unowned in ((clean, 3 * _GB, 0), (mixed, 5 * _GB, 2 * _GB)):
+        Scheduler._record_chunk_transient(
+            ns,
+            512,
+            pre_bytes=0,
+            post_bytes=post,
+            request_id="r",
+            loop_label="test",
+            kv_len=2048,
+            unowned_pool_bytes=unowned,
+        )
+    clean_tracker = clean._prefill_transient_tracker
+    mixed_tracker = mixed._prefill_transient_tracker
+    for tracker in (clean_tracker, mixed_tracker):
+        tracker.record_flat_reclaim(16 * _GB)
+    assert clean_tracker.flat_overhead_charge_for(False, 512) > 0
+    assert mixed_tracker.flat_overhead_charge_for(
+        False, 512
+    ) == clean_tracker.flat_overhead_charge_for(False, 512)
+
+
 def test_guard_reclaim_measures_after_the_kernel_releases_the_pool(monkeypatch):
     now = [100.0]
     mlx = {"active": 223 * _GB, "cache": int(7.75 * _GB)}

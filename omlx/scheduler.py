@@ -6391,7 +6391,7 @@ class Scheduler:
         repay reallocation charges. Partial speed-priority chunks do not
         replace representative overhead or full-step measurements.
         """
-        delta = post_bytes - pre_bytes
+        delta = post_bytes - pre_bytes - unowned_pool_bytes
         monitor = getattr(self, "memory_monitor", None)
         if (
             MemoryMonitor is not None
@@ -6435,8 +6435,6 @@ class Scheduler:
                 / 1024**2,
             )
             return
-        # Pool this chunk did not fill is fixed, not per-token work.
-        delta -= unowned_pool_bytes
         # The reclaim ledger sees every measurement, including samples the
         # EWMA gates below skip: a release on a sub-floor tail must still be
         # priced, and any positive growth confirms the pool reallocation and
