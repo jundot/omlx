@@ -3385,6 +3385,46 @@ class Scheduler:
                 return True
         return False
 
+    # Below this many rows per routed expert in a 512-token chunk the
+    # gather_qmm tiles of a sparse MoE mostly compute padding.
+    _SPARSE_MOE_ROWS_PER_EXPERT = 32
+
+    def _is_sparse_moe(self) -> bool:
+        """A MoE whose routing leaves few rows per expert at a 512-token chunk.
+
+        Flint (6 of 256 experts) gets ~12 rows per expert, MiMo (8 of 256)
+        ~16. Read from the model's config: num_experts / n_routed_experts /
+        num_local_experts and num_experts_per_tok.
+        """
+        def field(cfg, *names):
+            for name in names:
+                value = cfg.get(name) if isinstance(cfg, dict) else getattr(cfg, name, None)
+                if isinstance(value, int) and value > 0:
+                    return value
+            return None
+
+        roots = (
+            self.model,
+            getattr(self.model, "model", None),
+            getattr(self.model, "_language_model", None),
+            getattr(self.model, "language_model", None),
+        )
+        for root in roots:
+            if root is None:
+                continue
+            for cfg in (getattr(root, "args", None), getattr(root, "config", None)):
+                if cfg is None:
+                    continue
+                text = cfg.get("text_config") if isinstance(cfg, dict) else getattr(cfg, "text_config", None)
+                for c in (cfg, text):
+                    if c is None:
+                        continue
+                    experts = field(c, "num_experts", "n_routed_experts", "num_local_experts")
+                    top_k = field(c, "num_experts_per_tok")
+                    if experts and top_k and experts >= 64:
+                        return 512 * top_k / experts < self._SPARSE_MOE_ROWS_PER_EXPERT
+        return False
+
     def _align_block_size_with_rotating_window(self) -> None:
         """
         Align paged cache block size to a multiple of RotatingKVCache
@@ -3437,7 +3477,15 @@ class Scheduler:
         elif getattr(self.model, "model_type", None) == "hy_v4_flash":
             # Top-16-of-512 routing leaves ~16 rows per expert at 512 tokens.
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
-
+        elif self._is_sparse_moe():
+            # The same reason for other sparse MoE models with a sliding window
+            # (Flint: 6 of 256 experts, window 513): with the cache on, every
+            # chunk stops at a block boundary, so ~512-token blocks keep the
+            # expert GEMMs at ~12 rows each. The smallest multiple of the window
+            # from 2048 tokens. M5 Pro, Flint 128K: cold prompt 187-191 ->
+            # 148-150 s, a new question on the cached prompt 1.15 -> 0.75 s.
+            lo = self._POOLING_ROTATING_BLOCK_SIZE
+            hi = lo + window_size - 1
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
         else:
