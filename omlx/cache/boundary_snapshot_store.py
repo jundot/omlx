@@ -1221,7 +1221,7 @@ class BoundarySnapshotSSDStore:
         """
         arrays: dict[str, Any] = {}  # name -> mx.array
         layer_info: list[dict[str, str]] = []
-        # (reason, shape, unevaluated flag) per encoded recurrent tensor,
+        # (reason, shape, unevaluated flag) per recurrent tensor,
         # verified in one batch below rather than one sync per layer.
         gdn_checks: list[tuple[str, tuple[int, ...], Any]] = []
 
@@ -1296,6 +1296,16 @@ class BoundarySnapshotSSDStore:
                             info[f"zero_dim_{k}"] = _encode_shape(elem.shape)
                         else:
                             key = f"layer_{i}_state_{k}"
+                            if self._is_gdn_recurrent_state(
+                                class_name, cache_type, k, elem
+                            ):
+                                gdn_checks.append(
+                                    (
+                                        "non-finite GDN recurrent state",
+                                        tuple(elem.shape),
+                                        mx.all(mx.isfinite(elem)),
+                                    )
+                                )
                             if self._should_quantize_gdn_state(
                                 class_name,
                                 cache_type,
@@ -1350,6 +1360,24 @@ class BoundarySnapshotSSDStore:
 
         return tensors_raw, metadata
 
+    @staticmethod
+    def _is_gdn_recurrent_state(
+        class_name: str,
+        cache_type: str,
+        state_index: int,
+        tensor: Any,
+    ) -> bool:
+        """Identify the recurrent member independently of its storage codec."""
+        return bool(
+            state_index == 1
+            and (
+                str(class_name).endswith("ArraysCache")
+                or str(cache_type).endswith("ArraysCache")
+            )
+            and getattr(tensor, "dtype", None) == mx.float32
+            and len(getattr(tensor, "shape", ())) >= 1
+        )
+
     def _should_quantize_gdn_state(
         self,
         class_name: str,
@@ -1358,15 +1386,8 @@ class BoundarySnapshotSSDStore:
         tensor: Any,
     ) -> bool:
         """Select only the fp32 recurrent member of Arrays-family caches."""
-        eligible = bool(
-            self._gdn_sidecar_state_dtype != "fp32"
-            and state_index == 1
-            and (
-                str(class_name).endswith("ArraysCache")
-                or str(cache_type).endswith("ArraysCache")
-            )
-            and getattr(tensor, "dtype", None) == mx.float32
-            and len(getattr(tensor, "shape", ())) >= 1
+        eligible = self._gdn_sidecar_state_dtype != "fp32" and (
+            self._is_gdn_recurrent_state(class_name, cache_type, state_index, tensor)
         )
         if not eligible or self._gdn_sidecar_state_dtype not in {
             "rht_int8",
@@ -1428,18 +1449,13 @@ class BoundarySnapshotSSDStore:
         may still look finite, so a corrupt recurrent state would otherwise be
         written as a well-formed sidecar and restored later as silent garbage.
 
-        The validity flags are appended to ``checks`` as unevaluated arrays
-        rather than tested here. Forcing ``bool()`` per layer costs a
-        GPU->CPU sync each time (+19 ms over the 48-layer 27B state, ~19x the
-        codec itself); the caller evaluates all flags in one batch instead.
+        The serializer queues source validity for every recurrent tensor,
+        including raw fp32 and codec fallbacks. This method appends codec
+        validity flags to ``checks`` as unevaluated arrays. Forcing ``bool()``
+        per layer costs a GPU->CPU sync each time (+19 ms over the 48-layer
+        27B state, ~19x the codec itself); the caller evaluates all flags in
+        one batch instead.
         """
-        checks.append(
-            (
-                "non-finite GDN recurrent state",
-                tuple(getattr(tensor, "shape", ())),
-                mx.all(mx.isfinite(tensor)),
-            )
-        )
         if self._gdn_sidecar_state_dtype == "bf16":
             return tensor.astype(mx.bfloat16), None, _GDN_BF16_CODEC
 
