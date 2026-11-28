@@ -10,6 +10,7 @@ from omlx.utils.model_loading import dflash_batched_supported, dflash_compatibil
     ("model_type", "engine_type"),
     [
         ("qwen3_5_moe", "vlm"),
+        ("qwen4_exp", "vlm"),
         ("minicpmv4_7", "vlm"),
         ("qwen3_moe", "batched"),
     ],
@@ -23,6 +24,12 @@ def test_minicpm_v47_is_a_vlm_target_only():
     # MiniCPM-V 4.7 loads on the VLM engine (its text backbone is a Qwen3.5 MoE
     # behind a minicpmv4_7 wrapper); it is not a text-engine DFlash target.
     assert not dflash_batched_supported("minicpmv4_7", "batched")
+
+
+def test_qwen4_is_a_vlm_target_only():
+    assert not dflash_batched_supported("qwen4_exp", "batched")
+    assert not dflash_batched_supported("qwen4_exp_text", "batched")
+    assert not dflash_batched_supported("qwen4_exp_text", "vlm")
 
 
 @pytest.mark.parametrize(
