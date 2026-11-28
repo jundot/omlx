@@ -1293,14 +1293,13 @@ def _initial_batch_forward(gen_batch):
     """
     from .fused_batch import _supports_batch_rollback
 
-    # The VLM adapter's language model, or the model itself (Inkling 2).
-    hosts = (getattr(gen_batch.model, "_language_model", None), gen_batch.model)
+    host = getattr(gen_batch.model, "_language_model", None)
     chain, _, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
     if not (
         len(gen_batch.uids) > 1
         and chain
         and not head_clone
-        and any(getattr(host, "_omlx_mtp_batch_rollback", False) for host in hosts)
+        and getattr(host, "_omlx_mtp_batch_rollback", False)
         and gen_batch._next_tokens is not None
         and all(_supports_batch_rollback(c) for c in gen_batch.prompt_cache)
         and not any(
@@ -1425,26 +1424,14 @@ def _batch_policy_for_next(gen_batch: Any):
         if chain and width:
             # Deeper blocks than one shared verify forward holds verify row by row.
             depth = max(1, min(depth, width // len(gen_batch.uids) - 1))
-        fixed = _mtp_depth_fixed(gen_batch.model)
-        cap = _batch_depth_cap(gen_batch.model)
-        if chain and cap and not fixed:
-            depth = min(depth, cap)
-        policy = BatchPolicy(gen_batch.uids, depth if chain else 1, fixed=fixed)
+        policy = BatchPolicy(
+            gen_batch.uids,
+            depth if chain else 1,
+            fixed=_mtp_depth_fixed(gen_batch.model),
+        )
         memory.seed(policy)
         gen_batch._omlx_mtp_batch_policy = policy
     return policy
-
-
-def _batch_depth_cap(model: Any) -> int:
-    for host in (
-        model,
-        getattr(model, "language_model", None),
-        getattr(model, "_language_model", None),
-    ):
-        cap = getattr(host, "_omlx_mtp_batch_max_depth", 0) if host is not None else 0
-        if cap:
-            return int(cap)
-    return 0
 
 
 def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:

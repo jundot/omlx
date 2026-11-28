@@ -17,9 +17,6 @@ Appending writes into a buffer with room to grow, so a decode step copies
 nothing; the buffer is re-cut once per ``window`` tokens. Keys are only ever
 dropped in whole attention tiles, so a single row's prefill tiles sit where a
 cache of every key would have them and its output is bit-identical to it.
-
-A batched rollback whose rows accept different counts leaves row ``r`` ending
-``tails[r]`` keys early; a re-cut, extract, filter, extend or merge realigns it.
 """
 
 from __future__ import annotations
@@ -87,7 +84,6 @@ class ArraysCache(_ArraysCache):
 
     def extend(self, other):
         realign(self)
-        realign(other)
         joined = _join([self, other])
         self.cache = joined.cache
         self.left_padding = None
@@ -95,8 +91,6 @@ class ArraysCache(_ArraysCache):
 
     @classmethod
     def merge(cls, caches):
-        for state in caches:
-            realign(state)
         return _join(caches)
 
 
@@ -156,7 +150,6 @@ class _Buffer:
         # Left padding of each row, in buffer rows and as last published.
         self.pads: list[int] = []
         self.shown: list[int] | None = None
-        # Keys each row ends before ``n`` (a ragged rollback); [] when none.
         self.tails: list[int] = []
 
     @property
@@ -263,32 +256,22 @@ def append(state, keys: mx.array, values: mx.array):
     )
 
 
-def trim(state, count: int) -> bool:
-    """Drop the ``count`` newest keys: the rejected drafts of the verify
-    block just appended, which the buffer still holds the window for."""
+def trim(state, counts: list[int]) -> bool:
+    """Drop the ``counts[b]`` newest keys of row ``b``: the rejected drafts of
+    the verify block just appended, which the buffer still holds the window
+    for. Rows that drop more than the fewest end early (``tails``)."""
     buffer = _buffer(state)
-    if buffer.keys is None or not 0 <= count <= buffer.n:
+    if buffer.keys is None or min(counts) < 0 or max(counts) > buffer.n:
         return False
     state.cache[KEYS] = state.cache[VALUES] = buffer.view = None
-    buffer.n -= count
-    _publish(state, buffer)
-    return True
-
-
-def trim_rows(state, drops) -> bool:
-    """Drop ``drops[r]`` newest keys of row ``r`` without moving keys: rows
-    that drop more than the fewest end early (``tails``)."""
-    buffer = _buffer(state)
-    if buffer.keys is None:
-        return False
-    ends = [t + d for t, d in zip(buffer.tails or [0] * len(drops), drops)]
-    if max(ends) > buffer.n:
-        return False
-    common = min(ends)
-    state.cache[KEYS] = state.cache[VALUES] = buffer.view = None
+    common = min(counts)
     buffer.n -= common
-    rest = [e - common for e in ends]
-    buffer.tails = rest if any(rest) else []
+    extra = [count - common for count in counts]
+    if any(extra):
+        ends = [t + e for t, e in zip(buffer.tails or [0] * len(extra), extra)]
+        least = min(ends)
+        buffer.n -= least
+        buffer.tails = [end - least for end in ends] if max(ends) > least else []
     _publish(state, buffer)
     return True
 

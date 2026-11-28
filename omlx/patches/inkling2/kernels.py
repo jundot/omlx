@@ -1096,8 +1096,7 @@ _DECODE_PART_SOURCE = """
     const int g = int(sg) * 8 + fm;
     const bool row_ok = g < G;
     const int h = hk * G + (row_ok ? g : 0);
-    // Index of the query's own key, and the number of keys it sees. A ragged
-    // batch ends row b ``dims[3 + B + b]`` keys before S (its tail).
+    // Index of the query's own key, and the number of keys it sees.
     const int a = (RAGGED ? S - dims[3 + int(threadgroups_per_grid.z) + b] : S)
         - L + pos;
     int nk = a + 1 - lp;
@@ -1341,8 +1340,9 @@ _DECODE_SLIDING_CHUNK = 128
 _DECODE_STAGERS = 2
 
 
-def ragged_attention_ok(q, k) -> bool:
-    """Whether ``banded_sink_attention`` reads ragged rows (``tails``) in place."""
+def flash_decode_ok(q, k) -> bool:
+    """Whether ``banded_sink_attention`` sends a batch to the decode kernel,
+    which reads ragged rows (``tails``) in place."""
     return q.shape[2] < _FLASH_MIN_QUERIES and _use_flash_decode(q, k)
 
 
@@ -1514,11 +1514,7 @@ def banded_sink_attention(
     ``gqa_flash_decode_attention``.
     """
     b, length = q.shape[0], q.shape[2]
-    if (
-        (b > 1 or left_padding is not None)
-        and length < _FLASH_MIN_QUERIES
-        and _use_flash_decode(q, k)
-    ):
+    if (b > 1 or left_padding is not None) and flash_decode_ok(q, k):
         # Batches, and a row left alone in a batch cache: the kernel reads
         # left_padding itself instead of masking every cached key.
         return gqa_flash_decode_attention(

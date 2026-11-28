@@ -33,8 +33,6 @@ logger = logging.getLogger(__name__)
 TAIL = "_omlx_tail"  # list[int] per live row
 MARK = "_omlx_tail_ok"
 REALIGN_ALL = "_omlx_realign_all"
-# Class attribute: the tail-aware update_and_fetch this patch installed.
-TAIL_UPDATE = "_omlx_tail_update"
 _PENDING = "_omlx_pending_tail"
 # Realign once a tail exceeds this, so the realignment shift stays within the
 # native in-place roll (16 columns) after one more verify block.
@@ -204,7 +202,6 @@ def _wrap_class(cls) -> None:
     cls.prepare = prepare
     cls.finalize = finalize
     cls.update_and_fetch = update_and_fetch
-    setattr(cls, TAIL_UPDATE, update_and_fetch)
 
     for name in ("filter", "extend", "extract"):
         orig = getattr(cls, name)
