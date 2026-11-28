@@ -1482,13 +1482,9 @@ class _GLM5NextPrefillMemoryProfile:
             return 0
         query_tokens = int(query_tokens)
         kv_len = int(kv_len)
-        # MoE streams (routed gather + weighted output) run inside every
-        # layer after attention; price them on both candidates.
         moe = query_tokens * self.moe_top_k * self.hidden_size * self.dtype_size * 2
 
         if kv_len <= self.index_topk:
-            # Short contexts use dense SDPA with expanded K/V.
-            # Use tiled score storage when a bounded route is available.
             core = estimate_unfused_sdpa_call_bytes(
                 self.num_attention_heads,
                 query_tokens,
@@ -1523,8 +1519,6 @@ class _GLM5NextPrefillMemoryProfile:
             )
             sparse = core + kv_expand + moe
         else:
-            # Selection active: the indexer scores every pooled key and the q
-            # projection expands to the latent width on both routes.
             pooled = max(kv_len // max(self.index_kpool, 1), 1)
             indexer = (
                 self.index_n_heads * query_tokens * pooled * 4
@@ -1534,8 +1528,6 @@ class _GLM5NextPrefillMemoryProfile:
                 query_tokens * self.num_attention_heads * self.kv_lora_rank * self.dtype_size
             )
             if kv_len < _GLM5_NEXT_SPARSE_MLA_MIN_KV:
-                # Exact-block attention expands all cached K/V, regardless of query length.
-                # Include both FP32 projection outputs and their kernel input casts.
                 core = (
                     kv_len
                     * self.num_attention_heads
@@ -1543,7 +1535,6 @@ class _GLM5NextPrefillMemoryProfile:
                     * (self.dtype_size + _GLM5_NEXT_EXACT_BLOCK_PROMOTION_DTYPE_SIZE)
                 )
             else:
-                # A full latent gather bounds the tiled sparse-MLA allocation.
                 core = (
                     query_tokens
                     * min(self.index_topk, kv_len)
@@ -1552,8 +1543,6 @@ class _GLM5NextPrefillMemoryProfile:
                 )
             sparse = indexer + q_latent + core + moe
 
-        # GDN layer: fused q/k/v input stream, short conv in/out, fp32
-        # l2-norm temporaries and the chunked delta-rule scan intermediates.
         gdn = (
             query_tokens * self.linear_num_heads * self.linear_head_dim * self.dtype_size * 8
             + query_tokens * self.linear_num_heads * 64 * 4
