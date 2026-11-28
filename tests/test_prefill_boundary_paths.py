@@ -39,9 +39,12 @@ def boundary_scheduler():
     forwarded = []
     snapshots = []
     limit = SimpleNamespace(tokens=None)
+    throttle = SimpleNamespace(tokens=None)
 
     def adaptive(token_count, **kwargs):
         events.append(("adaptive", token_count))
+        if throttle.tokens is not None:
+            return min(token_count, throttle.tokens)
         return token_count
 
     def guard(token_count, **kwargs):
@@ -111,6 +114,7 @@ def boundary_scheduler():
             forwarded=forwarded,
             snapshots=snapshots,
             limit=limit,
+            throttle=throttle,
         )
     get_prefill_tracker().clear()
 
@@ -196,6 +200,64 @@ def test_existing_chunk_and_snapshot_sequence(
             assert context.events[event_index + 1] == ("eval",)
         elif event[0] == "snapshot":
             assert context.events[event_index - 1] == ("eval",)
+
+
+@pytest.mark.parametrize("path", ["external", "resumable"])
+@pytest.mark.parametrize(
+    "base_tokens,prefill_tokens,boundaries,throttle,expected_chunks",
+    [
+        # A 3-token throttle on a 4-token block used to run 3 + 1.
+        (0, 10, True, 3, [2, 2, 2, 2, 2]),
+        (3, 9, True, 3, [1, 2, 2, 2, 2]),
+        # Without boundaries the step (6) ends at the prompt end only.
+        (0, 6, False, 4, [3, 3]),
+        # A throttle that already fits the span is unchanged.
+        (0, 8, True, 4, [4, 4]),
+    ],
+)
+def test_throttled_span_is_split_evenly(
+    boundary_scheduler,
+    path,
+    base_tokens,
+    prefill_tokens,
+    boundaries,
+    throttle,
+    expected_chunks,
+):
+    context = boundary_scheduler
+    scheduler = context.scheduler
+    context.throttle.tokens = throttle
+    if not boundaries:
+        scheduler.block_aware_cache = None
+    tokens = list(range(base_tokens + prefill_tokens + 1))
+    request = Request(
+        request_id="throttled",
+        prompt=tokens,
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    request.prompt_token_ids = tokens
+    request.num_prompt_tokens = len(tokens)
+    request.cached_tokens = base_tokens
+    request.remaining_tokens = tokens[base_tokens:]
+    cache = [KVCache()]
+    if base_tokens:
+        keys = mx.zeros((1, 1, base_tokens, 1))
+        cache[0].update_and_fetch(keys, keys)
+
+    if path == "external":
+        scheduler._do_external_prefill(request, request.remaining_tokens, cache)
+    else:
+        state = scheduler._begin_prefill(request, request.remaining_tokens, cache)
+        state.sampler = MagicMock()
+        state.sm = MagicMock()
+        state.per_row_lps = []
+        while not scheduler._step_prefill_chunk(state):
+            pass
+
+    assert context.forwarded == tokens[base_tokens:-1]
+    assert [
+        event[1] for event in context.events if event[0] == "forward"
+    ] == expected_chunks
 
 
 @pytest.mark.parametrize(

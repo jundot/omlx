@@ -5,6 +5,7 @@ import pytest
 from omlx.prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
+    spread_throttled_chunk,
 )
 
 
@@ -75,3 +76,25 @@ def test_should_emit_prefill_boundary(
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    "throttled,span,grid,expected",
+    [
+        (1984, 2048, 32, 1024),
+        (416, 1055, 32, 352),
+        (192, 448, 32, 160),
+        (3, 4, 32, 2),
+        (4, 4, 32, 4),
+        (5, 4, 32, 5),
+        (1, 4, 32, 1),
+        (0, 4, 32, 0),
+    ],
+)
+def test_spread_throttled_chunk(throttled, span, grid, expected):
+    n = spread_throttled_chunk(throttled, span, grid)
+    assert n == expected
+    if 0 < throttled < span:
+        assert n <= throttled
+        # Same number of forwards as the trimmed chunk plus its remainder.
+        assert -(-span // n) == -(-span // throttled)
