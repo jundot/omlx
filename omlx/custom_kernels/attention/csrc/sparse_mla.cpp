@@ -96,9 +96,12 @@ class SparseMlaAttentionPrimitive : public Primitive {
         k_pe.ndim() != 4 || topk_indices.ndim() != 4) {
       return true;
     }
-    if (!last_dim_contiguous(q_latent) || !last_dim_contiguous(q_pe) ||
-        !last_dim_contiguous(kv_latent) || !last_dim_contiguous(k_pe) ||
-        !last_dim_contiguous(topk_indices)) {
+    // Zero-width rope (NoPE, GLM-5.3) reports strides(-1), which would decline
+    // the whole kernel; skip the contiguity check for d_pe == 0.
+    const bool nope = q_pe.shape(3) == 0;
+    if (!last_dim_contiguous(q_latent) ||
+        (!nope && (!last_dim_contiguous(q_pe) || !last_dim_contiguous(k_pe))) ||
+        !last_dim_contiguous(kv_latent) || !last_dim_contiguous(topk_indices)) {
       return true;
     }
     if ((q_latent.shape(1) != 64 && q_latent.shape(1) != 32) ||
