@@ -43,7 +43,8 @@
         "initial_cache_blocks": 256
     },
     "mcp": {
-        "config_path": null
+        "config_path": null,
+        "expose_tools": true
     },
     "huggingface": {
         "endpoint": "https://hf-mirror.com",

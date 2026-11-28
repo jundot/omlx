@@ -8,7 +8,7 @@ final class IntegrationsScreenVM {
         case claudeMode, opusModel, sonnetModel, haikuModel, desktopEnabled
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
         case hermesModel, copilotModel, dshModel, vibeModel
-        case mcpConfig
+        case mcpConfig, mcpExposeTools
         case splashPath, splashLimits, splashKvFormat, splashActivations
         case splashAnePrefill, splashMaxConcurrentRequests
         case markitdownEnabled, markitdownExposeModel, markitdownMaxFileSize
@@ -95,6 +95,9 @@ final class IntegrationsScreenVM {
 
     // MCP
     var mcpConfigPath: String = ""
+    var mcpExposeTools = true
+    private var mcpExposeToolsLoaded = true
+    private(set) var savingMCPExposeTools = false
     /// Last value persisted to the server. Drives the Apply button's
     /// enabled state — diverges from `mcpConfigPath` whenever the user
     /// has unsaved edits, converges on a successful save.
@@ -335,6 +338,8 @@ final class IntegrationsScreenVM {
                 self.mcpConfigPath = path
                 self.mcpConfigLoaded = path
             }
+            self.mcpExposeTools = settings.mcp?.exposeTools ?? true
+            self.mcpExposeToolsLoaded = mcpExposeTools
 
             // Available models
             try await refreshModels(client: client)
@@ -375,6 +380,10 @@ final class IntegrationsScreenVM {
         case .dshModel:             patch.integrationsDshModel = dshModel
         case .mcpConfig:
             patch.mcpConfig = mcpConfigPath.trimmingCharacters(in: .whitespaces)
+        case .mcpExposeTools:
+            guard !savingMCPExposeTools, mcpExposeTools != mcpExposeToolsLoaded else { return }
+            patch.mcpExposeTools = mcpExposeTools
+            savingMCPExposeTools = true
         case .splashPath:
             patch.splashPath = Self.trimmed(splashPathDraft)
         case .splashKvFormat:       patch.splashKvFormat = splashKvFormat
@@ -431,13 +440,18 @@ final class IntegrationsScreenVM {
         default:
             break
         }
-        defer { savingMarkitdownFields.remove(field) }
+        defer {
+            savingMarkitdownFields.remove(field)
+            if field == .mcpExposeTools { savingMCPExposeTools = false }
+        }
         do {
             _ = try await client.updateGlobalSettings(patch)
             self.lastError = nil
             switch field {
             case .mcpConfig:
                 self.mcpConfigLoaded = mcpConfigPath.trimmingCharacters(in: .whitespaces)
+            case .mcpExposeTools:
+                if let value = patch.mcpExposeTools { mcpExposeToolsLoaded = value }
             case .splashPath:
                 self.editingSplashPath = false
                 // Reload for the launcher status the server resolved.
@@ -467,6 +481,7 @@ final class IntegrationsScreenVM {
             }
         } catch {
             switch field {
+            case .mcpExposeTools: mcpExposeTools = mcpExposeToolsLoaded
             case .markitdownEnabled: markitdownEnabled = markitdownLoaded.enabled
             case .markitdownExposeModel: markitdownExposeModel = markitdownLoaded.exposeModel
             case .markitdownPdfProcessingEngine: markitdownPdfProcessingEngine = markitdownLoaded.pdfProcessingEngine
