@@ -931,8 +931,8 @@
                                     </div>
                                     <button type="button"
                                             @click="modelSettings.moe_expert_offload_enabled = !modelSettings.moe_expert_offload_enabled"
-                                            :disabled="(modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled || modelSettings.activation_fp16_enabled"
-                                            :class="[modelSettings.moe_expert_offload_enabled ? 'bg-black' : 'bg-neutral-200', ((modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled || modelSettings.activation_fp16_enabled) ? 'opacity-50 cursor-not-allowed' : '']"
+                                            :disabled="(modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled"
+                                            :class="[modelSettings.moe_expert_offload_enabled ? 'bg-black' : 'bg-neutral-200', ((modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled) ? 'opacity-50 cursor-not-allowed' : '']"
                                             role="switch"
                                             :aria-checked="modelSettings.moe_expert_offload_enabled ? 'true' : 'false'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1172,8 +1172,7 @@
                                         aria-label="{{ t('modal.model_settings.activation_fp16') }}"
                                         :aria-checked="!!modelSettings.activation_fp16_enabled"
                                         @click="modelSettings.activation_fp16_enabled = !modelSettings.activation_fp16_enabled"
-                                        :disabled="modelSettings.moe_expert_offload_enabled && !modelSettings.activation_fp16_enabled"
-                                        :class="[modelSettings.activation_fp16_enabled ? 'bg-black' : 'bg-neutral-200', (modelSettings.moe_expert_offload_enabled && !modelSettings.activation_fp16_enabled) ? 'opacity-40 cursor-not-allowed' : '']"
+                                        :class="modelSettings.activation_fp16_enabled ? 'bg-black' : 'bg-neutral-200'"
                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                     <span :class="modelSettings.activation_fp16_enabled ? 'translate-x-5' : 'translate-x-0'"
                                           class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>

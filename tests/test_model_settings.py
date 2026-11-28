@@ -80,10 +80,14 @@ class TestModelSettings:
         with pytest.raises(ValueError, match="resident_fraction"):
             ModelSettings(moe_expert_offload_resident_fraction=1.5)
 
-    def test_moe_expert_offload_rejects_fp16_recast(self):
-        """The recast cannot reach the offload slots, so the combo is rejected."""
-        with pytest.raises(ValueError, match="float16 activation recast"):
-            ModelSettings(moe_expert_offload_enabled=True, activation_fp16_enabled=True)
+    def test_moe_expert_offload_accepts_fp16_recast(self):
+        settings = ModelSettings(
+            moe_expert_offload_enabled=True, activation_fp16_enabled=True
+        )
+        assert (
+            settings.moe_expert_offload_enabled,
+            settings.activation_fp16_enabled,
+        ) == (True, True)
 
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""

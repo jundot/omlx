@@ -1744,6 +1744,9 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
     changes. Leaves are then swapped one chunk at a time, so peak memory grows
     by one chunk instead of a second copy of every bfloat16 leaf.
 
+    MoE expert offload slots live outside the module tree and are recast after
+    the leaves. Experts read from disk later take the slot dtype.
+
     Returns the number of tensors recast.
     """
     pending = [
@@ -1775,6 +1778,11 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
         mx.synchronize()
         model.update(tree_unflatten(converted))
         del chunk, converted
+    # moe_expert_offload imports this module at load time.
+    from ..patches.moe_expert_offload import moe_offload_caches
+
+    for cache in moe_offload_caches(model):
+        count += cache.cast_slots(mx.float16)
     if count:
         # Read by numerics_revision_for_model so bfloat16 KV blocks are not reused.
         model._omlx_fp16_recast = True

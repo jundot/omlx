@@ -1246,13 +1246,12 @@ private struct AdvancedPage: View {
                 Row(label: String(localized: "settings.advanced.activation_fp16.label",
                                   defaultValue: "Float16 Activations",
                                   comment: "Row label for the load-time bfloat16 to float16 recast toggle"),
-                    sublabel: vm.activationFp16ConflictReason ?? String(localized: "settings.advanced.activation_fp16.sub",
+                    sublabel: String(localized: "settings.advanced.activation_fp16.sub",
                                      defaultValue: "Converts the bfloat16 scales, norms and embeddings of this model to float16 at load. M1 and M2 GPUs emulate bfloat16, so prefill and decode run faster. Output can differ slightly from bfloat16.",
                                      comment: "Sublabel for the load-time bfloat16 to float16 recast toggle")) {
                     RowSwitch(isOn: vm.bind($vm.activationFp16Enabled, save: {
                         Task { await vm.save(.activationFp16, client: client) }
                     }))
-                    .disabled(vm.activationFp16ConflictReason != nil && !vm.activationFp16Enabled)
                 }
             }
             if showsLLMRows {

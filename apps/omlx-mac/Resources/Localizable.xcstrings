@@ -36448,30 +36448,6 @@
         }
       }
     },
-    "settings.advanced.activation_fp16.conflict.moe_offload" : {
-      "comment" : "Sublabel shown when the float16 activation recast can't be enabled because MoE expert offload is on",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "MoE-Expertenauslagerung deaktivieren, bevor Float16-Aktivierungen aktiviert werden."
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disable MoE Expert Offload before enabling Float16 Activations."
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disattiva MoE Expert Offload prima di attivare le attivazioni Float16."
-          }
-        }
-      }
-    },
     "settings.advanced.activation_fp16.label" : {
       "comment" : "Row label for the load-time bfloat16 to float16 recast toggle",
       "extractionState" : "manual",
@@ -41976,30 +41952,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "VLM"
-          }
-        }
-      }
-    },
-    "settings.moe_offload.conflict.activation_fp16" : {
-      "comment" : "Tooltip / sublabel shown when MoE expert offload can't be enabled because the float16 activation recast is on",
-      "extractionState" : "manual",
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Float16-Aktivierungen deaktivieren, bevor die MoE-Expertenauslagerung aktiviert wird."
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disable Float16 Activations before enabling MoE Expert Offload."
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disattiva le attivazioni Float16 prima di attivare MoE Expert Offload."
           }
         }
       }

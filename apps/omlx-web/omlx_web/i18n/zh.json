@@ -1376,7 +1376,7 @@
   "modal.model_settings.qwen4_gdn_decode_wide_proj": "Qwen4 扩展融合解码",
   "modal.model_settings.qwen4_gdn_decode_wide_proj_hint": "在 Qwen4 oQ8e 及其他 GDN 布局（如部分旧版 oQ 下载和社区模型）上加快解码（最多额外占用 1.5 GiB 内存）。对当前的 oQ2.5e 到 oQ6e 和 fp16 版本无效，开启 Lightning MTP 后效果也很小。",
   "modal.model_settings.activation_fp16": "Float16 Activations",
-  "modal.model_settings.activation_fp16_hint": "Converts the bfloat16 scales, norms and embeddings of this model to float16 at load. M1 and M2 GPUs emulate bfloat16, so prefill and decode run faster. Output can differ slightly from bfloat16. Not available with MoE expert offload.",
+  "modal.model_settings.activation_fp16_hint": "Converts the bfloat16 scales, norms and embeddings of this model to float16 at load. M1 and M2 GPUs emulate bfloat16, so prefill and decode run faster. Output can differ slightly from bfloat16.",
   "modal.model_settings.thinking_budget": "思考预算",
   "modal.model_settings.thinking_budget_hint": "限制推理模型的思考 Token 数。超出时强制结束思考。",
   "modal.model_settings.thinking_budget_placeholder": "例如 4096",
