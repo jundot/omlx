@@ -4414,9 +4414,16 @@ async def create_systemone(
     """
     Answer typed questions about a state with a decision or chat model.
 
-    TypeSafe System One compatible endpoint. Every answer carries a
-    probability for each option of a ``noul`` (yes/no), ``choice`` or
-    ``score`` question.
+    TypeSafe System One compatible endpoint. A ``noul`` (yes/no), ``choice`` or
+    ``score`` question is answered with a probability for each of its options;
+    a ``box``, ``boxes``, ``number`` or ``text`` question with the value it read
+    and how sure the model is of it.
+
+    A d1 model reads a picture too: a ``box`` question answers one object and a
+    ``boxes`` question every instance of something, as fractions of the picture
+    in ``top``, ``bottom``, ``left`` and ``right``, each with ``found`` and a
+    ``confidence``. Such a request carries exactly one image and needs no
+    ``state``: the picture is the whole state, so the key can be left out.
 
     Example request:
     ```json
@@ -4425,6 +4432,18 @@ async def create_systemone(
         "state": "Checkout fails for every customer since the last deploy.",
         "questions": {
             "urgent": {"type": "noul", "instructions": "Is this urgent?"}
+        }
+    }
+    ```
+
+    A box request to a d1 model, which needs no state:
+    ```json
+    {
+        "model": "d1-2B",
+        "images": ["data:image/jpeg;base64,..."],
+        "questions": {
+            "remote": {"type": "box", "instructions": "Where is the remote?"},
+            "cats": {"type": "boxes", "instructions": "Every cat.", "max": 4}
         }
     }
     ```

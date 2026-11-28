@@ -60,6 +60,10 @@ READOUT_TEMPLATE_KWARGS = {"enable_thinking": False}
 # the readout to count as an answer.
 MIN_LETTER_MASS = 0.5
 READOUT_CONCURRENCY = 8
+# What a chat model can answer by reading the option letters. The rest have a
+# readout of their own in a decision model: a letter readout would answer
+# "where is the cat?" with a confident "yes".
+CHAT_QUESTION_TYPES = ("noul", "choice", "score")
 
 
 class DecisionsRequestError(ValueError):
@@ -466,11 +470,29 @@ def decisions_request(request: SystemOneRequest) -> DecisionRequest:
     """Decisions request for a System One request to a chat model."""
     if request.videos:
         raise DecisionsRequestError("this model does not take videos")
+    if request.state is None:
+        raise DecisionsRequestError(
+            "state: a chat model answers questions about a state, so it cannot "
+            "be null; only a d1 model reads a picture with no state at all"
+        )
     # model_construct skips the Decisions API limits, which System One lacks.
     questions = []
     for name, question in request.questions.items():
         criteria = question.criteria
         instructions = description_text(question.instructions) or name
+        if question.type not in CHAT_QUESTION_TYPES:
+            raise DecisionsRequestError(
+                f"questions.{name}: a chat model answers "
+                f"{' or '.join(CHAT_QUESTION_TYPES)} questions, not "
+                f"{question.type!r}; a box needs a decision model such as "
+                "LiquidAI d1"
+            )
+        if question.multiple:
+            raise DecisionsRequestError(
+                f"questions.{name}: a letter readout picks one option, so a "
+                "chat model cannot answer a choice with multiple; a d1 model "
+                "scores every option on its own"
+            )
         if question.type == "score":
             if not isinstance(criteria, list) or not criteria:
                 raise DecisionsRequestError(

@@ -2170,7 +2170,6 @@ class TestSystemOneEndpoint:
     @pytest.mark.parametrize(
         "change",
         [
-            {"state": None},
             {"questions": {}},
             {"questions": {"q": {"type": "rank"}}},
         ],
@@ -2178,6 +2177,32 @@ class TestSystemOneEndpoint:
     def test_systemone_schema_validation(self, client, change):
         response = client.post("/v1/systemone", json={**self._BODY, **change})
         assert response.status_code == 422
+
+    def test_systemone_reads_a_picture_with_no_state(
+        self, client, mock_decision_engine
+    ):
+        # A d1 model locates things in an image, which is the whole state, so a
+        # box request carries no state at all. The families that read a state
+        # say so themselves, so the schema lets the key be absent.
+        body = {k: v for k, v in self._BODY.items() if k != "state"}
+        response = client.post(
+            "/v1/systemone",
+            json={
+                **body,
+                "images": ["data:image/png;base64,AAAA"],
+                "questions": {
+                    "cat": {"type": "box", "instructions": "Where?"},
+                    "cats": {"type": "boxes", "instructions": "Every cat.", "max": 4},
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        (call,) = mock_decision_engine.encoded
+        questions = call["request"]["questions"]
+        assert call["request"]["state"] is None
+        assert questions["cat"]["type"] == "box"
+        assert questions["cats"]["max"] == 4
 
 
 class TestDecisionsEndpoint:
