@@ -506,6 +506,7 @@ class TestCacheSettings:
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
             "hot_cache_write_through": False,
+            "window_state_at_turn_ends": False,
             "ane_compile_cache": False,
             "initial_cache_blocks": 256,
         }

@@ -487,6 +487,62 @@ class BlockTable:
 # PagedCacheManager - Main manager (vLLM BlockPool style)
 # =============================================================================
 
+def _is_window_kv_shapes(k_shape, v_shape) -> bool:
+    return (
+        k_shape is not None
+        and len(k_shape) == 4
+        and tuple(k_shape) == tuple(v_shape or ())
+    )
+
+
+def is_window_kv_state(state) -> bool:
+    """True for a non-sliceable state that holds a sliding-window K/V pair.
+
+    Inkling 2's sliding ArraysCache stores keys and values in slots 0 and 1
+    (two 4D arrays of the same shape), next to its conv windows. Recurrent
+    states (GDN, Mamba) start with a 3D conv state and do not match.
+    Accepts a raw state list/tuple or a loaded ``("__nstate__", cls, elems)``.
+    """
+    if isinstance(state, tuple) and len(state) == 3 and state[0] == "__nstate__":
+        state = state[2]
+    if not isinstance(state, (list, tuple)) or len(state) < 2:
+        return False
+    return _is_window_kv_shapes(
+        getattr(state[0], "shape", None), getattr(state[1], "shape", None)
+    )
+
+
+def keep_window_checkpoint(block_index: int, num_full_blocks: int) -> bool:
+    """Whether full block ``block_index`` of a chain keeps its window state.
+
+    The last two full blocks always do. Further back, a block keeps it when
+    its end is a multiple of the largest power of two not above half its
+    distance ``d`` from the end. That is about 2*log2(n) checkpoints per
+    conversation, and an edit that stock storage resumes ``k`` blocks before
+    the end resumes at most ``5k/3`` blocks before it here. A longer chain
+    keeps a subset of what a shorter one keeps, so checkpoints are only ever
+    removed as a conversation grows.
+    """
+    d = num_full_blocks - 1 - block_index
+    if d < 2:
+        return True
+    return (block_index + 1) % (1 << ((d // 2).bit_length() - 1)) == 0
+
+
+def is_window_layer(layer) -> bool:
+    """An extracted layer dict (``class_name``/``cache_type`` + ``state``)
+    of the ArraysCache family that holds sliding-window K/V."""
+    from .type_registry import CacheTypeRegistry
+
+    return (
+        isinstance(layer, dict)
+        and CacheTypeRegistry.is_arrays_family(
+            str(layer.get("class_name") or layer.get("cache_type") or "")
+        )
+        and is_window_kv_state(layer.get("state"))
+    )
+
+
 class PagedCacheManager(CacheManager):
     """
     Paged KV cache manager following vLLM's BlockPool architecture.
@@ -579,6 +635,13 @@ class PagedCacheManager(CacheManager):
         # Tail blocks by chain parent (None for a root). A tail is shorter
         # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
+        # window_state_at_turn_ends: known answers to "does this full block hold
+        # sliding-window state" (filled at store time, or read once from the
+        # block payload, e.g. after a restart), and whether this model stores
+        # window state at all.
+        self._swa_full_hashes: set = set()
+        self._swa_no_window: set = set()
+        self._swa_active = False
         # Tails shared across conversations, capped apart from ordinary tails.
         self._shared_tails: set[BlockHash] = set()
 
@@ -1017,6 +1080,7 @@ class PagedCacheManager(CacheManager):
             num_cached_tokens = 0
 
             num_full_blocks = len(token_ids) // self.block_size
+            level_parents: list = [None]  # parent hash before block i
 
             for i in range(num_full_blocks):
                 start = i * self.block_size
@@ -1061,6 +1125,7 @@ class PagedCacheManager(CacheManager):
 
                 cached_blocks.append(cached_block)
                 parent_hash = block_hash
+                level_parents.append(block_hash)
                 num_cached_tokens += self.block_size
                 self.stats.hits += 1
 
@@ -1079,6 +1144,35 @@ class PagedCacheManager(CacheManager):
                     cached_blocks.append(tail_block)
                     num_cached_tokens += tail_block.token_count
                     self.stats.hits += 1
+                    return cached_blocks, num_cached_tokens
+
+            if (
+                self._swa_active
+                and cached_blocks
+                and not self._swa_has_window(cached_blocks[-1].block_hash)
+            ):
+                # Window state is stored only at turn ends (tails) and each
+                # store's last full block. Restore from the longest such point
+                # instead of a block whose window part is a placeholder.
+                for level in range(len(cached_blocks) - 1, -1, -1):
+                    tail = self._match_tail_block(
+                        token_ids,
+                        level_parents[level],
+                        level * self.block_size,
+                        extra_keys=extra_keys,
+                        extra_key_token_start=extra_key_token_start,
+                        extra_key_ranges=extra_key_ranges,
+                    )
+                    if tail is not None:
+                        return (
+                            cached_blocks[:level] + [tail],
+                            level * self.block_size + tail.token_count,
+                        )
+                    if level > 0 and self._swa_has_window(
+                        cached_blocks[level - 1].block_hash
+                    ):
+                        return cached_blocks[:level], level * self.block_size
+                return [], 0
 
             return cached_blocks, num_cached_tokens
 
@@ -1196,6 +1290,47 @@ class PagedCacheManager(CacheManager):
             self.register_tail_block(parent_hash, tail_hash, token_count)
             seeded += 1
         return seeded
+
+    def _swa_has_window(self, block_hash: BlockHash | None) -> bool:
+        """Whether a full block holds real sliding-window state.
+
+        Answered from what store_cache recorded, else from the block's tensor
+        shapes (a block stored before a restart; no tensor data is read) and
+        remembered. Called with ``self._lock`` held.
+        """
+        if block_hash is None:
+            return False
+        if block_hash in self._swa_full_hashes:
+            return True
+        if block_hash in self._swa_no_window:
+            return False
+        ssd = self._paged_ssd_cache_manager
+        peek = ssd.peek_block_shapes(block_hash) if ssd is not None else None
+        if peek is None:
+            return False  # not stored or unreadable right now: do not remember
+        from .type_registry import CacheTypeRegistry
+
+        shapes, types = peek
+        has_window = any(
+            CacheTypeRegistry.is_arrays_family(t)
+            and _is_window_kv_shapes(
+                shapes.get(f"layer_{i}_state_0"), shapes.get(f"layer_{i}_state_1")
+            )
+            for i, t in enumerate(types or ())
+        )
+        self._swa_remember(block_hash, has_window)
+        return has_window
+
+    def _swa_remember(self, block_hash: BlockHash, has_window: bool | None) -> None:
+        """Record whether a block holds window state; None forgets it."""
+        self._swa_full_hashes.discard(block_hash)
+        self._swa_no_window.discard(block_hash)
+        if has_window is None:
+            return
+        known = self._swa_full_hashes if has_window else self._swa_no_window
+        if len(known) > 200_000:
+            known.clear()
+        known.add(block_hash)
 
     def _match_tail_block(
         self,

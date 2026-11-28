@@ -2065,6 +2065,9 @@ class SchedulerConfig:
     # RAM *and* persisted to SSD immediately, instead of deferring the SSD
     # write to hot-cache eviction or shutdown.
     hot_cache_write_through: bool = False
+    # Store sliding-window state only at turn ends and the newest full blocks
+    # (BlockAwarePrefixCache); mid-prefill snapshots then drop it early.
+    window_state_at_turn_ends: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     paged_ssd_cache_auto_size: bool = False
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
@@ -2728,6 +2731,7 @@ class Scheduler:
                 model=model,
                 paged_cache_manager=self.paged_cache_manager,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
+                window_state_at_turn_ends=self.config.window_state_at_turn_ends,
             )
 
             # Initialize paged SSD cache. If the backing directory is not
@@ -9408,6 +9412,9 @@ class Scheduler:
             return
 
         snapshot_block_size = snapshot_block_size or block_size
+        lean = self._swa_snapshot_is_lean(
+            request_id, token_count, snapshot_block_size, source
+        )
 
         # Offload snapshot to SSD if store is available, keeping only a
         # None marker in the dict.  Falls back to in-memory storage when
@@ -9423,7 +9430,11 @@ class Scheduler:
                     request_id,
                     token_count,
                     snapshot_cache,
-                    self._extract_snapshot_cache_states,
+                    (
+                        self._extract_lean_snapshot_cache_states
+                        if lean
+                        else self._extract_snapshot_cache_states
+                    ),
                     block_size=snapshot_block_size,
                 )
             if saved:
@@ -9441,7 +9452,9 @@ class Scheduler:
                 )
                 self._boundary_cache_snapshots[request_id][token_count] = (
                     _compact_boundary_snapshot_value(
-                        self._prefill_snapshot_value(snapshot_cache),
+                        self._swa_lean_value(
+                            self._prefill_snapshot_value(snapshot_cache), lean
+                        ),
                         token_count,
                         snapshot_block_size,
                         self._stream,
@@ -9451,7 +9464,9 @@ class Scheduler:
         else:
             self._boundary_cache_snapshots[request_id][token_count] = (
                 _compact_boundary_snapshot_value(
-                    self._prefill_snapshot_value(snapshot_cache),
+                    self._swa_lean_value(
+                        self._prefill_snapshot_value(snapshot_cache), lean
+                    ),
                     token_count,
                     snapshot_block_size,
                     self._stream,
@@ -9478,6 +9493,62 @@ class Scheduler:
         )
 
     _PREFILL_SNAPSHOT_MARKER = "__prefill_extracted__"
+
+    def _swa_snapshot_is_lean(
+        self, request_id: str, token_count: int, block_size: int, source: str
+    ) -> bool:
+        """Whether a boundary snapshot can drop its sliding-window K/V.
+
+        With window_state_at_turn_ends, store_cache keeps window state only at the
+        turn end and the store's last full block, and writes a placeholder
+        elsewhere. Holding the window for the other boundaries until the store
+        costs one window copy each (~170 MB on Inkling 2 Mini), so a long fresh
+        prompt holds GBs it throws away. Keep the tail snapshot and the
+        boundaries keep_window_checkpoint selects for the prompt.
+        """
+        if (
+            not self.config.window_state_at_turn_ends
+            or source == _TAIL_SNAPSHOT_SOURCE
+            or block_size <= 0
+        ):
+            return False
+        request = self.requests.get(request_id)
+        prompt = getattr(request, "prompt_token_ids", None) if request else None
+        if not prompt:
+            return False
+        from .cache.paged_cache import keep_window_checkpoint
+
+        return not keep_window_checkpoint(
+            token_count // block_size - 1, (len(prompt) - 1) // block_size
+        )
+
+    @staticmethod
+    def _swa_drop_window_states(layers: Any) -> Any:
+        """Give window K/V layers the placeholder the store would write."""
+        from .cache.paged_cache import is_window_layer
+
+        for layer in layers or ():
+            if is_window_layer(layer):
+                layer["state"] = (mx.zeros((1,)), mx.zeros((1,)))
+        return layers
+
+    def _swa_lean_value(self, value: Any, lean: bool) -> Any:
+        """In-memory snapshot value without window K/V when ``lean``."""
+        if (
+            lean
+            and isinstance(value, tuple)
+            and len(value) == 2
+            and value[0] == self._PREFILL_SNAPSHOT_MARKER
+        ):
+            self._swa_drop_window_states(value[1])
+        return value
+
+    def _extract_lean_snapshot_cache_states(
+        self, snapshot_cache: list[Any]
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """``_extract_snapshot_cache_states`` without window K/V (SSD store)."""
+        states, tokens = self._extract_snapshot_cache_states(snapshot_cache)
+        return self._swa_drop_window_states(states), tokens
 
     def _prefill_snapshot_value(self, snapshot_cache: list[Any]) -> Any:
         """In-memory snapshot value: pre-extracted states when possible.

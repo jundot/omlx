@@ -37,6 +37,9 @@ from .paged_cache import (
     CacheBlock,
     PagedCacheManager,
     compute_block_hash,
+    is_window_kv_state,
+    is_window_layer,
+    keep_window_checkpoint,
     resolve_block_extra_keys,
 )
 from .paged_ssd_cache import (
@@ -280,6 +283,7 @@ class BlockAwarePrefixCache(CacheManager):
         paged_cache_manager: PagedCacheManager,
         paged_ssd_cache_manager: PagedSSDCacheManager | None = None,
         gdn_ssd_split_enabled: bool = False,
+        window_state_at_turn_ends: bool = False,
     ):
         """
         Initialize block-aware prefix cache.
@@ -288,6 +292,8 @@ class BlockAwarePrefixCache(CacheManager):
             model: The MLX model (used for identification)
             paged_cache_manager: The PagedCacheManager instance for block management
             paged_ssd_cache_manager: The PagedSSDCacheManager for SSD storage (required for paged SSD-only mode)
+            window_state_at_turn_ends: Store sliding-window K/V state only in
+                each store's last block and newest full blocks.
         """
         self.model = model
         self.model_key = id(model)
@@ -295,6 +301,7 @@ class BlockAwarePrefixCache(CacheManager):
         self.paged_ssd_cache = paged_ssd_cache_manager
         self.block_size = paged_cache_manager.block_size
         self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
+        self._window_state_at_turn_ends = bool(window_state_at_turn_ends)
         self._gdn_split_fallback_reported = False
         self._gdn_checkpoint_loader: (
             Callable[[Any], list[dict[str, Any]] | None] | None
@@ -1090,6 +1097,12 @@ class BlockAwarePrefixCache(CacheManager):
             else len(new_tokens) // self.block_size
         )
         trailing_partial_tokens = len(new_tokens) % self.block_size
+        swa_active = self._swa_store_active(cache_data)
+        if swa_active:
+            self.paged_cache._swa_active = True
+        # Window state is kept in the last block (turn end) and in the full
+        # blocks keep_window_checkpoint selects; others get a placeholder.
+        swa_full_blocks = (existing_tokens + len(new_tokens)) // self.block_size
         self._last_partial_tokens_skipped = (
             0 if store_terminal else trailing_partial_tokens
         )
@@ -1346,18 +1359,32 @@ class BlockAwarePrefixCache(CacheManager):
                     # non-sliceable payloads forever. When this store carries
                     # a boundary snapshot for the block, repair the payload
                     # so partial-match walk-back can restore here again.
+                    # window_state_at_turn_ends: a dedup'd turn end may hold a
+                    # window placeholder; repair it from this store's end state.
+                    swa_tail_repair = (
+                        swa_active
+                        and is_last_block
+                        and global_end == existing_tokens + len(new_tokens)
+                    )
                     if (
                         not split_gdn_layout
-                        and not is_tail_terminal
+                        and (not is_tail_terminal or swa_tail_repair)
                         and is_tensor_data
                         and HAS_MLX
                         and self.paged_ssd_cache is not None
-                        and has_boundary_snapshot
+                        and (has_boundary_snapshot or swa_tail_repair)
                         and existing_block.block_hash is not None
-                        and existing_block.block_hash
-                        not in self._backfill_checked_hashes
+                        and (
+                            swa_tail_repair
+                            or existing_block.block_hash
+                            not in self._backfill_checked_hashes
+                        )
                     ):
-                        snapshot_cache_data = boundary_snapshots[global_end]
+                        snapshot_cache_data = (
+                            boundary_snapshots[global_end]
+                            if has_boundary_snapshot
+                            else cache_data
+                        )
                         backfilled = (
                             snapshot_cache_data
                             and self._maybe_backfill_dedup_block_payload(
@@ -1365,10 +1392,16 @@ class BlockAwarePrefixCache(CacheManager):
                                 global_end,
                                 snapshot_cache_data,
                                 hot_cache_write_back=hot_cache_write_back,
+                                keep_window=swa_tail_repair,
                             )
                         )
                         if backfilled:
                             self._backfill_checked_hashes.add(existing_block.block_hash)
+                            if swa_tail_repair:
+                                # Payload may have changed: re-probe on lookup.
+                                self.paged_cache._swa_remember(
+                                    existing_block.block_hash, None
+                                )
                             if (
                                 len(self._backfill_checked_hashes)
                                 > _BACKFILL_CHECKED_MAX_ENTRIES
@@ -1522,6 +1555,13 @@ class BlockAwarePrefixCache(CacheManager):
                     snapshot_cache_data=snapshot_cache_data,
                     externalize_arrays=split_gdn_layout,
                     live_state_at_true_end=live_state_at_true_end,
+                    swa_strip_window=(
+                        swa_active
+                        and not is_last_block
+                        and not keep_window_checkpoint(
+                            global_start // self.block_size, swa_full_blocks
+                        )
+                    ),
                 )
 
                 if block_kv_data and not self._block_token_count_matches_slices(
@@ -1544,6 +1584,18 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.block_ids.pop()
                     block_table.num_tokens -= len(block_tokens)
                     break
+
+                if swa_active and block.block_hash:
+                    self.paged_cache._swa_remember(
+                        block.block_hash,
+                        any(
+                            CacheTypeRegistry.is_arrays_family(t)
+                            and is_window_kv_state(layer)
+                            for t, layer in zip(
+                                layer_cache_types or (), block_kv_data or ()
+                            )
+                        ),
+                    )
 
                 if block_kv_data and block.block_hash:
                     # Use per-block meta_states from boundary snapshot when
@@ -1746,6 +1798,9 @@ class BlockAwarePrefixCache(CacheManager):
                 self._store_tip_hashes.add(new_tip.block_hash)
                 if len(self._store_tip_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
                     self._store_tip_hashes.clear()
+
+        if swa_active:
+            self._swa_thin_checkpoints(block_table, hot_cache_write_back)
 
         # Exact terminal blocks are discoverable only through
         # fetch_exact_prefix(); never expose them to general prefix matching.
@@ -2195,8 +2250,45 @@ class BlockAwarePrefixCache(CacheManager):
         self._tail_hashes.discard(block_hash)
         return True
 
+    def _swa_store_active(self, cache_data) -> bool:
+        """Turn-end window storage applies to models that store window state."""
+        return self._window_state_at_turn_ends and any(
+            is_window_layer(layer) for layer in cache_data or ()
+        )
+
+    def _swa_thin_checkpoints(self, block_table, hot_cache_write_back: bool) -> None:
+        """Strip window state from this chain's full blocks that
+        keep_window_checkpoint no longer selects now that the chain grew.
+
+        shortcut: a block shared with a shorter conversation is thinned by the
+        longer one's spacing; the shorter one keeps its turn end. Track
+        checkpoints per chain if shared prefixes branch often.
+        """
+        paged = self.paged_cache
+        full = [
+            block
+            for block in map(paged.allocated_blocks.get, block_table.block_ids)
+            if block is not None
+            and block.block_hash is not None
+            and block.token_count == self.block_size
+        ]
+        for i, block in enumerate(full):
+            if keep_window_checkpoint(i, len(full)):
+                continue
+            with paged._lock:
+                has_window = paged._swa_has_window(block.block_hash)
+                if has_window:
+                    paged._swa_remember(block.block_hash, False)
+            if has_window:
+                self._strip_rotating_payload(
+                    block.block_hash, hot_cache_write_back, strip_window_arrays=True
+                )
+
     def _strip_rotating_payload(
-        self, block_hash: bytes, hot_cache_write_back: bool = True
+        self,
+        block_hash: bytes,
+        hot_cache_write_back: bool = True,
+        strip_window_arrays: bool = False,
     ) -> bool:
         """Replace a superseded tip block's rotating payload with placeholders.
 
@@ -2240,6 +2332,10 @@ class BlockAwarePrefixCache(CacheManager):
                     and len(layer) >= 2
                     and hasattr(layer[0], "shape")
                     and tuple(layer[0].shape) != (1,)
+                ) or (
+                    strip_window_arrays
+                    and CacheTypeRegistry.is_arrays_family(type_name)
+                    and is_window_kv_state(layer)
                 ):
                     new_data.append((mx.zeros((1,)), mx.zeros((1,))))
                     stripped += 1
@@ -2338,6 +2434,7 @@ class BlockAwarePrefixCache(CacheManager):
         boundary_tc: int,
         snapshot_cache_data: list[dict[str, Any]],
         hot_cache_write_back: bool = True,
+        keep_window: bool = False,
     ) -> bool:
         """Rewrite a dedup'd placeholder block with boundary-snapshot state.
 
@@ -2427,6 +2524,22 @@ class BlockAwarePrefixCache(CacheManager):
                     if subs is None:
                         return True
                     new_data.append(("__cache_list__", subs))
+                elif (
+                    keep_window
+                    and CacheTypeRegistry.is_arrays_family(type_name)
+                    and is_window_kv_state(snap_state)
+                ):
+                    # Sliding-window state of a turn end (window_state_at_turn_ends).
+                    new_data.append(
+                        (
+                            "__nstate__",
+                            type_name,
+                            [
+                                self._clone_tensor(e) if hasattr(e, "shape") else e
+                                for e in snap_state
+                            ],
+                        )
+                    )
                 else:
                     # Other non-sliceable layouts (ArraysCache family) keep
                     # today's behavior; never persist a partially-filled
@@ -2481,6 +2594,7 @@ class BlockAwarePrefixCache(CacheManager):
         snapshot_cache_data: list[dict[str, Any]] | None = None,
         externalize_arrays: bool = False,
         live_state_at_true_end: bool = False,
+        swa_strip_window: bool = False,
     ) -> list[tuple[Any, Any]] | None:
         """
         Extract tensor slices for a single block from cache data.
@@ -2955,6 +3069,19 @@ class BlockAwarePrefixCache(CacheManager):
                     has_valid_state = has_snapshot or (
                         is_last_block and live_state_at_true_end
                     )
+                    if (
+                        has_valid_state
+                        and swa_strip_window
+                        and is_window_kv_state(
+                            snapshot_cache_data[layer_idx]["state"]
+                            if has_snapshot
+                            else layer_state["state"]
+                        )
+                    ):
+                        # Sliding-window K/V: only turn ends and the last full
+                        # block keep it (see store_cache); restores elsewhere
+                        # walk back or reject on the placeholder.
+                        has_valid_state = False
                     if has_valid_state:
                         state = (
                             snapshot_cache_data[layer_idx]["state"]

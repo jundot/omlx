@@ -4695,6 +4695,40 @@ class PagedSSDCacheManager(CacheManager):
                     return metadata
         return self._index.get(block_hash)
 
+    def peek_block_shapes(
+        self, block_hash: bytes
+    ) -> tuple[dict[str, tuple], list[str] | None] | None:
+        """Stored tensor shapes and layer cache types of a block.
+
+        Reads no tensor data (``mx.load`` is lazy, so an SSD file costs its
+        header only) and does not touch LRU order or stats. None if the
+        block is not stored or cannot be read.
+        """
+        with self._hot_cache_lock:
+            entry = self._hot_cache.get(block_hash)
+        if entry is None:
+            entry = self._pending_write_buffer_get(block_hash)
+        if entry is not None:
+            if entry.get("arrays") is not None:
+                shapes = {n: tuple(a.shape) for n, a in entry["arrays"].items()}
+            else:
+                shapes = {
+                    n: tuple(shape)
+                    for n, (_, _, shape) in (entry.get("tensors_raw") or {}).items()
+                }
+            return shapes, entry.get("layer_cache_types")
+        block_metadata = self._index.get(block_hash)
+        if block_metadata is None or not HAS_MLX:
+            return None
+        try:
+            arrays = mx.load(str(block_metadata.file_path))
+        except Exception:
+            return None
+        return (
+            {n: tuple(a.shape) for n, a in arrays.items()},
+            block_metadata.layer_cache_types,
+        )
+
     def has_block(self, block_hash: bytes) -> bool:
         """
         Check if a block exists in cache (hot cache, pending writes, or SSD storage).

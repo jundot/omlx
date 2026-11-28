@@ -313,7 +313,9 @@ def test_prefill_snapshot_decoupled_from_live_cache():
 
     stub = SimpleNamespace(
         block_aware_cache=object(),
-        config=SimpleNamespace(paged_cache_block_size=BLOCK_SIZE),
+        config=SimpleNamespace(
+            paged_cache_block_size=BLOCK_SIZE, window_state_at_turn_ends=False
+        ),
         model=SimpleNamespace(),
         _model_has_unreconstructible_cache=lambda: False,
         _cache_list_needs_boundary_snapshot=lambda cache: True,
@@ -340,6 +342,9 @@ def test_prefill_snapshot_decoupled_from_live_cache():
         lambda: Scheduler._enable_mtp_boundary_alignment(stub)
     )
     stub._eval_snapshot_cache = lambda caches: None
+    stub.requests = {}
+    stub._swa_snapshot_is_lean = lambda *a: Scheduler._swa_snapshot_is_lean(stub, *a)
+    stub._swa_lean_value = lambda *a: Scheduler._swa_lean_value(stub, *a)
 
     Scheduler._on_prefill_boundary_snapshot(stub, "req-alias", [live], BLOCK_SIZE)
 
