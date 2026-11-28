@@ -15,6 +15,7 @@ from omlx.cache.paged_ssd_cache import (
     PagedSSDCacheManager,
     SharedHotCacheBudget,
     _extract_tensor_bytes,
+    _extract_tensors_bytes_batch,
 )
 
 try:
@@ -1758,3 +1759,24 @@ class TestHotCacheWriteThrough:
         settings.cache.hot_cache_write_through = True
         config = settings.to_scheduler_config()
         assert config.hot_cache_write_through is True
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+def test_extract_tensors_bytes_batch_matches_single_extraction():
+    """Batched extraction matches per-tensor extraction across dtypes and sizes."""
+    base_bf16 = mx.arange(1 * 4 * 512 * 128, dtype=mx.bfloat16).reshape(1, 4, 512, 128)
+    base_f16 = mx.arange(1 * 4 * 512 * 128, dtype=mx.float16).reshape(1, 4, 512, 128)
+    # Use >8 MiB total across multiple tensors so the parallel copy path runs.
+    arrays = {
+        "layer_0_state_0": base_bf16[:, :, 16:496, :] * 1.5,
+        "layer_0_state_1": base_bf16[:, :, 16:496, :] + 1.0,
+        "layer_1_state_0": base_f16[:, :, :480, :] + 2.0,
+        "layer_1_state_1": mx.ones((1, 4, 1024, 256), dtype=mx.float32),
+        "layer_2_state_0": mx.arange(1 * 4 * 1024 * 256, dtype=mx.bfloat16).reshape(
+            1, 4, 1024, 256
+        ),
+        "layer_2_state_1": mx.array([7, 11, 13], dtype=mx.int32),
+    }
+    batched = _extract_tensors_bytes_batch(arrays)
+    expected = {name: _extract_tensor_bytes(arr) for name, arr in arrays.items()}
+    assert batched == expected

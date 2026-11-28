@@ -31,6 +31,7 @@ import time
 import uuid
 import weakref
 from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -1004,6 +1005,79 @@ def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     else:
         raw = bytes(memoryview(arr))
     return raw, dtype_str, shape
+
+
+_KV_COPY_WORKERS = min(8, max(2, os.cpu_count() or 4))
+_KV_COPY_PARALLEL_MIN_BYTES = 8 * 1024 * 1024
+_KV_COPY_EXECUTOR: ThreadPoolExecutor | None = None
+_KV_COPY_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_kv_copy_executor() -> ThreadPoolExecutor:
+    global _KV_COPY_EXECUTOR
+    if _KV_COPY_EXECUTOR is None:
+        with _KV_COPY_EXECUTOR_LOCK:
+            if _KV_COPY_EXECUTOR is None:
+                _KV_COPY_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=_KV_COPY_WORKERS,
+                    thread_name_prefix="omlx-kv-copy",
+                )
+    return _KV_COPY_EXECUTOR
+
+
+def _tensor_layer_index(name: str) -> int | None:
+    if not name.startswith("layer_"):
+        return None
+    sep = name.find("_", 6)
+    if sep <= 6:
+        return None
+    token = name[6:sep]
+    return int(token) if token.isdigit() else None
+
+
+def _copy_buffer_bytes(
+    item: tuple[str, Any, str, list[int]],
+) -> tuple[str, bytes, str, list[int]]:
+    name, view_arr, dtype_str, shape = item
+    return name, bytes(memoryview(view_arr)), dtype_str, shape
+
+
+def _extract_tensors_bytes_batch(
+    arrays: dict[str, mx.array],
+) -> dict[str, tuple[bytes, str, list[int]]]:
+    if not arrays:
+        return {}
+    names = list(arrays.keys())
+    arr_list = [arrays[n] for n in names]
+    # Single batched eval avoids per-tensor Metal syncs across hundreds of slices.
+    mx.eval(*arr_list)
+
+    u16_views: list[mx.array] = []
+    items: list[tuple[str, mx.array, str, list[int]]] = []
+    total_bytes = 0
+    for name, arr in zip(names, arr_list):
+        dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
+        shape = list(arr.shape)
+        total_bytes += int(arr.nbytes)
+        if arr.dtype == mx.bfloat16:
+            view_arr = arr.view(mx.uint16)
+            u16_views.append(view_arr)
+        else:
+            view_arr = arr
+        items.append((name, view_arr, dtype_str, shape))
+
+    if u16_views:
+        mx.eval(*u16_views)
+
+    result: dict[str, tuple[bytes, str, list[int]]] = {}
+    if total_bytes >= _KV_COPY_PARALLEL_MIN_BYTES and len(items) > 1:
+        executor = _get_kv_copy_executor()
+        for name, raw, dtype_str, shape in executor.map(_copy_buffer_bytes, items):
+            result[name] = (raw, dtype_str, shape)
+    else:
+        for name, view_arr, dtype_str, shape in items:
+            result[name] = (bytes(memoryview(view_arr)), dtype_str, shape)
+    return result
 
 
 def _restore_tensor_from_bytes(
@@ -2315,9 +2389,7 @@ class PagedSSDCacheManager(CacheManager):
         Returns True when the entry was retained, False on failure.
         """
         try:
-            promoted_raw = {}
-            for name, arr in arrays.items():
-                promoted_raw[name] = _extract_tensor_bytes(arr)
+            promoted_raw = _extract_tensors_bytes_batch(arrays)
             entry = {
                 "tensors_raw": promoted_raw,
                 "file_metadata": (
@@ -3933,9 +4005,7 @@ class PagedSSDCacheManager(CacheManager):
             # derived arrays before memoryview() so the buffer protocol never
             # becomes the first MLX eval site on the store-cache worker thread.
             # Race history: #978/#1040/#1106/#1437/#1558.
-            tensors_raw = {}
-            for name, arr in arrays.items():
-                tensors_raw[name] = _extract_tensor_bytes(arr)
+            tensors_raw = _extract_tensors_bytes_batch(arrays)
 
             # Estimate file size: raw tensor bytes + safetensors header.
             # The header is JSON-encoded per tensor (name + dtype + shape +
@@ -4084,6 +4154,7 @@ class PagedSSDCacheManager(CacheManager):
         file_metadata: dict[str, str],
         num_layers: int,
         layer_cache_types: list[str] | None = None,
+        skip_layer_indices: set[int] | None = None,
     ) -> list[Any] | None:
         """Reconstruct cache_data list from flattened arrays and metadata.
 
@@ -4137,6 +4208,9 @@ class PagedSSDCacheManager(CacheManager):
             return _load_nstate_flat(arrays, file_metadata, prefix, fallback_class)
 
         for i in range(num_layers):
+            if skip_layer_indices and i in skip_layer_indices:
+                cache_data.append(None)
+                continue
             cache_type = (
                 layer_cache_types[i]
                 if layer_cache_types and i < len(layer_cache_types)
@@ -4293,19 +4367,53 @@ class PagedSSDCacheManager(CacheManager):
     @staticmethod
     def _arrays_from_tensors_raw(
         tensors_raw: dict[str, tuple[bytes, str, list[int]]],
+        skip_layer_indices: set[int] | None = None,
     ) -> dict[str, mx.array]:
         """Convert raw bytes dict back to mx.array dict for _reconstruct_cache_data.
 
         Args:
             tensors_raw: Dict of {name: (raw_bytes, dtype_str, shape)}.
+            skip_layer_indices: Optional set of layer indices to skip decoding.
 
         Returns:
             Dict of {name: mx.array} with correct dtypes and shapes.
         """
         arrays = {}
         for name, (raw, dtype_str, shape) in tensors_raw.items():
+            if skip_layer_indices:
+                layer_idx = _tensor_layer_index(name)
+                if layer_idx is not None and layer_idx in skip_layer_indices:
+                    continue
             arrays[name] = _restore_tensor_from_bytes(raw, dtype_str, shape)
         return arrays
+
+    def peek_hot_block(
+        self,
+        block_hash: bytes,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Return a RAM hot-cache entry and its metadata dict without deserializing."""
+        entry = self._hot_cache_get(block_hash)
+        if entry is None:
+            return None, None
+        blk_meta = entry["block_metadata"]
+        metadata_dict = {
+            "num_layers": entry["num_layers"],
+            "token_count": blk_meta.token_count,
+            "model_name": blk_meta.model_name,
+            "block_size": blk_meta.block_size,
+            "cache_signature": blk_meta.cache_signature,
+            "parent_hash": blk_meta.parent_hash,
+            "layer_cache_types": entry["layer_cache_types"],
+            "layer_meta_states": blk_meta.layer_meta_states,
+        }
+        return entry, metadata_dict
+
+    def record_direct_hot_block_load(self, block_hash: bytes) -> None:
+        """Record index touch and hit stats after a direct hot-RAM restore."""
+        self._index.touch(block_hash)
+        self._stats["loads"] += 1
+        self._stats["hits"] += 1
+        self._stats["hot_cache_hits"] += 1
 
     def load_block(self, block_hash: bytes) -> list[Any] | None:
         """
