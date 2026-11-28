@@ -987,6 +987,13 @@ def test_lora_adapter_conflicts_raise_and_profile_merges_drop_them(tmp_path):
     assert (loaded.lora_adapter, loaded.dflash_enabled) == ("/a", False)
 
 
+def test_lora_adapter_runs_with_moe_expert_offload():
+    settings = ModelSettings(lora_adapter="/a", moe_expert_offload_enabled=True)
+    assert (settings.lora_adapter, settings.moe_expert_offload_enabled) == ("/a", True)
+    data = {"lora_adapter": "/a", "moe_expert_offload_enabled": True}
+    assert resolve_lora_conflicts(data) == (data, [])
+
+
 def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
     """The load path has to survive a settings file written by an older build
     or hand-edited: the model keeps its settings, minus the losing toggle."""
