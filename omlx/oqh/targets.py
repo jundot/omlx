@@ -46,6 +46,11 @@ _V41_ROUTED_ROLES = {
     "ffn.experts.w3": "post",
     "ffn.experts.w2": "own",
 }
+_ERNIE5_5_ROUTED_ROLES = {
+    "ffn.switch_mlp.gate_proj": "post",
+    "ffn.switch_mlp.up_proj": "post",
+    "ffn.switch_mlp.down_proj": "own",
+}
 
 # Narrowest rotation block the producer kernels take.
 _MIN_BLOCK = 128
@@ -125,8 +130,10 @@ DEEPSEEK_V41 = Scheme(_V41_ROUTED_ROLES, tensor_parallel=True, max_level=4)
 # Hy4 and Hy4-flash: routed experts only, the trunk keeps its oQ format.
 # Hy4-flash's experts read a latent projection, which no norm can rotate.
 HY_V4 = Scheme(_ROUTED_ROLES, tensor_parallel=False, group_scales=True)
+ERNIE5_5 = Scheme(_ERNIE5_5_ROUTED_ROLES, tensor_parallel=False, max_level=4)
 _SCHEMES = {
     "deepseek_v41": DEEPSEEK_V41,
+    "ernie5_5_moe": ERNIE5_5,
     "hy_v4_vl": HY_V4,
     "hy_v4_flash": HY_V4,
     "qwen3_5": QWEN,

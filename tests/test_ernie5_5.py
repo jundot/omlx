@@ -24,9 +24,12 @@ from transformers import PreTrainedTokenizerFast
 from omlx import oq
 from omlx.cache.type_registry import CacheTypeRegistry
 from omlx.custom_kernels.nax import is_nax_available
+from omlx.custom_kernels.oqh import fast as oqh_fast
 from omlx.engine.vlm import VLMBatchedEngine, _apply_template_thinking_mode
 from omlx.exceptions import InvalidRequestError
 from omlx.models.vlm import VLMModelAdapter
+from omlx.oqh import format as oqh_format
+from omlx.oqh.loading import install_load_hook
 from omlx.patches import fp4_expert_rows
 from omlx.patches.deepseek_v4 import apply_pooling_cache_support
 from omlx.patches.ernie5_5 import kernels, language, loading, sparse_prefill_available
@@ -636,7 +639,7 @@ _TINY = dict(
 )
 
 
-def _release_values(rng):
+def _release_values(rng, width=64):
     hidden, vocab, experts = 128, 64, 8
     values = {}
 
@@ -674,18 +677,23 @@ def _release_values(rng):
         add(f"{prefix}.gate.weight_1", "bf16", (experts, hidden))
         add(f"{prefix}.gate.routed_scaling_factor_param", "f32", (experts,), fill=1.0)
         add(f"{prefix}.e_score_correction_bias", "f32", (experts,), fill=0.0)
-        add(f"{prefix}.fc1_latent_proj.weight", "fp8", (64, hidden))
-        add(f"{prefix}.fc2_latent_proj.weight", "fp8", (hidden, 64))
-        add(f"{prefix}.latent_norm.weight", "bf16", (64,), fill=1.0)
+        add(f"{prefix}.fc1_latent_proj.weight", "fp8", (width, hidden))
+        add(f"{prefix}.fc2_latent_proj.weight", "fp8", (hidden, width))
+        add(f"{prefix}.latent_norm.weight", "bf16", (width,), fill=1.0)
         for part, shape in (
-            ("w1", (64, hidden)),
-            ("w3", (64, hidden)),
-            ("w2", (hidden, 64)),
+            ("w1", (width, hidden)),
+            ("w3", (width, hidden)),
+            ("w2", (hidden, width)),
         ):
             add(f"{prefix}.shared_experts.{part}.weight", "fp8", shape)
         for e in range(experts):
             for part in ("w1", "w2", "w3"):
-                add(f"{prefix}.experts.{e}.{part}.weight", "expert", (64, 64), std=0.3)
+                add(
+                    f"{prefix}.experts.{e}.{part}.weight",
+                    "expert",
+                    (width, width),
+                    std=0.3,
+                )
 
     add("model.embed_tokens.weight", "bf16", (vocab, hidden), std=1.0)
     add("lm_head.weight", "bf16", (vocab, hidden))
@@ -770,7 +778,7 @@ def _fp8_blocks(values):
     return np.array(mx.to_fp8(mx.array(values / full))), scale
 
 
-def _write_release(path, values, fp4_experts):
+def _write_release(path, values, fp4_experts, width=64):
     arrays = {}
     for name, (kind, value) in values.items():
         if kind == "expert" and fp4_experts:
@@ -815,6 +823,8 @@ def _write_release(path, values, fp4_experts):
         quantization["expert_dtype"] = "mxfp4"
     config = {
         **_TINY,
+        "moe_intermediate_size": width,
+        "moe_latent_size": width,
         "model_type": "ernie5_5_moe",
         "eos_token_id": 2,
         "dspark_block_size": 7,
@@ -924,6 +934,43 @@ def test_oq_builds_keep_release_tensors_and_order_by_level(tmp_path, monkeypatch
             tensors[draft + ".weight"][0], first.view(mx.uint32)
         ).item()
     assert 0 < kl[6] < kl[3] < kl[2.5] < 0.5, kl
+
+
+@pytest.mark.skipif(not oqh_fast.has_native(), reason="oQh kernels not built")
+def test_oqh_build_serves_rotated_experts(tmp_path, monkeypatch):
+    values = _release_values(np.random.default_rng(0), width=128)
+    fp4 = _write_release(tmp_path / "fp4", values, fp4_experts=True, width=128)
+    tokens = mx.array(np.random.default_rng(1).integers(3, 64, (6, 48)))
+    monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **k: tokens)
+    with pytest.raises(ValueError, match="below oQ4"):
+        oq.quantize_oq_streaming(str(fp4), str(tmp_path / "oq4h"), 4, hadamard=True)
+    output = tmp_path / "oq3.5h"
+    oq.quantize_oq_streaming(
+        str(fp4),
+        str(output),
+        3.5,
+        hadamard=True,
+        imatrix_num_samples=len(tokens),
+        imatrix_seq_length=tokens.shape[1],
+    )
+    config = json.loads((output / "config.json").read_text())
+    entries = config[oqh_format.CONFIG_KEY]["tensors"]
+    experts = {
+        f"language_model.model.layers.{i}.ffn.switch_mlp.{part}"
+        for i in (1, 2)
+        for part in ("gate_proj", "up_proj", "down_proj")
+    }
+    kept = {
+        p for p in experts if config["quantization"].get(p, {}).get("mode") == "mxfp4"
+    }
+    assert kept and set(entries) == experts - kept
+    install_load_hook()
+    reference, _ = loading.load(fp4, trust_remote_code=True)
+    built, _ = loading.load(output, trust_remote_code=True)
+    assert _kl(_logits(reference, tokens), _logits(built, tokens)) < 0.1
+    x = mx.random.normal((1, 48, 128), key=mx.random.key(2)).astype(mx.bfloat16)
+    for layer in built.language_model.layers[1:]:
+        assert _rel(layer.ffn(x[:, :1]), layer.ffn(x)[:, :1]) < 0.03
 
 
 def test_layerwise_imatrix_matches_cached_full_forward(tmp_path):

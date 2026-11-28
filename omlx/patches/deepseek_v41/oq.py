@@ -29,7 +29,6 @@ from ...oq import (
     _refine_expert_grams,
 )
 from ...oqh import format as oqh_format
-from ...oqh import targets as oqh_targets
 from .convert import iter_source_weights, source_engram_tables, strip_draft_config
 from .oq_inventory import projection_inventory
 from .oqh import (
@@ -458,11 +457,6 @@ def quantize(
     )
 
     _validate_v41_oq_settings(oq_level, dtype, group_size)
-    if hadamard and oq_level >= oqh_targets.DEEPSEEK_V41.max_level:
-        raise ValueError(
-            "V4.1 oQh re-rounds the routed experts below oQ4; oQ4 keeps the "
-            "source FP4 experts"
-        )
     # Engram sits outside the bit budget and calibration reads the source
     # checkpoint, so keeping it at source precision changes no other tensor.
     engram_bits = None if preserve_ngram_table else _offload_table_bits(oq_level)
