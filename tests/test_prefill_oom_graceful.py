@@ -14,6 +14,7 @@ cases execute a small initialized MLX model with controlled footprint readings;
 no downloaded checkpoint is required.
 """
 
+import dataclasses
 import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -2214,6 +2215,24 @@ def test_glm5_next_profile_prices_exact_block_expansion_for_small_chunks():
     assert native < est_prev, (
         "Kv>=4096 native route must price below the exact-block expansion"
     )
+
+
+def test_glm5_next_fused_kernel_pricing_is_monotone_and_covers_short_routes():
+    profile = make_prefill_memory_profile(_glm5_next_config(), compute_dtype_size=2)
+    fused = dataclasses.replace(profile, fused_sparse_kernels=True)
+    unfused = dataclasses.replace(profile, fused_sparse_kernels=False)
+
+    long_fused = fused.estimate_prefill_transient_bytes(4096, 131072)
+    long_unfused = unfused.estimate_prefill_transient_bytes(4096, 131072)
+    assert long_fused < long_unfused / 4
+    by_rows = [
+        fused.estimate_prefill_transient_bytes(rows, 131072)
+        for rows in (1, 8, 16, 31, 32, 64, 512, 4096)
+    ]
+    assert by_rows == sorted(by_rows)
+    assert fused.estimate_prefill_transient_bytes(
+        8, 131072
+    ) >= unfused.estimate_prefill_transient_bytes(8, 131072)
 
 
 def test_glm5_next_flat_overhead_guard_admits_full_chunk_at_1948_numbers():
