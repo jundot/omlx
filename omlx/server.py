@@ -4449,6 +4449,13 @@ async def create_systemone(
                     request.model_dump(), truncate=request.truncate
                 )
             except DecisionContextLengthError as e:
+                # Hindsight splits an oversized request only on this 400
+                # body; every other client keeps the 413 it always had.
+                if getattr(engine, "kind", None) == "hindsight":
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error_type": "max_tokens_exceeded", "msg": str(e)},
+                    ) from e
                 raise HTTPException(status_code=413, detail=str(e)) from e
             except DecisionRequestError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
@@ -4561,6 +4568,13 @@ async def create_decisions(
             try:
                 plan = await engine.encode(to_systemone(request))
             except DecisionContextLengthError as e:
+                # Hindsight splits an oversized request only on this 400
+                # body; every other client keeps the 413 it always had.
+                if getattr(engine, "kind", None) == "hindsight":
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error_type": "max_tokens_exceeded", "msg": str(e)},
+                    ) from e
                 raise HTTPException(status_code=413, detail=str(e)) from e
             except DecisionRequestError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
