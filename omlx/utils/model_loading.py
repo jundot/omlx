@@ -165,7 +165,14 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
         trust_remote_code=trust_remote_code,
     )
     from mlx_lm import load
-    return load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
+    model, tokenizer = load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
+    try:
+        from ..patches.sensenova_loop_sinkhorn import apply as _apply_sinkhorn_patch
+
+        _apply_sinkhorn_patch(model)
+    except Exception as e:  # optional optimization, never fail the load
+        logger.debug("sensenova sinkhorn patch skipped: %s", e)
+    return model, tokenizer
 
 
 def _add_glm5_next_nextn_quant_keys(cfg: dict, quant: dict) -> None:
