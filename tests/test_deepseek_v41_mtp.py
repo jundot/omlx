@@ -380,3 +380,75 @@ def test_dspark_stages_batched_across_requests_match_each_request(prompts):
         for ring, other in zip(expected, actual):
             assert other.offset == ring.offset
             np.testing.assert_allclose(other.keys, ring.keys, atol=2e-5, rtol=2e-4)
+
+
+def test_draft_keep_counts_the_drafts_likely_to_survive():
+    model = LanguageModel(mtp_config())
+
+    def keep(*probabilities):
+        return int(model.dspark_draft_keep(mx.log(mx.array(probabilities))).item())
+
+    assert keep(0.999, 0.999, 0.999) == 3
+    assert keep(0.999, 0.999, 0.2) == 2
+    # A confident draft behind an unlikely one is never reached.
+    assert keep(0.999, 0.2, 0.999) == 1
+    assert keep(0.2, 0.999, 0.999) == 0
+    # Survival is cumulative: individually acceptable drafts stop adding up.
+    assert keep(0.5, 0.5, 0.5) < 3
+
+
+@pytest.mark.parametrize("kept", [None, 0, 1])
+def test_single_request_verifies_only_the_kept_drafts(kept, monkeypatch):
+    from mlx_lm.generate import BatchGenerator
+
+    from omlx.patches.mlx_lm_mtp import batch_generator
+
+    batch_generator.apply()
+    model = LanguageModel(mtp_config())
+    load_reference_weights(model)
+    prompt = [3, 4, 5, 6, 7, 8, 9]
+    expected, cache = [], model.make_cache()
+    ids = mx.array([prompt])
+    for _ in range(16):
+        logits = model(ids, cache=cache)
+        token = int(mx.argmax(logits[0, -1]).item())
+        expected.append(token)
+        ids = mx.array([[token]])
+    model.configure_mtp(True, 3)
+    drafted, verified = [], []
+    rule = type(model).dspark_draft_keep
+
+    def keep(self, top_logprobs):
+        drafted.append(int(top_logprobs.shape[0]))
+        return rule(self, top_logprobs) if kept is None else mx.array(kept)
+
+    monkeypatch.setattr(type(model), "dspark_draft_keep", keep)
+    clip = batch_generator._clip_block_drafts
+
+    def tracked_clip(state, limit):
+        clip(state, limit)
+        verified.append((limit, int(state.drafts.shape[0])))
+
+    monkeypatch.setattr(batch_generator, "_clip_block_drafts", tracked_clip)
+    generator = BatchGenerator(
+        model,
+        max_tokens=16,
+        prefill_step_size=3,
+        sampler=lambda logits: mx.argmax(logits, -1),
+    )
+    result = []
+    try:
+        generator.insert([prompt])
+        for _ in range(64):
+            _, responses = generator.next()
+            result.extend(response.token for response in responses)
+            if len(result) == 16:
+                break
+    finally:
+        generator.close()
+    assert result == expected
+    # Every block is drafted whole, whatever the last cycle accepted.
+    assert drafted and set(drafted) == {3}
+    assert verified and all(width == limit for limit, width in verified)
+    if kept is not None:
+        assert {limit for limit, _ in verified} == {kept}
