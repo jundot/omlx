@@ -61,6 +61,7 @@ def _has_cli_overrides(args) -> bool:
         "max_image_side_length",
         "max_concurrent_requests",
         "embedding_batch_size",
+        "max_waiting_requests",
         "memory_guard",
         "memory_guard_gb",
         "paged_ssd_cache_dir",
@@ -1263,6 +1264,12 @@ Example directory structure:
         type=int,
         default=None,
         help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 32)",
+    )
+    serve_parser.add_argument(
+        "--max-waiting-requests",
+        type=int,
+        default=None,
+        help="Max requests per model that can wait for a free slot. 0 means max(max-concurrent-requests * 4, 32). (default: 0)",
     )
 
     # Memory guard options

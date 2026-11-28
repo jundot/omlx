@@ -1132,6 +1132,72 @@ class TestUpdateGlobalSettingsMaxConcurrentRequests:
         pool.apply_max_concurrent_requests.assert_not_awaited()
         gs.save.assert_not_called()
 
+class TestUpdateGlobalSettingsMaxWaitingRequests:
+    """update_global_settings: saving and hot-applying the waiting-queue cap."""
+
+    def _setup(self, validate_errors=()):
+        gs = MagicMock()
+        gs.scheduler = SimpleNamespace(
+            max_concurrent_requests=1,
+            max_waiting_requests=0,
+            embedding_batch_size=32,
+            chunked_prefill=False,
+        )
+        gs.validate.return_value = list(validate_errors)
+        gs.save.return_value = None
+        return gs, SimpleNamespace(apply_max_waiting_requests=AsyncMock())
+
+    def _save(self, gs, pool, value):
+        request = GlobalSettingsRequest(max_waiting_requests=value)
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server, "_server_state", SimpleNamespace(engine_pool=pool)
+            ),
+        ):
+            return asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+    def test_saves_and_hot_applies_max_waiting_requests(self):
+        gs, pool = self._setup()
+
+        result = self._save(gs, pool, 128)
+
+        assert "max_waiting_requests" in result["runtime_applied"]
+        assert gs.scheduler.max_waiting_requests == 128
+        pool.apply_max_waiting_requests.assert_awaited_once_with(128)
+
+    def test_does_not_hot_apply_when_validation_fails(self):
+        gs, pool = self._setup(validate_errors=["invalid max_waiting_requests"])
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._save(gs, pool, -1)
+
+        assert exc_info.value.status_code == 400
+        assert gs.scheduler.max_waiting_requests == 0
+        pool.apply_max_waiting_requests.assert_not_awaited()
+        gs.save.assert_not_called()
+
+    def test_early_field_rejection_leaves_cap_unchanged(self):
+        gs, pool = self._setup()
+        request = GlobalSettingsRequest(max_waiting_requests=4, embedding_batch_size=0)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server, "_server_state", SimpleNamespace(engine_pool=pool)
+            ),
+            pytest.raises(HTTPException),
+        ):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.scheduler.max_waiting_requests == 0
+        pool.apply_max_waiting_requests.assert_not_awaited()
+
+
 
 class TestUpdateGlobalSettingsGdnSidecarStateDtype:
     """update_global_settings: GDN sidecar precision invariants.

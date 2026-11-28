@@ -1613,6 +1613,32 @@ class EnginePool:
                 with suppress(RuntimeError):
                     executor.submit(_set_decode_cap, scheduler, value)
 
+    async def apply_max_waiting_requests(self, value: int) -> None:
+        """Apply the waiting-queue cap to future and currently loaded engines.
+
+        0 restores the cap derived from max concurrent requests.
+        """
+        value = int(value)
+        if value < 0:
+            raise ValueError("max waiting requests must be >= 0")
+
+        async with self._lock:
+            self._scheduler_config.max_waiting_requests = value
+            for entry in list(self._entries.values()):
+                engine = entry.engine if entry is not None else None
+                # Cluster ranks build their schedulers from the deployment.
+                if engine is None or getattr(
+                    engine, "_prefill_memory_guard_managed_externally", False
+                ):
+                    continue
+                config = getattr(engine, "_scheduler_config", None)
+                if config is not None:
+                    config.max_waiting_requests = value
+                core = getattr(getattr(engine, "_engine", None), "engine", None)
+                scheduler = getattr(core, "scheduler", None)
+                if scheduler is not None:
+                    scheduler.config.max_waiting_requests = value
+
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
     ) -> None:

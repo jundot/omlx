@@ -822,6 +822,7 @@ class GlobalSettingsRequest(BaseModel):
     # Scheduler settings
     max_concurrent_requests: int | None = None
     embedding_batch_size: int | None = None
+    max_waiting_requests: int | None = None
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
     concurrent_priority: ConcurrentPriority | None = None
@@ -5044,6 +5045,7 @@ def _global_settings_response(global_settings):
         "scheduler": {
             "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
             "embedding_batch_size": global_settings.scheduler.embedding_batch_size,
+            "max_waiting_requests": global_settings.scheduler.max_waiting_requests,
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
             "concurrent_priority": global_settings.scheduler.concurrent_priority,
@@ -5268,6 +5270,8 @@ async def update_global_settings(
     previous_embedding_batch_size: int | None = None
     pending_max_concurrent_requests: int | None = None
     previous_max_concurrent_requests: int | None = None
+    pending_max_waiting_requests: int | None = None
+    previous_max_waiting_requests: int | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -5507,6 +5511,14 @@ async def update_global_settings(
                 request.max_concurrent_requests
             )
             pending_max_concurrent_requests = request.max_concurrent_requests
+
+    # Waiting-queue cap (Live). Staged here; assigned right before validate().
+    if (
+        request.max_waiting_requests is not None
+        and request.max_waiting_requests
+        != global_settings.scheduler.max_waiting_requests
+    ):
+        pending_max_waiting_requests = request.max_waiting_requests
 
     # Apply embedding batch size setting (Live for loaded embedding engines)
     if request.embedding_batch_size is not None:
@@ -6327,6 +6339,9 @@ async def update_global_settings(
     if pending_embedding_batch_size is not None:
         previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
         global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
+    if pending_max_waiting_requests is not None:
+        previous_max_waiting_requests = global_settings.scheduler.max_waiting_requests
+        global_settings.scheduler.max_waiting_requests = pending_max_waiting_requests
 
     # Validate settings
     errors = global_settings.validate()
@@ -6338,6 +6353,10 @@ async def update_global_settings(
         if previous_max_concurrent_requests is not None:
             global_settings.scheduler.max_concurrent_requests = (
                 previous_max_concurrent_requests
+            )
+        if previous_max_waiting_requests is not None:
+            global_settings.scheduler.max_waiting_requests = (
+                previous_max_waiting_requests
             )
         raise HTTPException(status_code=400, detail=errors)
 
@@ -6353,6 +6372,10 @@ async def update_global_settings(
             global_settings.scheduler.max_concurrent_requests = (
                 previous_max_concurrent_requests
             )
+        if previous_max_waiting_requests is not None:
+            global_settings.scheduler.max_waiting_requests = (
+                previous_max_waiting_requests
+            )
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
     if pending_max_concurrent_requests is not None:
@@ -6364,6 +6387,17 @@ async def update_global_settings(
         runtime_applied.append("max_concurrent_requests")
         logger.info(
             f"Max concurrent requests set to {pending_max_concurrent_requests} (live)"
+        )
+
+    if pending_max_waiting_requests is not None:
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            await pool.apply_max_waiting_requests(pending_max_waiting_requests)
+        runtime_applied.append("max_waiting_requests")
+        logger.info(
+            f"Max waiting requests set to {pending_max_waiting_requests} (live)"
         )
 
     if pending_embedding_batch_size is not None:

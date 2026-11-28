@@ -184,7 +184,7 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, gpu_keep_warm_idle_window: 300, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
-                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', concurrent_priority: 'balanced' },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, max_waiting_requests: 0, chunked_prefill: false, prefill_priority: 'context', concurrent_priority: 'balanced' },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_unavailable: false, ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
@@ -1432,6 +1432,7 @@
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push(window.t('js.error.model_directory'));
                 if (!s.scheduler.max_concurrent_requests) errors.push(window.t('settings.resource.max_concurrent_requests'));
                 if (!s.scheduler.embedding_batch_size) errors.push(window.t('settings.resource.embedding_batch_size'));
+                if (!Number.isInteger(s.scheduler.max_waiting_requests) || s.scheduler.max_waiting_requests < 0) errors.push(window.t('settings.resource.max_waiting_requests'));
                 if (!s.cache.ssd_cache_max_size) errors.push(window.t('js.error.max_cache_size'));
                 if (!s.sampling.max_context_window) errors.push(window.t('js.error.max_context_window'));
                 if (!s.sampling.max_tokens) errors.push(window.t('settings.generation.max_tokens'));
@@ -1491,6 +1492,7 @@
                             memory_guard_custom_ceiling_gb: this.globalSettings.memory.memory_guard_custom_ceiling_gb,
                             max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
                             embedding_batch_size: this.globalSettings.scheduler.embedding_batch_size,
+                            max_waiting_requests: this.globalSettings.scheduler.max_waiting_requests,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             prefill_priority: this.globalSettings.scheduler.prefill_priority,
                             concurrent_priority: this.globalSettings.scheduler.concurrent_priority,

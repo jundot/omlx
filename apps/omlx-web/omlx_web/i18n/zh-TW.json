@@ -688,6 +688,8 @@
   "settings.resource.prefill_memory_guard_description": "當記憶體壓力接近右側保留層級得出的上限時，暫停預填充排程並驅逐 LRU 模型。",
   "settings.resource.max_concurrent_requests": "最大並發請求",
   "settings.resource.max_concurrent_requests_hint": "同時處理的最大請求數。數值越大吞吐量越高，但記憶體使用也越多。",
+  "settings.resource.max_waiting_requests": "最大等待請求",
+  "settings.resource.max_waiting_requests_hint": "每個模型可排隊等待空位的請求數。0 表示自動：最大並發請求 × 4，至少 32。",
   "settings.resource.embedding_batch_size": "Embedding 批次大小",
   "settings.resource.embedding_batch_size_hint": "單次前向計算處理的最大 embedding 輸入文字數。數值越大吞吐量越高，但記憶體使用也越多。",
   "settings.resource.chunked_prefill": "分塊預填充",

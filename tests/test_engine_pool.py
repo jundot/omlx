@@ -2550,6 +2550,26 @@ class TestEnginePoolAsync:
         assert scheduler.batch_generator.completion_batch_size == 4
 
     @pytest.mark.asyncio
+    async def test_apply_max_waiting_requests_updates_loaded_engines(self):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(scheduler_config=SchedulerConfig())
+        batched, scheduler = self._engine_with_scheduler(executor)
+        cluster_config = SchedulerConfig()
+        cluster = SimpleNamespace(
+            _scheduler_config=cluster_config,
+            _prefill_memory_guard_managed_externally=True,
+        )
+        self._add_entry(pool, "batched", batched)
+        self._add_entry(pool, "cluster", cluster)
+
+        await pool.apply_max_waiting_requests(128)
+        executor.shutdown(wait=True)
+
+        assert pool._scheduler_config.max_waiting_requests == 128
+        assert scheduler.config.max_waiting_requests == 128
+        assert cluster_config.max_waiting_requests == 0
+
+    @pytest.mark.asyncio
     async def test_get_engine_returns_cached(self, pool_with_mock_engines):
         """Test that get_engine returns cached engine on second call."""
         pool = pool_with_mock_engines

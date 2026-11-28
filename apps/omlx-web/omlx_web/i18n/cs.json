@@ -688,6 +688,8 @@
   "settings.resource.prefill_memory_guard_description": "Při tlaku na paměť odvozenému od úrovně rezervy vpravo pozastaví plánování prefillu a eviktuje modely principem LRU.",
   "settings.resource.max_concurrent_requests": "Max. souběžných požadavků",
   "settings.resource.max_concurrent_requests_hint": "Maximální počet současně zpracovávaných požadavků. Vyšší hodnoty zvyšují propustnost, ale spotřebují více paměti.",
+  "settings.resource.max_waiting_requests": "Max. čekajících požadavků",
+  "settings.resource.max_waiting_requests_hint": "Kolik požadavků na model může čekat na volné místo. 0 znamená automaticky: 4 × Max. souběžných požadavků, nejméně 32.",
   "settings.resource.embedding_batch_size": "Velikost dávky embeddingů",
   "settings.resource.embedding_batch_size_hint": "Maximální počet vstupních textů embedovaných v jednom průchodu. Vyšší hodnoty zvyšují propustnost, ale spotřebují více paměti.",
   "settings.resource.chunked_prefill": "Chunked prefill",

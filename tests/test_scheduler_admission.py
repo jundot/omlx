@@ -19,7 +19,7 @@ def scheduler():
     bare instance and seed those attributes directly.
     """
     s = Scheduler.__new__(Scheduler)
-    s.config = MagicMock(max_num_seqs=8)
+    s.config = MagicMock(max_num_seqs=8, max_waiting_requests=0)
     s.waiting = deque()
     s.requests = {}
     return s
@@ -79,6 +79,14 @@ class TestWaitingQueueCap:
         with pytest.raises(SchedulerQueueFullError) as exc:
             scheduler.add_request(_make_request("over"))
         assert exc.value.max_depth == 32
+
+    def test_explicit_cap_overrides_derived(self, scheduler):
+        scheduler.config.max_waiting_requests = 100
+        for i in range(100):
+            scheduler.waiting.append(_make_request(f"r{i}"))
+        with pytest.raises(SchedulerQueueFullError) as exc:
+            scheduler.add_request(_make_request("over"))
+        assert exc.value.max_depth == 100
 
     def test_duplicate_request_raises_before_cap(self, scheduler):
         # Duplicate check fires before the cap check.

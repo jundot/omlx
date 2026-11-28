@@ -2026,6 +2026,9 @@ class SchedulerConfig:
     completion_batch_size: int = 32
     # Per-forward embedding input chunk size
     embedding_batch_size: int = 32
+    # Waiting-queue cap before add_request raises SchedulerQueueFullError.
+    # 0 means max(max_num_seqs * 4, 32).
+    max_waiting_requests: int = 0
     prefill_step_size: int = 2048
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
@@ -11658,8 +11661,8 @@ class Scheduler:
         Add a new request to the scheduler.
 
         Raises SchedulerQueueFullError when the waiting queue is at or above
-        the configured cap (max(max_num_seqs * 4, 32)). Server layer maps
-        this to HTTP 503 + Retry-After.
+        the configured cap (max_waiting_requests, or max(max_num_seqs * 4, 32)
+        when that is 0). Server layer maps this to HTTP 503 + Retry-After.
 
         Args:
             request: The request to add
@@ -11669,7 +11672,9 @@ class Scheduler:
 
         # Cap the waiting queue so client-side polling can't accumulate
         # unbounded work and the scheduler can apply backpressure via 503.
-        max_waiting = max(self.config.max_num_seqs * 4, 32)
+        max_waiting = self.config.max_waiting_requests or max(
+            self.config.max_num_seqs * 4, 32
+        )
         if len(self.waiting) >= max_waiting:
             from .exceptions import SchedulerQueueFullError
 

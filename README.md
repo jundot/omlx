@@ -382,6 +382,9 @@ omlx serve --model-dir ~/models --hot-cache-max-size 20%
 # Adjust max concurrent requests (default: 8)
 omlx serve --model-dir ~/models --max-concurrent-requests 16
 
+# Cap queued requests per model (default 0 = max(4 × max concurrent, 32))
+omlx serve --model-dir ~/models --max-waiting-requests 4
+
 # With MCP tools
 omlx serve --model-dir ~/models --mcp-config mcp.json
 
