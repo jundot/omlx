@@ -1300,6 +1300,7 @@
   "modal.model_settings.model_type_auto": "Detecção automática",
   "modal.model_settings.max_context_window": "Janela de Contexto",
   "modal.model_settings.max_context_window_hint": "Define o tamanho total de contexto que o modelo consegue processar. Prompts mais longos são rejeitados.",
+  "modal.model_settings.max_context_window_memory_warning": "Only about {tokens} tokens fit in memory right now.",
   "modal.model_settings.embedding_context_window_hint": "Se a requisição não definir max_length, entradas mais longas são truncadas para esse tamanho.",
   "modal.model_settings.reranker_context_window_hint": "Usado quando a requisição não define max_length. Rerankers Jina leem os documentos juntos até esse número de tokens; os demais truncam cada par consulta-documento para esse tamanho.",
   "modal.model_settings.max_tokens": "Máx. de Tokens",

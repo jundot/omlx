@@ -1300,6 +1300,7 @@
   "modal.model_settings.model_type_auto": "自動偵測",
   "modal.model_settings.max_context_window": "上下文視窗",
   "modal.model_settings.max_context_window_hint": "設定模型可處理的總上下文大小。超過此長度的提示會被拒絕。",
+  "modal.model_settings.max_context_window_memory_warning": "Only about {tokens} tokens fit in memory right now.",
   "modal.model_settings.embedding_context_window_hint": "請求未設定 max_length 時，超過此長度的輸入會被截斷。",
   "modal.model_settings.reranker_context_window_hint": "請求未設定 max_length 時使用。Jina 重排序模型一次最多讀取這麼多 token 的文件，其他重排序模型會將每個查詢-文件配對截斷到此長度。",
   "modal.model_settings.max_tokens": "最大 Token 數",

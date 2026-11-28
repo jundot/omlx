@@ -1300,6 +1300,7 @@
   "modal.model_settings.model_type_auto": "Détection automatique",
   "modal.model_settings.max_context_window": "Fenêtre de contexte",
   "modal.model_settings.max_context_window_hint": "Définit la taille totale du contexte que le modèle peut gérer. Les prompts plus longs sont refusés.",
+  "modal.model_settings.max_context_window_memory_warning": "Only about {tokens} tokens fit in memory right now.",
   "modal.model_settings.embedding_context_window_hint": "Si la requête ne définit pas max_length, les entrées plus longues sont tronquées à cette longueur.",
   "modal.model_settings.reranker_context_window_hint": "Utilisé lorsque la requête ne définit pas max_length. Les rerankers Jina lisent les documents ensemble jusqu'à ce nombre de tokens ; les autres tronquent chaque paire requête-document à cette longueur.",
   "modal.model_settings.max_tokens": "Tokens max",

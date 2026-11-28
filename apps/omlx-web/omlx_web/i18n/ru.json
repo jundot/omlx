@@ -1300,6 +1300,7 @@
   "modal.model_settings.model_type_auto": "Автоопределение",
   "modal.model_settings.max_context_window": "Контекстное окно",
   "modal.model_settings.max_context_window_hint": "Задаёт общий размер контекста, который может обработать модель. Более длинные запросы отклоняются.",
+  "modal.model_settings.max_context_window_memory_warning": "Only about {tokens} tokens fit in memory right now.",
   "modal.model_settings.embedding_context_window_hint": "Если в запросе не задан max_length, более длинные входные данные обрезаются до этой длины.",
   "modal.model_settings.reranker_context_window_hint": "Используется, если в запросе не задан max_length. Реранкеры Jina читают документы вместе до этого числа токенов, остальные обрезают каждую пару запрос-документ до этой длины.",
   "modal.model_settings.max_tokens": "Макс. токены",

@@ -6014,3 +6014,188 @@ class TestIsMetalOutOfMemory:
         outer.__cause__ = oom
 
         assert is_metal_out_of_memory(outer) is True
+
+
+class TestContextMemoryFit:
+    """Post-load check of the context window against the memory guard (#5147)."""
+
+    @pytest.fixture(autouse=True)
+    def _settings(self, tmp_path, monkeypatch):
+        from omlx.settings import GlobalSettings
+
+        settings = GlobalSettings(base_path=tmp_path / "omlx")
+        monkeypatch.setattr(engine_pool_module, "get_global_settings", lambda: settings)
+        return settings
+
+    @staticmethod
+    def _entry(tmp_path, model_id: str = "model") -> EngineEntry:
+        model = tmp_path / model_id
+        model.mkdir()
+        return EngineEntry(
+            model_id=model_id,
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1024,
+            model_context_length=40_960,
+        )
+
+    def _pool(self, tmp_path) -> tuple[EnginePool, EngineEntry]:
+        entry = self._entry(tmp_path)
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._entries[entry.model_id] = entry
+        return pool, entry
+
+    @staticmethod
+    def _engine(fit: int | None) -> MagicMock:
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+        engine.scheduler.max_admitted_prompt_tokens = MagicMock(return_value=fit)
+        return engine
+
+    @staticmethod
+    def _fit_warnings(caplog) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records if "fit in memory" in r.getMessage()
+        ]
+
+    async def test_load_warns_when_window_exceeds_memory_fit(self, tmp_path, caplog):
+        pool, entry = self._pool(tmp_path)
+        engine = self._engine(20_352)
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            caplog.at_level(logging.WARNING, logger="omlx.engine_pool"),
+        ):
+            await pool._load_engine("model")
+
+        engine.scheduler.max_admitted_prompt_tokens.assert_called_once_with(
+            16 * 1024 * 1024, evictable_bytes=0
+        )
+        assert entry.memory_fit_context == 20_352
+        assert pool.get_status()["models"][0]["memory_fit_context"] == 20_352
+        (warning,) = self._fit_warnings(caplog)
+        assert "40,960 tokens" in warning
+        assert "about 20,352" in warning
+
+    async def test_fit_is_measured_after_the_limit_reaches_the_scheduler(
+        self, tmp_path
+    ):
+        pool, entry = self._pool(tmp_path)
+        engine = self._engine(None)
+        propagated = []
+        pool._process_memory_enforcer = SimpleNamespace(
+            _propagate_memory_limit=lambda: propagated.append(True)
+        )
+        engine.scheduler.max_admitted_prompt_tokens.side_effect = (
+            lambda limit, evictable_bytes: (20_352 if propagated else None)
+        )
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=engine):
+            await pool._load_engine("model")
+
+        assert entry.memory_fit_context == 20_352
+
+    async def test_estimator_error_does_not_fail_the_load(self, tmp_path, caplog):
+        pool, entry = self._pool(tmp_path)
+        engine = self._engine(None)
+        engine.scheduler.max_admitted_prompt_tokens.side_effect = RuntimeError("boom")
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            caplog.at_level(logging.WARNING, logger="omlx.engine_pool"),
+        ):
+            await pool._load_engine("model")
+
+        assert entry.engine is engine
+        assert entry.memory_fit_context is None
+        assert self._fit_warnings(caplog) == []
+
+    async def test_unload_clears_memory_fit(self, tmp_path):
+        pool, entry = self._pool(tmp_path)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._engine(20_352)):
+            await pool._load_engine("model")
+            assert entry.memory_fit_context == 20_352
+            await pool._unload_engine("model")
+
+        assert entry.memory_fit_context is None
+
+    def test_no_warning_when_window_fits(self, tmp_path, caplog):
+        pool, entry = self._pool(tmp_path)
+        entry.engine = self._engine(65_536)
+
+        with caplog.at_level(logging.WARNING, logger="omlx.engine_pool"):
+            pool._check_context_fits_memory(entry, None)
+
+        assert entry.memory_fit_context == 65_536
+        assert self._fit_warnings(caplog) == []
+
+    def test_per_model_override_is_the_window(self, tmp_path, caplog):
+        pool, entry = self._pool(tmp_path)
+        entry.engine = self._engine(65_536)
+
+        with caplog.at_level(logging.WARNING, logger="omlx.engine_pool"):
+            pool._check_context_fits_memory(
+                entry, ModelSettings(max_context_window=131_072)
+            )
+
+        (warning,) = self._fit_warnings(caplog)
+        assert "131,072 tokens" in warning
+
+    @pytest.mark.parametrize("fit", [None, 16 * 1024 * 1024])
+    def test_no_fit_when_guard_does_not_bound_the_prompt(self, tmp_path, caplog, fit):
+        pool, entry = self._pool(tmp_path)
+        entry.engine = self._engine(fit)
+
+        with caplog.at_level(logging.WARNING, logger="omlx.engine_pool"):
+            pool._check_context_fits_memory(
+                entry, ModelSettings(max_context_window=32 * 1024 * 1024)
+            )
+
+        assert entry.memory_fit_context is None
+        assert self._fit_warnings(caplog) == []
+
+    def test_idle_models_count_as_evictable(self, tmp_path):
+        pool, entry = self._pool(tmp_path)
+        entry.engine = self._engine(20_352)
+        other = self._entry(tmp_path, "other")
+        other.engine = self._engine(None)
+        for attr in ("running", "waiting", "prefilling", "requests"):
+            setattr(other.engine.scheduler, attr, [])
+        other.actual_size = 3 * 1024**3
+        pool._entries[other.model_id] = other
+        max_admitted = entry.engine.scheduler.max_admitted_prompt_tokens
+
+        pool._check_context_fits_memory(entry, None)
+        max_admitted.assert_called_with(16 * 1024 * 1024, evictable_bytes=3 * 1024**3)
+
+        other.is_pinned = True
+        pool._check_context_fits_memory(entry, None)
+        max_admitted.assert_called_with(16 * 1024 * 1024, evictable_bytes=0)
+
+    def test_refresh_remeasures_idle_models_only(self, tmp_path):
+        pool, entry = self._pool(tmp_path)
+        entry.engine = self._engine(20_352)
+        pool.refresh_memory_fit()
+        assert entry.memory_fit_context == 20_352
+
+        entry.engine.scheduler.max_admitted_prompt_tokens.return_value = 19_400
+        entry.in_use = 1
+        pool.refresh_memory_fit()
+        assert entry.memory_fit_context == 20_352
+
+        entry.in_use = 0
+        entry.engine.scheduler.has_pending_route_preflight_cleanup.return_value = True
+        pool.refresh_memory_fit()
+        assert entry.memory_fit_context == 20_352
+
+        entry.engine.scheduler.has_pending_route_preflight_cleanup.return_value = False
+        entry.engine.scheduler.route_preflight_usage_is_stale.return_value = False
+        pool.refresh_memory_fit()
+        assert entry.memory_fit_context == 20_352
+
+        entry.engine.scheduler.route_preflight_usage_is_stale.return_value = True
+        pool.refresh_memory_fit()
+        assert entry.memory_fit_context == 19_400

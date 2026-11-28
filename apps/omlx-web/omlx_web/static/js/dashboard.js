@@ -4178,6 +4178,20 @@
                 return window.t('modal.model_settings.ttl_no_ttl');
             },
 
+            get contextWindowMemoryWarning() {
+                const fit = this.selectedModel?.memory_fit_context;
+                if (!fit || this.modelSettings.is_diffusion_model) return '';
+                const native = this.selectedModel.model_context_length;
+                const policy = this.globalSettings.sampling?.max_context_window_policy;
+                const fallback = native
+                    ? (policy > 0 ? Math.min(native, policy) : native)
+                    : this.globalSettings.sampling?.max_context_window;
+                const contextWindow = this.modelSettings.max_context_window || fallback;
+                if (!contextWindow || contextWindow <= fit) return '';
+                return window.t('modal.model_settings.max_context_window_memory_warning')
+                    .replace('{tokens}', fit.toLocaleString());
+            },
+
             async loadServerInfo() {
                 try {
                     const response = await fetch('/admin/api/server-info');

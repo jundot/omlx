@@ -82,6 +82,47 @@ class TestListModelsSettings:
         assert settings_dict["max_tokens"] == 4096
         assert settings_dict["temperature"] == 0.7
 
+    def test_list_models_reports_memory_fit_context(self):
+        """The dashboard compares the context window with this fit (#5147)."""
+        mock_engine_pool = MagicMock()
+        mock_engine_pool.splash_target.return_value = (None, "")
+        mock_engine_pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": "test-model",
+                    "loaded": True,
+                    "estimated_size": 1000,
+                    "engine_type": "batched",
+                    "model_type": "llm",
+                    "model_context_length": 40960,
+                    "memory_fit_context": 20352,
+                }
+            ]
+        }
+        mock_settings_manager = MagicMock()
+        mock_settings_manager.get_all_settings.return_value = {}
+        mock_server_state = MagicMock()
+        mock_server_state.default_model = None
+
+        with (
+            patch.object(
+                admin_routes, "_get_engine_pool", return_value=mock_engine_pool
+            ),
+            patch.object(
+                admin_routes,
+                "_get_settings_manager",
+                return_value=mock_settings_manager,
+            ),
+            patch.object(
+                admin_routes, "_get_server_state", return_value=mock_server_state
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        assert result["models"][0]["memory_fit_context"] == 20352
+        calls = [call[0] for call in mock_engine_pool.method_calls]
+        assert calls.index("refresh_memory_fit") < calls.index("get_status")
+
     def test_list_models_reports_forced_qwen4_ple_offload(self, tmp_path):
         from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
             Qwen4ExpResidencyEstimate,

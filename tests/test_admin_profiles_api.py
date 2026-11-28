@@ -48,6 +48,9 @@ class _FakePool:
     def recommended_sampling_settings(self, entry):
         return dict(self.recommended_sampling)
 
+    def refresh_memory_fit(self):
+        pass
+
     def get_status(self):
         return {
             "models": [

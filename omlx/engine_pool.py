@@ -312,6 +312,10 @@ def _qwen35_cpu_share_estimated_bytes(
 _ADMISSION_CEILING_RECHECKS = 4
 _ADMISSION_CEILING_RECHECK_S = 0.25
 
+# Longest prompt the memory fit search tries (16M tokens), above any declared
+# context window. A model that admits it reports no fit and gets no warning.
+_MEMORY_FIT_SEARCH_TOKENS = 16 * 1024 * 1024
+
 
 def _settled_phys_footprint() -> int:
     """phys_footprint minus freed Metal buffers the kernel still charges."""
@@ -387,6 +391,9 @@ class EngineEntry:
     )
     model_context_length: int | None = (
         None  # Declared context length from config.json (None if unknown)
+    )
+    memory_fit_context: int | None = (
+        None  # Longest prompt the memory guard admits (None: unknown or unbounded)
     )
     source_type: str = "local"
     source_repo_id: str | None = None
@@ -2290,6 +2297,84 @@ class EnginePool:
             return min(native, policy or native, target.max_context)
         return native
 
+    def _measure_memory_fit(self, entry: EngineEntry) -> int | None:
+        """Longest cold prompt the prefill memory guard admits for this model.
+
+        Idle models that route preflight would evict first count as free.
+        None when the guard does not price prompts or admits every length
+        the search tries. Advisory: errors are logged at debug level.
+        """
+        scheduler = self._resolve_scheduler_from_engine(entry.engine)
+        max_admitted = getattr(scheduler, "max_admitted_prompt_tokens", None)
+        if not callable(max_admitted):
+            return None
+        try:
+            evictable = sum(
+                other.actual_size or self._entry_resident_size(other)
+                for other in self._entries.values()
+                if other is not entry and self._is_idle_for_prefill_eviction(other)
+            )
+            fit = max_admitted(_MEMORY_FIT_SEARCH_TOKENS, evictable_bytes=evictable)
+        except Exception:
+            logger.debug(
+                f"Could not estimate the memory fit for {entry.model_id}",
+                exc_info=True,
+            )
+            return None
+        if not isinstance(fit, int) or fit >= _MEMORY_FIT_SEARCH_TOKENS:
+            return None
+        return fit
+
+    def _check_context_fits_memory(
+        self, entry: EngineEntry, model_settings: object | None
+    ) -> None:
+        """Record the memory fit after a load; warn when the window is longer.
+
+        The prefill memory guard rejects prompts past the fit with a 400
+        (#5147). Advisory only: a failure here never fails the load.
+        """
+        entry.memory_fit_context = fit = self._measure_memory_fit(entry)
+        if fit is None:
+            return
+        try:
+            window = self._splash_sizing_context(entry, model_settings)
+            if not window:
+                window = get_global_settings().sampling.max_context_window
+        except Exception:
+            logger.debug(
+                f"Could not resolve the context window for {entry.model_id}",
+                exc_info=True,
+            )
+            return
+        if window and fit < window:
+            logger.warning(
+                f"Context window for {entry.model_id} is {window:,} tokens, but "
+                f"only about {fit:,} fit in memory now. The prefill memory guard "
+                "rejects longer prompts; lower max_context_window or run the "
+                "context benchmark."
+            )
+
+    def refresh_memory_fit(self) -> None:
+        """Re-measure the memory fit of idle loaded models for the dashboard.
+
+        The load-time value misses memory the first requests add, and models
+        loaded or unloaded since. A model that is serving, still releasing a
+        finished request's memory, or holding a fresh MLX sample from its
+        last step keeps its last value: right after a step that sample can be
+        charged against a footprint that has already dropped.
+        """
+        for entry in list(self._entries.values()):
+            if entry.engine is None or entry.is_loading or self._entry_is_busy(entry):
+                continue
+            scheduler = self._resolve_scheduler_from_engine(entry.engine)
+            cleanup = getattr(scheduler, "has_pending_route_preflight_cleanup", None)
+            if callable(cleanup) and cleanup() is True:
+                continue
+            stale = getattr(scheduler, "route_preflight_usage_is_stale", None)
+            if callable(stale) and stale() is False:
+                continue
+            entry.memory_fit_context = self._measure_memory_fit(entry)
+
     def _splash_wanted_bytes(
         self,
         entry: EngineEntry,
@@ -3988,6 +4073,7 @@ class EnginePool:
         entry.engine = None
         entry.last_access = 0.0
         entry.actual_size = None
+        entry.memory_fit_context = None
         entry.abort_requested = False
         entry.pending_unload_reason = None
         entry.pending_unload_allow_pinned = False
@@ -4839,6 +4925,7 @@ class EnginePool:
                 f"full model: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
+            self._check_context_fits_memory(entry, model_settings)
         except asyncio.CancelledError:
             if not load_completed:
                 self._schedule_failed_load_reclaim(model_id, pre_load_memory)
@@ -4999,6 +5086,7 @@ class EnginePool:
                     # d1 decision checkpoints share lfm3_omni but run on the decision engine.
                     "realtime_voice": e.engine_type == "vlm" and e.realtime_voice,
                     "model_context_length": e.model_context_length,
+                    "memory_fit_context": e.memory_fit_context,
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,

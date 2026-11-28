@@ -13466,6 +13466,72 @@ class Scheduler:
             limit_bytes=safety_rejection.limit_bytes,
         )
 
+    def max_admitted_prompt_tokens(
+        self, limit: int, *, evictable_bytes: int = 0
+    ) -> int | None:
+        """Longest cold prompt, up to ``limit`` tokens, preflight admits now.
+
+        Runs the two ``preflight_or_raise`` checks for a prompt with nothing
+        cached, without raising or logging, and bisects the prompt length.
+        ``evictable_bytes`` is memory the route frees before it rejects, such
+        as idle models the pool evicts. The engine pool uses this to report a
+        context window longer than any prompt the guard admits (#5147).
+
+        The estimate grows with the prompt except where a cheaper SDPA route
+        starts under speed priority, so near that point the search can stop
+        short of the longest admitted prompt. The length returned is always
+        admitted and, below ``limit``, the next one is not.
+
+        Returns None when the guard does not price prompts: it is disabled,
+        no ceiling has been propagated yet, or there is no model info.
+        """
+        if not self._prefill_memory_guard:
+            return None
+        if self._memory_hard_limit_bytes <= 0:
+            return None
+        if self.memory_monitor is None:
+            return None
+
+        current = max(
+            0,
+            self._current_usage_bytes(refresh_mlx_active=False) - evictable_bytes,
+        )
+        admission_limit = self._admission_limit_bytes()
+
+        def estimate(num_prompt_tokens: int) -> _AdmissionEstimate | None:
+            return self._admission_estimate(
+                num_prompt_tokens=num_prompt_tokens,
+                cached_tokens=0,
+                current=current,
+            )
+
+        def admitted(num_prompt_tokens: int) -> bool:
+            est = estimate(num_prompt_tokens)
+            if est is None:
+                return True
+            hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
+            if est.estimated - hot_cache_credit > admission_limit:
+                return False
+            rejection = self._preflight_safety_rejection(
+                est=est,
+                current_usage_bytes=current,
+                hot_cache_credit=hot_cache_credit,
+            )
+            return rejection is None
+
+        if limit < 2 or estimate(limit) is None:
+            return None
+        if admitted(limit):
+            return limit
+        lo, hi = 1, limit
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if admitted(mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
     def preflight_eviction_request(
         self,
         *,

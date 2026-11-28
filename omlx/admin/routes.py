@@ -2542,6 +2542,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         )
 
     # Get engine pool status
+    engine_pool.refresh_memory_fit()
     status = engine_pool.get_status()
     models_status = status.get("models", [])
     residency_ceiling = int(status.get("final_ceiling", 0) or 0)
@@ -2715,6 +2716,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             # Native context window from the model's config.json — used by
             # the context bench UI to hide targets the model cannot reach.
             "model_context_length": model_info.get("model_context_length"),
+            # Longest cold prompt the memory guard admits now (None: no bound).
+            "memory_fit_context": model_info.get("memory_fit_context"),
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "reasoning_efforts": model_info.get("reasoning_efforts"),

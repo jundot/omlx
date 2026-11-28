@@ -1300,6 +1300,7 @@
   "modal.model_settings.model_type_auto": "Automatisch erkennen",
   "modal.model_settings.max_context_window": "Kontextfenster",
   "modal.model_settings.max_context_window_hint": "Legt die gesamte Kontextgröße fest, die das Modell verarbeiten kann. Längere Prompts werden abgelehnt.",
+  "modal.model_settings.max_context_window_memory_warning": "Only about {tokens} tokens fit in memory right now.",
   "modal.model_settings.embedding_context_window_hint": "Längere Eingaben werden auf diese Länge gekürzt, wenn die Anfrage kein max_length festlegt.",
   "modal.model_settings.reranker_context_window_hint": "Wird verwendet, wenn eine Anfrage kein max_length festlegt. Jina-Reranker lesen Dokumente gemeinsam bis zu dieser Anzahl an Token, andere Reranker kürzen jedes Paar aus Anfrage und Dokument auf diese Länge.",
   "modal.model_settings.max_tokens": "Max. Tokens",

@@ -1300,6 +1300,7 @@
   "modal.model_settings.model_type_auto": "自動検出",
   "modal.model_settings.max_context_window": "コンテキストウィンドウ",
   "modal.model_settings.max_context_window_hint": "モデルが扱えるコンテキスト全体のサイズを設定します。これより長いプロンプトは拒否されます。",
+  "modal.model_settings.max_context_window_memory_warning": "Only about {tokens} tokens fit in memory right now.",
   "modal.model_settings.embedding_context_window_hint": "リクエストで max_length を指定しない場合、これより長い入力はこの長さで切り詰められます。",
   "modal.model_settings.reranker_context_window_hint": "リクエストで max_length を指定しない場合に使われます。Jina リランカーは文書をこのトークン数までまとめて読み込み、ほかのリランカーはクエリと文書の組ごとにこの長さで切り詰めます。",
   "modal.model_settings.max_tokens": "最大トークン数",

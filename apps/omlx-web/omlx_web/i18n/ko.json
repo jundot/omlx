@@ -1300,6 +1300,7 @@
   "modal.model_settings.model_type_auto": "자동 감지",
   "modal.model_settings.max_context_window": "컨텍스트 윈도우",
   "modal.model_settings.max_context_window_hint": "모델이 다룰 수 있는 전체 컨텍스트 크기를 정합니다. 이보다 긴 프롬프트는 거부됩니다.",
+  "modal.model_settings.max_context_window_memory_warning": "Only about {tokens} tokens fit in memory right now.",
   "modal.model_settings.embedding_context_window_hint": "요청에 max_length가 없으면 이보다 긴 입력은 이 길이로 잘립니다.",
   "modal.model_settings.reranker_context_window_hint": "요청에 max_length가 없을 때 쓰입니다. Jina 리랭커는 문서를 이 토큰 수까지 한 번에 읽고, 다른 리랭커는 쿼리-문서 쌍마다 이 길이로 자릅니다.",
   "modal.model_settings.max_tokens": "최대 토큰 수",
