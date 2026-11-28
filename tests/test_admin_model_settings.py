@@ -199,6 +199,21 @@ async def test_load_time_setting_change_clears_cached_failure():
 
 
 @pytest.mark.asyncio
+async def test_stt_mtp_setting_is_saved():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+    assert settings.stt_mtp_enabled is False
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(stt_mtp_enabled=True),
+    )
+
+    assert settings.stt_mtp_enabled is True
+
+
+@pytest.mark.asyncio
 async def test_embedding_audio_setting_is_load_time():
     pool, entry = _failed_pool()
     settings = ModelSettings()

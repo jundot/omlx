@@ -4475,7 +4475,12 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
                 elif entry.engine_type == "audio_stt":
-                    engine = STTEngine(model_name=entry.model_path)
+                    engine = STTEngine(
+                        model_name=entry.model_path,
+                        mtp_enabled=bool(
+                            getattr(model_settings, "stt_mtp_enabled", False)
+                        ),
+                    )
                 elif entry.engine_type == "audio_tts":
                     engine = TTSEngine(model_name=entry.model_path)
                 elif entry.engine_type == "audio_sts":

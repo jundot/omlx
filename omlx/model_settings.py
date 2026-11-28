@@ -657,6 +657,13 @@ class ModelSettings:
     # (8192 tokens at 40 ms each); longer inputs get the token-limit error.
     embedding_audio_max_seconds: Optional[float] = None
 
+    # Speech-to-text models with retained MTP weights (Nemotron 3.5 Transcribe
+    # converted with mlx-audio >= 0.6.4): decode with greedy MTP speculative
+    # decoding on /v1/audio/transcriptions. Off by default: the draft path
+    # changes tie-break rounding, so a few words can differ from plain decoding.
+    # Ignored for STT models without an MTP head.
+    stt_mtp_enabled: bool = False
+
     # Metadata
     display_name: Optional[str] = None
     description: Optional[str] = None

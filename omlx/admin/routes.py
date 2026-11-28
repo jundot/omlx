@@ -533,6 +533,7 @@ class ModelSettingsRequest(BaseModel):
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
     embedding_audio_enabled: bool | None = None
+    stt_mtp_enabled: bool | None = None
     embedding_audio_max_seconds: float | None = Field(default=None, gt=0)
 
     @field_validator("turboquant_kv_bits")
@@ -3692,6 +3693,8 @@ async def update_model_settings(
         current_settings.is_favorite = request.is_favorite
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
+    if "stt_mtp_enabled" in sent:
+        current_settings.stt_mtp_enabled = bool(request.stt_mtp_enabled)
     if "embedding_audio_enabled" in sent:
         current_settings.embedding_audio_enabled = bool(
             request.embedding_audio_enabled

@@ -968,6 +968,84 @@ class TestSTTDiarization:
 
 
 # ---------------------------------------------------------------------------
+# TestSTTMtp
+# ---------------------------------------------------------------------------
+
+_NEMOTRON_MODULE = "mlx_audio.stt.models.nemotron_transcribe.nemotron_transcribe"
+_WHISPER_MODULE = "mlx_audio.stt.models.whisper.whisper"
+
+
+class TestSTTMtp:
+    """``stt_mtp_enabled``: MTP speculative decoding only where the model has it."""
+
+    @staticmethod
+    async def _generate_kwargs(tmp_path, module, *, mtp_enabled, has_mtp, **kwargs):
+        seen = {}
+
+        class FakeModel:
+            __module__ = module
+            sample_rate = 16000
+            llm = SimpleNamespace(mtp=object() if has_mtp else None)
+
+            def generate(self, audio, **gen_kwargs):
+                seen.update(gen_kwargs)
+                return SimpleNamespace(text="hi", segments=[], total_time=0.1)
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(_make_wav_bytes(duration_secs=1.0))
+        engine = STTEngine("m", mtp_enabled=mtp_enabled)
+        engine._model = FakeModel()
+        await engine.transcribe(str(audio_path), **kwargs)
+        return seen
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("diarize", [False, True])
+    async def test_enabled_nemotron_with_mtp_head_speculates(self, tmp_path, diarize):
+        seen = await self._generate_kwargs(
+            tmp_path, _NEMOTRON_MODULE, mtp_enabled=True, has_mtp=True, diarize=diarize
+        )
+
+        assert seen["speculative"] is True
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_default(self, tmp_path):
+        seen = await self._generate_kwargs(
+            tmp_path, _NEMOTRON_MODULE, mtp_enabled=False, has_mtp=True
+        )
+
+        assert "speculative" not in seen
+
+    @pytest.mark.asyncio
+    async def test_conversion_without_mtp_head_is_unchanged(self, tmp_path):
+        # mlx-audio raises on speculative=True when llm.mtp.* was dropped.
+        seen = await self._generate_kwargs(
+            tmp_path, _NEMOTRON_MODULE, mtp_enabled=True, has_mtp=False
+        )
+
+        assert "speculative" not in seen
+
+    @pytest.mark.asyncio
+    async def test_other_stt_backends_never_get_the_argument(self, tmp_path):
+        seen = await self._generate_kwargs(
+            tmp_path, _WHISPER_MODULE, mtp_enabled=True, has_mtp=True
+        )
+
+        assert "speculative" not in seen
+
+    @pytest.mark.asyncio
+    async def test_explicit_caller_argument_wins(self, tmp_path):
+        seen = await self._generate_kwargs(
+            tmp_path,
+            _NEMOTRON_MODULE,
+            mtp_enabled=True,
+            has_mtp=True,
+            speculative=False,
+        )
+
+        assert seen["speculative"] is False
+
+
+# ---------------------------------------------------------------------------
 # TestSTTEndpointErrors
 # ---------------------------------------------------------------------------
 
