@@ -14,7 +14,11 @@ from mlx_vlm.models.base import LanguageModelOutput, create_attention_mask
 
 from ..deepseek_v4.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from ..deepseek_v41.mtp import AcceptanceDepthController
-from ..mlx_lm_mtp.cache_rollback import _is_decode_consistent_armed, _is_undo_armed
+from ..mlx_lm_mtp.cache_rollback import (
+    _is_decode_consistent_armed,
+    _is_undo_armed,
+    set_undo_armed,
+)
 from . import exact, verify_dispatch
 from . import kernels as hc_kernels
 from .config import TextConfig
@@ -511,6 +515,135 @@ class LanguageModel(nn.Module):
         if not all(e.is_trimmable() for e in entries):
             return False
         return all(e.trim(rejected) == rejected for e in entries)
+
+    # Max total tokens (batch_size * verify_width) verified in one shared
+    # forward pass. At 24, up to 4 concurrent requests verify at full DFly2
+    # depth 5 (width 6) in one target pass while larger batches adapt depth.
+    _MTP_SHARED_VERIFY_ROWS = 24
+
+    def mtp_shared_verify_rows(self) -> int:
+        if not self._omlx_mtp_decode_enabled or exact.armed() or EXACT_VERIFY:
+            return 0
+        return self._MTP_SHARED_VERIFY_ROWS
+
+    def mtp_verify_rows_ok(self, row_caches, width: int) -> bool:
+        if (
+            not self._omlx_mtp_decode_enabled
+            or exact.armed()
+            or EXACT_VERIFY
+            or len(row_caches) < 2
+            or width < 2
+            or width > 16
+        ):
+            return False
+        n_layers = len(self.layers)
+        return all(
+            c is not None and len(c) == n_layers and all(entry is not None for entry in c)
+            for c in row_caches
+        )
+
+    def mtp_verify_rows(self, inputs: mx.array, row_caches):
+        """Verify B requests' MTP blocks (inputs: [B, R]) in one target forward.
+
+        Merges each layer's per-row caches, runs one batched backbone forward
+        with rotating-cache undo armed, extracts each request's advanced cache
+        with its own pre-update rotating undo snapshot, and stashes per-row
+        ``left_padding``-rebased DFly2 indexer selections for ``mtp_prepare_row``.
+        """
+        b = len(row_caches)
+        n_layers = len(self.layers)
+
+        # Snapshot each row's pre-update RotatingKVCache fields (cheap ref copy;
+        # merge builds a separate BatchRotatingKVCache so originals stay intact).
+        rotating_snaps: dict[int, list[dict[str, Any]]] = {}
+        for layer_idx in range(n_layers):
+            if isinstance(row_caches[0][layer_idx], RotatingKVCache):
+                rotating_snaps[layer_idx] = [
+                    {
+                        "keys": rc[layer_idx].keys,
+                        "values": rc[layer_idx].values,
+                        "offset": rc[layer_idx].offset,
+                        "_idx": rc[layer_idx]._idx,
+                    }
+                    for rc in row_caches
+                ]
+
+        merged = [
+            type(row_caches[0][layer_idx]).merge(
+                [rc[layer_idx] for rc in row_caches]
+            )
+            for layer_idx in range(n_layers)
+        ]
+
+        prev_undo = _is_undo_armed()
+        prev_verify = verify_dispatch.armed()
+        set_undo_armed(True)
+        set_dspark_verify_armed(True)
+        try:
+            out = self(inputs, cache=merged, return_hidden=True)
+        finally:
+            set_undo_armed(prev_undo)
+            set_dspark_verify_armed(prev_verify)
+
+        # Capture batched topk selections per DFly index layer and the merged
+        # left_padding of each corresponding latent cache so we can rebase slots
+        # to each extracted row's 0-based coordinates.
+        index_layers = (
+            tuple(dict.fromkeys(self.dfly.cfg.index_layers)) if "dfly" in self else ()
+        )
+        batched_topk: dict[int, tuple[Any, list[int]]] = {}
+        for idx_layer in index_layers:
+            topk = self.layers[idx_layer].self_attn._captured_topk
+            if topk is not None:
+                latent = _latent_cache(merged[idx_layer])
+                lp = getattr(latent, "left_padding", None)
+                paddings = lp.tolist() if lp is not None else [0] * b
+            else:
+                paddings = [0] * b
+            batched_topk[idx_layer] = (topk, paddings)
+
+        # Grab per-layer rotating-cache update slices recorded by _wrap_rotating.
+        rotating_updates: dict[int, tuple[mx.array, mx.array, bool]] = {}
+        for layer_idx in rotating_snaps:
+            undo = getattr(merged[layer_idx], "_mtp_undo", None)
+            if undo is not None:
+                _, upd_keys, upd_values, decode_consistent = undo
+                rotating_updates[layer_idx] = (upd_keys, upd_values, decode_consistent)
+                merged[layer_idx]._mtp_undo = None
+
+        extracted_caches = []
+        for r in range(b):
+            rc = [merged[layer_idx].extract(r) for layer_idx in range(n_layers)]
+            for layer_idx, (upd_keys, upd_values, decode_consistent) in rotating_updates.items():
+                rc[layer_idx]._mtp_undo = (
+                    rotating_snaps[layer_idx][r],
+                    upd_keys[r : r + 1],
+                    upd_values[r : r + 1],
+                    decode_consistent,
+                )
+            row_topk = {}
+            for idx_layer, (topk, paddings) in batched_topk.items():
+                if topk is None:
+                    row_topk[idx_layer] = None
+                else:
+                    pad = int(paddings[r])
+                    sliced = topk[r : r + 1]
+                    row_topk[idx_layer] = sliced - pad if pad else sliced
+            rc[0]._dfly_row_topk = row_topk
+            extracted_caches.append(rc)
+
+        hidden = out.hidden_states[-1] if out.hidden_states else None
+        return out.logits, hidden, extracted_caches
+
+    def mtp_prepare_row(self, cache) -> None:
+        """Bind one extracted row's cache and rebased topk before DFly2 drafts."""
+        self._dfly_cache = cache
+        self._position_delta.value = None
+        row_topk = getattr(cache[0], "_dfly_row_topk", None)
+        if row_topk is not None:
+            cache[0]._dfly_row_topk = None
+            for idx_layer, topk in row_topk.items():
+                self.layers[idx_layer].self_attn._captured_topk = topk
 
     @property
     def layers(self):

@@ -661,6 +661,93 @@ def test_mtp_drafts_for_concurrent_requests(monkeypatch, kind):
     assert len(drafts) > 2
 
 
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_mtp_shared_verify_rows_matches_singleton(kind):
+    """Shared batched verify matches singleton logits, rollback, and DFly2 drafts."""
+    from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+    from omlx.patches.mlx_lm_mtp.cache_rollback import set_undo_armed
+
+    assert apply_mlx_lm_mtp_patch()
+    model = _quantized_model(kind, None, dfly=True, calm=True, dtype=mx.float32)
+    lm = model.language_model
+    lm.configure_mtp(True, 5)
+    # Unequal lengths exceeding both sliding_window and index_topk.
+    prompts = [_ids(11, n=26), _ids(12, n=19), _ids(13, n=22)]
+    blocks = [_ids(21 + i, n=4) for i in range(3)]
+    accepts = [0, 2, 3]
+
+    ref_caches, ref_logits, ref_hiddens, ref_drafts = [], [], [], []
+    for p, blk, acc in zip(prompts, blocks, accepts):
+        c = lm.make_cache()
+        lm(mx.array(p[None], dtype=mx.int32), cache=c)
+        set_undo_armed(True)
+        out = lm(mx.array(blk[None], dtype=mx.int32), cache=c, return_hidden=True)
+        set_undo_armed(False)
+        ref_logits.append(out.logits)
+        ref_hiddens.append(out.hidden_states[-1])
+        assert lm.mtp_partial_rollback(c, acc, len(blk) - 1)
+        anchor = mx.array([[int(blk[acc])]], dtype=mx.int32)
+        d, _ = lm.dspark_forward(
+            out.hidden_states[-1][:, : acc + 1], anchor, draft_length=3
+        )
+        ref_drafts.append(d)
+        ref_caches.append(c)
+
+    row_caches = []
+    for p in prompts:
+        c = lm.make_cache()
+        lm(mx.array(p[None], dtype=mx.int32), cache=c)
+        row_caches.append(c)
+    inputs = mx.array(np.stack(blocks), dtype=mx.int32)
+    assert lm.mtp_shared_verify_rows() >= inputs.shape[0] * inputs.shape[1]
+    assert lm.mtp_verify_rows_ok(row_caches, inputs.shape[1])
+    b_logits, b_hidden, ext_caches = lm.mtp_verify_rows(inputs, row_caches)
+    for r, (c, acc, blk) in enumerate(zip(ext_caches, accepts, blocks)):
+        lm.mtp_prepare_row(c)
+        np.testing.assert_allclose(
+            np.asarray(b_logits[r : r + 1]), np.asarray(ref_logits[r]), atol=1e-4, rtol=1e-4
+        )
+        np.testing.assert_allclose(
+            np.asarray(b_hidden[r : r + 1]), np.asarray(ref_hiddens[r]), atol=1e-4, rtol=1e-4
+        )
+        assert lm.mtp_partial_rollback(c, acc, len(blk) - 1)
+        anchor = mx.array([[int(blk[acc])]], dtype=mx.int32)
+        d, _ = lm.dspark_forward(
+            b_hidden[r : r + 1, : acc + 1], anchor, draft_length=3
+        )
+        np.testing.assert_allclose(np.asarray(d), np.asarray(ref_drafts[r]), atol=1e-4, rtol=1e-4)
+        nxt = mx.array([[42]], dtype=mx.int32)
+        np.testing.assert_allclose(
+            np.asarray(lm(nxt, cache=c).logits),
+            np.asarray(lm(nxt, cache=ref_caches[r]).logits),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+@pytest.mark.parametrize("kind", ["hy4", "flash"])
+def test_mtp_concurrent_requests_use_shared_verify(monkeypatch, kind):
+    """Concurrent requests verify together through mtp_verify_rows."""
+    from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+
+    assert apply_mlx_lm_mtp_patch()
+    model = _quantized_model(kind, None, dfly=True, calm=True, dtype=mx.float32)
+    lm = model.language_model
+    verify_shapes = []
+    original = type(lm).mtp_verify_rows
+
+    def tracked(self, inputs, row_caches):
+        verify_shapes.append(tuple(inputs.shape))
+        return original(self, inputs, row_caches)
+
+    monkeypatch.setattr(type(lm), "mtp_verify_rows", tracked)
+    prompts = [_ids(11, n=26), _ids(12, n=19), _ids(13, n=22)]
+    expected = [_generate(model, [p], 10, use_mtp=False)[0] for p in prompts]
+    verify_shapes.clear()
+    assert _generate(model, prompts, 10, use_mtp=True) == expected
+    assert any(shape[0] >= 2 for shape in verify_shapes)
+
+
 def _checkpoint(path, cfg, model):
     """Save a tiny model as an oMLX-layout BF16 checkpoint."""
     weights = {

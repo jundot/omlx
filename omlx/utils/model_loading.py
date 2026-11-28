@@ -1130,6 +1130,16 @@ def maybe_apply_pre_load_patches(
                 # DSpark drafts a whole dspark_block_size block per cycle.
                 block = (text_config or config).get("dspark_block_size")
                 set_mtp_depth(int(block) if block else 3)
+            elif model_type == "hy_v4_flash":
+                # DFly2 drafts a whole block per cycle (default 5 draft tokens).
+                spec = config.get("speculative_config") or {}
+                block = config.get("dfly_block_size")
+                depth = (
+                    int(block) - 1
+                    if block
+                    else int(spec.get("num_speculative_tokens") or 5)
+                )
+                set_mtp_depth(max(1, depth))
             else:
                 set_mtp_depth(3)
             if mtp_enabled:

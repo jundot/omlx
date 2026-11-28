@@ -313,9 +313,18 @@ def _verify_rows_together(batch, batch_state, host, indices, replacements):
     started = time.perf_counter()
     logits, hidden, caches = host.mtp_verify_rows(inputs, caches)
     verify_ms = (time.perf_counter() - started) * 1000 / len(rows)
-    jobs = [] if bg._dspark_host(batch.model) is not None else None
+    dspark = bg._dspark_host(batch.model)
+    jobs = (
+        []
+        if dspark is not None
+        and callable(getattr(dspark, "dspark_hidden_rows", None))
+        else None
+    )
+    prepare_row = getattr(host, "mtp_prepare_row", None)
     for i, ((index, row), state, cache) in enumerate(zip(rows, states, caches)):
         row.prompt_cache = cache
+        if callable(prepare_row):
+            prepare_row(cache)
         bg._set_singleton_mrope_delta(row)
         bg._run_verify_cycle_chain(
             row,
