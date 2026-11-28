@@ -93,6 +93,36 @@ def _concat_captured(captured: Sequence[mx.array]) -> mx.array:
     return mx.concatenate(list(captured), axis=-1)
 
 
+def _activation_dtype(model: nn.Module) -> mx.Dtype:
+    """Dtype the drafter's activations and KV ring compute in.
+
+    A ModelOpt NVFP4 drafter stores its block scales as ``uint8`` E4M3 bit
+    patterns, so the projection's ``scales`` dtype is not a compute type: a
+    ring or residual allocated from it truncates every hidden row. Read the
+    model's own floating parameters instead, preferring the drafter's
+    projection norms over the borrowed target embedding table.
+    """
+    encoder = getattr(model, "encoder", None)
+    candidates = (
+        getattr(model, "hidden_norm", None),
+        getattr(model, "norm", None),
+        getattr(model, "fc", None),
+        # Muse Glimmer's context projection hangs off ``encoder``.
+        getattr(encoder, "fc", None),
+        getattr(model, "embed_tokens", None),
+    )
+    for module in candidates:
+        if module is None:
+            continue
+        for attribute in ("weight", "scales"):
+            value = getattr(module, attribute, None)
+            if isinstance(value, mx.array) and mx.issubdtype(
+                value.dtype, mx.floating
+            ):
+                return value.dtype
+    return mx.bfloat16
+
+
 class DFlashDrafter:
     """Row-wise DFlash drafting against per-request context caches."""
 
@@ -164,6 +194,10 @@ class DFlashDrafter:
 
     @property
     def kind(self) -> str:
+        # LiLiCorr's head replaces the candidate selector: same DFlash block
+        # loop, correlation proposals instead of codebook edges.
+        if getattr(self.model.config, "model_type", None) == "lilicorr":
+            return "lilicorr"
         return "dflash2" if hasattr(self.model, "candidate_selector") else "dflash"
 
     def _proposal_count(self, state) -> int:
@@ -593,6 +627,45 @@ class DFlashDrafter:
         self._cohort = _Cohort(uids=uids, keys=keys, values=values, pos=pos)
         return self._cohort
 
+    def _lilicorr_proposals(
+        self, head, draft_hidden, logits, anchors, h_ctx, lengths, counts, samplers
+    ):
+        """Proposals from the LiLiCorr correlation head.
+
+        Each row's anchor is the newest *committed* projected context row. A
+        predraft's ``h_ctx`` holds every verify row while only ``counts`` of
+        them commit, so ``counts`` (when given) names the committed prefix;
+        otherwise every queued context row is committed and ``lengths`` does.
+        """
+        if any(int(n) <= 0 for n in lengths):
+            raise RuntimeError("LiLiCorr drafting requires committed target context")
+        embeddings = getattr(self.model, "embed_tokens", None)
+        if embeddings is None:
+            raise RuntimeError(
+                "LiLiCorr drafting needs the target token embedding table"
+            )
+        if counts is None:
+            anchor_context = mx.stack(
+                [h_ctx[index, lengths[index] - 1] for index in range(len(lengths))]
+            )
+        else:
+            # Lazy: a predraft must not stop to read the acceptance counts. A
+            # row that commits nothing still drafts a block nobody adopts, so
+            # its anchor only has to be a valid row.
+            last = mx.maximum(mx.concatenate(counts).astype(mx.int32), 1) - 1
+            anchor_context = mx.take_along_axis(
+                h_ctx, last[:, None, None], axis=1
+            )[:, 0]
+        return selection.select_lilicorr(
+            head,
+            draft_hidden,
+            logits,
+            anchors,
+            anchor_context,
+            samplers,
+            embeddings,
+        )
+
     def _draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
         """One draft forward for every row; mirrors DFlashAttention rowwise math.
 
@@ -608,10 +681,7 @@ class DFlashDrafter:
         block = self.block_size
         dtype = getattr(model, "context_dtype", None)
         if dtype is None:
-            fc = model.encoder.fc if hasattr(model, "encoder") else model.fc
-            dtype = fc.weight.dtype if hasattr(fc, "weight") else mx.bfloat16
-            if hasattr(fc, "scales"):
-                dtype = fc.scales.dtype
+            dtype = _activation_dtype(model)
 
         # Context segments: keep at most ``slots`` newest tokens per row and
         # count the rest as skipped so absolute positions stay aligned. A
@@ -850,7 +920,12 @@ class DFlashDrafter:
         logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)
-        if markov is not None:
+        head = getattr(model, "lilicorr", None)
+        if head is not None:
+            proposals = self._lilicorr_proposals(
+                head, draft_hidden, logits, anchors, h_ctx, lengths, counts, samplers
+            )
+        elif markov is not None:
             prepare = getattr(markov, "prepare_block", None)
             if prepare is not None:
                 # Recurrent Markov heads start each block from the newest

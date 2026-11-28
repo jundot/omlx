@@ -77,6 +77,67 @@ def select_markov(markov, logits, anchors, samplers) -> list[tuple]:
     ]
 
 
+def select_lilicorr(
+    head,
+    hidden: mx.array,
+    logits: mx.array,
+    anchors: mx.array,
+    anchor_context: mx.array,
+    samplers: list,
+    token_embeddings,
+) -> list[tuple]:
+    """LiLiCorr proposals: walk the correlation lattice from the anchor.
+
+    ``head.score`` returns ``candidates`` ``(B, slots, top_k)`` sorted by
+    descending draft logit and ``scores`` ``(B, slots, top_k, top_k)`` whose
+    last two axes are ``(predecessor rank, candidate rank)``. Position 0 has
+    one predecessor -- the anchor -- in row 0 (the other rows are zero, the
+    ``ggml_pad`` layout of ``build_lilicorr_scores``); position ``p`` reads the
+    row of the candidate chosen at ``p - 1``, so the path starts at predecessor
+    rank 0 and each pick is the argmax (or a draw) of the current row.
+
+    Greedy rows contribute no q, like the other selectors; sampled rows apply
+    their sampler's filters to the same row and expose the resulting normalized
+    density as a :class:`SparseDraftQ` over that position's candidates.
+    ``anchors`` only positions the block: LiLiCorr's position-0 predecessor is
+    the projected context row, not the anchor token id.
+    """
+    del anchors
+    batch, length, vocab = logits.shape
+    candidates, scores = head.score(hidden, logits, token_embeddings, anchor_context)
+    length = min(length, int(candidates.shape[1]))
+    predecessor = mx.zeros((batch,), dtype=mx.int32)
+    tokens = [[] for _ in range(batch)]
+    densities = [[] for _ in range(batch)]
+    for position in range(length):
+        # (batch, candidate) row of the candidate this row picked last.
+        row = mx.take_along_axis(
+            scores[:, position], predecessor[:, None, None], axis=1
+        )[:, 0]
+        ranks = []
+        for index, sampler in enumerate(samplers):
+            if sampler is None:
+                pick = mx.argmax(row[index], keepdims=True)
+            else:
+                pick, density = sample_candidates(row[index : index + 1], sampler)
+                densities[index].append(density)
+            ranks.append(pick.reshape(1))
+            tokens[index].append(candidates[index, position][pick].reshape(1))
+        # The next position's row is indexed by the candidate *rank* picked
+        # here, not by the token id it maps to.
+        predecessor = mx.concatenate(ranks).astype(mx.int32)
+    accept = [[] for _ in range(batch)]
+    for index in range(batch):
+        if not densities[index]:
+            continue
+        rows = mx.concatenate(densities[index])  # (length, top_k)
+        accept[index] = bg.SparseDraftQ(candidates[index, :length], rows, vocab)
+    return [
+        (mx.concatenate(tokens[index])[None].astype(mx.int32), accept[index])
+        for index in range(batch)
+    ]
+
+
 def sample_candidates(scores: mx.array, sampler) -> tuple[mx.array, mx.array]:
     """Draw from ``sampler``'s filters applied to candidate scores ``(1, C)``.
 
