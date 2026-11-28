@@ -220,6 +220,23 @@ def _gather_qmm_rerouted(x, w, *args, **kwargs):
 _gather_qmm_rerouted._omlx_m5_reroute = True
 
 
+def oqh_sorted_gather_qmm(x, w, rscale, indices, bits):
+    """Sorted oQh routed experts on the NAX tensor units, reading the row
+    scales in the kernel. None keeps the caller's path."""
+    if not getattr(mx.gather_qmm, "_omlx_m5_reroute", False) or not _on_nax_host():
+        return None
+    return _nax.sorted_gather_qmm(
+        x,
+        w,
+        rscale,
+        None,
+        indices.astype(mx.uint32),
+        group_size=64,
+        bits=bits,
+        mode="oqh",
+    )
+
+
 # SwitchGLU activations the gate/up epilogue reproduces, by exact class:
 # ``__call__(x_up, x_gate)`` is mlx-lm / mlx-vlm's compiled
 # ``swiglu(x_gate, x_up) = nn.silu(x_gate) * x_up`` ...

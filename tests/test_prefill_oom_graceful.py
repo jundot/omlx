@@ -14,6 +14,7 @@ cases execute a small initialized MLX model with controlled footprint readings;
 no downloaded checkpoint is required.
 """
 
+import dataclasses
 import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -167,6 +168,7 @@ def _throttle_ctx(
         _PREFILL_ABORT_MARGIN=Scheduler._PREFILL_ABORT_MARGIN,
         _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
         _last_mlx_active_memory_bytes=0,
+        _pool_release=None,
     )
     # Bind the real helper methods so the stand-in behaves like a Scheduler.
     ns._snap_chunk_size = Scheduler._snap_chunk_size.__get__(ns, Scheduler)
@@ -1367,6 +1369,7 @@ def test_step_prefill_reclaims_before_first_guard(monitor, expected_gathered):
         _reserve_qsa_index_capacity=MagicMock(),
     )
     ns.running = {}
+    ns._pool_release = None
     ns._decode_fairness = True
     ns._decode_time_owed_s = 0.0
     ns._decode_activity_key = "test-engine"
@@ -1397,9 +1400,15 @@ def test_step_prefill_reclaims_before_first_guard(monitor, expected_gathered):
         patch.object(sched_mod.mx, "stream"),
         patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
         patch.object(
-            sched_mod.mx, "get_active_memory", side_effect=[10 * _GB, 10 * _GB + 64]
+            sched_mod.mx,
+            "get_active_memory",
+            side_effect=[10 * _GB, 10 * _GB + 64, 10 * _GB + 64],
         ),
-        patch.object(sched_mod.mx, "get_cache_memory", side_effect=[0, 2 * _GB]),
+        patch.object(
+            sched_mod.mx,
+            "get_cache_memory",
+            side_effect=[0, 0, 2 * _GB, 2 * _GB, 2 * _GB],
+        ),
         # The previous chunk's released pool still sits in both ledgers, so
         # only the MLX counters show this chunk's growth.
         patch.object(sched_mod, "get_phys_footprint", return_value=41 * _GB),
@@ -2208,6 +2217,24 @@ def test_glm5_next_profile_prices_exact_block_expansion_for_small_chunks():
     )
 
 
+def test_glm5_next_fused_kernel_pricing_is_monotone_and_covers_short_routes():
+    profile = make_prefill_memory_profile(_glm5_next_config(), compute_dtype_size=2)
+    fused = dataclasses.replace(profile, fused_sparse_kernels=True)
+    unfused = dataclasses.replace(profile, fused_sparse_kernels=False)
+
+    long_fused = fused.estimate_prefill_transient_bytes(4096, 131072)
+    long_unfused = unfused.estimate_prefill_transient_bytes(4096, 131072)
+    assert long_fused < long_unfused / 4
+    by_rows = [
+        fused.estimate_prefill_transient_bytes(rows, 131072)
+        for rows in (1, 8, 16, 31, 32, 64, 512, 4096)
+    ]
+    assert by_rows == sorted(by_rows)
+    assert fused.estimate_prefill_transient_bytes(
+        8, 131072
+    ) >= unfused.estimate_prefill_transient_bytes(8, 131072)
+
+
 def test_glm5_next_flat_overhead_guard_admits_full_chunk_at_1948_numbers():
     """Retained pool memory must not be charged twice during admission."""
     monitor = _glm5_next_monitor()
@@ -2424,6 +2451,65 @@ def test_v41_flat_overhead_charges_pool_once_and_releases_on_reclaim():
     ns._prefill_transient_tracker.record_flat_reclaim(12 * _GB)
     charged = ns._predicted_chunk_transient(2047, 2048)
     assert charged == pytest.approx(static * 1.3 + flat, rel=1e-6)
+
+
+def test_v41_flat_overhead_ignores_pool_the_chunk_did_not_fill():
+    monitor = _v41_monitor()
+    clean = _throttle_ctx(current=0, hard=int(123.5 * _GB), monitor=monitor)
+    mixed = _throttle_ctx(current=0, hard=int(123.5 * _GB), monitor=monitor)
+    for ns, post, unowned in ((clean, 3 * _GB, 0), (mixed, 5 * _GB, 2 * _GB)):
+        Scheduler._record_chunk_transient(
+            ns,
+            512,
+            pre_bytes=0,
+            post_bytes=post,
+            request_id="r",
+            loop_label="test",
+            kv_len=2048,
+            unowned_pool_bytes=unowned,
+        )
+    clean_tracker = clean._prefill_transient_tracker
+    mixed_tracker = mixed._prefill_transient_tracker
+    for tracker in (clean_tracker, mixed_tracker):
+        tracker.record_flat_reclaim(16 * _GB)
+    assert clean_tracker.flat_overhead_charge_for(False, 512) > 0
+    assert mixed_tracker.flat_overhead_charge_for(
+        False, 512
+    ) == clean_tracker.flat_overhead_charge_for(False, 512)
+
+
+def test_guard_reclaim_measures_after_the_kernel_releases_the_pool(monkeypatch):
+    now = [100.0]
+    mlx = {"active": 223 * _GB, "cache": int(7.75 * _GB)}
+    graphics = [231 * _GB]
+
+    def sleep(seconds):
+        now[0] += seconds
+        if now[0] >= 100.1:
+            graphics[0] = int(223.25 * _GB)
+
+    def sync_and_clear(stream):
+        mlx["cache"] = 0
+
+    ns = _throttle_ctx(current=0, hard=int(123.5 * _GB))
+    ns._stream = None
+    ns._reclaim_prefill_headroom = Scheduler._reclaim_prefill_headroom.__get__(
+        ns, Scheduler
+    )
+    monkeypatch.setattr(sched_mod.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(sched_mod.time, "sleep", sleep)
+    monkeypatch.setattr(sched_mod, "_sync_and_clear_cache", sync_and_clear)
+    monkeypatch.setattr(sched_mod.mx, "get_active_memory", lambda: mlx["active"])
+    monkeypatch.setattr(sched_mod.mx, "get_cache_memory", lambda: mlx["cache"])
+    monkeypatch.setattr(sched_mod, "get_graphics_footprint", lambda: graphics[0])
+    monkeypatch.setattr(
+        sched_mod, "get_phys_footprint", lambda: graphics[0] + int(0.5 * _GB)
+    )
+    monkeypatch.setattr(sched_mod, "unreleased_graphics_bytes", lambda *a, **k: 0)
+    Scheduler._clear_cache(ns)
+    mlx["cache"] = 16 * 1024**2
+    Scheduler._clear_cache(ns)
+    assert Scheduler._reclaim_settled_headroom(ns) == int(223.75 * _GB)
 
 
 # --------------------------------------------------------------------------

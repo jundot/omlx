@@ -15,7 +15,6 @@ from ... import oq
 from ...oqh import format as fmt
 from ...oqh import quantize, targets
 from .loading import load
-from .quantization import QuantizedProjection
 
 logger = logging.getLogger(__name__)
 
@@ -44,19 +43,6 @@ def planned_bytes(inventory, allocation, names) -> int:
     )
 
 
-def float_experts(module, first: int, stop: int) -> mx.array:
-    if isinstance(module, QuantizedProjection):
-        return mx.dequantize(
-            module.weight[first:stop],
-            module.scales[first:stop],
-            module.get("biases")[first:stop] if "biases" in module else None,
-            group_size=module.group_size,
-            bits=module.bits,
-            mode=module.mode,
-        ).astype(mx.float32)
-    return module.weight[first:stop].astype(mx.float32)
-
-
 def _quantize_module(collector, owner, name, module, bits):
     n_exp = int(module.weight.shape[0])
     in_dim = oq.OQImatrixCollector._module_in_dim(module)
@@ -67,7 +53,7 @@ def _quantize_module(collector, owner, name, module, bits):
     out_dim = int(module.weight.shape[-2])
     for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
         gram = oq._shrunk_gram(collector.switch_gram(owner, first, stop))
-        weight = float_experts(module, first, stop)
+        weight = oq._float_experts(module, first, stop)
         p, r, b0, b1 = quantize.quantize(weight, gram, bits, signs, block)
         packed.append(p)
         rscale.append(r)
@@ -85,14 +71,6 @@ def _quantize_module(collector, owner, name, module, bits):
 
 def expert_layer(name: str) -> int:
     return int(name.split("layers.")[1].split(".")[0])
-
-
-def expert_owner(collector, name: str) -> str:
-    """The collector entry holding name's inputs (w3 shares w1's)."""
-    owner = collector.aliases.get(name, name)
-    if owner not in collector.switch_rows:
-        raise RuntimeError(f"V4.1: no calibration input for {name}")
-    return owner
 
 
 def iter_expert_grams(
@@ -202,7 +180,7 @@ def write_experts(
                 continue
             values, entry, b0, b1 = _quantize_module(
                 collector,
-                expert_owner(collector, name),
+                collector.owner(name),
                 name,
                 getattr(experts, part),
                 by_layer[i][name],

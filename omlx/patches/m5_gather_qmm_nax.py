@@ -84,8 +84,8 @@ float32 with the per-expert gate and up scales.
 Supported: ``transpose=True``, rhs-indices only, ``x`` of shape
 ``[M, 1, K]`` with a flat sorted ``uint32`` index of length ``M``, bf16/fp16
 activations, N a multiple of 32, affine 4/8-bit with group 32/64/128
-(scales and biases in the activation dtype), MXFP4 (group 32) and NVFP4
-(group 16, no global scale); the epilogue additionally needs
+(scales and biases in the activation dtype), MXFP4 and MXFP8 (group 32) and
+NVFP4 (group 16, no global scale); the epilogue additionally needs
 ``2 * n % 64 == 0``, the row map a uint32 ``[M]`` map and fewer than 2**32
 token-row elements. Anything else returns None and the caller keeps the
 stock path.
@@ -350,6 +350,31 @@ struct AffineQ {
   }
 };
 
+template <typename T, int GS, int BITS>
+struct RowQ {
+  using WT = T;
+  STEEL_CONST int kBits = BITS;
+  STEEL_CONST int kGroup = GS;
+  const device T* rscale;
+  int row_groups;
+
+  struct P {
+    float s;
+    float b;
+  };
+
+  METAL_FUNC void advance(const size_t n) thread {
+    rscale += n / row_groups;
+  }
+  METAL_FUNC P params(const int) const thread {
+    const float s = float(rscale[0]);
+    return P{s, -0.5f * float((1 << BITS) - 1) * s};
+  }
+  METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
+    return static_cast<WT>(p.s * float(q) + p.b);
+  }
+};
+
 // FP4: e2m1 values times the group scale, dequantized to bfloat like
 // mlx's fp QuantizedBlockLoader (Wtype = bfloat).
 // GS 32 is MXFP4 (e8m0 scales), GS 16 is NVFP4 (e4m3 scales).
@@ -378,6 +403,30 @@ struct Fp4Q {
   METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
     uint8_t qb = uint8_t(q);
     return static_cast<WT>(p.s * float(*(thread fp4_e2m1*)(&qb)));
+  }
+};
+
+template <int GS>
+struct Fp8Q {
+  using WT = bfloat;
+  STEEL_CONST int kBits = 8;
+  STEEL_CONST int kGroup = GS;
+  const device uint8_t* scales;
+
+  struct P {
+    float s;
+  };
+
+  METAL_FUNC void advance(const size_t n) thread {
+    scales += n;
+  }
+  METAL_FUNC P params(const int g) const thread {
+    uint8_t sb = scales[g];
+    return P{float(static_cast<bfloat>(*(thread fp8_e8m0*)(&sb)))};
+  }
+  METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
+    uint8_t qb = uint8_t(q);
+    return static_cast<WT>(p.s * float(*(thread fp8_e4m3*)(&qb)));
   }
 };
 
@@ -1081,6 +1130,16 @@ _FP_SOURCE = _MM_SOURCE_TMPL.format(
     q_init="Q q{scales};",
 )
 
+_FP8_SOURCE = _MM_SOURCE_TMPL.format(
+    q_type="using Q = omlx_gqmm::Fp8Q<GS>;",
+    q_init="Q q{scales};",
+)
+
+_ROW_SOURCE = _MM_SOURCE_TMPL.format(
+    q_type="using Q = omlx_gqmm::RowQ<T, GS, BITS>;",
+    q_init="Q q{scales, params[1] / GS};",
+)
+
 # ---------------------------------------------------------------------------
 # Gate/up activation epilogue
 # ---------------------------------------------------------------------------
@@ -1390,13 +1449,25 @@ def _get_kernel(kind: str):
                     header=mlx_src + _MM_HEADER,
                     source=_AFFINE_SOURCE,
                 )
-            else:
+            elif kind == "row":
                 kernel = mx.fast.metal_kernel(
-                    name="omlx_gqmm_mxfp4_v2",
+                    name="omlx_gqmm_oqh_row",
                     input_names=["x", "w", "scales", "tiles", "tile_count", "params"],
                     output_names=["y"],
                     header=mlx_src + _MM_HEADER,
-                    source=_FP_SOURCE,
+                    source=_ROW_SOURCE,
+                )
+            else:
+                name, source = {
+                    "fp": ("omlx_gqmm_mxfp4_v2", _FP_SOURCE),
+                    "fp8": ("omlx_gqmm_mxfp8", _FP8_SOURCE),
+                }[kind]
+                kernel = mx.fast.metal_kernel(
+                    name=name,
+                    input_names=["x", "w", "scales", "tiles", "tile_count", "params"],
+                    output_names=["y"],
+                    header=mlx_src + _MM_HEADER,
+                    source=source,
                 )
         _kernels[kind] = kernel
         return kernel
@@ -1494,10 +1565,22 @@ def supports(
             return False
         if scales.dtype != mx.uint8:
             return False
+    elif mode == "mxfp8":
+        if bits != 8 or group_size != 32 or biases is not None:
+            return False
+        if scales.dtype != mx.uint8:
+            return False
+    elif mode == "oqh":
+        if bits not in (2, 3, 4) or group_size != 64 or K % 64 or biases is not None:
+            return False
+        if scales.dtype != x.dtype:
+            return False
     else:
         return False
     if w.shape[2] * 32 != K * bits:
         return False
+    if mode == "oqh":
+        return scales.shape == (E, N)
     return scales.shape == (E, N, K // group_size)
 
 
@@ -1525,7 +1608,7 @@ def _launch(
     up operand in ``up`` = ``(w, scales)``, ``limit`` = ``(alpha, limit,
     beta)`` and ``expert_scales`` = ``(gate, up)``."""
     scan = _get_kernel("scan")
-    kind = "affine" if mode == "affine" else "fp"
+    kind = {"affine": "affine", "mxfp8": "fp8", "oqh": "row"}.get(mode, "fp")
     if row_map is not None and not epi:
         return None
     if epi:
@@ -1558,6 +1641,7 @@ def _launch(
     template = [("T", x.dtype), ("GS", group_size)]
     if mode == "affine":
         inputs.append(biases)
+    if mode in ("affine", "oqh"):
         template.append(("BITS", bits))
     if up is not None:
         inputs += up
@@ -1655,11 +1739,21 @@ def _self_test(key: tuple) -> Optional[bool]:
     dtype, mode, bits, group_size, plan, align_n, align_k = key
     N = 128 if align_n else 96
     K = _canary_k(plan, align_k)
+    ref_mode = "affine" if mode == "oqh" else mode
     try:
         wq, scales, biases, wd, x, idx = _canary_problem(
-            dtype, mode, bits, group_size, N, K
+            dtype, ref_mode, bits, group_size, N, K
         )
-        out = _launch(x, wq, scales, biases, idx, group_size, bits, mode, plan, None)
+        kernel_scales, kernel_biases = scales, biases
+        if mode == "oqh":
+            steps = mx.random.randint(8, 16, scales.shape[:2], key=mx.random.key(5))
+            kernel_scales = (steps.astype(mx.float32) / 512).astype(dtype)
+            kernel_biases = None
+            scales = mx.repeat(kernel_scales[..., None], K // group_size, axis=-1)
+            biases = scales * -((2**bits - 1) / 2)
+        out = _launch(
+            x, wq, kernel_scales, kernel_biases, idx, group_size, bits, mode, plan, None
+        )
         if out is None:
             return False
         if K % 64 == 0:
@@ -1672,7 +1766,7 @@ def _self_test(key: tuple) -> Optional[bool]:
                 transpose=True,
                 group_size=group_size,
                 bits=bits,
-                mode=mode,
+                mode=ref_mode,
                 sorted_indices=True,
             )
             ok = bool(mx.array_equal(out, ref).item())
@@ -1966,7 +2060,9 @@ def sorted_gather_qmm_swiglu(
     not verified; the caller then
     keeps the unfused path (materialising ``x[row_map]``).
     """
-    if not supports(x, w, scales, biases, indices, group_size, bits, mode, row_map):
+    if mode == "mxfp8" or not supports(
+        x, w, scales, biases, indices, group_size, bits, mode, row_map
+    ):
         return None
     M, K = int(indices.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])

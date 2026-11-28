@@ -9150,6 +9150,14 @@ class TestHybridDecodeKvEvalDefault:
         )
         assert scheduler._decode_eval_kv_cache_interval == 256
 
+    def test_pooling_cache_model_defaults_to_256(self, mock_tokenizer):
+        stub = type("PoolingCache", (), {})()
+        model = self._model_with_cache([stub])
+        scheduler = Scheduler(
+            model=model, tokenizer=mock_tokenizer, config=SchedulerConfig()
+        )
+        assert scheduler._decode_eval_kv_cache_interval == 256
+
     def test_plain_kv_model_defaults_to_0(self, mock_tokenizer):
         stub = type("KVCache", (), {})()
         model = self._model_with_cache([stub])

@@ -2327,6 +2327,8 @@ def _clear_rollback(prompt_cache: List[Any]) -> None:
         if getattr(c, "_undo", None) is not None:
             c._undo = None
             c._undo_chain = False
+        if getattr(c, "_ernie_verify_undo", None) is not None:
+            c._ernie_verify_undo = None
 
 
 def _ensure_uint32(arr):
@@ -3273,27 +3275,60 @@ def _dspark_draft_jobs(jobs: List[tuple]) -> None:
         for _, state, _, committed, _ in group:
             state.hist_offset += int(committed.shape[0])
         logits = host.dspark_logits(hidden)
-        if not all(_is_greedy(job[0]) and _proc_list(job[0]) is None for job in group):
-            for r, (gen_batch, state, _, committed, prev_buf) in enumerate(group):
-                _dspark_next_drafts(
-                    gen_batch, state, None, committed, prev_buf, depth=depth, logits=logits[r : r + 1]
-                )
-            continue
+        step_logits = getattr(host, "dspark_step_logits", None)
         previous = mx.concatenate([anchor.reshape(1) for anchor in anchors])
+        greedy = all(_is_greedy(job[0]) and _proc_list(job[0]) is None for job in group)
+        samplers = [_resolve_sampler(job[0]) for job in group]
+        procs = [_live_processors(_proc_list(job[0]), depth) for job in group]
+        snaps = [_snap_snapshotable(p) for p in procs]
         tokens, lps = [], []
         for idx in range(depth):
-            bias, _ = host.dspark_markov(previous)
-            lp = _logprobs(logits[:, idx, :] + bias)
-            token = _ensure_uint32(mx.argmax(lp, axis=-1))
+            if step_logits is not None:
+                block = step_logits(logits, idx, previous)
+            else:
+                bias, _ = host.dspark_markov(previous)
+                block = logits[:, idx, :] + bias
+            if greedy:
+                lp = _logprobs(block)
+                token = _ensure_uint32(mx.argmax(lp, axis=-1))
+            else:
+                prefixes = [
+                    (
+                        None
+                        if procs[r] is None or job[4] is None
+                        else mx.concatenate(
+                            [job[4], anchors[r].reshape(1)]
+                            + [t[r : r + 1] for t in tokens]
+                        ).astype(mx.int32)
+                    )
+                    for r, job in enumerate(group)
+                ]
+                rows = [
+                    (
+                        block[r : r + 1]
+                        if prefix is None
+                        else _apply_processors(procs[r], prefix, block[r : r + 1])
+                    )
+                    for r, prefix in enumerate(prefixes)
+                ]
+                lp = _logprobs(mx.concatenate(rows))
+                token = mx.concatenate(
+                    [
+                        _ensure_uint32(sampler(lp[r : r + 1])).reshape(1)
+                        for r, sampler in enumerate(samplers)
+                    ]
+                )
             tokens.append(token)
             lps.append(lp)
             previous = token
         drafts = mx.stack(tokens, axis=1)
         for r, (gen_batch, state, _, _, _) in enumerate(group):
-            sampler = _resolve_sampler(gen_batch)
+            _restore_snapshotable(procs[r], snaps[r])
             state.drafts = drafts[r]
             state.draft_lps = [lp[r] for lp in lps]
-            state.draft_accept_lps = [_accept_lp_for(sampler, lp[r : r + 1]).squeeze(0) for lp in lps]
+            state.draft_accept_lps = [
+                _accept_lp_for(samplers[r], lp[r : r + 1]).squeeze(0) for lp in lps
+            ]
             mx.async_eval(state.drafts)
 
 

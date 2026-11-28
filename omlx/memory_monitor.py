@@ -24,7 +24,16 @@ if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
 
 from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
-from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
+from omlx.patches.deepseek_v4.indexer_dispatch import (
+    native_indexer_available,
+    native_indexer_eligible,
+)
+from omlx.patches.deepseek_v4.sparse_attention_nax import nax_sparse_attention_ready
+from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill_route_active
+from omlx.patches.ernie5_5 import (
+    sparse_prefill_available as ernie55_sparse_prefill_available,
+)
+from omlx.patches.glm_moe_dsa.indexer_nax import max_rows_per_call
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
@@ -37,6 +46,11 @@ try:
 except ImportError:
     HAS_MLX_METAL = False
     mx = None
+
+try:
+    from omlx.custom_kernels.attention import fast as attention_fast
+except ImportError:
+    attention_fast = None
 
 # Mirrors MLX Metal ScaledDotProductAttention::use_fallback for the
 # generation/inference path. Full prefill and short vector kernels support
@@ -1434,6 +1448,8 @@ class _Qwen4ExpPrefillMemoryProfile:
 
 # Match the sparse-MLA threshold in Glm5NextSparseAttention.__call__.
 _GLM5_NEXT_SPARSE_MLA_MIN_KV = 4096
+_GLM5_NEXT_BATCHED_TILE_MIN_ROWS = 32
+_GLM5_NEXT_GATHERED_ATTENTION_MAX_ROWS = 8
 
 # FP32 projection outputs can coexist with their FP16/BF16 kernel inputs.
 _GLM5_NEXT_EXACT_BLOCK_PROMOTION_DTYPE_SIZE = 4
@@ -1462,6 +1478,7 @@ class _GLM5NextPrefillMemoryProfile:
     hidden_size: int
     dtype_size: float
     score_dtype_size: float
+    fused_sparse_kernels: bool
 
     def estimate_resident_kv_bytes(
         self, num_tokens: int, *, chunk_tokens: int = 1
@@ -1482,13 +1499,9 @@ class _GLM5NextPrefillMemoryProfile:
             return 0
         query_tokens = int(query_tokens)
         kv_len = int(kv_len)
-        # MoE streams (routed gather + weighted output) run inside every
-        # layer after attention; price them on both candidates.
         moe = query_tokens * self.moe_top_k * self.hidden_size * self.dtype_size * 2
 
         if kv_len <= self.index_topk:
-            # Short contexts use dense SDPA with expanded K/V.
-            # Use tiled score storage when a bounded route is available.
             core = estimate_unfused_sdpa_call_bytes(
                 self.num_attention_heads,
                 query_tokens,
@@ -1523,27 +1536,55 @@ class _GLM5NextPrefillMemoryProfile:
             )
             sparse = core + kv_expand + moe
         else:
-            # Selection active: the indexer scores every pooled key and the q
-            # projection expands to the latent width on both routes.
             pooled = max(kv_len // max(self.index_kpool, 1), 1)
+            if self.fused_sparse_kernels:
+                padded_rows = -(-query_tokens // 64) * 64
+                padded_keys = -(-pooled // 64) * 64
+                row_chunks = -(-query_tokens // 512)
+                tile_scores = (
+                    padded_rows * padded_keys * (2 * self.score_dtype_size + 2)
+                    + row_chunks * padded_keys * self.index_head_dim * self.dtype_size
+                )
+                batched_tail_scores = (
+                    self.index_n_heads
+                    * min(query_tokens, _GLM5_NEXT_BATCHED_TILE_MIN_ROWS - 1)
+                    * pooled
+                    * 4
+                )
+                scores = max(tile_scores, batched_tail_scores)
+            else:
+                scores = self.index_n_heads * query_tokens * pooled * 4
             indexer = (
-                self.index_n_heads * query_tokens * pooled * 4
+                scores
                 + query_tokens * (self.index_n_heads + 1) * self.index_head_dim * self.dtype_size
             )
             q_latent = (
                 query_tokens * self.num_attention_heads * self.kv_lora_rank * self.dtype_size
             )
             if kv_len < _GLM5_NEXT_SPARSE_MLA_MIN_KV:
-                # Exact-block attention expands all cached K/V, regardless of query length.
-                # Include both FP32 projection outputs and their kernel input casts.
                 core = (
                     kv_len
                     * self.num_attention_heads
                     * (self.qk_nope_head_dim + self.v_head_dim)
                     * (self.dtype_size + _GLM5_NEXT_EXACT_BLOCK_PROMOTION_DTYPE_SIZE)
                 )
+            elif self.fused_sparse_kernels:
+                selected = query_tokens * (self.index_topk + self.index_kpool - 1) * 16
+                projected = (
+                    2
+                    * query_tokens
+                    * self.num_attention_heads
+                    * self.v_head_dim
+                    * self.dtype_size
+                )
+                short_gather = (
+                    min(query_tokens, _GLM5_NEXT_GATHERED_ATTENTION_MAX_ROWS)
+                    * self.index_topk
+                    * self.kv_lora_rank
+                    * self.dtype_size
+                )
+                core = q_latent + selected + projected + short_gather
             else:
-                # A full latent gather bounds the tiled sparse-MLA allocation.
                 core = (
                     query_tokens
                     * min(self.index_topk, kv_len)
@@ -1552,8 +1593,6 @@ class _GLM5NextPrefillMemoryProfile:
                 )
             sparse = indexer + q_latent + core + moe
 
-        # GDN layer: fused q/k/v input stream, short conv in/out, fp32
-        # l2-norm temporaries and the chunked delta-rule scan intermediates.
         gdn = (
             query_tokens * self.linear_num_heads * self.linear_head_dim * self.dtype_size * 8
             + query_tokens * self.linear_num_heads * 64 * 4
@@ -1627,6 +1666,14 @@ def _make_glm5_next_prefill_memory_profile(
         hidden_size=int(hidden_size),
         dtype_size=float(compute_dtype_size),
         score_dtype_size=float(compute_dtype_size),
+        fused_sparse_kernels=compute_dtype_size == 2
+        and int(num_attention_heads) in (32, 64)
+        and int(index_n_heads) == 32
+        and int(index_head_dim) == 128
+        and int(index_topk) // int(index_kpool) == 512
+        and int(kv_lora_rank) == 512
+        and native_indexer_available()
+        and attention_fast.has_symbol("sparse_mla_attention"),
     )
 
 
@@ -1826,6 +1873,78 @@ def _make_deepseek_v41_prefill_memory_profile(
     )
 
 
+@dataclass(frozen=True)
+class _Ernie55PrefillMemoryProfile:
+    config: Any
+    dtype_size: float
+
+    def estimate_resident_kv_bytes(
+        self, num_tokens: int, *, chunk_tokens: int = 1
+    ) -> int:
+        c = self.config
+        window = min(num_tokens, c.sliding_window + chunk_tokens - 1)
+        pooled = sum(num_tokens // r + window for r in c.compress_ratios if r != -2)
+        latent = c.compress_ratios.count(-2) * num_tokens
+        width = c.hybrid_mla_kv_lora_rank + c.hybrid_mla_qk_rope_head_dim
+        return int(
+            (pooled * c.head_dim + latent * (width + c.index_head_dim))
+            * self.dtype_size
+        )
+
+    def estimate_prefill_transient_bytes(self, query_tokens: int, kv_len: int) -> int:
+        return int(
+            max(
+                self._mla_bytes(query_tokens, kv_len),
+                self._hca_bytes(query_tokens, kv_len),
+            )
+        )
+
+    def _mla_bytes(self, query_tokens: int, kv_len: int) -> float:
+        c = self.config
+        heads = c.hybrid_mla_num_attention_heads
+        if ernie55_sparse_prefill_available():
+            latent = c.hybrid_mla_kv_lora_rank
+            queries = heads * (
+                c.hybrid_mla_qk_nope_head_dim + c.hybrid_mla_qk_rope_head_dim
+            )
+            latent_queries_and_outputs = 2 * heads * latent
+            values_and_gates = 3 * heads * c.hybrid_mla_v_head_dim
+            index_queries = 3 * c.index_n_heads * c.index_head_dim
+            scores = min(query_tokens, max_rows_per_call(kv_len)) * kv_len
+            cache_growth = kv_len * (
+                latent + c.hybrid_mla_qk_rope_head_dim + c.index_head_dim
+            )
+            per_row = (
+                queries + latent_queries_and_outputs + values_and_gates + index_queries
+            )
+            return (query_tokens * per_row + scores + cache_growth) * self.dtype_size
+        scores = query_tokens * kv_len
+        dense_kv = (
+            kv_len
+            * heads
+            * (c.hybrid_mla_qk_nope_head_dim + c.hybrid_mla_v_head_dim)
+            * self.dtype_size
+        )
+        rope_and_sdpa_scores = 2 * self.dtype_size * heads * scores
+        ranks_keys = kv_len > c.index_topk + c.sliding_window
+        bf16_and_fp32_index_scores = (2 + 4) * c.index_n_heads * scores
+        return dense_kv + max(
+            rope_and_sdpa_scores, bf16_and_fp32_index_scores if ranks_keys else 0
+        )
+
+    def _hca_bytes(self, query_tokens: int, kv_len: int) -> float:
+        c = self.config
+        ratios = [r for r in c.compress_ratios if r != -2]
+        if not ratios:
+            return 0
+        rows = query_tokens * c.num_attention_heads
+        if wsdpa_prefill_route_active() or nax_sparse_attention_ready():
+            return 6 * rows * c.head_dim * self.dtype_size
+        pooled = kv_len // min(ratios)
+        hca_keys = c.sliding_window - 1 + query_tokens + pooled
+        return 2 * self.dtype_size * rows * hca_keys
+
+
 def make_prefill_memory_profile(
     config: Any,
     *,
@@ -1834,6 +1953,8 @@ def make_prefill_memory_profile(
 ) -> PrefillMemoryProfile | None:
     """Build a model-specific prefill strategy when the uniform formulas fail."""
     model_type = str(_cfg_get(config, "model_type", "") or "")
+    if model_type == "ernie5_5_moe":
+        return _Ernie55PrefillMemoryProfile(config, float(compute_dtype_size))
     if model_type.startswith("qwen4_exp"):
         return _make_qwen4_exp_prefill_memory_profile(
             config, compute_dtype_size=compute_dtype_size

@@ -2128,19 +2128,37 @@ class BlockAwarePrefixCache(CacheManager):
         # Step 3: CacheList fallback — check sub-states for seq_len
         # This handles all-CacheList models (e.g., deepseek_v32) and Hy4 Flash,
         # whose CacheList layers hold the whole sequence next to a window.
+        window_seq_len = 0
         for layer_state in cache_data:
             if (
-                layer_state.get("cache_type") == "CacheList"
-                or layer_state.get("class_name") == "CacheList"
+                layer_state.get("cache_type") != "CacheList"
+                and layer_state.get("class_name") != "CacheList"
             ):
-                sub_states = layer_state.get("state", [])
-                for sub_state in sub_states:
-                    if isinstance(sub_state, (list, tuple)) and len(sub_state) >= 2:
-                        sub_keys = sub_state[0]
-                        if hasattr(sub_keys, "shape") and len(sub_keys.shape) == 4:
-                            seq_len = sub_keys.shape[2]
-                            logger.debug(f"Using CacheList sub-cache seq_len={seq_len}")
-                            return max(seq_len, max_seq_len)
+                continue
+            names = layer_state.get("sub_class_names") or []
+            meta = layer_state.get("meta_state")
+            if (
+                not names
+                and isinstance(meta, (list, tuple))
+                and meta
+                and isinstance(meta[0], (list, tuple))
+            ):
+                names = meta[0]
+            for idx, sub_state in enumerate(layer_state.get("state", [])):
+                if not isinstance(sub_state, (list, tuple)) or len(sub_state) < 2:
+                    continue
+                sub_keys = sub_state[0]
+                if not hasattr(sub_keys, "shape") or len(sub_keys.shape) != 4:
+                    continue
+                seq_len = sub_keys.shape[2]
+                if idx < len(names) and CacheTypeRegistry.is_rotating_family(
+                    str(names[idx])
+                ):
+                    window_seq_len = window_seq_len or seq_len
+                    continue
+                logger.debug(f"Using CacheList sub-cache seq_len={seq_len}")
+                return max(seq_len, max_seq_len)
+        max_seq_len = max(max_seq_len, window_seq_len)
 
         if max_seq_len > 0:
             # Normal result for all-non-sliceable-KVCache models

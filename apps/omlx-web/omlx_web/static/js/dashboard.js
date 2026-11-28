@@ -8604,7 +8604,6 @@
             oqSelectedModelSupportsOqh() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 if (!model?.oqh_supported) return false;
-                // DeepSeek V4.1 takes oQh below oQ4 only.
                 return model.oqh_max_level == null || this.oqLevel < model.oqh_max_level;
             },
 

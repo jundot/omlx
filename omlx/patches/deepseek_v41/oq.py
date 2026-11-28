@@ -26,18 +26,13 @@ import numpy as np
 from ...oq import (
     _OQE_REFINE_SAMPLES,
     _OQE_REFINE_SEQ_LENGTH,
-    _OQRefineWriter,
-    _refine_affine_codes,
-    _shrunk_gram,
+    _refine_expert_grams,
 )
 from ...oqh import format as oqh_format
-from ...oqh import targets as oqh_targets
 from .convert import iter_source_weights, source_engram_tables, strip_draft_config
 from .oq_inventory import projection_inventory
 from .oqh import (
     expert_layer,
-    expert_owner,
-    float_experts,
     iter_expert_grams,
     plan_widths,
     planned_bytes,
@@ -399,73 +394,34 @@ def refine_experts(source, destination, weight_map, quantized, progress=None):
         and ".ffn.experts." in name
         and spec.get("mode") == "affine"
     }
-    stats = {"tensors": 0, "kept": 0, "before": 0.0, "after": 0.0}
     if not names:
         return {"status": "skipped", "reason": "no affine routed experts"}
-    layers = {expert_layer(name) for name in names}
-    # The writer only sees these tensors: V4.1 specs have no global default for
-    # the rest, and flushing a shard keeps every tensor it does not rewrite.
-    expert_map = {k: v for k, v in weight_map.items() if k.rsplit(".", 1)[0] in names}
-    writer = _OQRefineWriter(Path(destination), expert_map, quantized)
     grams = iter_expert_grams(
         source,
-        layers,
+        {expert_layer(name) for name in names},
         num_samples=_OQE_REFINE_SAMPLES,
         seq_length=_OQE_REFINE_SEQ_LENGTH,
     )
-    for done, (i, experts, collector) in enumerate(grams, start=1):
-        for part in ("w1", "w3", "w2"):
-            name = f"language_model.layers.{i}.ffn.experts.{part}"
-            if name not in names:
-                continue
-            owner = expert_owner(collector, name)
-            module = getattr(experts, part)
-            packed, scales, biases = writer.read(name)
-            bits, group_size = writer.spec(name)
-            n_exp, out_dim, in_dim = (
-                int(packed.shape[0]),
-                int(packed.shape[1]),
-                int(packed.shape[2]) * 32 // bits,
+    return _refine_expert_grams(
+        destination,
+        weight_map,
+        quantized,
+        names,
+        (
+            (
+                i,
+                {
+                    f"language_model.layers.{i}.ffn.experts.{part}": getattr(
+                        experts, part
+                    )
+                    for part in ("w1", "w3", "w2")
+                },
+                collector,
             )
-            parts, before, after, changed = [], 0.0, 0.0, False
-            for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
-                hessian = _shrunk_gram(collector.switch_gram(owner, first, stop))
-                result = _refine_affine_codes(
-                    float_experts(module, first, stop),
-                    packed[first:stop],
-                    scales[first:stop],
-                    biases[first:stop],
-                    hessian,
-                    bits,
-                    group_size,
-                )
-                del hessian
-                if result is None:
-                    parts.append(packed[first:stop])
-                else:
-                    parts.append(result[0])
-                    before, after, changed = before + result[1], after + result[2], True
-                mx.clear_cache()
-            if changed:
-                writer.write(name, mx.concatenate(parts))
-                stats["tensors"] += 1
-                stats["before"] += before
-                stats["after"] += after
-            else:
-                stats["kept"] += 1
-        writer.layer_done(i)
-        if progress is not None:
-            progress(done, len(layers))
-        logger.info("V4.1 oQe refine: layer %d done (%d/%d)", i, done, len(layers))
-    writer.finish()
-    gain = 1.0 - stats["after"] / stats["before"] if stats["before"] > 0 else 0.0
-    logger.info(
-        "V4.1 oQe refine: %d expert tensors refined (%d kept), Hessian error -%.1f%%",
-        stats["tensors"],
-        stats["kept"],
-        100.0 * gain,
+            for i, experts, collector in grams
+        ),
+        progress,
     )
-    return {"status": "done", **stats, "hessian_error_reduction": round(gain, 4)}
 
 
 def quantize(
@@ -501,11 +457,6 @@ def quantize(
     )
 
     _validate_v41_oq_settings(oq_level, dtype, group_size)
-    if hadamard and oq_level >= oqh_targets.DEEPSEEK_V41.max_level:
-        raise ValueError(
-            "V4.1 oQh re-rounds the routed experts below oQ4; oQ4 keeps the "
-            "source FP4 experts"
-        )
     # Engram sits outside the bit budget and calibration reads the source
     # checkpoint, so keeping it at source precision changes no other tensor.
     engram_bits = None if preserve_ngram_table else _offload_table_bits(oq_level)

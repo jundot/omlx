@@ -2468,6 +2468,62 @@ class TestArraysCacheLastBlockOnly:
         assert saved_keys.tolist() == expected_keys.tolist()
         assert saved_values.tolist() == expected_values.tolist()
 
+    def test_store_cache_slices_full_members_after_window_cache_list(self, mx):
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=2),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        existing_tokens = [10, 11, 12, 13]
+        block_table = paged_cache.create_block_table("req-001")
+        existing_block = paged_cache.allocate_block()
+        existing_block.block_hash = compute_block_hash(
+            None, existing_tokens, model_name="test-model"
+        )
+        existing_block.token_count = block_size
+        block_table.block_ids.append(existing_block.block_id)
+        block_table.num_tokens = block_size
+        paged_cache.register_block_hash(existing_block, existing_tokens, None)
+
+        full = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        window = full[:, :, 6:, :]
+        cache_data = [
+            {
+                "state": [(window, window), (None, None, mx.zeros((1, 2, 1)))],
+                "meta_state": (
+                    ["RotatingKVCache", "PoolingCache"],
+                    [("0", "2", "8", "2"), 4],
+                ),
+                "cache_type": "CacheList",
+                "class_name": "CacheList",
+            },
+            {
+                "state": [(full, full), (full, full)],
+                "meta_state": (["KVCache", "KVCache"], [(), ()]),
+                "sub_class_names": ["KVCache", "KVCache"],
+                "cache_type": "CacheList",
+                "class_name": "CacheList",
+            },
+        ]
+
+        result = cache.store_cache(
+            "req-001", existing_tokens + [20, 21, 22, 23], cache_data
+        )
+
+        assert result is not None
+        _, members = mock_ssd.save_block.call_args.kwargs["cache_data"][1]
+        assert members[0][0][0, 0, :, 0].tolist() == [4.0, 5.0, 6.0, 7.0]
+
     def test_store_cache_rolls_back_when_ssd_save_fails(self, mx):
         """Failed SSD save should not retain block metadata in paged cache."""
         block_size = 4

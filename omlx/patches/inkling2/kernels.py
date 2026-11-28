@@ -1097,7 +1097,8 @@ _DECODE_PART_SOURCE = """
     const bool row_ok = g < G;
     const int h = hk * G + (row_ok ? g : 0);
     // Index of the query's own key, and the number of keys it sees.
-    const int a = S - L + pos;
+    const int a = (RAGGED ? S - dims[3 + int(threadgroups_per_grid.z) + b] : S)
+        - L + pos;
     int nk = a + 1 - lp;
     if (WINDOW > 0) {
         nk = min(nk, WINDOW);
@@ -1339,6 +1340,12 @@ _DECODE_SLIDING_CHUNK = 128
 _DECODE_STAGERS = 2
 
 
+def flash_decode_ok(q, k) -> bool:
+    """Whether ``banded_sink_attention`` sends a batch to the decode kernel,
+    which reads ragged rows (``tails``) in place."""
+    return q.shape[2] < _FLASH_MIN_QUERIES and _use_flash_decode(q, k)
+
+
 def _use_flash_decode(q, k) -> bool:
     """BF16/FP16 queries on the GPU whose head layout fits the decode kernel."""
     return (
@@ -1352,9 +1359,12 @@ def _use_flash_decode(q, k) -> bool:
     )
 
 
-def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_padding=None):
+def gqa_flash_decode_attention(
+    q, k, v, rel, sink, *, scale, window, left_padding=None, tails=None
+):
     """``banded_sink_attention`` for batched or left-padded decode-sized
-    BF16/FP16 query blocks. Each row has the bits of the same row run alone."""
+    BF16/FP16 query blocks. Each row has the bits of the same row run alone.
+    ``tails[b]``: keys row ``b`` ends before the last."""
     global _decode_kernels
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
@@ -1384,6 +1394,8 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
     dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
     if left_padding is not None:
         dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
+    if tails is not None:
+        dims = mx.concatenate([dims, mx.array(tails, dtype=mx.int32)])
     part_o, part_m, part_l = part(
         inputs=[
             q,
@@ -1403,6 +1415,7 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
             ("WINDOW", int(window)),
             ("CHUNK", chunk),
             ("NSG", nsg),
+            ("RAGGED", tails is not None),
         ],
         grid=(ns * nsg * 32, hkv * length, b),
         threadgroup=(nsg * 32, 1, 1),
@@ -1490,24 +1503,30 @@ def banded_sink_attention(
     scale: float,
     window: int = 0,
     left_padding=None,
+    tails=None,
 ) -> mx.array:
     """Attention with a relative bias band and per-query sink logits.
 
     q: [B, Hq, L, D]; k, v: [B, Hkv, S, D] (queries are the last L keys);
     rel: [B, L, Hq, R] bias by backward distance d (applied for d < R);
     sink: [B, L, Hq] logits of a zero-value sink. ``window`` > 0 limits
-    keys to d < window (sliding layers use window == R).
+    keys to d < window (sliding layers use window == R). ``tails``: see
+    ``gqa_flash_decode_attention``.
     """
     b, length = q.shape[0], q.shape[2]
-    if (
-        (b > 1 or left_padding is not None)
-        and length < _FLASH_MIN_QUERIES
-        and _use_flash_decode(q, k)
-    ):
+    if (b > 1 or left_padding is not None) and flash_decode_ok(q, k):
         # Batches, and a row left alone in a batch cache: the kernel reads
         # left_padding itself instead of masking every cached key.
         return gqa_flash_decode_attention(
-            q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
+            q,
+            k,
+            v,
+            rel,
+            sink,
+            scale=scale,
+            window=window,
+            left_padding=left_padding,
+            tails=tails,
         )
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
