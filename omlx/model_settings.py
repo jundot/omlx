@@ -88,6 +88,20 @@ def resolve_lora_conflicts(data: dict) -> tuple:
     return resolved, names
 
 
+def validate_dfly2_settings(settings: dict) -> None:
+    """DFly2 rides the MTP generator, so it needs that machinery armed.
+
+    The drafter replaces the checkpoint's MTP *head* at runtime, not the batch
+    generator's speculative cycle: the cycle is what calls into the draft. So a
+    DFly2 checkpoint is valid together with ``mtp_enabled``, and forbidding the
+    pair (as an earlier revision did) silently disabled the draft: the settings
+    failed to load and the model fell back to plain decoding.
+    """
+    checkpoint = settings.get("dfly2_checkpoint")
+    if checkpoint is not None and not str(checkpoint).strip():
+        raise ValueError("dfly2_checkpoint must be a path or None, not an empty string")
+
+
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
     fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
     if (
@@ -595,6 +609,11 @@ class ModelSettings:
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "adaptive" | "dflash" | "off"
 
+    # A separate DFly2 draft checkpoint: three layers that read the target's own
+    # cached latents and indexer picks, so they keep no KV of their own. None
+    # leaves the model on its embedded drafter.
+    dfly2_checkpoint: Optional[str] = None
+
     # Lightning MTP uses the embedded head for single and concurrent requests.
     # Equal-depth rows share target verification when supported by the backbone;
     # each request keeps its own acceptance, draft history and cache frontier.
@@ -727,6 +746,7 @@ class ModelSettings:
                     "vlm_mtp decode path does not apply"
                 )
         validate_moe_expert_offload(self.to_dict())
+        validate_dfly2_settings(self.to_dict())
         if self.lora_adapter:
             conflict = lora_adapter_conflict(self.to_dict())
             if conflict:

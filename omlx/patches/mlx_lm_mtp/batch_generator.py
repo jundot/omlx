@@ -818,6 +818,10 @@ class _MtpStats:
     mtp_head_ms: float = 0.0  # cumulative time inside MTP-head forwards
     sample_ms: float = 0.0  # cumulative time in sampling + acceptance check
     cache_ops_ms: float = 0.0  # cumulative time in trim / rollback restore
+    # Which drafter produced this sequence's drafts. "MTP" is the checkpoint's
+    # own head; anything else is a replacement runtime (DFly2) that set
+    # ``_omlx_spec_backend_name`` on the host. Written once at state creation.
+    backend: str = "MTP"
 
 
 @dataclass
@@ -3140,6 +3144,18 @@ def _queue_dspark_block(host, prepare, gen_batch, state, hidden, packet, k, *, g
     return depth, block
 
 
+def _spec_backend_name(model: Any) -> str:
+    """Name of the drafter that will produce this sequence's drafts.
+
+    Read off the DSpark host so the finish line says "DFly2" when a replacement
+    runtime replaced the checkpoint's MTP head, and "MTP" otherwise.
+    """
+    host = _dspark_host(model)
+    if host is None:
+        return "MTP"
+    return str(getattr(host, "_omlx_spec_backend_name", "DSpark") or "DSpark")
+
+
 def _dspark_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -3583,7 +3599,7 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         # next_main_tok — the first committed history entry — and its logits
         # are the first draft's distribution; the rest of the chain follows.
         mx.eval(main_tok, next_main_tok)
-        state = _MtpState(uid=gen_batch.uids[0])
+        state = _MtpState(uid=gen_batch.uids[0], stats=_MtpStats(backend=_spec_backend_name(gen_batch.model)))
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
@@ -3691,7 +3707,10 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     # Queue the two confirmed tokens (main_tok + next_main_tok); their
     # logprobs come from the standard / patched samplers. Cache draft_id
     # while the array is already evaluated to avoid re-syncing in cycle 1.
-    state = _MtpState(uid=gen_batch.uids[0])
+    state = _MtpState(
+        uid=gen_batch.uids[0],
+        stats=_MtpStats(backend=_spec_backend_name(gen_batch.model)),
+    )
     state.mtp_cache = mtp_cache
     state.next_main = _ensure_uint32(next_main_tok)
     state.draft_tok = _ensure_uint32(draft_tok)
@@ -4169,10 +4188,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
             f" in {stats.copy_cycles}"
         )
     tpc = total_emits / stats.cycles if stats.cycles else 0.0
+    backend = getattr(stats, "backend", "MTP") or "MTP"
     logger.info(
         "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
         "emits[init=%d,draft=%d,bonus=%d,verify=%d] "
-        "timing[backbone=%.1fms mtp=%.1fms sample=%.1fms cache=%.1fms]",
+        "timing[backbone=%.1fms mtp=%.1fms sample=%.1fms cache=%.1fms] backend=%s",
         uid,
         finish_reason,
         total_emits,
@@ -4190,6 +4210,7 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         stats.mtp_head_ms,
         stats.sample_ms,
         stats.cache_ops_ms,
+        backend,
     )
 
 

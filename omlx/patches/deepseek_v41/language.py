@@ -389,7 +389,8 @@ class Attention(nn.Module):
             c,
             bool(ratio),
         )
-        new = pack_activation(rope(self.kv_norm(kv_input), rope_positions, c, bool(ratio)))
+        window_raw = rope(self.kv_norm(kv_input), rope_positions, c, bool(ratio))
+        new = pack_activation(window_raw)
         old = cache[1]
         # CED clears the stale window whenever bounded replay skips tokens.
         old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
@@ -428,6 +429,27 @@ class Attention(nn.Module):
                 shared["idx"] = self.indexer(
                     x, qr, latent, cache, shared, start, ratio, latent_start=ced_kv_start
                 )
+                # DFly2 seam: the draft needs the target's own picks and raw
+                # latents, taken before compressed/local values are packed.
+                # Absent attribute means the feature is off and costs nothing.
+                capture = getattr(self, "_omlx_dfly_capture", None)
+                if capture is not None and latent is not None:
+                    capture(
+                        layer=layer,
+                        start=start,
+                        ratio=ratio,
+                        window_latents=window_raw,
+                        compressed_latents=latent,
+                        compressed_start=(kv_start if layer in c.kv_source_layers else start),
+                        native_index_topk=shared["idx"],
+                        # A verify block commits only its accepted prefix; the
+                        # draft anchor must not run ahead of that.
+                        committed_rows=(1 if verify_state is not None else length),
+                        # Compressed rows leave the compressor unrotated while
+                        # the reference records them rotated; rotate here at
+                        # their own absolute positions.
+                        compressed_rope=lambda latents, positions: rope(latents, positions, c, True),
+                    )
             if latent is not None:
                 compressed = rope(
                     latent,
