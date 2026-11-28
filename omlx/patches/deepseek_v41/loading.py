@@ -290,6 +290,10 @@ def load(
             # The banks the scheduler's sized release/restore hooks act on.
             model._moe_offload_slots = []
             for layer_id, layer in enumerate(model.language_model.layers):
+                # Pipeline stages leave non-owned layers as None placeholders;
+                # they have no experts to wrap and are never forwarded here.
+                if layer is None:
+                    continue
                 prefix = f"language_model.layers.{layer_id}.ffn.experts"
                 layer.ffn.experts = OffloadedExpert(layer.ffn.experts, offload, prefix)
                 model._moe_offload_slots.append(layer.ffn.experts.slots)

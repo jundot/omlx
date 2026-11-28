@@ -752,3 +752,81 @@ def test_preflight_uses_per_node_model_paths(monkeypatch):
     # The peer is probed at its own path, not the coordinator's.
     assert "/Volumes/models/studio-copy" in calls[0][-1]
     assert "/nonexistent/shared" not in calls[0][-1]
+
+
+def test_streamed_experts_survive_the_decoder_without_recharging_the_rank():
+    """An offloaded plan may not come back resident on the far side.
+
+    ``planned_weight_bytes`` subtracts ``moe_offload_weight_bytes``; a decoder
+    that drops the field charges the rank for expert bytes it reads from disk,
+    so the approved placement and the launched admission disagree.
+    """
+
+    original = _planned_assignment(
+        moe_expert_offload_resident_fraction=0.25,
+        moe_offload_weight_bytes=8 * GIB,
+    )
+
+    restored = _assignment_from_dict(original.to_dict())
+
+    assert restored == original
+    assert restored.moe_offload_weight_bytes == 8 * GIB
+    assert restored.moe_expert_offload_resident_fraction == 0.25
+    assert restored.planned_weight_bytes == original.planned_weight_bytes
+    # The streamed share is not charged twice: weights minus offloaded experts,
+    # plus fixed weights, plus the KV cache.
+    assert restored.planned_weight_bytes == (
+        2 * GIB + 40 * GIB - 8 * GIB + 20 * GIB
+    )
+
+
+def test_a_resident_plan_decodes_unchanged():
+    original = _planned_assignment()
+    payload = original.to_dict()
+    assert "moe_offload_weight_bytes" not in payload
+    assert "moe_expert_offload_resident_fraction" not in payload
+
+    restored = _assignment_from_dict(payload)
+
+    assert restored == original
+    assert restored.moe_offload_weight_bytes == 0
+    assert restored.moe_expert_offload_resident_fraction == 0.0
+
+
+def test_streamed_experts_survive_the_worker_plan_and_the_registry_file():
+    assignments = (
+        _planned_assignment(
+            moe_expert_offload_resident_fraction=0.5,
+            moe_offload_weight_bytes=10 * GIB,
+        ),
+        _planned_assignment(
+            node_id="studio",
+            rank=1,
+            start_layer=0,
+            end_layer=2,
+            capacity_bytes=256 * GIB,
+            reserve_bytes=25 * GIB,
+            role="headless",
+        ),
+    )
+    deployment = ClusterDeployment(
+        deployment_id="experts",
+        model="org/model",
+        backend="ring",
+        hosts=(
+            ClusterHost("macbook", "127.0.0.1", ("10.0.0.1",)),
+            ClusterHost("studio", "studio.local", ("10.0.0.2",)),
+        ),
+        assignments=assignments,
+        plan_hash="f" * 64,
+    )
+
+    restored = ClusterDeployment.from_dict(json.loads(json.dumps(deployment.to_dict())))
+    _hash, decoded, _path_map, _signature = decode_worker_contract(deployment.encode_worker_plan())
+
+    assert [item.moe_offload_weight_bytes for item in restored.assignments] == [
+        10 * GIB,
+        0,
+    ]
+    assert [item.moe_offload_weight_bytes for item in decoded] == [10 * GIB, 0]
+    assert decoded[0].planned_weight_bytes == assignments[0].planned_weight_bytes

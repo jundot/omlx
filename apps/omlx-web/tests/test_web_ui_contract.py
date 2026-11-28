@@ -88,7 +88,13 @@ class TestProtectedPages:
         client, _ = web
         resp = client.get(path, headers=HTML)
         assert resp.status_code == 302
-        assert resp.headers["location"] == "/admin"
+        # The deep link rides along as ?next= so a login round trip returns
+        # to the originally requested page (assistant Open Chat, 2026-11-16).
+        assert resp.headers["location"] == (
+            "/admin?next=%2Fadmin%2Fdashboard"
+            if path == "/admin/dashboard"
+            else "/admin?next=%2Fadmin%2Fchat"
+        )
 
     @pytest.mark.parametrize("path", ["/admin/dashboard", "/admin/chat"])
     def test_json_without_session_is_401(self, web, path):
@@ -101,7 +107,27 @@ class TestProtectedPages:
         client, _ = web
         resp = client.get("/admin/api/global-settings", headers=HTML)
         assert resp.status_code == 302
-        assert resp.headers["location"] == "/admin"
+        assert resp.headers["location"] == (
+            "/admin?next=%2Fadmin%2Fapi%2Fglobal-settings"
+        )
+
+    def test_signed_in_login_page_honours_next(self, web):
+        client, _ = web
+        _login(client)
+        resp = client.get(
+            "/admin", headers=HTML, params={"next": "/admin/chat?model=dev-1.5b"}
+        )
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/admin/chat?model=dev-1.5b"
+
+    def test_signed_in_login_page_ignores_unsafe_next(self, web):
+        client, _ = web
+        _login(client)
+        resp = client.get(
+            "/admin", headers=HTML, params={"next": "//evil.example/x"}
+        )
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/admin/dashboard"
 
     def test_dashboard_renders_locale_version_and_static_urls(self, web):
         client, _ = web

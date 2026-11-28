@@ -45,6 +45,7 @@ from .deployment import (
     validate_model_path_map,
     validate_ssh_target,
 )
+from .identity import get_node_identity
 from .launch import (
     DistributedLaunchError,
     DistributedTeardownError,
@@ -86,7 +87,6 @@ from .planner import (
     with_mtp_head,
 )
 from .registry import get_cluster_registry, get_device_registry
-from .identity import get_node_identity
 from .replan import (
     hosts_from_deployment,
     nodes_from_deployment,
@@ -169,11 +169,144 @@ def _saved_lightning_mtp(model_path: str) -> bool | None:
     return None if settings is None else bool(settings.mtp_enabled)
 
 
-def _saved_engram_ssd_offload(model_path: str | None) -> bool:
-    """Whether the saved settings keep DeepSeek V4.1 Engram tables on SSD."""
+def _saved_ssd_offload(model_path: str | None) -> bool:
+    """Whether the saved settings stream this model's big tables from SSD.
+
+    DeepSeek V4.1 Engram and Qwen4-Exp PLE are the same problem: one table far
+    larger than the weights around it, read per token instead of held resident.
+    Both settings mean "keep it on SSD", and a checkpoint only ever honours the
+    one its architecture uses, so planning may treat either as offloaded. With
+    neither set the table is charged as resident, and a Qwen4-Exp pipeline plan
+    can never fit (a 37 GiB PLE layer in a 117 GiB model).
+    """
 
     settings = _saved_model_settings(model_path) if model_path else None
-    return bool(getattr(settings, "deepseek_v41_engram_ssd_offload", False))
+    if settings is None:
+        return False
+    return bool(
+        getattr(settings, "deepseek_v41_engram_ssd_offload", False)
+        or getattr(settings, "qwen4_ple_ssd_offload", False)
+    )
+
+
+# The Engram-era name stays as an alias: the DeepSeek path and its tests read it.
+_saved_engram_ssd_offload = _saved_ssd_offload
+
+
+def _saved_moe_offload(model_path: str | None) -> tuple[bool, float]:
+    """The saved routed-expert offload decision and resident fraction."""
+
+    settings = _saved_model_settings(model_path) if model_path else None
+    if settings is None:
+        return False, 0.0
+    enabled = bool(getattr(settings, "moe_expert_offload_enabled", False))
+    fraction = float(getattr(settings, "moe_expert_offload_resident_fraction", 0.25))
+    if not 0 < fraction <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="moe_expert_offload_resident_fraction must be in (0, 1]",
+        )
+    return enabled, fraction
+
+
+def _moe_offload_layer_bytes(
+    model: ModelLayout, fraction: float, *, mtp: bool
+) -> tuple[int, ...]:
+    """Per-layer routed-expert bytes this rank streams instead of holding.
+
+    Upstream's ``moe_offload`` module no longer exports a per-layer byte table:
+    ``ExpertOffloadPlan`` (via ``_plan``) owns it. A layer streams everything it
+    does not keep resident — ``layer_bytes - layer_bytes * capacity // count`` —
+    which is the same saving the assistant's ``policy.moe_offload_layer_bytes``
+    derives, so the coordinator's plan and the election cannot disagree about
+    it. The bytes come from the checkpoint's own headers, never an estimate.
+    """
+
+    if not 0 < fraction <= 1:
+        raise PlanningError("MoE resident fraction must be in (0, 1]")
+    source = (model.source or "").strip()
+    if not source or source == "synthetic":
+        return ()
+    from ..patches.deepseek_v41.moe_offload import _plan
+
+    try:
+        plan = _plan(source, float(fraction), mtp_resident=mtp)
+        count = int(plan.count) or 0
+        capacity = int(plan.capacity)
+        per_layer = [0] * model.layer_count
+        for prefix, full in plan.layer_bytes.items():
+            parts = prefix.split(".")
+            try:
+                index = int(parts[2])
+            except (IndexError, ValueError):
+                continue
+            if not 0 <= index < model.layer_count:
+                raise PlanningError(
+                    "expert-offload layout does not match the model's layers"
+                )
+            resident = int(full) * capacity // count if count else 0
+            per_layer[index] += int(full) - resident
+    except PlanningError:
+        raise
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        raise PlanningError(
+            f"could not size the expert-offload layout: {exc}"
+        ) from exc
+    return tuple(per_layer)
+
+
+def _moe_offload_for_plan(
+    model_path: str | None,
+    model: ModelLayout,
+    *,
+    mtp: bool,
+    tensor_parallel_size: int,
+) -> tuple[float, tuple[int, ...]]:
+    """The expert offload ``(fraction, per-layer bytes)`` this plan may price.
+
+    Only a DeepSeek-V4.1 MoE has a routed-expert layout the planner can size
+    today. Any other checkpoint — no setting, another MoE family, a synthetic
+    layout — gets no bytes and therefore upstream's resident plan unchanged: a
+    saving is never invented. A DeepSeek-V4.1 checkpoint whose saved setting is
+    on always gets a price, or an explicit error, because the loader is about to
+    stream those experts.
+    """
+
+    enabled, fraction = _saved_moe_offload(model_path)
+    if not enabled:
+        return 0.0, ()
+    if not model_path:
+        raise PlanningError(
+            "MoE expert offload needs a model path to measure the expert layout"
+        )
+    from ..patches.moe_offload_compat import moe_offload_compatibility
+
+    supported, reason = moe_offload_compatibility(model_path)
+    if not supported:
+        raise PlanningError(reason)
+    config_path = Path(model_path).expanduser() / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise PlanningError(
+            f"could not read the model config for expert offload: {exc}"
+        ) from exc
+    if str(config.get("model_type", "")).lower() != "deepseek_v41":
+        # Other families keep upstream's plan. Their loader may still offload,
+        # but the planner has no per-layer expert map for them, and charging
+        # resident experts is the conservative direction.
+        return 0.0, ()
+    if tensor_parallel_size > 1:
+        raise PlanningError(
+            "MoE expert offload is supported for pipeline stages only; "
+            "tensor-parallel ranks read every expert"
+        )
+    layer_bytes = _moe_offload_layer_bytes(model, fraction, mtp=mtp)
+    if len(layer_bytes) != model.layer_count:
+        raise PlanningError(
+            "expert-offload layer count does not match the model layout"
+        )
+    return fraction, layer_bytes
 
 
 def _cluster_mtp(
@@ -670,7 +803,17 @@ def _create_cluster_plan(request: ClusterPlanRequest):
     )
     pipeline_model = with_mtp_head(model) if request.mtp else model
     head_bytes = model.mtp_weight_bytes if request.mtp else 0
-    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
+    engram_ssd_offload = _saved_ssd_offload(request.model_path)
+    # The saved routed-expert offload setting is priced here too: the assistant
+    # elects from it, so the coordinator's own plan must not re-charge experts
+    # the loader streams. A tensor-parallel request is refused, because every
+    # TP rank reads every expert.
+    moe_fraction, moe_offload_layer_bytes = _moe_offload_for_plan(
+        request.model_path,
+        model,
+        mtp=bool(request.mtp),
+        tensor_parallel_size=request.tensor_parallel_size,
+    )
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
         if request.allocation != "balanced":
@@ -700,6 +843,8 @@ def _create_cluster_plan(request: ClusterPlanRequest):
             ),
             context_tokens=request.target_context_tokens,
             engram_ssd_offload=engram_ssd_offload,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
     else:
         plan = plan_unequal_pipeline(
@@ -711,6 +856,8 @@ def _create_cluster_plan(request: ClusterPlanRequest):
             ),
             context_tokens=request.target_context_tokens,
             engram_ssd_offload=engram_ssd_offload,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
     if path_map:
         plan = replace(plan, path_map=path_map)
@@ -943,6 +1090,25 @@ def _resolve_fabric(
     }
 
 
+@router.post("/plan")
+async def cluster_plan(request: ClusterPlanRequest):
+    """Plan explicit contiguous layers across rank-ordered node budgets.
+
+    The dashboard's one-click path is ``/autoconfigure``; this route is the
+    Cluster Assistant's remote-planning seam. When the elected coordinator is
+    another Mac, the assistant's origin asks that Mac to plan the placement it
+    would launch, so activation on the coordinator and the plan the user
+    approved are the same computation. It returns the signature with the plan,
+    which activation re-proves.
+    """
+
+    try:
+        plan = await asyncio.to_thread(_create_cluster_plan, request)
+    except (OSError, PlanningError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _plan_with_signature(plan.to_dict())
+
+
 @router.post("/autoconfigure")
 async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     """Build a complete cluster configuration from peers and a model.
@@ -977,7 +1143,24 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         mtp = _cluster_mtp(request.mtp, model, request.model_path)
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
+    engram_ssd_offload = _saved_ssd_offload(request.model_path)
+    # Same saved-setting derivation the assistant elects from: a DeepSeek-V4.1
+    # MoE with expert offload on is priced by pipeline stage, so the coordinator
+    # cannot re-charge streamed experts when it re-plans the approved split.
+    try:
+        moe_fraction, moe_offload_layer_bytes = _moe_offload_for_plan(
+            request.model_path,
+            model,
+            mtp=mtp,
+            tensor_parallel_size=1,
+        )
+    except PlanningError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Every tensor-parallel rank reads every expert, so an offloaded plan is a
+    # pipeline plan. Automatic takes that split instead of silently pricing the
+    # experts resident; an explicit tensor request is refused below.
+    moe_forced_pipeline = bool(moe_offload_layer_bytes) and request.strategy == "auto"
+    plan_strategy = "pipeline" if moe_forced_pipeline else request.strategy
 
     transports: tuple[Any, ...] = ()
     transport_error: str | None = None
@@ -1038,14 +1221,52 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             nodes,
             transports=strategy_transports,
             prefer=request.prefer,
-            strategy=request.strategy,
+            strategy=plan_strategy,
             measurements=measurements,
             workload_profile=request.execution_profile,
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             engram_ssd_offload=engram_ssd_offload,
             tensor_split=_tensor_split_arg(request.tensor_split),
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
+        if moe_offload_layer_bytes:
+            if choice.tensor_parallel_size > 1:
+                raise PlanningError(
+                    "MoE expert offload is supported for pipeline stages only; "
+                    "tensor-parallel ranks read every expert"
+                )
+            # ``choose_parallelism`` has no expert-offload seam, so rebuild the
+            # pipeline plan with it: the stage then holds ``layer - offloaded``,
+            # exactly the split the assistant's election approved.
+            reason = choice.reason
+            choice_warnings = choice.warnings
+            if moe_forced_pipeline:
+                reason = (
+                    f"{reason}. Routed experts are offloaded per pipeline "
+                    "stage, so tensor parallelism was not considered."
+                )
+                choice_warnings += (
+                    "MoE expert offload streams routed experts per pipeline "
+                    "stage, so tensor parallelism was not considered.",
+                )
+            choice = replace(
+                choice,
+                plan=plan_hybrid(
+                    model,
+                    nodes,
+                    tensor_parallel_size=1,
+                    workload_profile=request.execution_profile,
+                    context_tokens=request.target_context_tokens,
+                    head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
+                    engram_ssd_offload=engram_ssd_offload,
+                    moe_offload_layer_bytes=moe_offload_layer_bytes,
+                    moe_expert_offload_resident_fraction=moe_fraction,
+                ),
+                reason=reason,
+                warnings=choice_warnings,
+            )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1146,6 +1367,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             engram_ssd_offload=engram_ssd_offload,
             tensor_split=_tensor_split_arg(request.tensor_split),
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
         choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
@@ -1283,6 +1506,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 context_tokens=request.target_context_tokens,
                 mtp=mtp,
                 engram_ssd_offload=engram_ssd_offload,
+                moe_offload_layer_bytes=moe_offload_layer_bytes,
+                moe_expert_offload_resident_fraction=moe_fraction,
             )
             performance_changes = _plan_changes(
                 choice.plan.to_dict(),
@@ -1623,6 +1848,85 @@ def _run_staging_job(
         _update_staging_job(job_id, fail)
 
 
+def start_cluster_staging(
+    deployment: ClusterDeployment,
+    *,
+    source_host: str = "127.0.0.1",
+    parallel: int = 4,
+) -> dict[str, Any]:
+    """Create and start one observable staging job; return its first snapshot.
+
+    Extracted unchanged out of ``POST /stage`` so the Cluster Assistant's
+    ``apply`` uses this one implementation instead of a second copy: the route
+    and the assistant differ only in who signed the deployment and who polls the
+    job. The caller has already validated the placement.
+    """
+
+    model_path = Path(deployment.model).expanduser()
+    job_id = secrets.token_hex(12)
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "ready": False,
+        "model_path": str(model_path),
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "error": "",
+        "nodes": {
+            assignment.node_id: {
+                "node_id": assignment.node_id,
+                "rank": assignment.rank,
+                "status": "queued",
+                "files_total": 0,
+                "files_completed": 0,
+                "bytes_total": 0,
+                "bytes_completed": 0,
+                "files": {},
+                "error": "",
+            }
+            for assignment in deployment.assignments
+        },
+    }
+    _record_staging_job(job)
+    thread = threading.Thread(
+        target=_run_staging_job,
+        args=(job_id, deployment),
+        kwargs={
+            "source_host": source_host,
+            "parallel": parallel,
+        },
+        name=f"omlx-model-staging-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return _staging_job_snapshot(job_id) or job
+
+
+def read_cluster_staging_job(job_id: str) -> dict[str, Any] | None:
+    """One staging job's current progress, or ``None`` when it is unknown."""
+
+    return _staging_job_snapshot(job_id)
+
+
+def prepare_cluster_deployment(
+    request: ClusterDeploymentRequest,
+) -> tuple[ClusterDeploymentRequest, ClusterDeployment, dict[str, Any]]:
+    """Recompute the deployment and return it with the signature it will carry.
+
+    This is the head of ``_activate_and_report`` exposed as one call, so the
+    Cluster Assistant can stage exactly the placement the activation will
+    launch: same planner, same request, same ``placement_signature`` the
+    approval guard compares. It decides nothing of its own — an invalid request
+    raises exactly what activation would raise.
+    """
+
+    deployment, plan = _create_deployment(request)
+    signed = request.model_copy(
+        update={"approved_placement": _placement_signature(plan)}
+    )
+    return signed, deployment, _plan_with_signature(plan)
+
+
 @router.post("/stage")
 async def cluster_stage(request: ClusterStageRequest):
     """Start an observable, resumable model×node staging job."""
@@ -1644,43 +1948,11 @@ async def cluster_stage(request: ClusterStageRequest):
                 status_code=400,
                 detail="The coordinator does not have the selected model to stage.",
             )
-        job_id = secrets.token_hex(12)
-        job = {
-            "job_id": job_id,
-            "status": "queued",
-            "ready": False,
-            "model_path": str(model_path),
-            "created_at": time.time(),
-            "updated_at": time.time(),
-            "error": "",
-            "nodes": {
-                assignment.node_id: {
-                    "node_id": assignment.node_id,
-                    "rank": assignment.rank,
-                    "status": "queued",
-                    "files_total": 0,
-                    "files_completed": 0,
-                    "bytes_total": 0,
-                    "bytes_completed": 0,
-                    "files": {},
-                    "error": "",
-                }
-                for assignment in deployment.assignments
-            },
-        }
-        _record_staging_job(job)
-        thread = threading.Thread(
-            target=_run_staging_job,
-            args=(job_id, deployment),
-            kwargs={
-                "source_host": source_host,
-                "parallel": request.parallel,
-            },
-            name=f"omlx-model-staging-{job_id[:8]}",
-            daemon=True,
+        return start_cluster_staging(
+            deployment,
+            source_host=source_host,
+            parallel=request.parallel,
         )
-        thread.start()
-        return _staging_job_snapshot(job_id)
     except InsufficientDiskError as exc:
         raise HTTPException(status_code=507, detail=str(exc)) from exc
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -1693,7 +1965,7 @@ async def cluster_stage_status(job_id: str):
 
     if not re.fullmatch(r"[0-9a-f]{24}", job_id):
         raise HTTPException(status_code=404, detail="staging job not found")
-    snapshot = _staging_job_snapshot(job_id)
+    snapshot = read_cluster_staging_job(job_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="staging job not found")
     return snapshot
@@ -1929,6 +2201,8 @@ def _build_performance_plan(
     mtp: bool = False,
     engram_ssd_offload: bool = False,
     tensor_split: Any = "auto",
+    moe_offload_layer_bytes: tuple[int, ...] = (),
+    moe_expert_offload_resident_fraction: float = 0.0,
 ) -> ShardPlan:
     """Build a shard plan using the hybrid planner when tensor parallelism is active."""
 
@@ -1942,6 +2216,10 @@ def _build_performance_plan(
             context_tokens=context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             tensor_split=tensor_split,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=(
+                moe_expert_offload_resident_fraction
+            ),
         )
     return plan_unequal_pipeline(
         with_mtp_head(model) if mtp else model,
@@ -1950,6 +2228,8 @@ def _build_performance_plan(
         microbatch_size=microbatch_size,
         context_tokens=context_tokens,
         engram_ssd_offload=engram_ssd_offload,
+        moe_offload_layer_bytes=moe_offload_layer_bytes,
+        moe_expert_offload_resident_fraction=moe_expert_offload_resident_fraction,
     )
 
 
@@ -1993,6 +2273,26 @@ def _performance_optimized_deployment(
         ),
         "auto",
     )
+    # Likewise the approved expert-offload decision: re-reading the saved
+    # setting could price a different fraction than the plan that was approved,
+    # and an un-applied offload has no bytes to charge.
+    moe_fraction = next(
+        (
+            item.moe_expert_offload_resident_fraction
+            for item in deployment.assignments
+            if item.moe_expert_offload_resident_fraction
+        ),
+        0.0,
+    )
+    moe_offload_layer_bytes: tuple[int, ...] = ()
+    if moe_fraction:
+        moe_offload_layer_bytes = _moe_offload_layer_bytes(
+            model, moe_fraction, mtp=False
+        )
+        if not moe_offload_layer_bytes:
+            # The approved plan claimed a streamed share this layout cannot be
+            # sized for; charge the experts resident rather than a made-up split.
+            moe_fraction = 0.0
     plan = _build_performance_plan(
         model,
         nodes,
@@ -2003,6 +2303,8 @@ def _performance_optimized_deployment(
         mtp=deployment.execution.mtp,
         engram_ssd_offload=engram_ssd_offload,
         tensor_split=approved_split,
+        moe_offload_layer_bytes=moe_offload_layer_bytes,
+        moe_expert_offload_resident_fraction=moe_fraction,
     )
     execution = tune_execution_settings(
         deployment.execution,
@@ -2023,6 +2325,8 @@ def _performance_optimized_deployment(
             mtp=deployment.execution.mtp,
             engram_ssd_offload=engram_ssd_offload,
             tensor_split=approved_split,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
     deployment_id = (
         request.deployment_id.strip()
@@ -2396,6 +2700,22 @@ async def cluster_catalogue(request: ClusterCatalogueRequest) -> dict[str, Any]:
         "runnable_count": len(runnable),
         "largest_runnable": runnable[0] if runnable else None,
     }
+
+
+@router.post("/performance-probe")
+async def cluster_performance_probe(request: ClusterDeploymentRequest) -> dict[str, Any]:
+    """Run the synthetic compute probe on the placement this caller approved.
+
+    The probe is model-independent: it measures each rank's effective weight
+    rate and the collective link before a model is loaded. The assistant calls
+    it after apply and stores the profiles for its *next* plan; it never
+    rewrites the current plan.
+    """
+
+    _, deployment, _ = await asyncio.to_thread(
+        prepare_cluster_deployment, request
+    )
+    return await asyncio.to_thread(run_cluster_performance_probe, deployment)
 
 
 @router.get("/deployments")

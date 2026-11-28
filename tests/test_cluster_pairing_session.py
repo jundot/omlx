@@ -542,3 +542,77 @@ def test_forget_cleanup_serializes_with_inflight_retry(tmp_path):
     assert forgotten.is_set()
     assert session.snapshot()["cleanup_pending"] is False
     assert _restart(tmp_path, joiner).ui_session.snapshot()["cleanup_pending"] is False
+
+
+def test_approved_join_retires_when_coordinator_is_unpaired(tmp_path):
+    """An approved join whose coordinator is gone must not ghost the UI.
+
+    Measured live 2026-11-16 on .12: after .11 was unpaired, the leftover
+    approved record toasted "This Mac joined X's cluster" on every page load
+    and painted the manual mode's joining panel. The snapshot must retire
+    it, and the retirement must survive a restart.
+    """
+
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    shown = joiner.ui_session.begin("coordinator:8000")
+    coordinator.approve(joiner.node_id, shown["code"])
+    assert joiner.ui_session.poll()["state"] == "approved"
+    saved = json.loads(joiner.ui_session.path.read_text())
+    assert saved["attempt"]["coordinator_node_id"] == "coord-node"
+
+    joiner.unpair(coordinator.node_id)
+
+    assert joiner.ui_session.snapshot()["state"] == "idle"
+    restored = _restart(tmp_path, joiner)
+    assert restored.ui_session.snapshot()["state"] == "idle"
+
+
+def test_legacy_approved_join_retires_by_coordinator_address(tmp_path):
+    """Records written before coordinator_node_id existed reconcile by IP."""
+
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    shown = joiner.ui_session.begin("coordinator:8000")
+    coordinator.approve(joiner.node_id, shown["code"])
+    assert joiner.ui_session.poll()["state"] == "approved"
+
+    # A pre-reconcile record: no node id, the coordinator long unpaired.
+    with joiner.ui_session.lock:
+        joiner.ui_session.attempt.pop("coordinator_node_id", None)
+        joiner.ui_session.attempt["coordinator_addr"] = "192.0.2.11:8000"
+    joiner.unpair(coordinator.node_id)
+
+    assert joiner.ui_session.snapshot()["state"] == "idle"
+
+
+def test_legacy_approved_join_survives_while_coordinator_is_paired(tmp_path):
+    """The address fallback never retires a join whose coordinator is there."""
+
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    shown = joiner.ui_session.begin("coordinator:8000")
+    coordinator.approve(joiner.node_id, shown["code"])
+    assert joiner.ui_session.poll()["state"] == "approved"
+
+    # The loopback coordinator advertises 127.0.0.1; the join stays.
+    with joiner.ui_session.lock:
+        joiner.ui_session.attempt.pop("coordinator_node_id", None)
+        joiner.ui_session.attempt["coordinator_addr"] = "127.0.0.1:8000"
+
+    assert joiner.ui_session.snapshot()["state"] == "approved"
+
+
+def test_device_store_failure_never_retires_an_approved_join(tmp_path):
+    """Fail closed: the reconcile must not eat a join on a read error."""
+
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    shown = joiner.ui_session.begin("coordinator:8000")
+    coordinator.approve(joiner.node_id, shown["code"])
+    assert joiner.ui_session.poll()["state"] == "approved"
+
+    def broken():
+        raise RuntimeError("device store unavailable")
+
+    joiner.paired_devices = broken
+    try:
+        assert joiner.ui_session.snapshot()["state"] == "approved"
+    finally:
+        del joiner.paired_devices

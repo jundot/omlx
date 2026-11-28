@@ -117,6 +117,7 @@ def test_no_unreachable_functions_in_the_cluster_package():
     """
 
     allowed_uncalled = {
+        ("deployment.py", "decode_worker_plan"),
         # Maintainer-only real-collective regression gate. It deliberately is
         # not exposed in the GUI or production route surface.
         ("collective.py", "_run_local_minimax_decode_smoke"),
@@ -126,6 +127,13 @@ def test_no_unreachable_functions_in_the_cluster_package():
         ("registry.py", "reset_configured_device_registry"),
         ("pairing.py", "reset_pairing_manager"),
         ("pairing_routes.py", "set_pairing_manager_getter"),
+        # The tested fold primitive: the measure job attaches a calibration
+        # profile on the node payload directly, so this copy-helper is exercised
+        # only by the measurement tests today.
+        ("measurement.py", "with_calibration"),
+        # The tested key contract for a tuning preset (model signature +
+        # hardware pair); TuningPresetStore already keys by preset_key, so the
+        # comparison has no production caller yet.
     }
 
     name_counts = Counter(

@@ -122,6 +122,11 @@ async def login_page(request: Request):
         HTML login/setup page.
     """
     if _host.is_admin(request):
+        # Already signed in: honour a pending deep link instead of flattening
+        # it to the dashboard. query_params already decodes ?next= once.
+        nxt = (request.query_params.get("next") or "").strip()
+        if nxt.startswith("/") and not nxt.startswith("//"):
+            return RedirectResponse(url=nxt, status_code=302)
         return RedirectResponse(url="/admin/dashboard", status_code=302)
 
     _sync_locale()

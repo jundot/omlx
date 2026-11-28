@@ -163,7 +163,49 @@ class PairingSession:
                     self.manager._local_code = None
                     self._save()
                     return self.snapshot()
+            elif result["state"] == "approved" and not self._coordinator_paired(
+                self.attempt
+            ):
+                # The join is over: the coordinator this Mac joined is no
+                # longer a paired device (unpaired, forgotten, or a wiped
+                # state). Retire the record instead of ghosting the UI with
+                # "This Mac joined X's cluster" forever.
+                self.attempt = None
+                self._save()
+                return self.snapshot()
             return result
+
+    def _coordinator_paired(self, attempt: dict[str, Any]) -> bool:
+        """Is the coordinator of an approved join still a paired device?
+
+        Fail closed: a device-list read error never retires the join.
+        """
+        try:
+            paired = self.manager.paired_devices()
+        except Exception:
+            return True
+        coordinator_id = str(attempt.get("coordinator_node_id") or "")
+        if coordinator_id:
+            return any(
+                str(device.get("node_id") or "") == coordinator_id
+                for device in paired
+            )
+        # Records written before the node id was stored fall back to the
+        # coordinator address: the host must appear among a paired
+        # device's known addresses.
+        addr = str(attempt.get("coordinator_addr") or "")
+        host = addr.rsplit(":", 1)[0].strip("[]") if ":" in addr else ""
+        if not host:
+            return True
+        for device in paired:
+            for entry in device.get("last_addrs") or []:
+                if str(entry) == host:
+                    return True
+            for entry in device.get("addrs") or []:
+                ip = entry.get("ip") if isinstance(entry, dict) else entry
+                if str(ip or "") == host:
+                    return True
+        return False
 
     def offer_invite(self, node_id: str) -> None:
         with self.lock:
@@ -335,6 +377,12 @@ class PairingSession:
                         "state": "approved",
                         "coordinator_addr": current["coordinator_addr"],
                         "coordinator_name": record.get("friendly_name", ""),
+                        # Reconciliation anchor: an approved join whose
+                        # coordinator is no longer a paired device is a
+                        # ghost (measured 2026-11-16: it toasted "joined
+                        # X's cluster" on every page load after X was
+                        # unpaired). The node id is the exact match.
+                        "coordinator_node_id": record.get("node_id", ""),
                     }
                 elif status.get("state") == "denied":
                     self.manager._local_code = None

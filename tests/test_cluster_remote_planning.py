@@ -127,6 +127,59 @@ def test_a_model_whose_config_omits_its_depth_is_still_readable(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Capability detection sees the pre-load patched architecture (frozen).
+# ---------------------------------------------------------------------------
+
+
+def test_capability_detection_sees_the_pre_load_patched_architecture(
+    tmp_path, monkeypatch
+):
+    """R3: inspection applies oMLX's pre-load patches before detecting capability.
+
+    The patches register rank modules and carry process-global side effects
+    (``set_mtp_active(False)``, the Qwen3.5 YaRN window). That is intentional
+    and frozen ("pipeline capability is part of the plan"): the layout must
+    describe the architecture the rank will load, and a checkpoint that
+    cannot pipeline after patching is never planned as PP.
+    """
+
+    import sys
+    import types
+
+    from omlx.utils import model_loading
+
+    root = _model(tmp_path / "m", present_layers=range(4), declared_layers=4)
+    config = json.loads((root / "config.json").read_text())
+    config["model_type"] = "omlx_test_patched"
+    (root / "config.json").write_text(json.dumps(config))
+    module_name = "mlx_lm.models.omlx_test_patched"
+    applied = []
+
+    def fake_pre_load_patches(model_path, *args, **kwargs):
+        applied.append(model_path)
+        module = types.ModuleType(module_name)
+        module.SUPPORTS_PIPELINE = True
+        monkeypatch.setitem(sys.modules, module_name, module)
+
+    monkeypatch.setattr(
+        model_loading, "maybe_apply_pre_load_patches", fake_pre_load_patches
+    )
+
+    layout = inspect_safetensors_layout(root)
+
+    assert applied == [str(root)], "the patches run before capability detection"
+    assert layout.supports_pipeline is True
+
+    # Control: without the patches the same checkpoint is not pipeline-capable,
+    # so the answer above really comes from the patched architecture.
+    monkeypatch.delitem(sys.modules, module_name)
+    monkeypatch.setattr(
+        model_loading, "maybe_apply_pre_load_patches", lambda *a, **k: None
+    )
+    assert inspect_safetensors_layout(root).supports_pipeline is False
+
+
+# ---------------------------------------------------------------------------
 # Choosing the node: ask, do not assume.
 # ---------------------------------------------------------------------------
 

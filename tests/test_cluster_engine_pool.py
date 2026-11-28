@@ -50,6 +50,28 @@ def test_engine_pool_admits_only_rank_zero_resident_weight(tmp_path):
     assert entry.estimated_size == 300
 
 
+def test_local_only_prices_the_whole_model_not_a_deployments_shard(tmp_path):
+    """A local-only load must not borrow a deployment's rank-0 shard size.
+
+    The measured Qwen3.8 failure compared rank 0's ~48.5 GiB shard against live
+    admission while the assistant's single-node promise was about the whole
+    model. With ``local_only`` the registry deployment is ignored everywhere,
+    including admission, so the verdict is "this Mac alone".
+    """
+
+    model_path = str(tmp_path / "nemotron")
+    deployment = _deployment(model_path)
+    pool = EnginePool()
+    pool._cluster_registry = SimpleNamespace(
+        get_for_model=lambda model: deployment if model == model_path else None
+    )
+    entry = _entry(model_path)
+
+    assert pool._entry_resident_size(entry) == 90
+    assert entry.estimated_size == 300
+    assert pool._entry_resident_size(entry, local_only=True) == 300
+
+
 def test_loaded_engine_retains_resident_accounting_after_deactivation(tmp_path):
     model_path = str(tmp_path / "nemotron")
     deployment = _deployment(model_path)
@@ -291,6 +313,50 @@ async def test_a_failed_distributed_engine_is_not_leased_when_reloadable(tmp_pat
     # A healthy engine is not treated as failed.
     entry.engine = SimpleNamespace(runtime_failed_reason=None)
     assert pool._runtime_failed_engine(entry.engine) is False
+
+
+async def test_a_local_only_request_never_leases_a_distributed_engine(tmp_path):
+    """local_only means "this Mac alone", so a cluster engine is not reused."""
+
+    pool, entry = _failed_pool(tmp_path)
+    engine = SimpleNamespace(deployment=_deployment(entry.model_path))
+    entry.engine = engine
+
+    # A normal request reuses it (that is the cluster's own serving path).
+    assert pool._acquire_loaded_engine("nemotron", False, True, None) is engine
+    # A local-only request refuses to.
+    assert (
+        pool._acquire_loaded_engine(
+            "nemotron", False, True, None, local_only=True
+        )
+        is None
+    )
+
+
+async def test_get_engine_local_only_unloads_the_cluster_engine_before_reloading(
+    tmp_path,
+):
+    """run-local must not report a cluster launch as this Mac's own model.
+
+    ``get_engine(local_only=True)`` unloads the distributed engine and asks the
+    local load path; the sentinel proves it reached that path instead of
+    returning the ready cluster engine.
+    """
+
+    pool, entry = _failed_pool(tmp_path)
+    entry.engine = SimpleNamespace(deployment=_deployment(entry.model_path))
+    sentinel = RuntimeError("reached the local load path")
+
+    def stop_at_load(model_id, e):
+        raise sentinel
+
+    pool._raise_if_model_path_missing_locked = stop_at_load
+    with pytest.raises(RuntimeError) as err:
+        await pool.get_engine("nemotron", local_only=True)
+
+    assert err.value is sentinel
+    pool._unload_engine.assert_awaited_once_with("nemotron")
+    assert entry.engine is None
 
 
 @pytest.mark.parametrize("peers_reachable", [None, True])
