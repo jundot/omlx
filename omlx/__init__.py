@@ -21,6 +21,8 @@ from omlx._version import __version__
 # and relaxes the compute preemption timeout behind ImpactingInteractivity kills.
 if sys.platform == "darwin":
     os.environ.setdefault("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1")
+    # macOS: unwires an idle process's GPU memory unless MLX renews its residency.
+    os.environ.setdefault("MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS", "1000")
 
 _LAZY = {
     "Request": "omlx.request",
