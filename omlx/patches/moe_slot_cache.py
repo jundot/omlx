@@ -45,6 +45,7 @@ class SlotCache:
                 arrays += [self.global_scales[proj], lin["global_scale"]]
             self.resident[proj] = arrays
         self.slot_of: dict[int, int] = {}
+        self.slot_expert = [0] * self.capacity
         self.free = list(range(self.capacity))
         self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
         self.hits = self.misses = 0
@@ -120,8 +121,12 @@ class SlotCache:
                     self.map[victim] = -1
                 for (proj, field, _), plan, raw in raws:
                     self.glu[proj][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
-                for proj, scale in self.global_scales.items():
-                    self.glu[proj]["global_scale"][slot] = scale[e]
+                self.slot_expert[slot] = e
+                if self.global_scales:
+                    # mlx: a slot write chains onto the table until a read evaluates it
+                    rows = mx.array(self.slot_expert)
+                    for proj, scale in self.global_scales.items():
+                        self.glu[proj]["global_scale"][:] = scale[rows]
                 self.slot_of[e] = slot
                 self.map[e] = slot
                 self.misses += 1
