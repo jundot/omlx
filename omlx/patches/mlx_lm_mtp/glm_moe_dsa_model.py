@@ -358,11 +358,48 @@ def _patch_model(glm: Any) -> None:
             self._omlx_mtp_depth = get_mtp_depth()
             self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             self._omlx_mtp_head_clone = False
-            # Marginal cost prior for the adaptive depth controller: with
-            # 8-of-256 routing each extra verify row pulls an almost
-            # disjoint expert set (~55% of step bytes), measured ~35 ms
-            # per row on GLM-5.2 vs the dense-backbone 7 ms default.
+            # Marginal cost prior for the adaptive depth controller.
+            #
+            # Scope note: this __init__ serves the GLM-5.2 family
+            # (mlx_lm glm_moe_dsa). The 35 ms prior was measured on
+            # GLM-5.2 itself (8-of-256 routing, bf16) and stays correct
+            # for unquantized 5.2 loads.
+            #
+            # Quantized loads pay far less per extra verify row (oQ4e packs
+            # expert weights to ~1/4 the bytes, and on GLM-5.3 Flash oQ4e
+            # the measured backbone cost per cycle *drops* as drafting
+            # deepens: 52 ms at tok/cycle<1.8 vs 26 ms at >=2.3 over ~250
+            # MTP sessions on an M3 Ultra 512GB). mlx_lm quantizes after
+            # ModelArgs is built, so the quantization signal is not on
+            # `config` here — detect it lazily from the loaded module tree
+            # on first controller use instead of a load-time constant.
             self._omlx_mtp_marginal_ms = 35.0
+
+    def _default_marginal_ms(self) -> float:
+        """Quantization-aware fallback when the measured slope is absent.
+
+        mlx_lm applies nn.quantize after ModelArgs construction, so this
+        cannot be decided in __init__; inspect the live module tree once.
+        """
+        cached = getattr(self, "_omlx_mtp_marginal_resolved", None)
+        if cached is not None:
+            return cached
+        quantized = False
+        try:
+            for layer in getattr(getattr(self, "model", self), "layers", []) or []:
+                mlp = getattr(layer, "mlp", None)
+                if mlp is None:
+                    continue
+                # Quantized mlx modules carry `scales`/`bits` parameters;
+                # a single hit anywhere in the first MoE block is decisive.
+                if any("scales" in k for k, _ in mlp.items()):
+                    quantized = True
+                    break
+        except Exception:
+            quantized = False
+        resolved = 7.0 if quantized else 35.0
+        self._omlx_mtp_marginal_resolved = resolved
+        return resolved
 
     def __call__(
         self,
