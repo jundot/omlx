@@ -1600,6 +1600,86 @@ def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
     assert mx.get_peak_memory() - base < 10 * block
 
 
+def _full_mask_inputs(batch, heads, length, keys, extent, dtype, sink_dtype=None):
+    q = (mx.random.normal((batch, heads, length, 128)) * 0.3).astype(dtype)
+    # K/V as a strided slice of a larger cache buffer.
+    kbuf = (mx.random.normal((batch, 2, keys + 32, 128)) * 0.3).astype(dtype)
+    vbuf = mx.random.normal((batch, 2, keys + 32, 128)).astype(dtype)
+    rel = mx.random.normal((batch, length, heads, extent)).astype(dtype)
+    sink = (mx.random.normal((batch, length, heads)) * 2).astype(sink_dtype or dtype)
+    return q, kbuf[:, :, :keys], vbuf[:, :, :keys], rel, sink
+
+
+@pytest.mark.parametrize(
+    "batch,heads,length,keys,extent,budget,sink_dtype",
+    [
+        (1, 4, 64, 64, 32, None, None),  # no history: the chunk's own keys
+        (1, 4, 96, 700, 128, None, None),  # far keys before the bias band
+        (1, 6, 200, 900, 64, 1 << 16, None),  # several query blocks
+        (2, 4, 48, 300, 512, None, None),  # band wider than the history
+        (1, 4, 80, 400, 64, None, "float32"),  # FP32 sinks round to q's dtype
+    ],
+)
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_inkling2_fused_full_mask_is_bit_identical(
+    monkeypatch, batch, heads, length, keys, extent, budget, sink_dtype, dtype
+):
+    # The one-kernel full-attention mask must reproduce the MLX-op mask exactly,
+    # so the masked SDPA output keeps every bit.
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    if budget is not None:
+        monkeypatch.setattr(kernels, "_MASK_BUDGET", budget)
+    sd = getattr(mx, sink_dtype) if sink_dtype else None
+    args = _full_mask_inputs(batch, heads, length, keys, extent, getattr(mx, dtype), sd)
+    scale = 128**-0.5
+    fused = kernels._masked_attention(*args, scale, 0, None)
+    monkeypatch.setattr(kernels, "_full_mask", lambda *a, **k: None)
+    reference = kernels._masked_attention(*args, scale, 0, None)
+    assert fused.shape == reference.shape
+    assert mx.array_equal(fused, reference).item()
+
+
+def test_inkling2_full_attention_takes_the_fused_mask(monkeypatch):
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    calls = []
+    real = kernels._full_mask
+
+    def spy(*args, **kwargs):
+        out = real(*args, **kwargs)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(kernels, "_full_mask", spy)
+    monkeypatch.setattr(kernels, "_MASK_BUDGET", 1 << 16)
+    args = _full_mask_inputs(1, 4, 128, 600, 64, mx.bfloat16)
+    mx.eval(kernels._masked_attention(*args, 128**-0.5, 0, None))
+    # Every query block of a full-attention call is built by the kernel.
+    assert len(calls) > 1 and all(calls)
+
+
+@pytest.mark.parametrize("window,left_padding", [(64, None), (0, [0, 9])])
+def test_inkling2_windowed_or_padded_masks_keep_the_mlx_ops(
+    monkeypatch, window, left_padding
+):
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    called = []
+    monkeypatch.setattr(kernels, "_full_mask", lambda *a, **k: called.append(1))
+    batch = 2 if left_padding else 1
+    args = _full_mask_inputs(batch, 4, 64, 300, 64, mx.bfloat16)
+    lp = mx.array(left_padding, dtype=mx.int32) if left_padding else None
+    mx.eval(kernels._masked_attention(*args, 128**-0.5, window, lp))
+    assert not called
+
+
 def test_inkling2_image_processor_pads_normalizes_and_orders_blocks():
     from PIL import Image
 

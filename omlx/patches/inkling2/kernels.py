@@ -1547,6 +1547,90 @@ def banded_sink_attention(
     return _masked_attention(q, k, v, rel, sink, scale, window, left_padding)
 
 
+# Full-attention prefill mask in one pass. The MLX-op construction below
+# (gather of the bias band, two where's, broadcast fills and a concatenate of
+# the [B, Hq, rows, 1 + keys] tensor) makes several passes over a mask that
+# reaches 1 GiB per query block at long context; this kernel writes each
+# element once, with the same values (bit-identical masks):
+#   column 0     the row's sink logit
+#   column 1 + j -inf for a future key (d < 0), the relative bias rel[d] for
+#                d < r, 0 for older keys,  d = (a0 + i) - (lo + j)
+# Sliding windows and left padding keep the MLX-op path.
+_FULL_MASK_SOURCE = """
+    const int c0 = int(thread_position_in_grid.x) * 8;
+    const int i = int(thread_position_in_grid.y);
+    const int bh = int(thread_position_in_grid.z);
+    const int ncols = p[0];
+    const int nq = p[1];
+    const int hq = p[2];
+    const int r = p[3];
+    const int a0 = p[4];
+    const int lo = p[5];
+    const int i0 = p[6];
+    const int L = p[7];
+    if (c0 >= ncols || i >= nq) {
+      return;
+    }
+    const int b = bh / hq;
+    const int h = bh % hq;
+    const int row = i0 + i;
+    const device T* relrow = rel + ((size_t(b) * L + row) * hq + h) * size_t(r);
+    device T* dst = mask + (size_t(bh) * nq + i) * size_t(ncols);
+    const int qpos = a0 + i;
+    const T neg = T(-INFINITY);
+    for (int u = 0; u < 8; ++u) {
+      const int c = c0 + u;
+      if (c >= ncols) {
+        break;
+      }
+      T val;
+      if (c == 0) {
+        val = sink[(size_t(b) * L + row) * hq + h];
+      } else {
+        const int d = qpos - (lo + c - 1);
+        val = d < 0 ? neg : (d < r ? relrow[d] : T(0));
+      }
+      dst[c] = val;
+    }
+"""
+_full_mask_kernel = None
+_full_mask_failed = False
+
+
+def _full_mask(rel, sink, *, nq, nk, a0, lo, i0, dtype):
+    """The full-attention mask of query rows [i0, i0 + nq) as one kernel, or
+    None (the caller builds it from MLX ops)."""
+    global _full_mask_kernel, _full_mask_failed
+    if _full_mask_failed:
+        return None
+    b, length, hq, r = rel.shape
+    try:
+        if _full_mask_kernel is None:
+            _full_mask_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_full_mask",
+                input_names=["rel", "sink", "p"],
+                output_names=["mask"],
+                source=_FULL_MASK_SOURCE,
+            )
+        ncols = nk + 1
+        return _full_mask_kernel(
+            inputs=[
+                rel.astype(dtype),
+                sink.astype(dtype),
+                mx.array([ncols, nq, hq, r, a0, lo, i0, length], dtype=mx.int32),
+            ],
+            template=[("T", dtype)],
+            grid=((ncols + 7) // 8, nq, b * hq),
+            threadgroup=(64, 1, 1),
+            output_shapes=[(b, hq, nq, ncols)],
+            output_dtypes=[dtype],
+        )[0]
+    except Exception:  # noqa: BLE001
+        _full_mask_failed = True
+        logger.warning("Inkling 2 fused full-attention mask unavailable", exc_info=True)
+        return None
+
+
 def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
     """MLX SDPA over an additive mask that carries the bias band and sinks."""
     b, hq, length, d = q.shape
@@ -1575,6 +1659,19 @@ def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
         nq = i1 - i0
         a0 = s - length + i0
         hi = s - length + i1
+        mask = None
+        if not window and lp_ok is None:
+            mask = _full_mask(
+                rel, sink, nq=nq, nk=nk, a0=a0, lo=lo, i0=i0, dtype=q.dtype
+            )
+        if mask is not None:
+            out = mx.fast.scaled_dot_product_attention(
+                q[:, :, i0:i1], kz, vz, scale=scale, mask=mask
+            )
+            if qb < length:
+                mx.eval(out)
+            outs.append(out)
+            continue
         f = max(lo, a0 - r + 1)
         near = hi - f
         dist = (a0 - f) + mx.arange(nq)[:, None] - mx.arange(near)[None, :]
