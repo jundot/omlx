@@ -113,6 +113,7 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
 # deliberately failing an mlx-vlm load and relying on the engine-pool fallback.
 # Remove a family once mlx-vlm provides its multimodal implementation.
 MLX_LM_TEXT_ONLY_MODEL_TYPES = {
+    "kimi_k31",
     "mimo_v2",
     "mimo_v2_flash",
 }

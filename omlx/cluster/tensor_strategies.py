@@ -73,6 +73,11 @@ MUSE_SPARK = TensorStrategy(
     model_types=("muse_spark",),
     source="oMLX adapter for MLX-LM's Muse Spark attention and experts",
 )
+KIMI_K31 = TensorStrategy(
+    name="kimi_k31",
+    model_types=("kimi_k31",),
+    source="MLX-LM's Kimi K3 shard() per layer",
+)
 
 
 def registered_model_types() -> frozenset[str]:
@@ -850,6 +855,20 @@ def _shard_ministral3(
         type(model).shard(view, group)
 
     _shard_layers(list(model.model.layers), shard_layer, mx, progress, MINISTRAL3)
+
+
+@_register(KIMI_K31)
+def _shard_kimi_k31(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    # MLX-LM's shard() only touches the layers it is given.
+    def shard_layer(layer: Any) -> None:
+        type(model).shard(SimpleNamespace(layers=[layer]), group)
+
+    _shard_layers(list(model.layers), shard_layer, mx, progress, KIMI_K31)
 
 
 @_register(MUSE_SPARK)

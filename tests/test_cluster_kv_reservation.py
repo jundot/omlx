@@ -103,6 +103,22 @@ def test_mla_models_are_not_over_counted():
     assert _kv_cache_replicated_across_tp(uniform) is False
 
 
+def test_kimi_k31_attention_layers_also_cache_the_indexer():
+    """24 of 93 layers grow a latent cache, an indexer key and its zero value."""
+
+    text = {
+        "num_hidden_layers": 93,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "linear_attn_config": {"kda_layers": list(range(1, 70))},
+        "dsa_config": {"index_head_dim": 128},
+    }
+    config = {"model_type": "kimi_k31", "text_config": text}
+
+    per_attention_layer = (512 + 64 + 2 * 128) * 2
+    assert _kv_bytes_per_token_per_layer(config) == -(-per_attention_layer * 24 // 93)
+
+
 def test_glm5_next_nope_hybrid_uses_sparse_layer_average():
     text_config = {
         "num_hidden_layers": 4,
