@@ -125,7 +125,7 @@ def _load_oq_build(model, path, quantization, draft):
     model.load_weights(list(weights.items()), strict=True)
 
 
-def load(path, *, trust_remote_code=False):
+def load(path, *, trust_remote_code=False, processor=True):
     """Load the FP4 or FP8 release repacked to mxfp4 and mxfp8, or an oQ build."""
     path = Path(path)
     raw_config = json.loads((path / "config.json").read_text())
@@ -136,7 +136,7 @@ def load(path, *, trust_remote_code=False):
         or quantization.get("weight_block_size") != [_FP8_BLOCK, _FP8_BLOCK]
     ):
         raise ValueError(f"oMLX serves ERNIE 5.5 Flash Preview from {_RELEASES}")
-    if not trust_remote_code:
+    if processor and not trust_remote_code:
         raise ValueError(
             "ERNIE 5.5 renders chats with tokenizer code shipped in the model "
             "repository. Enable Trust Remote Code for this model to load it."
@@ -148,7 +148,7 @@ def load(path, *, trust_remote_code=False):
         model.language_model.dspark = DSpark(config)
     if oq_build is not None:
         _load_oq_build(model, path, oq_build, draft)
-        return _finish(model, path)
+        return _finish(model, path, processor)
     weight_map = json.loads((path / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -175,7 +175,7 @@ def load(path, *, trust_remote_code=False):
     specs = _quantization(weights)
     nn.quantize(language_model, class_predicate=lambda name, _: specs.get(name, False))
     language_model.load_weights(list(weights.items()), strict=True)
-    return _finish(model, path)
+    return _finish(model, path, processor)
 
 
 def draft_head_bytes(path):
@@ -186,7 +186,7 @@ def draft_head_bytes(path):
     return values // 2 + values // _MX_GROUP
 
 
-def _finish(model, path):
+def _finish(model, path, processor):
     language_model = model.language_model
     if "dspark" in language_model:
         language_model.dspark.head = nn.QuantizedLinear.from_linear(
@@ -196,6 +196,8 @@ def _finish(model, path):
     model.eval()
     language_model.configure_mtp(True, get_mtp_depth())
     language_model._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
+    if not processor:
+        return model, None
     # transformers: AutoTokenizer reads config.json and has no ernie5_5_moe config.
     tokenizer = AutoTokenizer.from_pretrained(
         path, trust_remote_code=True, config=PreTrainedConfig()

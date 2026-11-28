@@ -12469,7 +12469,6 @@ def _refine_oqe_output(
             output,
             weight_map,
             quantization,
-            trust_remote_code=trust_remote_code,
             progress=progress,
         )
     writer = _OQRefineWriter(output, weight_map, quantization)
@@ -12747,7 +12746,6 @@ def _collect_imatrix(
             calib_dataset=calib_dataset,
             num_samples=num_samples,
             seq_length=seq_length,
-            trust_remote_code=trust_remote_code,
             progress_callback=progress_callback,
             progress_start=progress_start,
             progress_end=progress_end,
@@ -13574,7 +13572,6 @@ def _measure_sensitivity_from_quantized_model(
             calib_dataset=calib_dataset,
             num_samples=num_samples,
             seq_length=seq_length,
-            trust_remote_code=trust_remote_code,
         )
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,

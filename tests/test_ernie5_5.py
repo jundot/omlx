@@ -881,7 +881,6 @@ def test_oq_builds_keep_release_tensors_and_order_by_level(tmp_path, monkeypatch
             level,
             enhanced=True,
             preserve_mtp=True,
-            trust_remote_code=True,
             imatrix_num_samples=len(tokens),
             imatrix_seq_length=tokens.shape[1],
         )

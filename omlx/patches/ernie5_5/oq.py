@@ -8,8 +8,10 @@ each layer gets a fresh request cache per sample, as a single-shot prefill does.
 """
 
 import re
+from pathlib import Path
 
 import mlx.core as mx
+from transformers import PreTrainedTokenizerFast
 
 from ... import oq
 from .config import ModelConfig
@@ -97,11 +99,12 @@ def _forward(language, index, hidden, before_row=None):
     return outputs
 
 
-def _calibration(model_path, dataset, num_samples, seq_length, trust_remote_code):
-    model, processor = load(model_path, trust_remote_code=trust_remote_code)
-    tokens = oq._load_calibration_data(
-        processor.tokenizer, dataset, num_samples, seq_length
+def _calibration(model_path, dataset, num_samples, seq_length):
+    model, _ = load(model_path, processor=False)
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=str(Path(model_path) / "tokenizer.json")
     )
+    tokens = oq._load_calibration_data(tokenizer, dataset, num_samples, seq_length)
     if tokens is None or len(tokens) == 0:
         raise ValueError("ERNIE 5.5 calibration requires nonempty calibration data")
     return model, tokens
@@ -130,15 +133,12 @@ def collect_checkpoint_imatrix(
     calib_dataset,
     num_samples,
     seq_length,
-    trust_remote_code,
     progress_callback,
     progress_start,
     progress_end,
 ):
     """oQe imatrix of a release checkpoint, as oQ's collector returns it."""
-    model, tokens = _calibration(
-        model_path, calib_dataset, num_samples, seq_length, trust_remote_code
-    )
+    model, tokens = _calibration(model_path, calib_dataset, num_samples, seq_length)
 
     def progress(done, total):
         oq._emit_progress(
@@ -184,12 +184,9 @@ def measure_sensitivity(
     calib_dataset,
     num_samples,
     seq_length,
-    trust_remote_code,
 ):
     """Relative layer output error with the routed experts at ``bits``."""
-    model, tokens = _calibration(
-        model_path, calib_dataset, num_samples, seq_length, trust_remote_code
-    )
+    model, tokens = _calibration(model_path, calib_dataset, num_samples, seq_length)
     language = model.language_model
     hidden = _embedded(language, tokens)
     scores = {}
@@ -229,9 +226,7 @@ def _expert_grams(model, tokens, layers):
         mx.clear_cache()
 
 
-def refine_experts(
-    source, output, weight_map, quantization, *, trust_remote_code, progress
-):
+def refine_experts(source, output, weight_map, quantization, *, progress):
     """oQe code refinement of the affine routed experts, against source Grams."""
     names = {match[1] for key in weight_map if (match := _AFFINE_EXPERT.fullmatch(key))}
     if not names:
@@ -241,7 +236,6 @@ def refine_experts(
         oq._OQE_REFINE_CALIB_DATASET,
         oq._OQE_REFINE_SAMPLES,
         oq._OQE_REFINE_SEQ_LENGTH,
-        trust_remote_code,
     )
     layers = {oq._extract_layer_index(name) for name in names}
     return oq._refine_expert_grams(
