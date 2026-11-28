@@ -15078,6 +15078,39 @@ class Scheduler:
                                     )
                                 )
                                 with self._phase_timer("store_cache_main_collect"):
+                                    # The payload is a view of the batch buffer
+                                    # the request decoded in. Cut it to the
+                                    # tokens not stored yet, so the rows still
+                                    # decoding do not need a copy of their KV
+                                    # while the store worker runs.
+                                    head = None
+                                    if system_store is not None:
+                                        # The system store keeps its own copy of
+                                        # its unstored head, so the main payload
+                                        # can be cut to its tail too.
+                                        system_len = len(system_store[0])
+                                        block_size = self.config.paged_cache_block_size
+                                        stored = (
+                                            system_len // block_size * block_size
+                                            if block_size
+                                            else 0
+                                        )
+                                        prefix_cache = self.block_aware_cache
+                                        head = prefix_cache.copy_payload_prefix(
+                                            system_store[1], system_len, stored
+                                        )
+                                        if head is not None:
+                                            system_store = (
+                                                system_store[0],
+                                                head,
+                                                *system_store[2:],
+                                            )
+                                    if (
+                                        system_store is None or head is not None
+                                    ) and self.block_aware_cache.trim_store_payload(
+                                        request_id, cache_to_store
+                                    ):
+                                        request._extracted_cache = cache_to_store
                                     pre_eval_arrays = (
                                         self._collect_arrays_from_extracted_cache(
                                             cache_to_store

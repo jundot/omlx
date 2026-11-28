@@ -222,6 +222,71 @@ def test_merge_of_several_requests_drops_donors_and_keeps_empty_rows_zero():
         assert _fields_equal(_row_fields(batch, 2, 300, 600), expected[1][i])
 
 
+def _append(batch):
+    rows = batch.left_padding.shape[0]
+    token = mx.zeros((rows, 2, 1, 64), mx.float16)
+    batch.update_and_fetch(token, token)
+
+
+@pytest.mark.parametrize("stays", [0, 1])
+def test_a_row_leaving_is_kept_as_a_view_until_the_next_token(monkeypatch, stays):
+    """The rows that stay are not copied when a row leaves, only at the next
+    token. That copy runs inside the scheduler's deferred clear window after a
+    finish (#435), so it must not clear the pool itself."""
+    tokens = 4096
+    batches = [
+        BatchAffine8KVCache.merge(
+            [_affine8_cache(tokens, 40 + i), _affine8_cache(tokens, 60 + i)]
+        )
+        for i in range(4)
+    ]
+    expected = [
+        [mx.contiguous(part) for part in _row_fields(batch, stays, 0, tokens)]
+        for batch in batches
+    ]
+    mx.eval(expected, [(batch.keys, batch.values) for batch in batches])
+    kept = sum(part.nbytes for parts in expected for part in parts)
+    clears = []
+    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(True))
+    mx.synchronize()
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+
+    for batch in batches:
+        batch.filter([stays])
+    mx.eval([(batch.keys, batch.values) for batch in batches])
+    # Allocations only: a gather of the rows that stay would add ``kept``.
+    assert mx.get_peak_memory() - before < 0.05 * kept
+
+    for batch in batches:
+        _append(batch)
+    mx.eval([(batch.keys, batch.values) for batch in batches])
+
+    assert clears == []
+    for batch, parts in zip(batches, expected):
+        assert batch.left_padding.tolist() == [0]
+        assert batch.offset.tolist() == [tokens + 1]
+        assert _fields_equal(_row_fields(batch, 0, 0, tokens), parts)
+
+
+def test_filter_of_scattered_rows_still_gathers_them():
+    rows = [_affine8_cache(200 + 50 * i, 80 + i) for i in range(3)]
+    batch = BatchAffine8KVCache.merge(rows)
+    expected = [_row_fields(batch, r, 100 - 50 * r, 300) for r in (0, 2)]
+    expected = [[mx.contiguous(part) for part in parts] for parts in expected]
+    mx.eval(expected)
+
+    batch.filter([0, 2])
+    mx.eval(batch.keys, batch.values)
+
+    assert batch.offset.tolist() == [200, 300]
+    assert batch.left_padding.tolist() == [100, 0]
+    assert _fields_equal(_row_fields(batch, 0, 100, 300), expected[0])
+    assert _fields_equal(_row_fields(batch, 1, 0, 300), expected[1])
+    _append(batch)
+    assert _fields_equal(_row_fields(batch, 1, 0, 300), expected[1])
+
+
 @pytest.mark.parametrize(
     "scheme,bits,cache_class",
     [

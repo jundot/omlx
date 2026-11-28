@@ -347,3 +347,146 @@ def test_restored_affine_cache_has_room_for_the_next_tokens(manager_factory):
         mx.zeros((1, 2, 3, 13), mx.float16), mx.zeros((1, 2, 3, 21), mx.float16)
     )
     assert _state_length(restored.keys) == capacity
+
+
+def _sliced(data, end):
+    sliced = dict(data)
+    sliced["state"] = tuple(_slice_state_range(part, 0, end) for part in data["state"])
+    return sliced
+
+
+def _two_layer_store(manager_factory, stored=8):
+    manager = manager_factory(types=["Affine8KVCache", "KVCache"])
+    manager.set_expected_layer_signature(
+        ["Affine8KVCache", "KVCache"], turboquant_kv_bits=8
+    )
+    prefix, _ = _prefix(manager, num_layers=2)
+    affine = _cache(length=16, cls=Affine8KVCache)
+    dense_state = (
+        mx.random.normal((1, 2, 16, 13)),
+        mx.random.normal((1, 2, 16, 21)),
+    )
+    mx.eval(dense_state)
+
+    def payload(end=16):
+        dense = {
+            "state": tuple(part[:, :, :end, :] for part in dense_state),
+            "cache_type": "KVCache",
+            "meta_state": (end,),
+        }
+        return [_sliced(_data(affine), end), dense]
+
+    # An earlier request stored the first tokens.
+    assert prefix.store_cache("first", list(range(stored)), payload(stored)) is not None
+    prefix.release_cache("first")
+    return manager, prefix, affine, dense_state, payload
+
+
+@pytest.mark.parametrize("stored", [8, 4])
+def test_store_after_a_restore_cuts_only_the_new_tokens(manager_factory, stored):
+    """A finished request's payload is cut to the tokens its blocks lack.
+
+    With 4 stored tokens the cut part is longer than the stored prefix, which
+    the store's own global-or-relative guess would read as a whole sequence.
+    """
+    manager, prefix, affine, dense_state, payload = _two_layer_store(
+        manager_factory, stored
+    )
+    tokens = list(range(16))
+    table, _ = prefix.fetch_cache("second", tokens)
+    assert table is not None and table.num_tokens == stored
+
+    data = payload()
+    assert prefix.trim_store_payload("second", data) == stored
+    assert all(layer["token_base"] == stored for layer in data)
+    assert data[0]["state"][0].norms.shape[2] == 16 - stored
+    assert data[1]["state"][0].shape[2] == 16 - stored
+    assert prefix.store_cache("second", tokens, data) is not None
+    prefix.release_cache("second")
+    manager.close()
+
+    table, remaining = prefix.fetch_cache("check", tokens + [99])
+    assert table is not None and table.num_tokens == 16 and remaining == [99]
+    restored = prefix.reconstruct_cache(table)
+    assert restored is not None
+    _assert_state_equal(_state(affine), _state(restored[0]))
+    for expected, actual in zip(dense_state, restored[1].state):
+        assert mx.array_equal(expected, actual).item()
+
+
+def test_prefix_copy_holds_only_the_unstored_head(manager_factory):
+    """The system-prefix store copies only the head past its stored grid."""
+    manager, prefix, affine, dense_state, payload = _two_layer_store(manager_factory)
+    tokens = list(range(10))
+    head = prefix.copy_payload_prefix(payload(), 10, start=8)
+    assert head is not None
+    assert all(layer["token_base"] == 8 for layer in head)
+    assert head[0]["state"][0].norms.shape[2] == 2
+    assert head[1]["state"][0].shape[2] == 2
+    table, _ = prefix.fetch_cache("sys", tokens[:8])
+    assert table is not None and table.num_tokens == 8
+    assert prefix.store_cache("sys", tokens, head) is not None
+    prefix.release_cache("sys")
+    manager.close()
+
+    table, remaining = prefix.fetch_cache("check", tokens + [99])
+    assert table is not None and table.num_tokens == 8 and remaining == [8, 9, 99]
+
+
+def test_prefix_copy_from_zero_has_no_base(manager_factory):
+    manager, prefix, _, dense_state, payload = _two_layer_store(manager_factory)
+    head = prefix.copy_payload_prefix(payload(), 6)
+    assert head is not None and all("token_base" not in layer for layer in head)
+    assert head[1]["state"][0].shape[2] == 6
+    for expected, actual in zip(dense_state, head[1]["state"]):
+        assert mx.array_equal(expected[:, :, :6, :], actual).item()
+    assert prefix.copy_payload_prefix(payload(), 6, start=6) is None
+    manager.close()
+
+
+def test_cut_leaves_recurrent_layers_whole(manager_factory):
+    """A hybrid payload: only the attention layers are cut and carry token_base."""
+    manager, prefix, _, _, payload = _two_layer_store(manager_factory)
+    prefix.fetch_cache("second", list(range(16)))
+    data = payload()
+    recurrent_state = [mx.random.normal((1, 3, 8)), mx.random.normal((1, 2, 4, 4))]
+    recurrent = {
+        "state": recurrent_state,
+        "class_name": "ArraysCache",
+        "meta_state": "",
+    }
+    data.insert(1, recurrent)
+    assert prefix.trim_store_payload("second", data) == 8
+    assert data[1] is recurrent and data[1]["state"] is recurrent_state
+    assert "token_base" not in data[1]
+    assert data[0]["token_base"] == 8 and data[2]["token_base"] == 8
+    assert data[2]["state"][0].shape[2] == 8
+    prefix.release_cache("second")
+    manager.close()
+
+
+def test_cut_payload_is_not_stored_without_its_prefix(manager_factory):
+    """If the block table lost the prefix, the cut payload stores nothing."""
+    manager, prefix, _, _, payload = _two_layer_store(manager_factory)
+    tokens = list(range(16))
+    prefix.fetch_cache("second", tokens)
+    data = payload()
+    assert prefix.trim_store_payload("second", data) == 8
+    prefix.release_cache("second")
+    prefix.paged_cache.delete_block_table("second")
+    prefix.store_cache("second", tokens, data)
+    prefix.release_cache("second")
+    manager.close()
+
+    table, _ = prefix.fetch_cache("check", tokens + [99])
+    assert table is not None and table.num_tokens == 8
+
+
+def test_payload_without_a_stored_prefix_is_left_whole(manager_factory):
+    manager = manager_factory(types=["Affine8KVCache"])
+    manager.set_expected_layer_signature(["Affine8KVCache"], turboquant_kv_bits=8)
+    prefix, _ = _prefix(manager)
+    data = [_data(_cache(length=16, cls=Affine8KVCache))]
+    before = data[0]["state"]
+    assert prefix.trim_store_payload("fresh", data) == 0
+    assert data[0]["state"] is before and "token_base" not in data[0]
