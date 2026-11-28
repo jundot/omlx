@@ -1307,6 +1307,115 @@ def test_prefill_reserve_sizes_growing_caches_once():
     assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 0
 
 
+def test_prefill_reserve_adds_decode_headroom_for_long_prompts():
+    """A long prompt's KV caches keep 1/64 of the prompt as spare, so that
+    many generated tokens write in place instead of copying the cache every
+    256 tokens. Other cache kinds are sized as before."""
+    mx = sched_mod.mx
+    keys, kv, inner, rotating, pool, caches = _filled_caches()
+    ns = _reserve_ctx()
+
+    assert sched_mod._kv_decode_headroom(16_383, 256) == 0
+    assert sched_mod._kv_decode_headroom(16_384, 256) == 256
+    assert sched_mod._kv_decode_headroom(8_192, 128) == 128
+    # 290,000 tokens: 1,133 steps for the prompt and 17 steps of spare.
+    assert sched_mod._kv_decode_headroom(290_000, 256) == 4352
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 290_000) == 3
+    for c in (kv, inner):
+        assert c.keys.shape[2] == c.values.shape[2] == 290_048 + 4352
+        assert c.offset == 3
+        assert bool(mx.array_equal(c.keys[..., :3, :], keys))
+    assert pool._pool_buf.shape[1] == 290_000 // 4
+    assert rotating.keys.shape[2] == 3
+    # Admission counts the capacity that holds the prompt as reserved, not
+    # the decode headroom.
+    per_token = (kv.keys.nbytes + kv.values.nbytes) // kv.keys.shape[2]
+    assert sched_mod._reserved_spare_bytes([kv]) == (294_400 - 3) * per_token
+    assert sched_mod._reserved_spare_bytes([kv], 290_000) == (290_048 - 3) * per_token
+    # Sized once: later chunks of the same prompt change nothing.
+    assert Scheduler._reserve_prefill_capacity(ns, caches, 290_000) == 0
+
+
+def test_prefill_reserve_headroom_keeps_the_cache_contents():
+    """A cache with decode headroom returns the same keys and values as one
+    that grows the stock way, across several 256-token boundaries."""
+    from mlx_lm.models.cache import KVCache
+
+    mx = sched_mod.mx
+    mx.random.seed(7)
+    prompt = mx.random.normal((1, 2, 20_000, 4)).astype(mx.float16)
+    stock, roomy = KVCache(), KVCache()
+    for c in (stock, roomy):
+        c.update_and_fetch(prompt[:, :, :2048], prompt[:, :, :2048])
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(_reserve_ctx(), [roomy], 20_000) == 1
+    assert roomy.keys.shape[2] == 20_224 + 256
+    for c in (stock, roomy):
+        c.update_and_fetch(prompt[:, :, 2048:], prompt[:, :, 2048:])
+    before = stock.keys.shape[2]
+    for i in range(200):
+        step = mx.full((1, 2, 1 + i % 3, 4), float(i)).astype(mx.float16)
+        k0, v0 = stock.update_and_fetch(step, step * 2)
+        k1, v1 = roomy.update_and_fetch(step, step * 2)
+        if i % 50 == 49:
+            assert stock.offset == roomy.offset
+            assert bool(mx.array_equal(k0, k1)) and bool(mx.array_equal(v0, v1))
+    # 399 tokens later the stock cache has regrown; the roomy one has not.
+    assert stock.keys.shape[2] > before
+    assert roomy.keys.shape[2] == 20_480
+
+
+def test_prefill_reserve_drops_decode_headroom_that_does_not_fit():
+    """The headroom must fit next to one admission chunk, also for a lone
+    prompt. Otherwise the prompt alone is reserved, once."""
+    cap = 10 * _GB
+    _, kv, inner, _, _, caches = _filled_caches()
+    per_token = (kv.keys.nbytes + kv.values.nbytes) // kv.keys.shape[2]
+    exact = 2 * (290_048 - 256) * per_token
+    hook = caches[1].caches[1].prefill_capacity_bytes(290_000)
+    spare = 2 * 4352 * per_token
+
+    # Room for the prompt and half the headroom.
+    ns = _reserve_ctx(current=cap - exact - hook - spare // 2, cap=cap)
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 290_000) == 3
+    for c in (kv, inner):
+        assert c.keys.shape[2] == 290_048
+    # The caches hold the prompt, so later chunks leave them alone even when
+    # room appears.
+    ns = _reserve_ctx(cap=cap)
+    ns._prefill_chunk_pool = (1, 1)
+    with patch.object(sched_mod, "_sync_and_clear_cache") as clear:
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 290_000) == 0
+    clear.assert_not_called()
+    assert ns._prefill_chunk_pool == (1, 1)
+
+    # Room for the prompt and the headroom, but not for a chunk beside them:
+    # a lone prompt keeps its chunk room and gets the prompt alone.
+    _, kv, _, _, _, caches = _filled_caches()
+    ns = _reserve_ctx(
+        current=cap - exact - hook - spare - 1024, cap=cap, floor_transient=4096
+    )
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 290_000) == 3
+    assert kv.keys.shape[2] == 290_048
+    _, kv, _, _, _, caches = _filled_caches()
+    ns = _reserve_ctx(
+        current=cap - exact - hook - spare - 8192, cap=cap, floor_transient=4096
+    )
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 290_000) == 3
+    assert kv.keys.shape[2] == 290_048 + 4352
+
+    # No room for the prompt either: nothing is reserved, as before.
+    _, kv, _, _, _, caches = _filled_caches()
+    ns = _reserve_ctx(current=cap - exact // 2, cap=cap)
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 290_000) == 0
+    assert kv.keys.shape[2] == 256
+
+
 def test_prefill_reserve_keeps_room_for_a_floor_chunk():
     """With other requests in flight, a reserve that would starve their next
     chunk falls back to growth; a lone prompt only has to fit itself."""

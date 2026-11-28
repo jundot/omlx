@@ -1586,8 +1586,25 @@ def _iter_leaf_caches(caches: Any):
             yield c
 
 
-def _kv_capacity_plan(cache_obj: Any, tokens: int) -> tuple[int, int]:
-    """Return (capacity, added bytes) to hold ``tokens`` in a plain KV cache."""
+def _kv_decode_headroom(tokens: int, step: int) -> int:
+    """Spare tokens a plain KV cache keeps for decode after a long prompt.
+
+    Decode grows the cache by ``step`` tokens at a time, each time copying
+    the whole cache and leaving the old copy in the MLX pool. 1/64 of the
+    prompt, in whole steps, lets that many generated tokens write into the
+    reserved buffer; a longer reply grows by ``step`` again. Prompts under 64
+    steps get none. The same 1/64 rule as ``turboquant_kv._growth_step``.
+    """
+    return (int(tokens) >> 6) // step * step
+
+
+def _kv_capacity_plan(
+    cache_obj: Any, tokens: int, *, headroom: bool = False
+) -> tuple[int, int]:
+    """Return (capacity, added bytes) to hold ``tokens`` in a plain KV cache.
+
+    With ``headroom`` the capacity also covers ``_kv_decode_headroom``.
+    """
     if type(cache_obj) not in _STEP_GROWN_KV_CACHE_TYPES:
         return 0, 0
     keys, values = cache_obj.keys, cache_obj.values
@@ -1595,17 +1612,27 @@ def _kv_capacity_plan(cache_obj: Any, tokens: int) -> tuple[int, int]:
         return 0, 0
     step = max(1, int(cache_obj.step))
     capacity = -(-int(tokens) // step) * step
+    if headroom:
+        capacity += _kv_decode_headroom(tokens, step)
     per_token = (keys.nbytes + values.nbytes) // max(1, keys.shape[2])
     return capacity, (capacity - keys.shape[2]) * per_token
 
 
-def _reserved_spare_bytes(caches: Any) -> int:
-    """Bytes of cache capacity allocated beyond the tokens written so far."""
+def _reserved_spare_bytes(caches: Any, tokens: int | None = None) -> int:
+    """Bytes of cache capacity allocated beyond the tokens written so far.
+
+    With ``tokens`` (the prompt length) only the capacity that holds the
+    prompt counts: decode headroom is not part of the prompt's KV.
+    """
     spare = 0
     for c in _iter_leaf_caches(caches):
         if type(c) in _STEP_GROWN_KV_CACHE_TYPES and c.keys is not None:
             per_token = (c.keys.nbytes + c.values.nbytes) // max(1, c.keys.shape[2])
-            spare += (c.keys.shape[2] - c.offset) * per_token
+            held = c.keys.shape[2]
+            if tokens is not None:
+                step = max(1, int(c.step))
+                held = min(held, -(-int(tokens) // step) * step)
+            spare += max(0, held - c.offset) * per_token
         else:
             hook = getattr(c, "prefill_spare_bytes", None)
             spare += int(hook()) if callable(hook) else 0
@@ -5882,6 +5909,12 @@ class Scheduler:
         ``reserve_prefill_capacity`` hook (DeepSeek V4 PoolingCache) are
         sized the same way.
 
+        A long prompt's plain KV caches also get decode headroom
+        (``_kv_decode_headroom``) when it fits next to one admission charge
+        chunk. It pays off when the request then decodes alone on these
+        caches; a request that joins a batch or is quantized after prefill
+        leaves it behind. A fully cached prompt skips prefill and this reserve.
+
         Skipped unless the grown caches fit under the prefill peak target.
         While other requests are in flight, one admission charge chunk must
         also fit, so the reserve cannot starve their next chunk. A lone
@@ -5891,16 +5924,20 @@ class Scheduler:
         """
         if not cache_list or tokens <= 0:
             return 0
-        plans = []
-        total = 0
-        for c in _iter_leaf_caches(cache_list):
-            capacity, added = _kv_capacity_plan(c, tokens)
-            if not added:
-                hook = getattr(c, "prefill_capacity_bytes", None)
-                added = int(hook(tokens)) if callable(hook) else 0
-            if added > 0:
-                plans.append((c, capacity))
-                total += added
+
+        def plan(headroom: bool) -> tuple[list, int]:
+            plans, total = [], 0
+            for c in _iter_leaf_caches(cache_list):
+                capacity, added = _kv_capacity_plan(c, tokens, headroom=headroom)
+                if not added:
+                    hook = getattr(c, "prefill_capacity_bytes", None)
+                    added = int(hook(tokens)) if callable(hook) else 0
+                if added > 0:
+                    plans.append((c, capacity))
+                    total += added
+            return plans, total
+
+        plans, total = plan(True)
         if not plans:
             return 0
         # A prefix restored from the SSD cache may still be lazy. Load it
@@ -5917,11 +5954,14 @@ class Scheduler:
         target = Scheduler._prefill_peak_target(self)
         if target > 0:
             current = self._current_usage_bytes()
-            floor = 0
-            if Scheduler._prefill_shares_memory(self, request_id):
-                floor = self._admission_transient_bound(
-                    Scheduler._admission_charge_tokens(self, int(tokens)), int(tokens)
-                )
+            chunk = self._admission_transient_bound(
+                Scheduler._admission_charge_tokens(self, int(tokens)), int(tokens)
+            )
+            floor = chunk if Scheduler._prefill_shares_memory(self, request_id) else 0
+            # The decode headroom is optional and must leave room for a
+            # chunk even for a lone prompt; without it the prompt may fit.
+            if current + total + chunk > target:
+                plans, total = plan(False)
             if current + total + floor > target:
                 # Once per prompt; the check repeats every chunk.
                 if getattr(self, "_reserve_skip_logged", None) == id(cache_list):
@@ -13188,7 +13228,9 @@ class Scheduler:
         current = max(
             0,
             self._current_usage_bytes()
-            - _reserved_spare_bytes(getattr(request, "prompt_cache", None)),
+            - _reserved_spare_bytes(
+                getattr(request, "prompt_cache", None), prompt_tokens
+            ),
         )
         est = self._admission_estimate(
             num_prompt_tokens=prompt_tokens,
