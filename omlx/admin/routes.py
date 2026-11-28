@@ -8419,14 +8419,52 @@ async def get_recommended_models(
 
 
 def _free_disk_bytes(path: str | Path) -> int:
-    """Free bytes on the volume holding `path` (or its nearest existing parent)."""
+    """Free bytes on the volume holding `path` (or its nearest existing parent).
+
+    On macOS, ``shutil.disk_usage().free`` maps to ``statvfs`` ``f_bavail``,
+    which excludes purgeable space: local APFS snapshots and caches that the
+    system deletes on its own as soon as a write needs the room. A nearly full
+    volume then reports far less usable space than Finder's "available"
+    number, and the downloader gate wrongly blocks downloads that fit (#5349).
+    NSURL's available capacity for important usage includes purgeable space
+    and is what a download should be measured against; statvfs stays the
+    fallback for every other platform and for query failures.
+    """
     try:
         check_path = Path(path).expanduser().resolve()
         while not check_path.exists() and check_path.parent != check_path:
             check_path = check_path.parent
+        if sys.platform == "darwin":
+            important = _important_usage_bytes(check_path)
+            if important is not None:
+                return important
         return shutil.disk_usage(check_path).free
     except OSError:
         return 0
+
+
+def _important_usage_bytes(path: Path) -> Optional[int]:
+    """macOS volume capacity available for important usage, purgeable space
+    included (the number Finder shows as "available"). None when Foundation is
+    unavailable or the query fails, so the caller falls back to statvfs."""
+    try:
+        from Foundation import (
+            NSURL,
+            NSURLVolumeAvailableCapacityForImportantUsageKey,
+        )
+    except ImportError:
+        return None
+    try:
+        url = NSURL.fileURLWithPath_(str(path))
+        ok, value, _error = url.getResourceValue_forKey_error_(
+            None, NSURLVolumeAvailableCapacityForImportantUsageKey, None
+        )
+    except Exception:
+        logger.debug("NSURL important-usage query failed", exc_info=True)
+        return None
+    if not ok or value is None:
+        return None
+    return int(value)
 
 
 @router.get("/api/hf/recommendations")

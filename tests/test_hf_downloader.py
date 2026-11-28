@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -2153,6 +2154,58 @@ def _blob_info(repo_id: str, size: int, safetensors=None):
     extra.size = 1_000_000
     info.siblings = [sibling, extra]
     return info
+
+
+class TestFreeDiskBytes:
+    """The downloader free-space gate must count macOS purgeable space (#5349).
+
+    statvfs ``f_bavail`` excludes it, so on a nearly full APFS volume the old
+    check reported far less usable space than Finder and disabled downloads
+    that fit. NSURL's important-usage capacity is the value the gate needs.
+    """
+
+    def _fake_foundation(self, monkeypatch, result):
+        """Install a stand-in Foundation whose query returns `result`."""
+        import types
+
+        fake = types.ModuleType("Foundation")
+
+        class _URL:
+            def __init__(self, path):
+                self.path = path
+
+            def getResourceValue_forKey_error_(self, _ref, _key, _error):
+                return result
+
+        fake.NSURL = types.SimpleNamespace(fileURLWithPath_=_URL)
+        fake.NSURLVolumeAvailableCapacityForImportantUsageKey = "important"
+        monkeypatch.setitem(sys.modules, "Foundation", fake)
+        monkeypatch.setattr(admin_routes.sys, "platform", "darwin")
+
+    def test_darwin_prefers_important_usage(self, tmp_path, monkeypatch):
+        self._fake_foundation(monkeypatch, (True, 42 * 1024**3, None))
+        # A fresh install has no model folder yet; its parent volume counts.
+        assert admin_routes._free_disk_bytes(tmp_path / "models") == 42 * 1024**3
+
+    def test_darwin_falls_back_when_query_fails(self, tmp_path, monkeypatch):
+        self._fake_foundation(monkeypatch, (False, None, None))
+        with patch.object(admin_routes.shutil, "disk_usage") as usage:
+            usage.return_value = shutil._ntuple_diskusage(100, 40, 10)
+            assert admin_routes._free_disk_bytes(tmp_path) == 10
+
+    def test_darwin_falls_back_without_foundation(self, tmp_path, monkeypatch):
+        # A None sys.modules entry makes `import Foundation` raise ImportError.
+        monkeypatch.setitem(sys.modules, "Foundation", None)
+        monkeypatch.setattr(admin_routes.sys, "platform", "darwin")
+        with patch.object(admin_routes.shutil, "disk_usage") as usage:
+            usage.return_value = shutil._ntuple_diskusage(100, 40, 10)
+            assert admin_routes._free_disk_bytes(tmp_path) == 10
+
+    def test_other_platforms_use_statvfs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(admin_routes.sys, "platform", "linux")
+        with patch.object(admin_routes.shutil, "disk_usage") as usage:
+            usage.return_value = shutil._ntuple_diskusage(100, 40, 10)
+            assert admin_routes._free_disk_bytes(tmp_path) == 10
 
 
 class TestGetRecommendedModels:
