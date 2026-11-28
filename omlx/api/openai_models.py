@@ -518,6 +518,11 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionChoice]
     usage: Usage = Field(default_factory=Usage)
+    # Minefield 141: id of the engine that actually served the request,
+    # present only when it differs from `model` (e.g. model_fallback
+    # silently served the default model). Callers otherwise cannot tell
+    # that another engine answered.
+    serving_model_id: Optional[str] = None
 
 
 # =============================================================================

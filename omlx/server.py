@@ -1815,6 +1815,19 @@ def _serving_model_id(
     return lease.model_id or resolve_model_id(requested_model) or requested_model
 
 
+def _serving_attribution(
+    resolved_model: str | None,
+    requested_model: str | None,
+) -> str | None:
+    """Minefield 141: served model id when it differs from the requested one.
+
+    model_fallback serves the default engine while the response's `model`
+    still reports the requested name; this lets callers detect that another
+    engine answered.
+    """
+    return resolved_model if resolved_model and resolved_model != requested_model else None
+
+
 async def get_embedding_engine(model: str) -> EmbeddingEngine:
     """
     Get embedding engine for the specified model.
@@ -4907,7 +4920,14 @@ async def create_completion(
             _build_completion(),
             lease=lease,
             headers=(
-                {_REQUEST_ID_HEADER: inference_request_id}
+                {
+                    _REQUEST_ID_HEADER: inference_request_id,
+                    **(
+                        {"x-omlx-serving-model": _serving_attribution(resolved_model, request.model)}
+                        if resolved_model != request.model
+                        else {}
+                    ),
+                }
                 if len(prompts) == 1
                 else None
             ),
@@ -5154,6 +5174,7 @@ async def create_chat_completion(
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
+        serving_attribution = _serving_attribution(resolved_model, request.model)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -5397,6 +5418,8 @@ async def create_chat_completion(
                 "Cache-Control": "no-cache",
                 _REQUEST_ID_HEADER: inference_request_id,
             }
+            if serving_attribution:
+                sse_headers["x-omlx-serving-model"] = serving_attribution
             if response_format_warning:
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
@@ -5550,6 +5573,7 @@ async def create_chat_completion(
 
             return ChatCompletionResponse(
                 model=request.model,
+                serving_model_id=serving_attribution,
                 choices=[
                     ChatCompletionChoice(
                         message=AssistantMessage(
@@ -5595,6 +5619,8 @@ async def create_chat_completion(
             ).model_dump_json(exclude_none=True)
 
         json_headers = {_REQUEST_ID_HEADER: inference_request_id}
+        if serving_attribution:
+            json_headers["x-omlx-serving-model"] = serving_attribution
         if response_format_warning:
             json_headers["Warning"] = response_format_warning
         return await _json_response_or_keepalive(

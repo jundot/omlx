@@ -1281,6 +1281,81 @@ class TestChatCompletionEndpoint:
         assert "model=missing-model" not in summaries[-1]
         assert mock_engine_pool.release_calls == ["test-model"]
 
+    def _fallback_pool(self, mock_engine_pool, monkeypatch):
+        """Enable model_fallback and make only test-model resolvable."""
+        from omlx.exceptions import ModelNotFoundError
+        from omlx.server import _server_state
+        from omlx.settings import GlobalSettings
+
+        settings = GlobalSettings()
+        settings.model.model_fallback = True
+        monkeypatch.setattr(_server_state, "global_settings", settings)
+
+        original_get_engine = mock_engine_pool.get_engine
+
+        async def get_engine(model_id, _lease=False, runtime_settings=None):
+            if model_id == "missing-model":
+                raise ModelNotFoundError(model_id, ["test-model"])
+            return await original_get_engine(
+                model_id,
+                _lease=_lease,
+                runtime_settings=runtime_settings,
+            )
+
+        monkeypatch.setattr(mock_engine_pool, "get_engine", get_engine)
+
+    def test_chat_completion_fallback_attributes_serving_model(
+        self, client, mock_engine_pool, monkeypatch
+    ):
+        """Minefield 141: fallback responses must attribute the served model.
+
+        model_fallback serves the default engine while `model` still reports
+        the requested name; the x-omlx-serving-model header and the additive
+        serving_model_id field let callers detect the substitution.
+        """
+        self._fallback_pool(mock_engine_pool, monkeypatch)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "missing-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model"] == "missing-model"
+        assert response.headers["x-omlx-serving-model"] == "test-model"
+        assert data["serving_model_id"] == "test-model"
+
+    def test_chat_completion_exact_match_has_no_fallback_attribution(
+        self, client, monkeypatch
+    ):
+        """Minefield 141: exact-match requests carry no attribution.
+
+        Fallback stays enabled to prove attribution keys off an actual
+        serving difference, not merely off the setting.
+        """
+        from omlx.server import _server_state
+        from omlx.settings import GlobalSettings
+
+        settings = GlobalSettings()
+        settings.model.model_fallback = True
+        monkeypatch.setattr(_server_state, "global_settings", settings)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert "x-omlx-serving-model" not in response.headers
+        assert "serving_model_id" not in response.json()
+
     def test_chat_completion_basic(self, client):
         """Test basic chat completion request."""
         response = client.post(
