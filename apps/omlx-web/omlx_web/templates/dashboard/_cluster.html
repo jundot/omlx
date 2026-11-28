@@ -832,6 +832,333 @@
             </div>
         </section>
 
+        <!-- ========================== assistant ========================== -->
+        <!-- The assistant card is mounted independently of wizardState() so the
+             entry stays reachable on a Mac that already has a saved setup. Its
+             own state machine gates the branches. -->
+        <section x-show="assistantSurfaceVisible()" x-cloak
+                 class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                 data-cluster-assistant-section>
+            <div class="p-5 sm:p-6">
+                <!-- Assistant — the one-action path. It renders the assistant
+                     API's answer (measure → recommend → plan) and never
+                     computes a plan, a rank order or a coordinator. Each state
+                     carries data-assistant-state so the static contract test
+                     can find every branch. -->
+                <div class="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3"
+                     data-cluster-assistant>
+                    <div class="flex items-start justify-between gap-3">
+                        <div class="min-w-0">
+                            <div class="text-xs font-semibold text-neutral-900">{{ t('cluster.assistant.title') }}</div>
+                            <div class="text-caption text-neutral-500 mt-0.5">{{ t('cluster.assistant.blurb') }}</div>
+                        </div>
+                        <span class="text-caption font-semibold text-neutral-500 whitespace-nowrap"
+                              data-cluster-assistant-state-label
+                              x-text="assistantStateLabel()"></span>
+                    </div>
+
+                    <!-- idle: nothing measured yet -->
+                    <div class="mt-3" x-show="assistantState() === 'idle'" x-cloak
+                         data-assistant-state="idle">
+                        <button type="button" @click="startAssistant()"
+                                :disabled="assistantRunning()"
+                                class="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-40"
+                                data-cluster-assistant-entry>
+                            {{ t('cluster.assistant.entry') }}
+                            <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i>
+                        </button>
+                    </div>
+
+                    <!-- measuring: checking the Macs -->
+                    <div class="mt-3 flex items-center gap-2 text-xs text-neutral-500"
+                         x-show="assistantState() === 'measuring'" x-cloak
+                         data-assistant-state="measuring">
+                        <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span>{{ t('cluster.assistant.measuring') }}</span>
+                    </div>
+
+                    <!-- recommending: choosing the model -->
+                    <div class="mt-3 flex items-center gap-2 text-xs text-neutral-500"
+                         x-show="assistantState() === 'recommending'" x-cloak
+                         data-assistant-state="recommending">
+                        <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span>{{ t('cluster.assistant.recommending') }}</span>
+                    </div>
+
+                    <!-- measuring_model: the recommendation named another model,
+                         so it is measured model-bound before plan -->
+                    <div class="mt-3 flex items-center gap-2 text-xs text-neutral-500"
+                         x-show="assistantState() === 'measuring_model'" x-cloak
+                         data-assistant-state="measuring_model">
+                        <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        <span x-text="window.t('cluster.assistant.measuring_model').replace('{model}', assistantModelLabel())"></span>
+                    </div>
+
+                    <!-- planning: the plan summary and the resource levers -->
+                    <div class="mt-3" x-show="assistantState() === 'planning'" x-cloak
+                         data-assistant-state="planning">
+                        <div class="flex items-center gap-2 text-xs text-neutral-500"
+                             x-show="!assistant.plan">
+                            <svg aria-hidden="true" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                            <span>{{ t('cluster.assistant.planning') }}</span>
+                        </div>
+                        <div x-show="assistant.plan" data-cluster-assistant-plan>
+                            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2"
+                                 data-cluster-assistant-summary>
+                                <div class="min-w-0">
+                                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.model') }}</div>
+                                    <div class="text-xs font-semibold text-neutral-900 truncate"
+                                         data-cluster-assistant-model
+                                         x-text="assistantModelLabel()"></div>
+                                </div>
+                                <div class="min-w-0">
+                                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.context') }}</div>
+                                    <div class="text-xs font-semibold text-neutral-900"
+                                         data-cluster-assistant-context
+                                         x-text="assistantContextLabel()"></div>
+                                </div>
+                                <div class="min-w-0">
+                                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.coordinator') }}</div>
+                                    <div class="text-xs font-semibold text-neutral-900 truncate"
+                                         data-cluster-assistant-coordinator
+                                         x-text="assistantCoordinatorName()"></div>
+                                </div>
+                                <div class="min-w-0">
+                                    <div class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.assistant.summary.macs') }}</div>
+                                    <div class="text-xs font-semibold text-neutral-900"
+                                         data-cluster-assistant-macs
+                                         x-text="window.t('cluster.assistant.summary.macs_value').replace('{count}', String(assistantMacCount()))"></div>
+                                </div>
+                            </div>
+                            <!-- No token rate exists yet: the backend reports
+                                 stage seconds only and observed = null. -->
+                            <p class="text-caption text-neutral-500 mt-2">{{ t('cluster.assistant.speed_unknown') }}</p>
+                            <!-- Phase A: the chosen subset and the resolved
+                                 levers. Every value comes from the plan; a
+                                 levers the backend did not choose is not shown. -->
+                            <div class="mt-2 space-y-0.5 text-caption text-neutral-600"
+                                 data-cluster-assistant-policy>
+                                <p>
+                                    <span class="font-semibold">Macs</span>
+                                    <span data-cluster-assistant-selected
+                                          x-text="assistantSelectionLabel()"></span>
+                                </p>
+                                <p>
+                                    <span class="font-semibold">Tier</span>
+                                    <span data-cluster-assistant-tier
+                                          x-text="assistantTierLabel()"></span>
+                                </p>
+                                <p>
+                                    <span class="font-semibold">Context</span>
+                                    <span data-cluster-assistant-policy-context
+                                          x-text="assistantPolicyContextLabel()"></span>
+                                </p>
+                                <p x-show="assistantOffloadLabel()">
+                                    <span class="font-semibold">Offload</span>
+                                    <span data-cluster-assistant-offload
+                                          x-text="assistantOffloadLabel()"></span>
+                                </p>
+                                <p x-show="assistantExpertsLabel()">
+                                    <span class="font-semibold">Experts</span>
+                                    <span data-cluster-assistant-experts
+                                          x-text="assistantExpertsLabel()"></span>
+                                </p>
+                            </div>
+                            <!-- Decision 2026-11-14: the user chooses the
+                                 tradeoff. The plan is quality-first; when it
+                                 offloads routed experts, the experts-resident
+                                 alternative is offered here (a smaller context)
+                                 and apply uses whichever is selected. No
+                                 upfront context question; only a real trade. -->
+                            <div class="mt-2" x-show="assistantTradeoffs().length" x-cloak
+                                 data-cluster-assistant-tradeoffs>
+                                <p class="text-caption font-semibold text-neutral-600">Context vs speed</p>
+                                <p class="text-caption text-neutral-500">
+                                    Keeping experts resident costs context; keeping context offloads experts (slower).
+                                </p>
+                                <div class="mt-1 flex flex-wrap gap-2">
+                                    <button type="button" @click="assistant.selectedTradeoff = null"
+                                            :class="assistantTradeoffSelected() ? 'bg-white border-neutral-200 text-neutral-700' : 'bg-neutral-900 text-white border-neutral-900'"
+                                            class="px-3 py-1.5 text-caption font-semibold border rounded-full"
+                                            data-cluster-assistant-tradeoff-quality>
+                                        Best quality
+                                    </button>
+                                    <template x-for="(tradeoff, tradeoffIndex) in assistantTradeoffs()" :key="tradeoffIndex">
+                                        <button type="button" @click="assistant.selectedTradeoff = tradeoff"
+                                                :class="assistant.selectedTradeoff === tradeoff ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white border-neutral-200 text-neutral-700'"
+                                                class="px-3 py-1.5 text-caption font-semibold border rounded-full"
+                                                data-cluster-assistant-tradeoff>
+                                            <span x-text="(tradeoff.context_tokens || 0).toLocaleString() + ' tokens, experts resident'"></span>
+                                        </button>
+                                    </template>
+                                </div>
+                            </div>
+                            <!-- A small Mac cannot hold a workstation reserve;
+                                 the assistant uses it as Headless and says so. -->
+                            <template x-for="(note, noteIndex) in assistantSmallMacNotes()" :key="noteIndex">
+                                <p class="text-caption text-amber-700 mt-1"
+                                   data-cluster-assistant-small-mac x-text="note"></p>
+                            </template>
+                        </div>
+                    </div>
+
+                    <!-- failed: one message and exactly one action -->
+                    <div class="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700"
+                         x-show="assistantState() === 'failed'" x-cloak
+                         role="alert"
+                         data-assistant-state="failed"
+                         data-cluster-assistant-error>
+                        <p class="font-semibold" x-text="assistantErrorMessage()"></p>
+                        <p class="mt-1"
+                           x-show="assistant.error?.action === 'retry_coordinator'"
+                           data-cluster-assistant-coordinator-note
+                           x-text="assistantCoordinatorInstruction()"></p>
+                        <button type="button"
+                                @click="assistantActionHandler(assistant.error?.action)"
+                                :disabled="assistant.busy"
+                                class="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
+                                x-show="!(assistant.error?.code === 'topology_incomplete' && assistant.topologyFallback)"
+                                data-cluster-assistant-action
+                                x-text="assistantActionLabel(assistant.error?.action)"></button>
+
+                        <!-- Topology: the measured fabric has no line for the
+                             selected rank order. Show the exact missing cable;
+                             the 2-Mac plan is applied only after this explicit
+                             confirmation (and its signature records it). -->
+                        <div class="mt-2 rounded-lg border border-red-200 bg-white px-2.5 py-2"
+                             x-show="assistant.error?.code === 'topology_incomplete'" x-cloak
+                             data-cluster-assistant-topology>
+                            <p class="font-semibold">The measured fabric has no line for this plan</p>
+                            <p class="mt-1" x-show="assistant.missingLinks?.length"
+                               data-cluster-assistant-missing-links>
+                                Missing link:
+                                <span class="font-mono"
+                                      x-text="(assistant.missingLinks || []).map((pair) => pair.join(' <-> ')).join(', ')"></span>
+                            </p>
+                            <p class="mt-1" x-show="assistant.topologyFallback"
+                               data-cluster-assistant-fallback-summary>
+                                Two Macs fit: <span x-text="(assistant.topologyFallback?.rank_order || []).join(' <-> ')"></span>
+                                at <span x-text="assistant.topologyFallback?.context_tokens"></span> tokens.
+                            </p>
+                            <button type="button"
+                                    @click="confirmAssistantTwoMacFallback()"
+                                    x-show="assistant.topologyFallback"
+                                    class="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100"
+                                    data-cluster-assistant-two-mac-fallback>
+                                Run with 2 Macs
+                            </button>
+                        </div>
+
+                        <!-- Free space: the UI of the one action `free_disk_space`
+                             (the live-run notes). The user picks the Mac first,
+                             so no other Mac's models are ever listed; Delete is
+                             a two-step confirm, and the assistant never deletes
+                             by itself. Sizes come from the measurement, and the
+                             model the cluster is about to run is not offered. -->
+                        <div class="mt-2 rounded-lg border border-red-200 bg-white px-2.5 py-2"
+                             x-show="assistant.error?.action === 'free_disk_space' && assistant.freeSpaceOpen" x-cloak
+                             data-cluster-assistant-free-space>
+                            <p class="font-semibold">{{ t('cluster.assistant.free_space.hint') }}</p>
+                            <div class="mt-1 flex flex-wrap items-center gap-2">
+                                <template x-for="node in assistantFreeSpaceNodes()" :key="node.node_id">
+                                    <button type="button" @click="chooseAssistantFreeSpaceNode(node.node_id)"
+                                            class="px-2.5 py-1 text-caption font-semibold rounded-full border"
+                                            :class="assistant.freeSpaceNode === node.node_id ? 'border-red-300 bg-red-50 text-red-800' : 'border-red-200 bg-white text-red-700 hover:bg-red-50'"
+                                            :data-selected="assistant.freeSpaceNode === node.node_id ? 'true' : 'false'"
+                                            data-cluster-assistant-free-space-node
+                                            x-text="assistantNodeLabel(node.node_id)"></button>
+                                </template>
+                            </div>
+                            <div class="mt-2" x-show="assistant.freeSpaceNode"
+                                 data-cluster-assistant-free-space-models>
+                                <p x-show="!assistantFreeSpaceModels().length"
+                                   class="text-caption text-neutral-500">{{ t('cluster.assistant.free_space.none') }}</p>
+                                <template x-for="model in assistantFreeSpaceModels()" :key="model.model_id">
+                                    <div class="flex items-center justify-between gap-2 py-0.5"
+                                         data-cluster-assistant-free-space-model>
+                                        <span class="min-w-0 truncate text-caption">
+                                            <span class="font-semibold" x-text="model.label"></span>
+                                            <span class="text-neutral-500" x-text="' · ' + model.size"></span>
+                                        </span>
+                                        <button type="button" @click="deleteAssistantModel(model)"
+                                                :disabled="assistant.freeSpaceBusy"
+                                                class="px-2.5 py-1 text-caption font-semibold text-red-800 bg-white border border-red-300 rounded-full hover:bg-red-100 disabled:opacity-40"
+                                                data-cluster-assistant-free-space-delete
+                                                x-text="assistantDeleteLabel(model)"></button>
+                                    </div>
+                                </template>
+                            </div>
+                            <p class="mt-1 text-caption" x-show="assistant.freeSpaceError"
+                               data-cluster-assistant-free-space-error
+                               x-text="assistant.freeSpaceError"></p>
+                        </div>
+                    </div>
+
+                    <!-- Advanced evidence stays collapsed: stages, rank order,
+                         ids, warnings and the raw operation body. -->
+                    <details class="mt-3" x-show="assistantHasDetails()"
+                             data-cluster-assistant-details>
+                        <summary class="text-caption font-semibold uppercase tracking-wider text-neutral-400 cursor-pointer">{{ t('cluster.assistant.details') }}</summary>
+                        <div class="mt-2 space-y-1 text-caption text-neutral-500">
+                            <p>
+                                <span class="font-semibold">{{ t('cluster.assistant.details.measurement') }}</span>
+                                <code class="font-mono break-all" data-cluster-assistant-measurement x-text="assistant.measurementId"></code>
+                            </p>
+                            <p x-show="assistant.plan">
+                                <span class="font-semibold">{{ t('cluster.assistant.details.signature') }}</span>
+                                <code class="font-mono break-all" data-cluster-assistant-signature x-text="assistant.plan?.plan_signature || ''"></code>
+                            </p>
+                            <p x-show="assistant.plan">
+                                <span class="font-semibold">{{ t('cluster.assistant.details.rank_order') }}</span>
+                                <code class="font-mono break-all" data-cluster-assistant-rank-order x-text="assistantRankOrderLabel()"></code>
+                            </p>
+                            <div x-show="assistantStages().length" data-cluster-assistant-stages>
+                                <span class="font-semibold">{{ t('cluster.assistant.details.stages') }}</span>
+                                <table class="mt-1 w-full text-left text-caption">
+                                    <thead>
+                                        <tr class="text-neutral-400">
+                                            <th class="py-0.5 pr-2 font-semibold">{{ t('cluster.assistant.details.rank') }}</th>
+                                            <th class="py-0.5 pr-2 font-semibold">{{ t('cluster.assistant.details.mac') }}</th>
+                                            <th class="py-0.5 pr-2 font-semibold">{{ t('cluster.assistant.details.layers') }}</th>
+                                            <th class="py-0.5 font-semibold">{{ t('cluster.assistant.details.headroom') }}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <template x-for="stage in assistantStages()" :key="stage.rank">
+                                            <tr class="border-t border-neutral-200">
+                                                <td class="py-0.5 pr-2 font-mono" x-text="stage.rank"></td>
+                                                <td class="py-0.5 pr-2 font-mono truncate" x-text="stage.node_id"></td>
+                                                <td class="py-0.5 pr-2 font-mono" x-text="stage.first_layer + '–' + stage.last_layer"></td>
+                                                <td class="py-0.5 font-mono" x-text="Math.round(stage.headroom_gib) + ' GiB'"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div x-show="assistantPlanWarnings().length"
+                                 data-cluster-assistant-warnings>
+                                <span class="font-semibold">{{ t('cluster.assistant.details.warnings') }}</span>
+                                <template x-for="warning in assistantPlanWarnings()" :key="warning.code + warning.node_id">
+                                    <p class="mt-0.5" x-text="warning.message"></p>
+                                </template>
+                            </div>
+                            <!-- Phase A: advanced override. The default is the
+                                 fewest Macs that fit; forcing every Mac is an
+                                 explicit choice and the plan is recomputed. -->
+                            <button type="button"
+                                    class="mt-2 text-caption font-semibold text-neutral-500 underline"
+                                    data-cluster-assistant-use-all-macs
+                                    x-show="assistantCanChangeNodeSelection()"
+                                    @click="toggleAssistantNodeSelection()"
+                                    x-text="assistant.nodeSelection === 'all' ? 'Use the fewest Macs that fit' : 'Use all Macs'">
+                            </button>
+                        </div>
+                    </details>
+                </div>
+                <!-- /Assistant -->
+            </div>
+        </section>
+
         <!-- ============================ plan ============================= -->
         <section x-show="wizardState() === 'plan'" x-cloak
                  class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
