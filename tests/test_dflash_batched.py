@@ -1239,3 +1239,62 @@ def test_inkling2_predraft_reads_the_newest_committed_row():
         return blocks
 
     assert run(predraft=True) == run(predraft=False)
+
+
+def test_markov_draft_trims_lm_head_to_active_depth(monkeypatch):
+    """Committed Markov drafts only project the positions the controller will
+    verify, matching full-width proposals bit for bit and skipping the LM head
+    when cur == 0 while still refreshing the recurrent head's context."""
+    mx.random.seed(99)
+    seed_caps = [mx.random.normal((1, 6, 128)).astype(mx.bfloat16) for _ in range(4)]
+    next_caps = [mx.random.normal((1, 2, 128)).astype(mx.bfloat16) for _ in range(4)]
+    tail_caps = [mx.random.normal((1, 1, 128)).astype(mx.bfloat16) for _ in range(4)]
+    anchor = mx.array([7], dtype=mx.uint32)
+
+    ref_drafter = _tiny_inkling2()._omlx_drafter
+    ref_drafter.seed(0, seed_caps)
+    ref_state = SimpleNamespace(uid=0, depth=4, controller=SimpleNamespace(cur=4))
+    ref_drafter.draft([(None, ref_state, [], anchor, None)])
+    ref_full = ref_state.drafts.tolist()
+    ref_drafter.draft([(None, ref_state, next_caps, anchor, None)])
+    ref_f_rnn_after_step2 = ref_drafter.model.markov_head._f_rnn[0] * 1.0
+    ref_drafter.draft([(None, ref_state, tail_caps, anchor, None)])
+    ref_after_zero = ref_state.drafts.tolist()
+
+    drafter = _tiny_inkling2()._omlx_drafter
+    seen_widths = []
+    orig_logits = drafter.model._logits
+
+    def spy_logits(hidden):
+        seen_widths.append(int(hidden.shape[1]))
+        return orig_logits(hidden)
+
+    monkeypatch.setattr(drafter.model, "_logits", spy_logits)
+    drafter.seed(0, seed_caps)
+
+    # Active depth 2 < block depth 4: LM head only sees 2 rows, matching prefix.
+    st2 = SimpleNamespace(uid=0, depth=4, controller=SimpleNamespace(cur=2))
+    drafter.draft([(None, st2, [], anchor, None)])
+    assert seen_widths == [2]
+    assert st2.drafts.tolist() == ref_full[:2]
+
+    # Active depth 0: LM head is skipped, drafts are empty, and prepare_block
+    # still refreshes _f_rnn so the following block matches full-width drafting.
+    seen_widths.clear()
+    st0 = SimpleNamespace(uid=0, depth=4, controller=SimpleNamespace(cur=0))
+    drafter.draft([(None, st0, next_caps, anchor, None)])
+    assert seen_widths == []
+    assert st0.drafts.tolist() == []
+    assert mx.array_equal(drafter.model.markov_head._f_rnn[0], ref_f_rnn_after_step2)
+
+    # Predraft (commit=False) keeps full width so adopt_predraft can step cur up.
+    seen_widths.clear()
+    assert drafter.predraft(None, st2, tail_caps, mx.array([1]), anchor)
+    assert seen_widths == [4]
+    drafter.discard_predraft()
+
+    seen_widths.clear()
+    st4 = SimpleNamespace(uid=0, depth=4, controller=SimpleNamespace(cur=4))
+    drafter.draft([(None, st4, tail_caps, anchor, None)])
+    assert seen_widths == [4]
+    assert st4.drafts.tolist() == ref_after_zero

@@ -847,7 +847,6 @@ class DFlashDrafter:
         draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]
         if wide:
             draft_hidden = draft_hidden.astype(dtype)
-        logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)
         if markov is not None:
@@ -863,27 +862,42 @@ class DFlashDrafter:
                     newest = mx.take_along_axis(h_ctx, last[:, None, None], axis=1)
                     held = [1] * batch
                 prepare(draft_hidden, newest, held, uids)
-            proposals = selection.select_markov(markov, logits, anchors, samplers)
-        elif selector is not None and selection.fused_select_eligible(
-            selector, draft_hidden
-        ):
-            proposals = selection.select_fused(
-                selector, draft_hidden, logits, anchors, samplers
-            )
-        elif all(sampler is None for sampler in samplers):
-            if selector is not None:
-                tokens = selector.select(
-                    draft_hidden, logits, anchors, selection.greedy_proposals
+            want = int(draft_hidden.shape[1])
+            if commit:
+                want = min(
+                    want,
+                    max(
+                        (self._proposal_count(state) for state, *_ in rows),
+                        default=0,
+                    ),
+                )
+            if want == 0:
+                proposals = [([], []) for _ in rows]
+            else:
+                logits = model._logits(draft_hidden[:, :want])
+                proposals = selection.select_markov(markov, logits, anchors, samplers)
+        else:
+            logits = model._logits(draft_hidden)
+            if selector is not None and selection.fused_select_eligible(
+                selector, draft_hidden
+            ):
+                proposals = selection.select_fused(
+                    selector, draft_hidden, logits, anchors, samplers
+                )
+            elif all(sampler is None for sampler in samplers):
+                if selector is not None:
+                    tokens = selector.select(
+                        draft_hidden, logits, anchors, selection.greedy_proposals
+                    )
+                else:
+                    tokens = selection.greedy_proposals(logits)
+                proposals = [(tokens[i : i + 1], []) for i in range(batch)]
+            elif selector is not None:
+                proposals = selection.select_sampled(
+                    selector, draft_hidden, logits, anchors, samplers
                 )
             else:
-                tokens = selection.greedy_proposals(logits)
-            proposals = [(tokens[i : i + 1], []) for i in range(batch)]
-        elif selector is not None:
-            proposals = selection.select_sampled(
-                selector, draft_hidden, logits, anchors, samplers
-            )
-        else:
-            proposals = selection.sample_positions(logits, samplers)
+                proposals = selection.sample_positions(logits, samplers)
         if not commit:
             self._predraft = _Predraft(
                 uids=tuple(uids),
