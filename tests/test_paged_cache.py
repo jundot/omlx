@@ -6,6 +6,7 @@ This module tests the block-based paged KV cache management following vLLM's
 architecture, adapted for MLX on Apple Silicon.
 """
 
+import logging
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -1010,6 +1011,58 @@ class TestPagedCacheManager:
             manager.cached_block_hash_to_block.insert(tail_hash, block)
         manager.register_tail_block(parent_hash, tail_hash, len(tokens))
         return tail_hash
+
+    @pytest.mark.parametrize(
+        "tokens, suffix, expected",
+        [
+            # Token 6 differs, but hashing can only locate the start of block 1.
+            pytest.param(
+                [1, 2, 3, 4, 5, 6, 99, 8],
+                [5, 6, 99, 8],
+                "matched_blocks=1 matched_tokens=4 boundary_block=1 "
+                "boundary_token=4 map=[block 0 HIT, block 1 UNMATCHED]",
+                id="partial",
+            ),
+            pytest.param(
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                [],
+                "matched_blocks=2 matched_tokens=8 boundary_block=2 "
+                "boundary_token=8 map=[blocks 0-1 HIT, end of prompt]",
+                id="full",
+            ),
+            pytest.param(
+                [91, 92, 93, 94],
+                [91, 92, 93, 94],
+                "matched_blocks=0 matched_tokens=0 boundary_block=0 "
+                "boundary_token=0 map=[block 0 UNMATCHED]",
+                id="cold",
+            ),
+            pytest.param(
+                [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 99],
+                [99],
+                "matched_blocks=3 matched_tokens=10 boundary_block=3 "
+                "boundary_token=10 map=[blocks 0-2 HIT, block 3 UNMATCHED]",
+                id="tail-extends-hit",
+            ),
+        ],
+    )
+    def test_prefix_match_boundary(self, caplog, tokens, suffix, expected):
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=16, initial_blocks=16, model_name="test-model"
+        )
+        parent_hash = self._register_full(manager, None, [1, 2, 3, 4])
+        parent_hash = self._register_full(manager, parent_hash, [5, 6, 7, 8])
+        self._register_tail(manager, parent_hash, [9, 10])
+
+        with caplog.at_level(logging.INFO, logger="omlx.cache.paged_cache"):
+            _, _, remaining = manager.find_shared_prefix(tokens)
+        assert remaining == suffix
+        assert not caplog.messages
+
+        with caplog.at_level(logging.DEBUG, logger="omlx.cache.paged_cache"):
+            _, _, remaining = manager.find_shared_prefix(tokens)
+        assert remaining == suffix
+        assert caplog.messages == [f"Paged prefix match: {expected}"]
 
     def test_get_computed_blocks_matches_tail_after_full_chain(self):
         """A tail under the last matched block extends the hit past the grid."""
