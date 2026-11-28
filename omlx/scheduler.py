@@ -15812,6 +15812,25 @@ class Scheduler:
     # Serialized blocks a requeue store may queue ahead of the SSD writer, so
     # it never buffers a whole request in host RAM while memory is short.
     _MEMORY_REQUEUE_PENDING_WRITES = 2
+    # The requeue store runs on the inference thread at the speed of the SSD
+    # cache drive: every running request stops decoding and no abort is
+    # processed until it ends. On a slow drive a long context took minutes
+    # (measured: one 216 MB block per ~10 s on an SD card, ~6 min for two
+    # 150k-token requests). Past this budget the store stops between blocks;
+    # what is stored stays a valid prefix and the rest is recomputed after
+    # the requeue. OMLX_MEMORY_REQUEUE_STORE_BUDGET_S overrides, 0 = no limit.
+    _MEMORY_REQUEUE_STORE_BUDGET_S = 30.0
+
+    def _memory_requeue_store_budget_s(self) -> float:
+        import os
+
+        raw = os.environ.get("OMLX_MEMORY_REQUEUE_STORE_BUDGET_S")
+        if raw is not None and raw.strip():
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                pass
+        return float(self._MEMORY_REQUEUE_STORE_BUDGET_S)
 
     def _memory_requeue_storage_ready(self) -> bool:
         return (
@@ -15896,10 +15915,28 @@ class Scheduler:
         _safe_sync_stream(self._stream)
         kept: list[str] = []
         ssd = self.paged_ssd_cache_manager
+        budget = Scheduler._memory_requeue_store_budget_s(self)
+        deadline = started + budget if budget > 0 else None
+
+        def should_stop() -> bool:
+            # An abort (user or emergency) ends a request anyway; the deadline
+            # bounds how long every other request stays frozen.
+            return bool(self._pending_abort_ids) or (
+                deadline is not None and time.perf_counter() >= deadline
+            )
+
         with ssd.bounded_pending_writes(self._MEMORY_REQUEUE_PENDING_WRITES):
             for request in live:
-                # An emergency abort ends these requests anyway.
-                if self._pending_abort_ids:
+                if should_stop():
+                    if not self._pending_abort_ids:
+                        logger.warning(
+                            "Memory requeue store budget of %.0fs spent; %s is "
+                            "requeued without a stored prefix",
+                            budget,
+                            request.request_id,
+                        )
+                        kept.append(f"{request.request_id[:8]} 0 (budget)")
+                        continue
                     break
                 state = self._prefill_states.get(request.request_id)
                 live_tokens = (
@@ -15910,7 +15947,9 @@ class Scheduler:
                     - request.requeued_output_tokens
                 )
                 try:
-                    stored = self._store_for_memory_requeue(request)
+                    stored = self._store_for_memory_requeue(
+                        request, should_stop=should_stop
+                    )
                     kept.append(f"{request.request_id[:8]} {stored}/{live_tokens}")
                 except Exception as e:
                     logger.warning(
@@ -15975,7 +16014,11 @@ class Scheduler:
             mx.eval(*arrays)
         return tokens, cache_to_store, model_cache_config, snapshots
 
-    def _store_for_memory_requeue(self, request: "Request") -> int:
+    def _store_for_memory_requeue(
+        self,
+        request: "Request",
+        should_stop: Callable[[], bool] | None = None,
+    ) -> int:
         """Write a live request's KV to the paged SSD cache; returns tokens kept."""
         request_id = request.request_id
         state = self._prefill_states.get(request_id)
@@ -16019,12 +16062,16 @@ class Scheduler:
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
                 hot_cache_write_back=False,
                 _store_tail_terminal=tail_terminal == len(tokens),
+                should_stop=should_stop,
             )
         if table is None and self.paged_cache_manager is not None:
             table = self.paged_cache_manager.get_block_table(store_id)
         if table and self.paged_cache_manager is not None:
             self.paged_cache_manager.release_for_eviction(table.block_ids)
         self.block_aware_cache.clear_request_entry(store_id)
+        if table is not None and should_stop is not None:
+            # A stopped store keeps only its first blocks; report what is kept.
+            return min(len(tokens), int(getattr(table, "num_tokens", len(tokens))))
         return len(tokens)
 
     @staticmethod
