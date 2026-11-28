@@ -223,6 +223,10 @@ class QuantizedProjection(QuantizedSwitchLinear):
     def input_dims(self):
         return self.weight.shape[-1] * 32 // self.bits
 
+    @property
+    def output_dims(self):
+        return self.weight.shape[-2]
+
     def _can_use_affine_blocks(self, x, sorted_indices, dtype=None):
         dtype = dtype or x.dtype
         return (
