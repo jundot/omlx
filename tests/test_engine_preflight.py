@@ -123,14 +123,14 @@ class TestPreflightOrRaise:
         )
         scheduler._memory_hard_limit_bytes = est.estimated - gb
         scheduler._memory_hot_cache_reserved_bytes = est.kv_exact + 4 * gb
-        # Up to the prompt's own KV may be its protected prefix, not credit.
+        # No cached prefix: every held hot-cache byte is releasable after admission.
         hot = [est.kv_exact + 2 * gb]
         monkeypatch.setattr(scheduler, "_hot_cache_cpu_bytes", lambda: hot[0])
 
         scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
         assert scheduler.preflight_eviction_request(num_prompt_tokens=65536) is None
 
-        hot[0] = est.kv_exact + gb // 2
+        hot[0] = gb // 2
         with pytest.raises(PrefillMemoryExceededError):
             scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
 

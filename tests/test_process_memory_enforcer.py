@@ -2008,6 +2008,65 @@ class TestMemoryLimitPropagation:
         # Freed blocks must leave phys_footprint, not wait in malloc's cache.
         relief.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_release_hot_cache_for_prefill_sheds_active_prefixes_when_allowed(
+        self, mock_engine_pool
+    ):
+        """#4213: a single-user workflow fills the hot cache with its own
+        active batch, so every block is protected, the default pass frees
+        nothing, and the next long prompt dies with a 400. The protected
+        pass sheds those blocks oldest-first instead: the cost to the
+        active requests is a re-prefill, never correctness, and the
+        propagated limit rises for the retry."""
+        gb = 1024**3
+        budget = SharedHotCacheBudget(6 * gb)
+        removed = []
+
+        class _Owner:
+            def _hot_cache_remove(self, block_hash, update_budget=True):
+                removed.append(block_hash)
+                return {}
+
+            def _handle_hot_cache_eviction(self, block_hash, entry):
+                pass
+
+        owner = _Owner()
+        for block_hash in (b"old", b"held", b"mid", b"new"):
+            budget.put(owner, block_hash, gb)
+        mock_engine_pool._scheduler_config = SimpleNamespace(hot_cache_budget=budget)
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=30 * gb)
+        enforcer._get_abort_limit_bytes = lambda: 30 * gb
+
+        scheduler = MagicMock(spec=[])
+        scheduler.batch_generator = None
+        # The workflow's own live batch owns every block.
+        scheduler.get_active_hot_cache_block_hashes = lambda: {
+            b"old",
+            b"held",
+            b"mid",
+            b"new",
+        }
+        scheduler.paged_ssd_cache_manager = SimpleNamespace(
+            wait_for_pending_writes=MagicMock(return_value=True)
+        )
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        mock_engine_pool._entries = {"model-a": _make_entry("model-a", engine=engine)}
+        enforcer._propagate_memory_limit()
+        assert scheduler._memory_hard_limit_bytes == int(25.5 * gb)
+
+        with patch.object(pme, "release_free_malloc_memory"):
+            # Default behaviour is unchanged: protected blocks stay.
+            assert await enforcer.release_hot_cache_for_prefill(int(1.5 * gb)) == 0
+            assert removed == []
+            released = await enforcer.release_hot_cache_for_prefill(
+                int(1.5 * gb), allow_protected=True
+            )
+
+        assert removed == [b"old", b"held"]
+        assert released == 2 * gb
+        assert scheduler._memory_hard_limit_bytes == int(27.5 * gb)
+
     def test_propagate_with_guard_disabled(self, enforcer):
         """When the guard is disabled the field reflects it; hard limit is
         still propagated for observability — the reader's early-return on
