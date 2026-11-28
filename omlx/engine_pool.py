@@ -84,6 +84,7 @@ from .model_settings import (
     specprefill_draft,
     validate_ane_prefill,
 )
+from .patches.ernie5_5.loading import draft_head_bytes as ernie5_5_draft_head_bytes
 from .patches.inkling2 import INKLING2_MODEL_TYPES
 from .patches.inkling2.dspark import (
     bundled_inkling2_dspark_path,
@@ -749,6 +750,11 @@ class EnginePool:
             if draft is not None:
                 # BF16 draft weights plus the folded [vocab, rank] Markov head.
                 extra += draft.stat().st_size + 201024 * 256 * 2
+        elif (
+            getattr(runtime_settings, "mtp_enabled", False)
+            and entry.config_model_type == "ernie5_5_moe"
+        ):
+            extra += ernie5_5_draft_head_bytes(entry.model_path)
         lora_path = getattr(runtime_settings, "lora_adapter", None)
         if lora_path and (info := adapter_info(lora_path)) is not None:
             extra += info.resident_bytes

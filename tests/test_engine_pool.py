@@ -1927,6 +1927,27 @@ class TestEnginePoolAsync:
             "model-a", ModelSettings(dflash_enabled=True)
         )
 
+    def test_ernie55_draft_head_is_charged_with_mtp(
+        self, pool_with_mock_engines, small_mock_model_dir
+    ):
+        pool = pool_with_mock_engines
+        entry = pool.get_entry("model-a")
+        entry.config_model_type = "ernie5_5_moe"
+        (small_mock_model_dir / "model-a" / "config.json").write_text(
+            json.dumps(
+                {
+                    "vocab_size": 201216,
+                    "hidden_size": 4096,
+                    "dspark_target_layer_ids": [40, 41, 42],
+                }
+            )
+        )
+        assert pool._entry_runtime_resident_size(
+            entry, ModelSettings(mtp_enabled=True)
+        ) - pool._entry_runtime_resident_size(entry, ModelSettings()) == (
+            437_846_016
+        )
+
     @pytest.mark.asyncio
     async def test_minimax_bundled_dspark_is_charged_and_takes_the_mtp_depth(
         self, pool_with_mock_engines, small_mock_model_dir

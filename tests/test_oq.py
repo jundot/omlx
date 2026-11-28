@@ -3654,6 +3654,21 @@ class TestDiscoverSanitizePlan:
         other.join(5)
         assert mx.eval is real_eval and mx.stack is real_stack
 
+    def test_transpose_replays_only_a_whole_lineage(self, sf_file):
+        idx = _LazyTensorIndex([sf_file[0]])
+        key = "model.embed_tokens.weight"
+
+        def plain(weights):
+            return {"t": weights[key].T}
+
+        def split_then_transpose(weights):
+            parts = mx.split(weights[key], 4)
+            return {f"p{i}": p.T for i, p in enumerate(parts)}
+
+        assert _discover_sanitize_plan(plain, idx)["t"]["transform"] == "transpose_1_0"
+        with pytest.raises(ValueError, match="non-replayable"):
+            _discover_sanitize_plan(split_then_transpose, idx)
+
     def test_rename_sanitize(self, sf_file):
         path, tensors = sf_file
         idx = _LazyTensorIndex([path])
@@ -7928,6 +7943,16 @@ class TestRecorderRefusesUnreplayableOps:
         with pytest.raises(
             ValueError, match="non-replayable transform|single-source transform"
         ):
+            self._discover(sanitize, logical)
+
+    def test_decoded_tensor_is_not_laundered_by_split_at_its_middle(self):
+        logical = {"w": ((256, 128), "BF16")}
+
+        def sanitize(weights):
+            decoded = mx.from_fp8(weights["w"], dtype=mx.bfloat16)
+            return {"out": mx.split(decoded, [128])[1]}
+
+        with pytest.raises(ValueError, match="non-replayable transform"):
             self._discover(sanitize, logical)
 
     def test_scalar_multiply_still_records(self):

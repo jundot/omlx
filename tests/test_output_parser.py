@@ -9,12 +9,15 @@ import types
 from types import SimpleNamespace
 
 import pytest
-from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer, TokenizerWrapper
 from mlx_lm.tool_parsers import json_tools, qwen3_coder
 
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
 from omlx.adapter.output_parser import detect_output_parser
+from omlx.api.tool_calling import parse_tool_calls
+from omlx.api.utils import _chat_template_supports_tool_role
+from omlx.patches.ernie5_5.processing import Processor
 
 
 class FakeDetokenizer:
@@ -127,6 +130,61 @@ def test_k2_reasoning_modes_and_tool_envelopes():
         assert clean == "answer"
         assert calls[0].function.name == "weather"
         assert json.loads(calls[0].function.arguments) == {"city": "Paris"}
+
+
+class ErnieTokenizer:
+    tokens = [
+        "<ernie:tool_call>",
+        "</ernie:tool_call>",
+        "<ernie:think>",
+        "</ernie:think>",
+        "Hi",
+        "\u0120",
+        "ok",
+        '<invoke\u0120name="weather"><parameter\u0120name="days">3</parameter></invoke>',
+    ]
+
+    def __len__(self):
+        return len(self.tokens)
+
+    def convert_ids_to_tokens(self, ids):
+        return [self.tokens[i] for i in ids]
+
+    def convert_tokens_to_ids(self, token):
+        return self.tokens.index(token) if token in self.tokens else -1
+
+    @property
+    def detokenizer(self):
+        return BPEStreamingDetokenizer(self)
+
+
+def test_ernie55_think_markers_and_tool_calls():
+    tokenizer = ErnieTokenizer()
+    Processor(tokenizer)
+    factory = detect_output_parser("ernie", tokenizer, {"model_type": "ernie5_5_moe"})
+    session = factory.create_session(tokenizer)
+    session.notify_prefilled_thought()
+    text = "".join(
+        session.process_token(token).stream_text for token in (4, 5, 3, 6, 0, 7, 1)
+    )
+    text += session.finalize().stream_text
+    call = '<invoke name="weather"><parameter name="days">3</parameter></invoke>'
+    assert text == f"Hi </think>ok<ernie:tool_call>{call}</ernie:tool_call>"
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {"properties": {"days": {"type": "integer"}}},
+            },
+        }
+    ]
+    clean, calls = parse_tool_calls(text.split("</think>")[1], tokenizer, tools)
+    assert clean == "ok"
+    assert json.loads(calls[0].function.arguments) == {"days": 3}
+    broken = "ok<ernie:tool_call>not a call</ernie:tool_call>"
+    assert parse_tool_calls(broken, tokenizer, tools) == (broken, None)
+    assert _chat_template_supports_tool_role(tokenizer)
 
 
 class DeepSeekV4Tokenizer(CohereTokenizer):

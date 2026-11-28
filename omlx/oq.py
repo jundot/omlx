@@ -42,6 +42,8 @@ try:
     from omlx.oqh import targets as oqh_targets
     from omlx.oqh.writer import OqhWriter
     from omlx.patches import minimax_m3_dspark as minimax_dspark
+    from omlx.patches.ernie5_5 import oq as ernie5_5_oq
+    from omlx.patches.ernie5_5.loading import repack as ernie5_5_repack
     from omlx.patches.inkling2 import apply_inkling2_patch
     from omlx.patches.inkling2 import oq_layout as inkling2_layout
     from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
@@ -467,7 +469,7 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
         return True
     return quant_method == "fp8" and (
         _is_deepseek_v4_config(config)
-        or config.get("model_type") == "bailing_hybrid"
+        or config.get("model_type") in ("bailing_hybrid", "ernie5_5_moe")
         or (
             config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}
             and quantization_config.get("store_dtype") == "mxfp4"
@@ -686,6 +688,30 @@ def _indexer_q8_override(path: str, config: dict) -> dict | None:
     )
 
 
+_ERNIE5_5_FLOAT_WEIGHTS = (
+    "embed_tokens",
+    "lm_head",
+    "compressor.wkv",
+    "compressor.wgate",
+    "indexer.wk",
+    "indexer.weights_proj",
+    "embed_q",
+    "unembed_out",
+    "mapping_proj",
+)
+_ERNIE5_5_SOURCE_SPEC = {"bits": 8, "group_size": 32, "mode": "mxfp8"}
+
+
+def _ernie5_5_fixed_spec(path: str, config: dict) -> dict | bool | None:
+    if config.get("model_type") != "ernie5_5_moe":
+        return None
+    if _is_routed_expert(path) and not _is_mtp_tensor(path):
+        return None
+    if path.endswith(_ERNIE5_5_FLOAT_WEIGHTS) or _is_moe_router(path):
+        return False
+    return dict(_ERNIE5_5_SOURCE_SPEC)
+
+
 def _is_hy_v4_engram_table(path: str, config: dict) -> bool:
     """Hy4-flash's hashed n-gram tables (about 31.7 GB each in BF16).
 
@@ -762,6 +788,10 @@ def universal_quant_predicate(
     non_quantizable = config.get("_oq_non_quantizable", set())
     if path in non_quantizable:
         return False
+
+    fixed = _ernie5_5_fixed_spec(path, config)
+    if fixed is not None:
+        return fixed
 
     indexer_override = _indexer_q8_override(path, config)
     if indexer_override is not None:
@@ -1149,6 +1179,7 @@ def _budgeted_shapes(named_shapes: dict[str, tuple], config: dict) -> dict[str, 
         and not _is_vision_tensor(path)
         and not _is_audio_tensor(path)
         and not _is_lfm3_speech_module(path, config)
+        and _ernie5_5_fixed_spec(path, config) is None
     }
 
 
@@ -3059,6 +3090,8 @@ class _TrackedTensor:
             while axis < len(new_shape):
                 result_shape.append(new_shape[axis])
                 axis += 1
+            if split_info is not None and self.as_expr() is None:
+                return self._unreplayable(shape=result_shape)
             if split_info is not None:
                 ax, idx_n, total = split_info
                 return _TrackedTensor(
@@ -3074,6 +3107,8 @@ class _TrackedTensor:
             dim = new_shape[0] if new_shape else 0
             length = self._slice_length(dim, idx) if dim > 0 else 0
             half = self._detect_half_split(dim, idx) if dim > 0 else None
+            if half is not None and self.as_expr() is None:
+                return self._unreplayable(shape=[length] + new_shape[1:])
             if half is not None:
                 return _TrackedTensor(
                     [length] + new_shape[1:],
@@ -3183,7 +3218,7 @@ class _TrackedTensor:
             axes_list = list(axes)
         axes_list = [a % self.ndim if a < 0 else a for a in axes_list]
         new_shape = tuple(self.shape[a] for a in axes_list)
-        if self.transform == "nested_unreplayable":
+        if self.transform == "nested_unreplayable" or self.as_expr() is None:
             return self._unreplayable(shape=new_shape)
         return _TrackedTensor(
             new_shape,
@@ -3202,14 +3237,7 @@ class _TrackedTensor:
 
     @property
     def T(self):
-        axes = tuple(reversed(range(self.ndim)))
-        return _TrackedTensor(
-            tuple(reversed(self.shape)),
-            self.dtype,
-            list(self.sources),
-            "transpose",
-            recipe=list(self.recipe) + [("transpose", axes)],
-        )
+        return self.transpose()
 
     @property
     def size(self):
@@ -3439,24 +3467,12 @@ def _discover_sanitize_plan_locked(sanitize_fn, lazy_index):
                         )
                     )
                 return parts
-            # list of indices
-            parts = []
-            prev = 0
-            idxs = list(indices_or_sections) + [tensor.shape[axis]]
-            for i, idx in enumerate(idxs):
-                sh = list(tensor.shape)
-                sh[axis] = idx - prev
-                if tensor.transform == "nested_unreplayable":
-                    parts.append(tensor._unreplayable(shape=sh))
-                    prev = idx
-                    continue
-                parts.append(
-                    _TrackedTensor(
-                        sh, tensor.dtype, list(tensor.sources), f"split_{i}", axis=axis
-                    )
-                )
-                prev = idx
-            return parts
+            axis %= tensor.ndim
+            bounds = [0, *indices_or_sections, tensor.shape[axis]]
+            return [
+                tensor[(slice(None),) * axis + (slice(start, stop),)]
+                for start, stop in zip(bounds, bounds[1:])
+            ]
         return _orig["split"](tensor, indices_or_sections, axis=axis)
 
     def _fake_moveaxis(tensor, src_ax, dst_ax):
@@ -4162,6 +4178,7 @@ def estimate_bpw_and_size(
     if dtype not in OQ_DTYPES:
         raise ValueError(f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}")
     _validate_oq_dtype_for_model(config, dtype)
+    ernie5_5_oq.check_level(config, oq_level)
     if text_only and decision_kind(source, config) == "d3":
         raise ValueError("Decision 3.0 requires its vision encoder")
 
@@ -4950,6 +4967,8 @@ def _build_model_sanitizer(
         from mlx_vlm.models.flint import Model, ModelConfig
 
         return Model(ModelConfig.from_dict(config)).sanitize
+    if config.get("model_type") == "ernie5_5_moe":
+        return ernie5_5_oq.sanitizer(config)
     architectures = config.get("architectures", [])
     # Detect VLMs by the canonical vision-subconfig predicate (used everywhere
     # else in oq.py), not just the ForConditionalGeneration arch name. OCR VLMs
@@ -5670,6 +5689,7 @@ class _LazyTensorIndex:
         self._modelopt_nvfp4_experts = bool(
             config and _is_muse_spark_modelopt_nvfp4(config)
         )
+        self._ernie5_5 = bool(config and config.get("model_type") == "ernie5_5_moe")
         self._index = {}
         for sf_path in weight_files:
             with open(sf_path, "rb") as f:
@@ -5893,7 +5913,15 @@ class _LazyTensorIndex:
                 "group_size": 32,
                 "mode": "mxfp8",
             }
-        if not sk.endswith(".scale"):
+        if self._ernie5_5 and sk.endswith("_scale_inv"):
+            if w_dtype == "F8_E4M3" and s_dtype == "F32":
+                return {
+                    "kind": "fp8_ue8m0",
+                    "bits": 8,
+                    "group_size": 32,
+                    "mode": "mxfp8",
+                }
+        elif not sk.endswith(".scale"):
             return None
         # FP4-packed experts (DeepSeek V4): int8 bytes carry 2 fp4 values
         # each, e8m0 scale per 32 logical values -> 16 bytes per group.
@@ -5987,6 +6015,10 @@ class _LazyTensorIndex:
                 scale_raw = mx.repeat(scale_raw, col_rep, -1)
             if row_rep > 1:
                 scale_raw = mx.repeat(scale_raw, row_rep, 0)
+        elif info["kind"] == "fp8_ue8m0":
+            packed, scale_raw, exact = ernie5_5_repack(weight_raw, scale_raw)
+            if not exact.item():
+                raise ValueError(f"FP8 block scales of {wk} are not powers of two")
         mx.eval(packed, scale_raw)
         return packed, scale_raw
 
@@ -7528,6 +7560,7 @@ def quantize_oq_streaming(
         )
         text_only = True
     _validate_oq_dtype_for_model(config, dtype)
+    ernie5_5_oq.check_level(config, oq_level)
     if decision_kind(source, config) == "d3":
         if text_only:
             raise ValueError(
@@ -11882,6 +11915,12 @@ class _OQGramCollector(OQImatrixCollector):
             used += cost
         yield first, n_experts
 
+    def owner(self, name: str) -> str:
+        owner = self.aliases.get(name, name)
+        if owner not in self.switch_rows:
+            raise RuntimeError(f"oQe: no calibration input for {name}")
+        return owner
+
     def switch_gram(self, name: str, first: int, stop: int):
         rows, row_ids, experts = self._merged_rows(name)
         keep = (experts >= first) & (experts < stop)
@@ -12086,6 +12125,77 @@ def _refine_captured(collector, modules: dict, writer, stats: dict) -> None:
             stats["after"] += result[2]
         del targets, results
         mx.clear_cache()
+
+
+def _float_experts(module, first: int, stop: int) -> mx.array:
+    if "scales" not in module:
+        return module.weight[first:stop].astype(mx.float32)
+    biases = module.get("biases")
+    return mx.dequantize(
+        module.weight[first:stop],
+        module.scales[first:stop],
+        None if biases is None else biases[first:stop],
+        group_size=module.group_size,
+        bits=module.bits,
+        mode=module.mode,
+    ).astype(mx.float32)
+
+
+def _refine_expert_grams(output, weight_map, quantization, names, grams, progress):
+    expert_map = {k: v for k, v in weight_map.items() if k.rsplit(".", 1)[0] in names}
+    writer = _OQRefineWriter(Path(output), expert_map, quantization)
+    layer_count = len({_extract_layer_index(name) for name in names})
+    stats = {"tensors": 0, "kept": 0, "before": 0.0, "after": 0.0}
+    for done, (layer, modules, collector) in enumerate(grams, start=1):
+        for name, module in modules.items():
+            if name not in names:
+                continue
+            owner = collector.owner(name)
+            packed, scales, biases = writer.read(name)
+            bits, group_size = writer.spec(name)
+            n_exp, out_dim = int(packed.shape[0]), int(packed.shape[1])
+            in_dim = int(packed.shape[2]) * 32 // bits
+            parts, before, after, changed = [], 0.0, 0.0, False
+            for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
+                hessian = _shrunk_gram(collector.switch_gram(owner, first, stop))
+                result = _refine_affine_codes(
+                    _float_experts(module, first, stop),
+                    packed[first:stop],
+                    scales[first:stop],
+                    biases[first:stop],
+                    hessian,
+                    bits,
+                    group_size,
+                )
+                del hessian
+                if result is None:
+                    parts.append(packed[first:stop])
+                else:
+                    parts.append(result[0])
+                    before, after, changed = before + result[1], after + result[2], True
+                mx.clear_cache()
+            if changed:
+                writer.write(name, mx.concatenate(parts))
+                stats["tensors"] += 1
+                stats["before"] += before
+                stats["after"] += after
+            else:
+                stats["kept"] += 1
+        writer.layer_done(layer)
+        if progress is not None:
+            progress(done, layer_count)
+        logger.info(
+            "oQe expert refine: layer %d done (%d/%d)", layer, done, layer_count
+        )
+    writer.finish()
+    gain = 1.0 - stats["after"] / stats["before"] if stats["before"] > 0 else 0.0
+    logger.info(
+        "oQe expert refine: %d tensors refined (%d kept), Hessian error -%.1f%%",
+        stats["tensors"],
+        stats["kept"],
+        100.0 * gain,
+    )
+    return {"status": "done", **stats, "hessian_error_reduction": round(gain, 4)}
 
 
 def _refine_head(model, layers, hidden_states, writer, stats) -> None:
@@ -12343,16 +12453,6 @@ def _refine_oqe_output(
             "has no streamed calibration walk, skipped"
         )
         return {"status": "skipped", "reason": "calibrated through a proxy"}
-    writer = _OQRefineWriter(output, weight_map, quantization)
-    stats = {
-        "tensors": 0,
-        "kept": 0,
-        "quantized": 0,
-        "skipped_layers": 0,
-        "before": 0.0,
-        "after": 0.0,
-    }
-    started = _time.monotonic()
 
     def progress(done: int, total: int) -> None:
         frac = done / max(total, 1)
@@ -12363,6 +12463,24 @@ def _refine_oqe_output(
             f"oQe code refinement, layer {done}/{total}",
         )
 
+    if model_type == "ernie5_5_moe":
+        return ernie5_5_oq.refine_experts(
+            source,
+            output,
+            weight_map,
+            quantization,
+            progress=progress,
+        )
+    writer = _OQRefineWriter(output, weight_map, quantization)
+    stats = {
+        "tensors": 0,
+        "kept": 0,
+        "quantized": 0,
+        "skipped_layers": 0,
+        "before": 0.0,
+        "after": 0.0,
+    }
+    started = _time.monotonic()
     walk = _refine_oqe_streamed if streamed else _refine_oqe_resident
     walk(
         str(source),
@@ -12622,6 +12740,16 @@ def _collect_imatrix(
             progress_start=progress_start,
             progress_end=progress_end,
         )
+    if config.get("model_type") == "ernie5_5_moe":
+        return ernie5_5_oq.collect_checkpoint_imatrix(
+            model_path,
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
+        )
 
     model, tokenizer = _load_calibration_model(
         model_path, config, trust_remote_code=trust_remote_code
@@ -12659,7 +12787,7 @@ def _oqe_cache_missing_mtp_entries(
         return False
     collection = cache.metadata.get("collection")
     if (
-        config.get("model_type") == "deepseek_v41"
+        config.get("model_type") in ("deepseek_v41", "ernie5_5_moe")
         and isinstance(collection, dict)
         and collection.get("uncalibrated_policy") == "preserve_source_precision"
     ):
@@ -13437,6 +13565,14 @@ def _measure_sensitivity_from_quantized_model(
     bits. The relative MSE ranking matches fp16 qdq-MSE with ~90% top-10
     overlap.
     """
+    if config.get("model_type") == "ernie5_5_moe":
+        return ernie5_5_oq.measure_sensitivity(
+            model_path,
+            bits=_base_bits_for_level(oq_level),
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+        )
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
