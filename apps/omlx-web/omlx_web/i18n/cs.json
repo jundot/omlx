@@ -444,6 +444,8 @@
   "models.oq.preserve_ngram": "Keep original Engram tables",
   "models.oq.preserve_ngram_help": "Copy the Engram tables in their original FP8 storage instead of quantizing them to 4 bits. The output takes more disk space, but memory use stays the same with SSD N-gram Offload. Output name gets a -ngram suffix.",
   "models.oq.preserve_mtp_unavailable": "Zdrojový model nemá hlavy MTP.",
+  "models.oq.bundled_dspark": "Bundled DSpark drafter",
+  "models.oq.bundled_dspark_help": "Automatically preserved during quantization.",
   "models.oq.combine_assistant": "Sloučit pomocný model jako hlavu MTP",
   "models.oq.combine_assistant_help": "Sloučí samostatný checkpoint gemma4_assistant do výstupu jako hlavu Lightning MTP. Výsledný model dostane příponu -mtp a půjde zapnout Lightning MTP.",
   "models.oq.combine_assistant_none": "Žádný",

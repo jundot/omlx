@@ -444,6 +444,8 @@
   "models.oq.preserve_ngram": "Originale Engram-Tabellen beibehalten",
   "models.oq.preserve_ngram_help": "Die Engram-Tabellen im ursprünglichen FP8-Format kopieren, statt sie auf 4 Bit zu quantisieren. Die Ausgabe braucht mehr Festplattenspeicher, der Arbeitsspeicherbedarf bleibt mit „N-Gramm-Auslagerung auf SSD“ aber gleich. Der Ausgabename erhält das Suffix -ngram.",
   "models.oq.preserve_mtp_unavailable": "Quellmodell hat keine MTP-Köpfe.",
+  "models.oq.bundled_dspark": "Bundled DSpark drafter",
+  "models.oq.bundled_dspark_help": "Automatically preserved during quantization.",
   "models.oq.combine_assistant": "Assistentenmodell als MTP-Kopf einbinden",
   "models.oq.combine_assistant_help": "Einen separaten gemma4_assistant-Checkpoint als Lightning-MTP-Kopf in das Ausgabemodell integrieren. Der Ausgabename erhält den Zusatz -mtp. Der Lightning-MTP-Schalter funktioniert anschließend für dieses Modell.",
   "models.oq.combine_assistant_none": "Keines",

@@ -1541,8 +1541,12 @@
                                             </button>
                                         </div>
                                         <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-700 leading-relaxed">{{ t('models.oq.text_only_hint') }}</p>
+                                        <div x-show="oqSelectedModelHasBundledDspark()" x-cloak>
+                                            <span class="text-sm text-neutral-600">{{ t('models.oq.bundled_dspark') }}</span>
+                                            <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.bundled_dspark_help') }}</p>
+                                        </div>
                                         <!-- Preserve MTP weights -->
-                                        <div class="flex items-center justify-between">
+                                        <div x-show="!oqSelectedModelHasBundledDspark()" x-cloak class="flex items-center justify-between">
                                             <div class="flex-1 min-w-0 pr-3">
                                                 <span class="text-sm text-neutral-600">{{ t('models.oq.preserve_mtp') }}</span>
                                                 <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.preserve_mtp_help') }}</p>

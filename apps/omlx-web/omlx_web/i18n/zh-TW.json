@@ -444,6 +444,8 @@
   "models.oq.preserve_ngram": "Keep original Engram tables",
   "models.oq.preserve_ngram_help": "Copy the Engram tables in their original FP8 storage instead of quantizing them to 4 bits. The output takes more disk space, but memory use stays the same with SSD N-gram Offload. Output name gets a -ngram suffix.",
   "models.oq.preserve_mtp_unavailable": "來源模型沒有 MTP 頭。",
+  "models.oq.bundled_dspark": "Bundled DSpark drafter",
+  "models.oq.bundled_dspark_help": "Automatically preserved during quantization.",
   "models.oq.combine_assistant": "合併 assistant 模型為 MTP 頭",
   "models.oq.combine_assistant_help": "將獨立的 gemma4_assistant 檢查點合併至輸出中作為 Lightning MTP 頭。輸出名稱會加上 -mtp 後綴，且 Lightning MTP 切換可作用於結果。",
   "models.oq.combine_assistant_none": "無",
