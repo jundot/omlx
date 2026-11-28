@@ -198,6 +198,42 @@ def test_scheduler_gdn_and_ssd_observability_is_mapped_to_model_row(tmp_path):
     }
     assert row["last_prefix_lookup"]["reused_kv_tokens"] == 16384
     assert row["last_prefix_lookup"]["unreused_common_prefix_tokens"] == 1616
+    assert "gdn_embedded_state" not in row
+
+
+def test_runtime_cache_surfaces_embedded_gdn_codec_counters(tmp_path):
+    class Engine:
+        scheduler = SimpleNamespace(
+            get_ssd_cache_stats=lambda: {
+                "ssd_cache": {
+                    "num_files": 1,
+                    "total_size_bytes": 1024,
+                    "max_size_bytes": 4096,
+                    "hot_cache_max_bytes": 0,
+                    "hot_cache_size_bytes": 0,
+                    "hot_cache_entries": 0,
+                },
+                "gdn_embedded_state": {
+                    "state_dtype": "rht_int16",
+                    "state_encodes": "7",
+                    "state_dequantizations": 2,
+                    "encode_failures": None,
+                    "decode_failures": 0,
+                    "capability_fallbacks": 1,
+                    "unexpected_key": "must not leak",
+                },
+            }
+        )
+
+    row = _build(_Pool(Engine()), tmp_path)["models"][0]
+    assert row["gdn_embedded_state"] == {
+        "state_dtype": "rht_int16",
+        "state_encodes": 7,
+        "state_dequantizations": 2,
+        "encode_failures": 0,
+        "decode_failures": 0,
+        "capability_fallbacks": 1,
+    }
 
 
 def test_engine_returning_none_stats_is_skipped(tmp_path):

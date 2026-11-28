@@ -63,6 +63,7 @@ from .cache.prefix_cache import (
     cachelist_pm_member_plan,
 )
 from .decode_activity import get_decode_activity
+from .utils.legacy_kwargs import deprecated_init_kwargs
 from .exceptions import (
     InvalidRequestError,
     PrefillMemoryExceededError,
@@ -2012,6 +2013,7 @@ def _mimo_fused_full_attention() -> bool:
         return False
 
 
+@deprecated_init_kwargs(gdn_sidecar_state_dtype="gdn_snapshot_state_dtype")
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
@@ -2073,7 +2075,8 @@ class SchedulerConfig:
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
-    gdn_sidecar_state_dtype: str = "fp32"
+    # Storage precision for GDN recurrent state in either payload layout.
+    gdn_snapshot_state_dtype: str = "fp32"
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -2082,6 +2085,15 @@ class SchedulerConfig:
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
+
+    @property
+    def gdn_sidecar_state_dtype(self) -> str:
+        """Compatibility alias for ``gdn_snapshot_state_dtype``."""
+        return self.gdn_snapshot_state_dtype
+
+    @gdn_sidecar_state_dtype.setter
+    def gdn_sidecar_state_dtype(self, value: str) -> None:
+        self.gdn_snapshot_state_dtype = value
 
 
 @dataclass
@@ -9316,6 +9328,33 @@ class Scheduler:
         )
         return bool(callable(supported) and supported(layer_types))
 
+    def _should_encode_staged_boundary(
+        self, snapshot_cache: list[Any] | None = None
+    ) -> bool:
+        # Encode ephemeral SSD staging snapshots only when they will be promoted
+        # to durable sidecars; fallback embedded layouts encode in save_block().
+        manager = self.paged_ssd_cache_manager
+        if manager is not None and getattr(
+            manager, "_expected_layer_cache_types", None
+        ) is not None:
+            return self._gdn_split_active()
+        if snapshot_cache and self.block_aware_cache is not None:
+            supported = getattr(
+                self.block_aware_cache, "_gdn_split_layout_supported", None
+            )
+            if callable(supported):
+                layer_types = [
+                    type(cache).__name__
+                    for cache in snapshot_cache
+                    if cache is not None
+                ]
+                if layer_types:
+                    return bool(
+                        getattr(self.config, "gdn_ssd_split_enabled", False)
+                        and supported(layer_types)
+                    )
+        return bool(getattr(self.config, "gdn_ssd_split_enabled", False))
+
     def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
         """Force the leaf KV tensors of an in-memory boundary snapshot concrete.
 
@@ -9427,6 +9466,9 @@ class Scheduler:
                     snapshot_cache,
                     self._extract_snapshot_cache_states,
                     block_size=snapshot_block_size,
+                    encode_gdn_state=self._should_encode_staged_boundary(
+                        snapshot_cache
+                    ),
                 )
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
@@ -9849,6 +9891,9 @@ class Scheduler:
                     snapshot_cache,
                     self._extract_snapshot_cache_states,
                     block_size=snapshot_block_size,
+                    encode_gdn_state=self._should_encode_staged_boundary(
+                        snapshot_cache
+                    ),
                 )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
@@ -17288,7 +17333,7 @@ class Scheduler:
                 expected_block_size=self.config.paged_cache_block_size,
                 expected_block_size_tokens=self.config.paged_cache_block_size,
                 expected_kv_bytes_per_token=expected_kv_bytes_per_token,
-                gdn_sidecar_state_dtype=self.config.gdn_sidecar_state_dtype,
+                gdn_snapshot_state_dtype=self.config.gdn_snapshot_state_dtype,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
@@ -17311,8 +17356,10 @@ class Scheduler:
                     self._boundary_snapshot_store = BoundarySnapshotSSDStore(
                         base_dir=Path(self.config.paged_ssd_cache_dir),
                         pending_max_bytes=self.config.gdn_ssd_pending_max_bytes,
-                        gdn_sidecar_state_dtype=(
-                            self.config.gdn_sidecar_state_dtype
+                        # Embedded-layout snapshots are ephemeral staging; keep
+                        # them fp32 so save_block() encodes the state once.
+                        gdn_snapshot_state_dtype=(
+                            self.config.gdn_snapshot_state_dtype
                             if self.config.gdn_ssd_split_enabled
                             else "fp32"
                         ),
@@ -17622,7 +17669,9 @@ class Scheduler:
                 ),
                 "backpressure_ms": self._boundary_snapshot_store.backpressure_ms,
                 "state_dtype": (
-                    self._boundary_snapshot_store.gdn_sidecar_state_dtype
+                    self._boundary_snapshot_store.gdn_snapshot_state_dtype
+                    if self._should_encode_staged_boundary()
+                    else "fp32"
                 ),
                 "state_dequantizations": (
                     self._boundary_snapshot_store.gdn_state_dequantizations
@@ -17650,6 +17699,26 @@ class Scheduler:
                     self.paged_ssd_cache_manager.gdn_sidecar_size_bytes
                     if self.paged_ssd_cache_manager is not None
                     else 0
+                ),
+            }
+
+        if self.paged_ssd_cache_manager is not None:
+            stats["gdn_embedded_state"] = {
+                "state_dtype": self.config.gdn_snapshot_state_dtype,
+                "state_encodes": (
+                    self.paged_ssd_cache_manager.gdn_state_encodes
+                ),
+                "state_dequantizations": (
+                    self.paged_ssd_cache_manager.gdn_state_dequantizations
+                ),
+                "encode_failures": (
+                    self.paged_ssd_cache_manager.gdn_state_encode_failures
+                ),
+                "decode_failures": (
+                    self.paged_ssd_cache_manager.gdn_state_decode_failures
+                ),
+                "capability_fallbacks": (
+                    self.paged_ssd_cache_manager.gdn_capability_fallbacks
                 ),
             }
 
