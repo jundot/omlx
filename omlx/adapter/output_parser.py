@@ -1097,9 +1097,7 @@ class InklingOutputParserSession:
         visible_text += v
 
         tool_calls: list[dict[str, str]] = []
-        saw_tool_call = False
         for match in InklingOutputParserSession._TOOL_RE.finditer(self._raw_text):
-            saw_tool_call = True
             payload = match.group(1).strip()
             if not payload:
                 continue
@@ -1154,7 +1152,8 @@ class InklingOutputParserSession:
             visible_text=visible_text,
             tool_calls=tool_calls,
             finish_reason="tool_calls" if tool_calls else None,
-            tool_call_failed=saw_tool_call and not tool_calls,
+            tool_call_failed=not tool_calls
+            and _INKLING_CONTENT_TOOL_JSON in self._raw_text,
         )
 
 

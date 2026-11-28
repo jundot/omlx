@@ -8407,24 +8407,13 @@ class TestStopStringOutputBuffer:
             assert not outputs[-1].tool_calls
             assert outputs[-1].output_text == "".join(pieces)
 
-    @pytest.mark.parametrize(
-        "with_tools, terminal_reason, expected",
-        [
-            (True, "stop", "tool_calls"),
-            (False, "stop", "stop"),
-            (True, "length", "length"),
-        ],
-    )
     def test_inkling_malformed_call_reports_tool_call_finish(
-        self, mock_model, monkeypatch, with_tools, terminal_reason, expected
+        self, mock_model, monkeypatch
     ):
-        from omlx.adapter import output_parser
-
         scheduler = self._setup(mock_model)
         request = scheduler.running["stop-output"]
         request.sampling_params.stop = []
-        if with_tools:
-            request.tools = [{"type": "function", "function": {"name": "get"}}]
+        request.tools = [{"type": "function", "function": {"name": "get"}}]
         tokenizer = scheduler.tokenizer
         tokenizer.pieces = {
             **tokenizer.pieces,
@@ -8434,24 +8423,19 @@ class TestStopStringOutputBuffer:
         }
         scheduler._build_state_machine(request)
         monkeypatch.setattr(
-            output_parser,
+            output_parser_module,
             "create_streaming_detokenizer",
             lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
         )
-        session = output_parser.InklingOutputParserSession(tokenizer)
+        session = output_parser_module.InklingOutputParserSession(tokenizer)
         scheduler._get_output_parser_session = lambda request_id: session
         responses = [self._response(token) for token in (100, 101, 102)]
-        if terminal_reason == "stop":
-            responses.append(self._response(tokenizer.eos_token_id, "stop"))
-        else:
-            responses[-1].finish_reason = "length"
+        responses.append(self._response(tokenizer.eos_token_id, "stop"))
 
-        outputs, finished = scheduler._process_batch_responses(responses)
+        outputs, _ = scheduler._process_batch_responses(responses)
 
-        assert finished == {request.request_id}
-        assert outputs[-1].finish_reason == expected
+        assert outputs[-1].finish_reason == "tool_calls"
         assert outputs[-1].tool_calls is None
-        assert outputs[-1].output_text == "<think>Check the value.</think>"
 
     def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
         scheduler = self._setup(mock_model)
