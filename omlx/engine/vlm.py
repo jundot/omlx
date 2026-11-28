@@ -2492,12 +2492,11 @@ class VLMBatchedEngine(BaseEngine):
         # Initialize vision feature cache
         vision_ssd_dir = None
         if not self.is_diffusion_model:
-            if self._scheduler_config and getattr(
-                self._scheduler_config, "paged_ssd_cache_dir", None
+            ssd_cache_dir = getattr(self._scheduler_config, "paged_ssd_cache_dir", None)
+            if ssd_cache_dir and not getattr(
+                self._scheduler_config, "hot_cache_only", False
             ):
-                vision_ssd_dir = (
-                    Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
-                )
+                vision_ssd_dir = Path(ssd_cache_dir) / "vision_features"
             self._vision_cache = VisionFeatureSSDCache(
                 cache_dir=vision_ssd_dir,
                 # Agent sessions resend 20-90 screenshots; bound by bytes.

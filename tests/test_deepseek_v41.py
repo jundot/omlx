@@ -904,24 +904,30 @@ def test_prefill_engram_dedupe_matches_undeduped(monkeypatch):
     np.testing.assert_array_equal(actual[:, 1], h[:, 1])
 
 
-async def _run_vlm_engine(tmp_path):
+async def _run_vlm_engine(tmp_path, hot_cache_only):
     import asyncio
 
     from PIL import Image
 
     from omlx.engine.vlm import VLMBatchedEngine
     from omlx.patches.deepseek_v41.convert import convert
-    from omlx.scheduler import SchedulerConfig
+    from omlx.settings import CacheSettings, GlobalSettings
 
     source, _ = write_checkpoint(tmp_path)
     target = tmp_path / "mlx"
     # The engine passes source and converted checkpoints to the same load().
     # Conversion also runs the source weight reader.
     convert(source, target)
+    settings = GlobalSettings(
+        base_path=tmp_path,
+        cache=CacheSettings(hot_cache_only=hot_cache_only, hot_cache_max_size="64MB"),
+    )
+    scheduler_config = settings.to_scheduler_config()
+    scheduler_config.prefill_step_size = 4
     engine = VLMBatchedEngine(
         str(target),
         enable_thinking=False,
-        scheduler_config=SchedulerConfig(prefill_step_size=4),
+        scheduler_config=scheduler_config,
     )
     try:
         await engine.start()
@@ -959,8 +965,20 @@ async def _run_vlm_engine(tmp_path):
         ):
             outputs.append(chunk)
         assert outputs and outputs[-1].finished
+        # V4.1 assembles image embeddings directly, so exercise the shared
+        # feature cache created at startup with a representative MLX tensor.
+        cache = engine._vision_cache
+        features = mx.ones((4, 32))
+        cache.put("test-image", str(target), features)
+        assert mx.array_equal(cache.get("test-image", str(target)), features).item()
     finally:
         await engine.stop()
+
+    vision_cache_dir = tmp_path / "cache" / "vision_features"
+    if hot_cache_only:
+        assert not vision_cache_dir.exists()
+    else:
+        assert len(list(vision_cache_dir.rglob("*.safetensors"))) == 1
 
 
 def raw_safetensors(path, tensors):
@@ -1037,7 +1055,8 @@ def test_quantized_conversion_and_loaded_projection(tmp_path):
     model.close()
 
 
-def test_real_vlm_engine_text_and_images(tmp_path):
+@pytest.mark.parametrize("hot_cache_only", [False, True], ids=["ssd", "hot-only"])
+def test_real_vlm_engine_text_and_images(tmp_path, hot_cache_only):
     import subprocess
 
     script = """
@@ -1048,7 +1067,9 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import test_deepseek_v41 as t
 
-asyncio.run(asyncio.wait_for(t._run_vlm_engine(Path(sys.argv[2])), timeout=60))
+asyncio.run(asyncio.wait_for(
+    t._run_vlm_engine(Path(sys.argv[2]), sys.argv[3] == "hot-only"), timeout=60
+))
 """
     # Engine startup installs process-wide Metal routes. Keep those real hooks
     # in a subprocess so unrelated estimator unit tests retain their fixtures.
@@ -1059,6 +1080,7 @@ asyncio.run(asyncio.wait_for(t._run_vlm_engine(Path(sys.argv[2])), timeout=60))
             script,
             str(Path(__file__).parent),
             str(tmp_path),
+            "hot-only" if hot_cache_only else "ssd",
         ],
         capture_output=True,
         text=True,
