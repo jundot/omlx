@@ -1236,6 +1236,32 @@ _mlx_lm_generate_module._extend_cache = _patched_extend_cache
 PromptProcessingBatch.split = _patched_ppb_split
 
 
+class _EvalEachLayer(list):
+    # Iterating materializes each layer before the next, so filter frees one
+    # layer's old arrays at a time.
+    def __iter__(self):
+        for layer in list.__iter__(self):
+            yield layer
+            _eval_cache_layer(layer)
+
+
+_original_generation_batch_filter = GenerationBatch.filter
+
+
+def _patched_generation_batch_filter(self, keep):
+    if len(keep) == len(self.uids):
+        return _original_generation_batch_filter(self, keep)
+    # Materialize each layer as it is filtered, as merge and extend do.
+    self.prompt_cache = _EvalEachLayer(self.prompt_cache)
+    try:
+        return _original_generation_batch_filter(self, keep)
+    finally:
+        self.prompt_cache = list(self.prompt_cache)
+
+
+GenerationBatch.filter = _patched_generation_batch_filter
+
+
 # Monkey-patch ChunkedKVCache for Llama-4 (Scout / Maverick): mlx_lm's
 # ChunkedKVCache lacks the batch-aware methods (`merge`, `filter`, `extract`,
 # `size`, `extend`) that BatchGenerator's continuous-batching code path
@@ -1449,6 +1475,35 @@ def _output_tokens_cacheable(request: "Request") -> bool:
     return not getattr(request, "needs_think_prefix", False) or bool(
         getattr(request, "preserve_reasoning", False)
     )
+
+
+def _detach(value, copies: list, seen: set, depth: int):
+    if isinstance(value, mx.array):
+        copy = mx.array(value)
+        copies.append(copy)
+        return copy
+    if depth > 4:
+        return value
+    if isinstance(value, list):
+        return [_detach(v, copies, seen, depth + 1) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_detach(v, copies, seen, depth + 1) for v in value)
+    attrs = getattr(value, "__dict__", None)
+    if attrs is None or isinstance(value, type) or id(value) in seen:
+        return value
+    seen.add(id(value))
+    for key, item in list(attrs.items()):
+        if isinstance(item, (mx.array, list, tuple)) or hasattr(item, "__dict__"):
+            attrs[key] = _detach(item, copies, seen, depth + 1)
+    return value
+
+
+def _detach_finished_row(caches: list[Any]) -> list[Any]:
+    # An extracted row holds views into the batch; copies let the old batch free.
+    copies: list[mx.array] = []
+    out = [_detach(cache, copies, set(), 0) for cache in caches]
+    mx.eval(copies)
+    return out
 
 
 def _first_leaf_cache_offset(cache_obj: Any) -> int | None:
@@ -14788,6 +14843,9 @@ class Scheduler:
                 # Extract cache for future reuse.
                 # In the new API, prompt_cache is a direct value (not callable).
                 raw_cache = getattr(response, "prompt_cache", None)
+                if raw_cache is not None and len(self.uid_to_request_id) > 1:
+                    with mx.stream(self._stream):
+                        raw_cache = _detach_finished_row(raw_cache)
                 if raw_cache is not None:
                     try:
                         # Sparse or unsupported layouts cannot round-trip through
