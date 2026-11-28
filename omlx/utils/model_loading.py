@@ -426,6 +426,40 @@ def normalize_laguna_compressed_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_bailing_kda_lower_bound(cfg: dict) -> dict:
+    """Coerce an integer ``kda_lower_bound`` to float for Bailing/Ling configs.
+
+    Ling 3.0 community quantizations (e.g. ``Lykegenes/Ling-3.0-tiny-oQ4e-fp16``)
+    ship ``"kda_lower_bound": -5`` in config.json.  JSON integers are valid
+    numbers, but ``mlx_lm.models.bailing_moe_v3.ModelArgs`` declares the field
+    as ``float`` and recent ``huggingface-hub`` releases validate ``@strict``
+    dataclasses on assignment, so ``int`` values raise::
+
+        StrictDataclassFieldValidationError: Validation error for field
+        'kda_lower_bound': TypeError: Field 'kda_lower_bound' expected float,
+        got int (value: -5)
+
+    and the model fails to load with HTTP 409.  Normalizing the value to
+    ``-5.0`` before config instantiation keeps these published configs
+    loadable without requiring users to hand-edit config.json.
+
+    Only plain ints are coerced; bools, floats, None and missing values pass
+    through untouched.  Mutates *cfg* in place and returns it for convenience.
+    """
+    if cfg.get("model_type") not in ("bailing_hybrid", "bailing_moe_v3"):
+        return cfg
+
+    sections = [cfg]
+    text = cfg.get("text_config")
+    if isinstance(text, dict):
+        sections.append(text)
+    for section in sections:
+        value = section.get("kda_lower_bound")
+        if type(value) is int:  # noqa: E721 - bool must NOT be coerced
+            section["kda_lower_bound"] = float(value)
+    return cfg
+
+
 def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
     """Map Ling mixed FP8/MXFP4 checkpoints to MLX runtime formats.
 
@@ -567,6 +601,7 @@ def _patch_mlx_lm_load_config() -> None:
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
+        normalize_bailing_kda_lower_bound(cfg)
         normalize_mimo_mxfp4_quant(cfg)
         normalize_inkling2_modelopt_quant(cfg)
         normalize_raon1_mini_model_file(cfg)

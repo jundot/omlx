@@ -941,6 +941,72 @@ class TestCheckpointHasMtpWeights:
         )
 
 
+class TestNormalizeBailingKdaLowerBound:
+    """normalize_bailing_kda_lower_bound coerces int kda_lower_bound to float.
+
+    Ling 3.0 community quantizations ship ``"kda_lower_bound": -5`` (int).
+    mlx-lm's bailing_moe_v3 ModelArgs declares the field as float, and
+    huggingface-hub's strict dataclass validation rejects ints on assignment,
+    making the model fail to load with HTTP 409.
+    """
+
+    def test_int_is_coerced_to_float(self):
+        cfg = {"model_type": "bailing_hybrid", "kda_lower_bound": -5}
+
+        model_loading.normalize_bailing_kda_lower_bound(cfg)
+
+        assert cfg["kda_lower_bound"] == -5.0
+        assert isinstance(cfg["kda_lower_bound"], float)
+
+    def test_bailing_moe_v3_is_also_normalized(self):
+        cfg = {"model_type": "bailing_moe_v3", "kda_lower_bound": -5}
+
+        model_loading.normalize_bailing_kda_lower_bound(cfg)
+
+        assert isinstance(cfg["kda_lower_bound"], float)
+
+    def test_text_config_is_normalized(self):
+        cfg = {
+            "model_type": "bailing_hybrid",
+            "text_config": {"kda_lower_bound": -5},
+        }
+
+        model_loading.normalize_bailing_kda_lower_bound(cfg)
+
+        assert isinstance(cfg["text_config"]["kda_lower_bound"], float)
+
+    def test_float_passes_through_untouched(self):
+        cfg = {"model_type": "bailing_hybrid", "kda_lower_bound": -5.0}
+
+        model_loading.normalize_bailing_kda_lower_bound(cfg)
+
+        assert cfg["kda_lower_bound"] == -5.0
+
+    def test_bool_is_not_coerced(self):
+        cfg = {"model_type": "bailing_hybrid", "kda_lower_bound": True}
+
+        model_loading.normalize_bailing_kda_lower_bound(cfg)
+
+        assert cfg["kda_lower_bound"] is True
+
+    def test_none_and_missing_pass_through(self):
+        cfg = {"model_type": "bailing_hybrid", "kda_lower_bound": None}
+        model_loading.normalize_bailing_kda_lower_bound(cfg)
+        assert cfg["kda_lower_bound"] is None
+
+        cfg = {"model_type": "bailing_hybrid"}
+        model_loading.normalize_bailing_kda_lower_bound(cfg)
+        assert "kda_lower_bound" not in cfg
+
+    def test_other_model_types_untouched(self):
+        cfg = {"model_type": "qwen3_5", "kda_lower_bound": -5}
+
+        model_loading.normalize_bailing_kda_lower_bound(cfg)
+
+        assert cfg["kda_lower_bound"] == -5
+        assert isinstance(cfg["kda_lower_bound"], int)
+
+
 class TestExpandPerLayerQuantKeys:
     """expand_per_layer_quant_keys adds runtime module-tree key variants."""
 
