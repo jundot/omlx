@@ -570,10 +570,57 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_mimo_mxfp4_quant(cfg)
         normalize_inkling2_modelopt_quant(cfg)
         normalize_raon1_mini_model_file(cfg)
+        _merge_qc_per_path_into_quantization(cfg, model_path)
         return cfg
 
     _lu.load_config = _patched
     _MLX_LM_LOAD_CONFIG_PATCHED = True
+
+
+def _merge_qc_per_path_into_quantization(cfg: dict, model_path: str | Path | None = None) -> None:
+    """Merge ``quantization_config`` per-path entries into ``quantization``.
+
+    Pre-quantized checkpoints (MiniCPM5-2B, mixed bit-width) put the
+    per-layer quantization spec in ``quantization_config`` while
+    ``quantization`` holds only the global default. mlx-vlm's
+    ``nn.quantize`` class_predicate reads only ``config["quantization"]``,
+    so merge the per-path entries so it can build each layer at the correct
+    bit-width.
+
+    Scoped to the MiniCPM5 family: the merge exists solely to serve the
+    MiniCPM5 pre-quantized ``llama`` checkpoints that carry a mixed
+    bit-width ``quantization_config``. Pass ``model_path`` so the caller can
+    restrict the merge to ``llama`` checkpoints; when it is None or does not
+    resolve to ``llama``, the merge is a no-op. This keeps the helper from
+    rewriting quantization for unrelated mlx-lm loads (jundot #5275 review).
+    """
+    # Only the MiniCPM5 family (text-only llama with a mixed per-path
+    # quantization_config) needs this merge; gate on the declared model_type.
+    # Skip only when the path is readable AND resolves to a non-llama type;
+    # an unreadable path (model_type None) falls through to the content
+    # guards below rather than being silently skipped.
+    if model_path is not None:
+        mt = _config_model_type(model_path)
+        if mt is not None and mt != "llama":
+            return
+    quant = cfg.get("quantization")
+    qc = cfg.get("quantization_config")
+    if not isinstance(quant, dict) or not isinstance(qc, dict):
+        return
+    # Only merge when quantization is a bare global default (no per-path).
+    if any(isinstance(v, dict) or v is False for v in quant.values()):
+        return
+    per_path = {
+        k: v for k, v in qc.items()
+        if isinstance(v, dict) or v is False
+    }
+    if not per_path:
+        return
+    # Preserve the global defaults as the top-level recipe.
+    merged = dict(quant)
+    for k, v in per_path.items():
+        merged.setdefault(k, v)
+    cfg["quantization"] = merged
 
 
 def _checkpoint_has_t5_weights(model_path: str | Path) -> bool:
@@ -1475,6 +1522,11 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         "gemma4",
         "gemma4_unified",
         "muse_glimmer",
+        # Text-only llama (e.g. MiniCPM5-2B) loaded via mlx-vlm so the
+        # block-drafter (DFlash/DSpark) path is available; its LanguageModel
+        # carries capture_layer_ids / rollback_speculative_cache through
+        # omlx.patches.minicpm5_dspark.
+        "llama",
     ),
     "batched": (
         "qwen3_5",
@@ -1484,6 +1536,9 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         "laguna",
         "mimo_v2",
         "mimo_v2_flash",
+        # Text-only llama (MiniCPM5-2B) via mlx_lm on the batched engine so
+        # DFlash/DSpark is available without VLM forcing.
+        "llama",
     ),
 }
 
