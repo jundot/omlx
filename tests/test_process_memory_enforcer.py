@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import io
+import logging
 from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +21,9 @@ from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.tts import TTSEngine
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer, tier_reserve_bytes
 from omlx.scheduler import SchedulerConfig
+
+# Readings the hard-pressure confirm window takes after the first one.
+_CONFIRM_READS = ProcessMemoryEnforcer._HARD_READING_CONFIRM_READS
 
 
 def _make_enforcer(
@@ -418,6 +422,7 @@ class TestCheckAndEnforce:
             mock_mx.get_active_memory.side_effect = _cycling(
                 [
                     15 * 1024**3,  # Initial check (over limit)
+                    *[15 * 1024**3] * _CONFIRM_READS,
                     15 * 1024**3,  # Re-check before eviction loop
                     8 * 1024**3,  # After eviction (under limit)
                 ]
@@ -477,6 +482,7 @@ class TestCheckAndEnforce:
             mock_mx.get_active_memory.side_effect = _cycling(
                 [
                     20 * 1024**3,  # Initial check
+                    *[20 * 1024**3] * _CONFIRM_READS,
                     20 * 1024**3,  # Re-check (still over)
                     15 * 1024**3,  # After first eviction (still over)
                     8 * 1024**3,  # After second eviction (under limit)
@@ -536,6 +542,7 @@ class TestCheckAndEnforce:
             mock_mx.get_active_memory.side_effect = _cycling(
                 [
                     20 * 1024**3,  # Initial check
+                    *[20 * 1024**3] * _CONFIRM_READS,
                     20 * 1024**3,  # Re-check (still over)
                     15 * 1024**3,  # After eviction (still over)
                 ]
@@ -1655,6 +1662,7 @@ class TestSingleModelMemoryPressure:
             mock_mx.get_active_memory.side_effect = _cycling(
                 [
                     15 * 1024**3,  # Initial check
+                    *[15 * 1024**3] * _CONFIRM_READS,
                     15 * 1024**3,  # While loop check
                     8 * 1024**3,  # After unload
                 ]
@@ -1817,6 +1825,7 @@ class TestSingleModelMemoryPressure:
             mock_mx.get_active_memory.side_effect = _cycling(
                 [
                     15 * 1024**3,  # Initial check
+                    *[15 * 1024**3] * _CONFIRM_READS,
                     15 * 1024**3,  # While loop check
                     8 * 1024**3,  # After eviction (under limit)
                 ]
@@ -2643,6 +2652,25 @@ class TestTwoWatermarkPressureLevels:
         assert enforcer_2wm._pressure_level == "hard"
 
     @pytest.mark.asyncio
+    async def test_hard_reading_gone_within_confirm_window_is_not_hard(
+        self, enforcer_2wm, caplog
+    ):
+        """A freed Metal buffer still charged to phys_footprint lifts one reading only."""
+        readings = iter([98 * 1024**3])
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+            caplog.at_level(logging.INFO, logger="omlx.process_memory_enforcer"),
+        ):
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.side_effect = lambda: next(readings, 88 * 1024**3)
+            await enforcer_2wm._check_and_enforce()
+        assert "-> hard" not in caplog.text, caplog.text
+        assert "Hard memory reading not confirmed" in caplog.text, caplog.text
+        assert enforcer_2wm._pressure_level == "soft"
+        enforcer_2wm._engine_pool._unload_engine.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_hard_pressure_without_reachable_scheduler_shrinks_hot_cache(
         self, mock_engine_pool
     ):
@@ -2667,7 +2695,7 @@ class TestTwoWatermarkPressureLevels:
             patch.object(
                 enforcer,
                 "_current_usage_bytes",
-                side_effect=[98 * 1024**3, 80 * 1024**3],
+                side_effect=[98 * 1024**3] * (1 + _CONFIRM_READS) + [80 * 1024**3],
             ),
             patch(
                 "omlx.process_memory_enforcer.asyncio.to_thread",

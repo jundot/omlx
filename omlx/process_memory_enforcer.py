@@ -1353,6 +1353,44 @@ class ProcessMemoryEnforcer:
     # while a reclaimable pool drains. Prefill chunks run ~5s at full step
     # size, so 5 one-second polls cover at least one chunk boundary.
     _PRESSURE_RECLAIM_GRACE_POLLS_MAX = 5
+    # macOS keeps charging a Metal buffer MLX has freed to phys_footprint for
+    # roughly 10-40 ms after MLX has already reused its pages, so one reading
+    # can count a buffer twice. On an M4 Mac mini, Qwen3.8 Flash Next prefill
+    # under chunk backpressure frees and reallocates 0.27-0.54 GB attention
+    # buffers every ~8 ms; single readings sat up to 0.86 GB above the memory
+    # in use while system free pages did not move. The lowest of a few
+    # readings over this window drops the double charge (replayed on 32
+    # sampled chunks: 0.50 GB left at 0 ms, 0.03 GB at 50 ms); memory that
+    # is really in use stays across it.
+    _HARD_READING_CONFIRM_WINDOW_S = 0.05
+    _HARD_READING_CONFIRM_READS = 5
+
+    async def _lowest_usage_below_or_at(self, current: int, hard: int) -> int:
+        """Lowest usage over the confirm window while readings stay at or above ``hard``.
+
+        Returns ``current`` unchanged when it is already below ``hard``, and
+        stops at the first reading below it.
+        """
+        if current < hard:
+            return current
+        first = current
+        step = self._HARD_READING_CONFIRM_WINDOW_S / self._HARD_READING_CONFIRM_READS
+        reads = 0
+        while reads < self._HARD_READING_CONFIRM_READS and current >= hard:
+            await asyncio.sleep(step)
+            current = min(current, self._current_usage_bytes())
+            reads += 1
+        logger.info(
+            "Hard memory reading %s: %s, lowest of %d more reading(s) over %.0f ms "
+            "is %s (hard=%s)",
+            "confirmed" if current >= hard else "not confirmed",
+            _format_gb(first),
+            reads,
+            reads * step * 1000,
+            _format_gb(current),
+            _format_gb(hard),
+        )
+        return current
 
     def _pool_bytes(self) -> int:
         """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
@@ -1773,6 +1811,7 @@ class ProcessMemoryEnforcer:
             dropped_images = await asyncio.to_thread(clear_image_decode_cache)
             if dropped_images:
                 current = self._current_usage_bytes()
+        current = await self._lowest_usage_below_or_at(current, hard)
         prev_level = self._pressure_level
         # Admission may follow a dynamic ceiling, but emergency aborts must
         # use the stable physical cap, as the prefill guard already does.
