@@ -6313,7 +6313,10 @@ class Scheduler:
         pooled = int(mx.get_cache_memory())
         residual = _graphics_residual() if pooled > 0 else None
         if defer_to_background_store:
-            if _sync_and_clear_cache(self._stream, defer_to_background_store=True) is False:
+            if (
+                _sync_and_clear_cache(self._stream, defer_to_background_store=True)
+                is False
+            ):
                 self._pool_clear_deferred = True
                 return
         else:
@@ -8657,7 +8660,9 @@ class Scheduler:
             return token_count
         return block_size
 
-    def _incremental_store_allowed(self, request: "Request", prompt_cache: list[Any]) -> bool:
+    def _incremental_store_allowed(
+        self, request: "Request", prompt_cache: list[Any]
+    ) -> bool:
         """The finish and cancel store rules, plus room on the store worker."""
         if (
             self.block_aware_cache is None
@@ -8701,7 +8706,12 @@ class Scheduler:
         """
         cache = self.block_aware_cache
         block_size = self.config.paged_cache_block_size
-        if cache is None or block_size <= 0 or end_tokens <= 0 or end_tokens % block_size:
+        if (
+            cache is None
+            or block_size <= 0
+            or end_tokens <= 0
+            or end_tokens % block_size
+        ):
             return
         rid = request.request_id
         start = self._incremental_stored.get(rid)
@@ -8723,7 +8733,9 @@ class Scheduler:
         if payload is None:
             return
         if self._incremental_converts_to_turboquant(prompt_cache):
-            converted = self._incremental_turboquant_payload(prompt_cache, payload, start)
+            converted = self._incremental_turboquant_payload(
+                prompt_cache, payload, start
+            )
             if converted is None:
                 return
             payload, model_cache_config = converted
@@ -8777,7 +8789,7 @@ class Scheduler:
                 model_cache_config,
                 provider,
             )
-        except Exception as e:  # noqa: BLE001 - the finish store stores it all
+        except RuntimeError as e:
             logger.debug("Incremental store not submitted for %s: %s", rid, e)
             return
         with self._incremental_lock:
@@ -8869,7 +8881,9 @@ class Scheduler:
         kv_indices = [
             i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
         ]
-        last = kv_indices[-1] if self._turboquant_skip_last and len(kv_indices) > 1 else -1
+        last = (
+            kv_indices[-1] if self._turboquant_skip_last and len(kv_indices) > 1 else -1
+        )
         cache_class = quantized_cache_class("turboquant")
         bits = float(self._turboquant_kv_bits)
         out = []
@@ -8927,7 +8941,7 @@ class Scheduler:
                     )
                 finally:
                     background_store_holds_lock.clear()
-        except Exception as e:  # noqa: BLE001 - the finish store stores what is left
+        except Exception as e:
             logger.warning("Incremental store_cache failed for %s: %s", request_id, e)
         finally:
             with self._incremental_lock:
@@ -8956,7 +8970,7 @@ class Scheduler:
         if not future.cancel():
             try:
                 future.result(timeout=self._INCREMENTAL_RELEASE_WAIT_S)
-            except Exception:  # noqa: BLE001
+            except TimeoutError:
                 logger.warning(
                     "Incremental store for %s still running at release", request_id
                 )

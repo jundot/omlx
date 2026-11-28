@@ -105,7 +105,7 @@ class _Executor:
                 continue
             try:
                 future.set_result(fn(*args))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 future.set_exception(exc)
 
 
@@ -342,16 +342,16 @@ def test_lock_is_let_go_while_a_store_waits_on_io():
     """A store waiting for room in the SSD write queue does not hold the
     lock every prefill chunk's clear_cache takes."""
     got = []
-    with _mx_buffer_access_lock:  # noqa: SIM117 - held twice on purpose
-        with _mx_buffer_access_lock:  # held twice, as store_cache nests it
-            with mx_buffer_lock_released():
-                t = threading.Thread(
-                    target=lambda: got.append(_mx_buffer_access_lock.acquire(timeout=1))
-                    or _mx_buffer_access_lock.release()
-                )
-                t.start()
-                t.join(2)
-            assert _mx_buffer_access_lock._is_owned()
+    # Held twice, as store_cache nests it.
+    with _mx_buffer_access_lock, _mx_buffer_access_lock:
+        with mx_buffer_lock_released():
+            t = threading.Thread(
+                target=lambda: got.append(_mx_buffer_access_lock.acquire(timeout=1))
+                or _mx_buffer_access_lock.release()
+            )
+            t.start()
+            t.join(2)
+        assert _mx_buffer_access_lock._is_owned()
     assert got == [True]
     assert not _mx_buffer_access_lock._is_owned()
     with mx_buffer_lock_released():  # not held: a no-op
