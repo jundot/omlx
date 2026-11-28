@@ -2702,6 +2702,14 @@ class VLMBatchedEngine(BaseEngine):
                 apply_qwen35_gdn_prefill_patch()
             except Exception:
                 logger.debug("GDN prefill patch not applied", exc_info=True)
+            try:
+                from ..patches.qwen35_gdn_tail_capture import (
+                    apply_qwen35_gdn_tail_capture_patch,
+                )
+
+                apply_qwen35_gdn_tail_capture_patch()
+            except Exception:
+                logger.debug("GDN tail capture patch not applied", exc_info=True)
 
         # Qwen3.5/3.6 q4 MLP prefill -> native qmm tile tuned for long batches.
         # Decode and target-verify paths keep the original QuantizedLinear.

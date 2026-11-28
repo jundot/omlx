@@ -74,6 +74,12 @@ from .patches.inkling2.kernels import (
     prefill_mask_elements as inkling2_prefill_mask_elements,
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
+from .patches.qwen35_gdn_tail_capture import (
+    captured_snapshot_cache,
+    model_capture_layers,
+    request_tail_capture,
+    tail_capture_ready,
+)
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.vlm_batch_kv_capacity import (
@@ -4721,8 +4727,19 @@ class Scheduler:
                     cache_tokens=base_size + processed_tokens,
                     block_size=block_size,
                 )
-            # Stop once more at each tail position so its state is captured.
+            # Stop once more at each tail position so its state is captured,
+            # unless the model keeps the state at the tail inside the chunk.
+            capture_at = self._plan_tail_capture(
+                request,
+                prompt_cache,
+                cache_tokens=base_size + processed_tokens,
+                n_tokens=n_to_process,
+                tail_at=tail_at,
+                system_at=system_at,
+            )
             for stop_at in (system_at, tail_at):
+                if capture_at is not None and stop_at == capture_at:
+                    continue
                 if stop_at is not None and base_size + processed_tokens < stop_at:
                     n_to_process = min(
                         n_to_process, stop_at - base_size - processed_tokens
@@ -4775,6 +4792,12 @@ class Scheduler:
 
             # Keep token and embedding slices aligned at the final prefill chunk.
             n_to_process = min(n_to_process, remaining)
+            capture_at = Scheduler._arm_tail_capture(
+                prompt_cache,
+                capture_at,
+                cache_tokens=cache_tokens,
+                n_tokens=n_to_process,
+            )
             if getattr(request, "benchmark_trace", False):
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
@@ -4933,6 +4956,16 @@ class Scheduler:
                 self._on_prompt_progress([(uid, processed_tokens, total_length)])
 
             # Boundary snapshot emission
+            if boundary_enabled and capture_at is not None:
+                captured = captured_snapshot_cache(prompt_cache)
+                if captured is not None:
+                    self._emit_prefill_tail_snapshot(request, captured, capture_at)
+                    if not getattr(self, "_tail_capture_logged", False):
+                        self._tail_capture_logged = True
+                        logger.info(
+                            "Prefill tail snapshot taken inside the chunk at token %d",
+                            capture_at,
+                        )
             if boundary_enabled:
                 total_tokens = base_size + processed_tokens
                 if should_emit_prefill_boundary(
@@ -8750,6 +8783,73 @@ class Scheduler:
             ):
                 return end
         return None
+
+    def _plan_tail_capture(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+        *,
+        cache_tokens: int,
+        n_tokens: int,
+        tail_at: int | None,
+        system_at: int | None,
+    ) -> int | None:
+        """The tail position this chunk passes and keeps the state of, if any.
+
+        Only the generation-prompt tail, only when the system prefix stop is
+        behind, and not while MTP prompt priming tracks this request (it keeps
+        hidden states at the exact chunk end). Plans only:
+        ``_arm_tail_capture`` arms it once the chunk size is final.
+        """
+        if (
+            tail_at is None
+            or not cache_tokens < tail_at < cache_tokens + n_tokens
+            or (system_at is not None and system_at > cache_tokens)
+            or not tail_capture_ready()
+        ):
+            return None
+        ctx = _mtp_priming._find_ctx(self.model)
+        if getattr(ctx, "valid", False) and getattr(ctx, "request_id", None) == request.request_id:
+            return None
+        stateful = [
+            c
+            for c in prompt_cache
+            if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
+        ]
+        # Every stateful cache must belong to a patched Gated DeltaNet layer.
+        if not stateful or model_capture_layers(self.model) != len(stateful):
+            return None
+        if not all(type(c).__name__ == "ArraysCache" for c in stateful):
+            return None
+        return tail_at
+
+    @staticmethod
+    def _arm_tail_capture(
+        prompt_cache: list[Any],
+        capture_at: int | None,
+        *,
+        cache_tokens: int,
+        n_tokens: int,
+    ) -> int | None:
+        """Arm the planned capture once the chunk size is final.
+
+        Armed only after the memory guard, so a chunk that pauses for eviction
+        leaves no capture on the saved cache. None when the chunk no longer
+        passes the tail.
+        """
+        if (
+            capture_at is None
+            or not cache_tokens < capture_at < cache_tokens + n_tokens
+        ):
+            return None
+        stateful = [
+            c
+            for c in prompt_cache
+            if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
+        ]
+        if not request_tail_capture(stateful, capture_at - cache_tokens):
+            return None
+        return capture_at
 
     def _emit_prefill_tail_snapshot(
         self,
