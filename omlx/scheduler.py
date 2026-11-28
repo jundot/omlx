@@ -5977,7 +5977,9 @@ class Scheduler:
                     target / 1024**3,
                 )
                 return 0
-        with mx.stream(self._stream):
+        # One lock hold for all layers: a store holding the lock between
+        # tensors then delays the reserve once, not once per layer.
+        with mx.stream(self._stream), _mx_buffer_access_lock:
             for c, capacity in plans:
                 if capacity:
                     mx.eval(_grow_kv_capacity(c, capacity))
