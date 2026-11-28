@@ -103,6 +103,7 @@ from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.routes import helper_status as prefill_helper_status
 from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
 from ..request import live_decode_rate
+from ..secure_mode import is_enabled as _secure_mode_enabled
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_ACTIVATIONS,
@@ -4984,6 +4985,10 @@ def _global_settings_response(global_settings):
 
     return {
         "base_path": str(global_settings.base_path),
+        # Read-only: owned by the privileged helper (root-owned state file),
+        # so it is absent from GlobalSettingsRequest and cannot be written
+        # through POST /admin/api/global-settings.
+        "secure_server": {"enabled": _secure_mode_enabled()},
         "server": {
             "host": global_settings.server.host,
             "port": global_settings.server.port,

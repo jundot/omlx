@@ -574,3 +574,20 @@ def _hermetic_metal_release_accounting(monkeypatch):
     if metal_sync is not None:
         metal_sync._residuals.clear()
         metal_sync._last_unreleased = (0.0, 0)
+
+
+@pytest.fixture(autouse=True)
+def _secure_server_record_off(tmp_path, monkeypatch):
+    """Keep the Secure Server record test-local.
+
+    ``omlx.secure_mode.state_path()`` falls back to the real root-owned
+    ``/Library/Application Support/oMLX/secure-server/state.json``, which is
+    world-readable. On a machine where Secure Server is enabled that leaks into
+    unrelated tests: the benchmark and accuracy upload paths take their
+    ``skipped: secure_server`` branch and their assertions fail. Pointing the
+    override at a missing temp file reads as off, which is the state a fresh CI
+    runner has. Tests that exercise the mode set their own path and win.
+    """
+    monkeypatch.setenv(
+        "OMLX_SECURE_MODE_STATE_PATH", str(tmp_path / "secure-server-off.json")
+    )

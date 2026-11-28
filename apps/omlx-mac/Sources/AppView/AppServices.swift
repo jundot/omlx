@@ -10,12 +10,25 @@
 
 import Foundation
 import SwiftUI
+import os
+
+/// Decisions that decide whether a server exists are logged with public privacy: the
+/// handoff between launch paths is exactly where "nothing happened" has several
+/// indistinguishable causes.
+private let log = Logger(subsystem: "app.omlx", category: "services")
 
 @MainActor
 @Observable
 final class AppServices: NSObject {
     var config: AppConfig
     var serverState: ServerProcess.State = .stopped
+    /// Whether the server has been running since it last stopped. The secure-server
+    /// toggle needs this instead of `serverState`: the helper stops the sandboxed
+    /// server *before* it answers the call, so by the time the change notification
+    /// arrives the state can already say `.stopped` and the app cannot tell "the user
+    /// had a server running" from "the user had none", which decides whether the
+    /// server is brought back under the other launch path.
+    private var serverWasRunning = false
     /// PR 8 — when non-nil, the AppView swaps the Models screen for the
     /// per-model ModelSettingsScreen drilled to this id.
     var modelDetailID: String?
@@ -81,11 +94,18 @@ final class AppServices: NSObject {
     }
 
     func bind(server: ServerProcess?) {
-        // Detach from the previous server (if any) before re-attaching.
+        // Detach from the previous server (if any) before re-attaching. Both observers
+        // go: leaving the mode-change one behind meant a rebind left the old object
+        // listening, so one toggle could restart the server twice.
         if self.server != nil {
             NotificationCenter.default.removeObserver(
                 self,
                 name: ServerProcess.stateDidChangeNotification,
+                object: nil
+            )
+            NotificationCenter.default.removeObserver(
+                self,
+                name: SecureServerController.didChangeNotification,
                 object: nil
             )
         }
@@ -97,6 +117,14 @@ final class AppServices: NSObject {
                 selector: #selector(serverStateDidChange(_:)),
                 name: ServerProcess.stateDidChangeNotification,
                 object: server
+            )
+            applySandboxDirective(to: server)
+            adoptRunningSandboxedServer(server)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(secureServerModeDidChange(_:)),
+                name: SecureServerController.didChangeNotification,
+                object: nil
             )
         }
     }
@@ -111,6 +139,90 @@ final class AppServices: NSObject {
         updated.bindAddress = proc.bindAddress
         updated.port = proc.port
         updateConfig(updated)
+        switch proc.state {
+        case .running, .unresponsive, .starting:
+            serverWasRunning = true
+        case .stopped, .stopping, .failed:
+            serverWasRunning = false
+        }
+    }
+
+    /// Point the server at the privileged helper while Secure Server mode is on.
+    ///
+    /// The decision cannot be deferred to the server: pf matches the uid that
+    /// owned the socket when it was created, so a sandboxed server has to be
+    /// *spawned* by something able to change uid. Leaving an existing server
+    /// running after the mode is turned on would be the worst of both worlds — a
+    /// locked padlock in the UI over a process with unrestricted network access.
+    private func applySandboxDirective(to server: ServerProcess) {
+        let controller = SecureServerController.shared
+        // The record is consulted as well as the controller: this runs during launch,
+        // and a controller instance that has not yet measured anything must not turn
+        // into permission to spawn an unrestricted server.
+        guard controller.isEnabled || SecureServer.enabledOnRecord else {
+            server.sandboxDirective = nil
+            return
+        }
+        server.sandboxDirective = ServerSandbox(
+            start: { launch in
+                let result = try await controller.startServer(launch)
+                if let reason = result.error {
+                    throw ServerProcess.StartError.spawnFailed(reason)
+                }
+                guard let pid = result.pid else {
+                    throw ServerProcess.StartError.spawnFailed("the helper returned no pid")
+                }
+                return Int32(pid)
+            },
+            stop: { await controller.stopServer() },
+            runningPID: {
+                guard let status = await controller.measuredStatus(),
+                      status.enabled, let pid = status.serverPID else { return nil }
+                return Int32(pid)
+            }
+        )
+    }
+
+    /// Adopts a sandboxed server the helper already has running.
+    ///
+    /// The helper records the server's pid, so after an app relaunch while the mode is
+    /// on the server keeps running where the app can see neither it nor a reason to
+    /// care — until a flip stops it and leaves nothing behind. Reading the pid from the
+    /// helper's measured status is what closes that gap.
+    private func adoptRunningSandboxedServer(_ server: ServerProcess) {
+        guard SecureServerController.shared.isEnabled else { return }
+        Task { @MainActor in
+            let status = await SecureServerController.shared.measuredStatus()
+            log.notice(
+                "adoption: enabled=\(SecureServerController.shared.isEnabled, privacy: .public) measured=\(status?.enabled.description ?? "nil", privacy: .public) pid=\(status?.serverPID.map(String.init) ?? "nil", privacy: .public) state=\(String(describing: server.state), privacy: .public)"
+            )
+            guard let status, status.enabled, let pid = status.serverPID else { return }
+            server.adoptSandboxedServer(pid: Int32(pid))
+            // The outcome, not the preconditions: this is the line that says whether the
+            // app now tracks the running server.
+            log.notice("adoption result: state=\(String(describing: server.state), privacy: .public) pid=\(pid, privacy: .public)")
+        }
+    }
+
+    /// A mode change makes the running server the wrong kind of process, so it is
+    /// restarted rather than left behind: on, it still belongs to the console user
+    /// and matches none of the rules; off, the helper has already stopped it and an
+    /// ordinary server takes its place.
+    @objc private func secureServerModeDidChange(_ note: Notification) {
+        guard let server else { return }
+        // Read the remembered intent, not `server.state`: the helper has already
+        // stopped the sandboxed server by the time this notification is posted.
+        let hadServer = serverWasRunning
+        // Named so a handoff that does not happen says which decision it came from
+        // instead of needing another flip to infer.
+        log.notice("secure-server changed: hadServer=\(hadServer, privacy: .public) state=\(String(describing: server.state), privacy: .public)")
+        applySandboxDirective(to: server)
+        guard hadServer else { return }
+        Task { @MainActor in
+            // `forceRestart` stops first and waits for the port itself; waiting here
+            // would probe while the old server still listens and waste the timeout.
+            _ = try? await server.forceRestart()
+        }
     }
 
     func updateConfig(_ next: AppConfig) {

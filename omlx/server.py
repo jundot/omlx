@@ -70,6 +70,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from omlx._version import __version__
 
+from . import secure_mode
 from .api.anthropic_models import (
     MessagesRequest as AnthropicMessagesRequest,
 )
@@ -817,6 +818,25 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def secure_server_egress_guard(request: FastAPIRequest, call_next):
+    """Refuse egress-triggering endpoints while Secure Server mode is on.
+
+    UX only: pf is the enforcement, so this deny-list is not exhaustive. The
+    point is to answer a download with a 403 that names the way out of the
+    mode instead of leaving the client hanging on a dropped packet.
+    """
+    if secure_mode.is_enabled() and secure_mode.is_blocked(
+        request.method, request.url.path
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": secure_mode.SECURE_MODE_DETAIL},
+        )
+    return await call_next(request)
+
 
 # Include MCP routes
 from .api.mcp_routes import router as mcp_router
