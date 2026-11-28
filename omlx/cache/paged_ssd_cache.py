@@ -38,6 +38,7 @@ from typing import Any
 import numpy as np
 
 from omlx.utils.formatting import format_bytes
+from omlx.utils.metal_sync import mx_buffer_lock_released
 
 from ..utils.fatal import fatal_exit
 from .interface import CacheManager
@@ -2257,7 +2258,7 @@ class PagedSSDCacheManager(CacheManager):
             # Non-blocking callers (hot-cache LRU spill) also wait so a
             # transient writer backlog doesn't silently drop blocks. Blocking
             # callers (shutdown flush) use the same bounded wait.
-            with self._persistence_io():
+            with self._persistence_io(), mx_buffer_lock_released():
                 self._write_queue.put(item, timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS)
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
@@ -3936,6 +3937,10 @@ class PagedSSDCacheManager(CacheManager):
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
+                # The bytes are copied out: a pool clear waiting for the lock
+                # can run here instead of after the whole block.
+                with mx_buffer_lock_released():
+                    pass
 
             # Estimate file size: raw tensor bytes + safetensors header.
             # The header is JSON-encoded per tensor (name + dtype + shape +
@@ -4046,7 +4051,9 @@ class PagedSSDCacheManager(CacheManager):
             # transient bursts (faster than the writer can drain) don't
             # immediately punch holes in the cache chain.
             try:
-                with self._persistence_io():
+                # The bytes are copied out: no Metal buffer is needed while
+                # this waits for room, so prefill chunks can clear the pool.
+                with self._persistence_io(), mx_buffer_lock_released():
                     self._write_queue.put(
                         (block_hash, cache_entry),
                         timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
@@ -4057,9 +4064,10 @@ class PagedSSDCacheManager(CacheManager):
                     f"SSD cache write queue saturated (cap={self._max_pending_writes}); "
                     f"writing {block_hash.hex()[:16]} inline"
                 )
-                ok = self._write_block_file(
-                    block_hash, cache_entry, source="inline-fallback"
-                )
+                with mx_buffer_lock_released():
+                    ok = self._write_block_file(
+                        block_hash, cache_entry, source="inline-fallback"
+                    )
                 self._finish_write(block_hash, cache_entry, ok)
                 if not ok:
                     return False

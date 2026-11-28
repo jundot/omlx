@@ -1307,6 +1307,23 @@ def test_prefill_reserve_sizes_growing_caches_once():
     assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 0
 
 
+def test_prefill_reserve_holds_the_buffer_lock_across_all_layers():
+    """A store that lets the lock go between tensors delays the reserve once,
+    not before every grown cache's release."""
+    caches = _filled_caches()[-1]
+    ns = _reserve_ctx()
+    lock = sched_mod._mx_buffer_access_lock
+    held = []
+
+    with patch.object(
+        sched_mod,
+        "_sync_and_clear_cache",
+        side_effect=lambda stream: held.append(lock._is_owned()),
+    ):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 3
+    assert held == [True, True, True]
+
+
 def test_prefill_reserve_keeps_room_for_a_floor_chunk():
     """With other requests in flight, a reserve that would starve their next
     chunk falls back to growth; a lone prompt only has to fit itself."""
