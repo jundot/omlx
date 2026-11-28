@@ -37,6 +37,10 @@
 #   apps/omlx-mac/Scripts/build.sh release --bare     # skip Python embed
 #                                                       (no server, just the
 #                                                       AppView shell)
+#   apps/omlx-mac/Scripts/build.sh release --slim     # Swift app + omlx source,
+#                                                       no Python/MLX layers;
+#                                                       uses the provisioned
+#                                                       runtime venv
 #   apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 #                                                     # build and bundle optional
 #                                                     # native custom kernels
@@ -54,6 +58,9 @@
 #   OMLX_WITH_CUSTOM_KERNEL=1           # same as --with-custom-kernel
 #   OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET=15.0
 #                                       # macOS min version for custom kernels
+
+#   OMLX_TEAM_ID=ABCDE12345             # Apple Developer team id for the
+#                                       # helper's SMJobBless requirements.
 
 set -euo pipefail
 
@@ -85,11 +92,13 @@ if [ $# -gt 0 ]; then
 fi
 
 BARE=0
+SLIM=0
 WITH_CUSTOM_KERNEL="${OMLX_WITH_CUSTOM_KERNEL:-0}"
 REBUILD_DONOR=auto    # auto | force | never
 for arg in "$@"; do
     case "$arg" in
         --bare) BARE=1 ;;
+        --slim) SLIM=1 ;;
         --with-custom-kernel) WITH_CUSTOM_KERNEL=1 ;;
         --rebuild-donor) REBUILD_DONOR=force ;;
         --no-rebuild-donor) REBUILD_DONOR=never ;;
@@ -144,6 +153,28 @@ _is_mach_o_file() {
     local type
     type="$(file -b "$path" 2>/dev/null || true)"
     [[ "$type" == *"Mach-O"* ]]
+}
+
+# --- Signing team ---------------------------------------------------------
+#
+# No signing identity is committed. The SMJobBless trust requirements on both
+# sides (SMAuthorizedClients in the helper, SMPrivilegedExecutables in the app)
+# carry the Apple Developer team (OU) as $(OMLX_TEAM_ID). Xcode expands it in
+# the app's Info.plist; this script does the same for the helper plists, which
+# are embedded with -sectcreate and therefore never pass through Xcode.
+# Empty is allowed so an ad-hoc build works: the requirement then matches no
+# certificate, which is exactly why an unsigned build cannot bless.
+OMLX_TEAM_ID="${OMLX_TEAM_ID:-}"
+if [ -n "$OMLX_TEAM_ID" ]; then
+    [[ "$OMLX_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] \
+        || die "OMLX_TEAM_ID must be a 10-character Apple team id (got '$OMLX_TEAM_ID')."
+fi
+
+# Copy a helper plist, substituting the team id for the $(OMLX_TEAM_ID) marker.
+_render_helper_plist() {
+    local src="$1"
+    local dst="$2"
+    sed -e "s/\$(OMLX_TEAM_ID)/${OMLX_TEAM_ID}/g" "$src" >"$dst"
 }
 
 _sign_embedded_mach_o_files() {
@@ -553,6 +584,115 @@ STAGED_APP="$OUTPUT_DIR/oMLX.app"
 log "Staging bundle at $STAGED_APP"
 rm -rf "$STAGED_APP"
 ditto "$XCODE_APP" "$STAGED_APP"
+
+if [ "$SLIM" -eq 1 ]; then
+    RESOURCES_DIR="$STAGED_APP/Contents/Resources"
+    mkdir -p "$RESOURCES_DIR"
+
+    log "Slim build: copying omlx/omlx_web source (no Python/MLX layers)…"
+    rm -rf "$RESOURCES_DIR/omlx" "$RESOURCES_DIR/omlx_web"
+    rsync -a         --exclude='__pycache__' --exclude='*.pyc' --exclude='tests'         --exclude='.git' --exclude='custom_kernels/*/csrc'         --exclude='custom_kernels/include'         "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
+    rsync -a         --exclude='__pycache__' --exclude='*.pyc'         "$REPO_ROOT/apps/omlx-web/omlx_web/" "$RESOURCES_DIR/omlx_web/"
+    [ -f "$RESOURCES_DIR/omlx_web/templates/dashboard.html" ]         || die "omlx_web templates are missing from the slim bundle."
+    ok "  + omlx/omlx_web source"
+
+    # First-run installer inputs: the pinned uv binary, the lock/manifest and
+    # the manual fallback script. Python/MLX themselves are downloaded later.
+    RUNTIME_BUNDLE="$RESOURCES_DIR/runtime"
+    PROJECT_BUNDLE="$RESOURCES_DIR/runtime-project"
+    mkdir -p "$RUNTIME_BUNDLE" "$PROJECT_BUNDLE"
+    UV_BIN="${UV_BIN:-$(command -v uv || true)}"
+    if [ -z "$UV_BIN" ] && [ -x "$REPO_ROOT/.venv/bin/uv" ]; then
+        UV_BIN="$REPO_ROOT/.venv/bin/uv"
+    fi
+    [ -n "$UV_BIN" ] && [ -x "$UV_BIN" ] \
+        || die "uv binary not found; set UV_BIN=/path/to/uv"
+    cp "$UV_BIN" "$RUNTIME_BUNDLE/uv"
+    chmod 755 "$RUNTIME_BUNDLE/uv"
+    cp "$REPO_ROOT/pyproject.toml" "$REPO_ROOT/uv.lock" \
+        "$REPO_ROOT/.python-version" "$PROJECT_BUNDLE/"
+    cp "$REPO_ROOT/apps/omlx-mac/Scripts/provision_runtime.sh" "$PROJECT_BUNDLE/"
+    ok "  + runtime installer (uv + lock)"
+
+    # Privileged helper: one signed executable plus its launchd plists. The
+    # app's Info.plist has the matching SMPrivilegedExecutables requirement.
+    HELPER_DIR="$REPO_ROOT/apps/omlx-mac/Helper"
+    HELPER_TOOLS="$STAGED_APP/Contents/Library/LaunchServices"
+    HELPER_DAEMONS="$STAGED_APP/Contents/Library/LaunchDaemons"
+    mkdir -p "$HELPER_TOOLS" "$HELPER_DAEMONS"
+    if [ -z "$OMLX_TEAM_ID" ]; then
+        warn "OMLX_TEAM_ID is empty: the helper's SMJobBless requirements name no signing team, so this helper cannot be blessed. Set OMLX_TEAM_ID to your Apple team id for a blessed build."
+    fi
+    # The plists are embedded with -sectcreate, so Xcode never processes them:
+    # render the team id into a build copy first.
+    RENDERED_HELPER_PLISTS="$BUILD_DIR/helper-plists"
+    mkdir -p "$RENDERED_HELPER_PLISTS"
+    _render_helper_plist "$HELPER_DIR/Info.plist" \
+        "$RENDERED_HELPER_PLISTS/Info.plist"
+    _render_helper_plist "$HELPER_DIR/app.omlx.helper.bless.plist" \
+        "$RENDERED_HELPER_PLISTS/app.omlx.helper.bless.plist"
+    _render_helper_plist "$HELPER_DIR/app.omlx.helper.plist" \
+        "$RENDERED_HELPER_PLISTS/app.omlx.helper.plist"
+    # SMJobBless reads the helper's Info.plist and launchd plist from the
+    # binary's __TEXT sections, not from files on disk. Embedding the launchd
+    # plist is mandatory: without it SMJobBless cannot find a job to install.
+    # The launchd plist carries only its Label; SMJobBless fills in
+    # ProgramArguments itself.
+    xcrun swiftc -O -target "$(uname -m)-apple-macos15.0" \
+        -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+        -Xlinker "$RENDERED_HELPER_PLISTS/Info.plist" \
+        -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __launchd_plist \
+        -Xlinker "$RENDERED_HELPER_PLISTS/app.omlx.helper.bless.plist" \
+        -o "$HELPER_TOOLS/app.omlx.helper" "$HELPER_DIR/main.swift" \
+        || die "privileged helper compilation failed."
+    # Kept for the later SMAppService.daemon(plistName:) path, which reads the
+    # plist from the bundle. SMJobBless ignores this file.
+    cp "$RENDERED_HELPER_PLISTS/app.omlx.helper.plist" \
+        "$HELPER_DAEMONS/app.omlx.helper.plist"
+    chmod 755 "$HELPER_TOOLS/app.omlx.helper"
+    ok "  + privileged helper (SMJobBless)"
+
+    # The slim app starts the server from the external runtime venv; no
+    # PYTHONHOME and no embedded framework path.
+    for wrapper in omlx-cli omlx-cluster-python; do
+        cat > "$STAGED_APP/Contents/MacOS/$wrapper" <<'WRAPPER'
+#!/bin/sh
+set -eu
+REAL_PATH="$(realpath "$0")"
+APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$REAL_PATH")/.." && pwd)"
+RESOURCES="$APP_ROOT/Resources"
+RUNTIME_DIR="${OMLX_RUNTIME_DIR:-$HOME/Library/Application Support/oMLX/runtime}"
+PYTHON="$RUNTIME_DIR/venv/bin/python3"
+if [ ! -x "$PYTHON" ]; then
+    echo "oMLX runtime missing at $PYTHON; run apps/omlx-mac/Scripts/provision_runtime.sh" >&2
+    exit 1
+fi
+export PYTHONDONTWRITEBYTECODE=1
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$RESOURCES:$PYTHONPATH"
+else
+    export PYTHONPATH="$RESOURCES"
+fi
+WRAPPER
+    done
+    cat >> "$STAGED_APP/Contents/MacOS/omlx-cli" <<'WRAPPER'
+exec "$PYTHON" -m omlx.cli "$@"
+WRAPPER
+    cat >> "$STAGED_APP/Contents/MacOS/omlx-cluster-python" <<'WRAPPER'
+exec "$PYTHON" "$@"
+WRAPPER
+    chmod 755 "$STAGED_APP/Contents/MacOS/omlx-cli"         "$STAGED_APP/Contents/MacOS/omlx-cluster-python"
+    # These two are shell scripts, so the later "Re-sign ad-hoc" block below
+    # (which only runs on the embedded-Python path) never reaches them. A file
+    # in `Contents/MacOS` must carry a signature or the bundle cannot be
+    # sealed at release time, so sign them ad-hoc here; `package_dmg.sh`
+    # re-signs them with the Developer ID identity before it seals the app.
+    codesign --force --sign - "$STAGED_APP/Contents/MacOS/omlx-cli" \
+        "$STAGED_APP/Contents/MacOS/omlx-cluster-python" >/dev/null 2>&1 || true
+    ok "  + slim runtime wrappers"
+    ok "Bundle ready: $STAGED_APP"
+    exit 0
+fi
 
 if [ "$BARE" -eq 1 ]; then
     warn "--bare set: skipping Python embed. The server will fail to spawn."

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd plist embedded into the helper binary at
+  __TEXT,__launchd_plist by apps/omlx-mac/Scripts/build.sh.
+
+  SMJobBless reads the launchd configuration from that section (not from the
+  file in Contents/Library/LaunchDaemons) and fills in ProgramArguments itself,
+  because the tool is copied to /Library/PrivilegedHelperTools. Extra launchd
+  keys are allowed; Program/ProgramArguments are not, so the tool takes no
+  custom command line. Any parameters arrive over XPC.
+
+  MachServices is required, not optional: it is what makes launchd create the
+  bootstrap name the helper's NSXPCListener and the app's NSXPCConnection use.
+  RunAtLoad stays false so launchd starts the root daemon on the first
+  connection instead of at every boot.
+
+  The Label must equal the tool's file name (app.omlx.helper), the key in the
+  app's SMPrivilegedExecutables dictionary and PrivilegedHelper.helperID.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.omlx.helper</string>
+    <key>MachServices</key>
+    <dict>
+        <key>app.omlx.helper</key>
+        <true/>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

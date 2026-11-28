@@ -60284,6 +60284,306 @@
           }
         }
       }
+    },
+    "integrations.section.claude_code" : {
+      "comment" : "Section header for the Claude Code integration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        }
+      }
+    },
+    "integrations.section.claude_code.sub" : {
+      "comment" : "Subtitle for the Claude Code section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leitet Anfragen von Claude Code an lokale Modelle oder die Cloud weiter"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Route Claude Code requests to local models or the cloud"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Направлять запросы Claude Code в локальные модели или облако"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将 Claude Code 请求路由到本地模型或云端"
+          }
+        }
+      }
+    },
+    "integrations.section.other" : {
+      "comment" : "Section header for the additional integrations list",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Weitere Integrationen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Other Integrations"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Другие интеграции"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "其他集成"
+          }
+        }
+      }
+    },
+    "integrations.section.other.sub" : {
+      "comment" : "Subtitle for the Other Integrations section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardmodell und Startbefehl für jede benannte Integration"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Default model + launcher command for each named integration"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модель по умолчанию и команда запуска для каждой интеграции"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每个命名集成的默认模型 + 启动器命令"
+          }
+        }
+      }
+    },
+    "integrations.section.setup_command" : {
+      "comment" : "Section header for the Claude Code setup command block",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einrichtungsbefehl"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Setup Command"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Команда настройки"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "设置命令"
+          }
+        }
+      }
+    },
+    "integrations.setup.advanced.label" : {
+      "comment" : "Disclosure label revealing the advanced env-var recipe for running claude directly",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweitert: claude direkt ausführen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Advanced — run `claude` directly"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Дополнительно — запускать `claude` напрямую"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "高级 — 直接运行 `claude`"
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_apply" : {
+      "comment" : "Button that raises the Metal wired limit with one system admin dialog",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply with Admin…"
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_applied" : {
+      "comment" : "Confirmation after the admin dialog raised the Metal wired limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The wired limit was raised. Restart oMLX if it is already serving."
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_invalid" : {
+      "comment" : "Error when the requested Metal wired limit is invalid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The wired-limit value is outside the supported range."
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_cancelled" : {
+      "comment" : "Error when the user cancels the admin dialog",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The administrator prompt was cancelled; the wired limit was not changed."
+          }
+        }
+      }
+    },
+    "performance.memory.wired_limit_failed" : {
+      "comment" : "Prefix for a failed privileged wired-limit action",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not set the wired limit."
+          }
+        }
+      }
+    },
+    "menubar.item.cluster_assistant" : {
+      "comment" : "Menubar item that opens the existing web dashboard on the Cluster Assistant tab",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cluster Assistant"
+          }
+        }
+      }
+    },
+    "welcome.button.cluster_assistant" : {
+      "comment" : "Footer button that opens the existing Cluster Assistant tab",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cluster Assistant"
+          }
+        }
+      }
+    },
+    "welcome.button.search_models" : {
+      "comment" : "Tooltip of the re-scan button next to the Model Directory picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erneut nach Modellordnern auf diesem Mac suchen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Look again for model folders on this Mac"
+          }
+        }
+      }
+    },
+    "welcome.storage.model_dir.found" : {
+      "comment" : "Model Directory subtitle once existing model folders were detected; the count and the path",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld in %@ gefunden. Wähle einen anderen Ordner, wenn deine Modelle woanders liegen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Found %lld in %@. Choose another folder if your models live elsewhere."
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

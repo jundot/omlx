@@ -53,6 +53,7 @@ final class LocalizationSmokeTests: XCTestCase {
     private static let sentinelKeys: [String] = [
         // Welcome wizard
         "welcome.window.title", "welcome.button.start_server",
+        "welcome.button.cluster_assistant",
         // Main app shell
         "about.section.project", "about.license.name",
         "logs.section.title", "network.section.proxies.title",
@@ -84,6 +85,7 @@ final class LocalizationSmokeTests: XCTestCase {
         // Menubar + updates
         "menubar.item.quit", "menubar.stats.session_section",
         "menubar.item.settings", "menubar.item.web_dashboard",
+        "menubar.item.cluster_assistant",
         "update.channel.stable", "update.confirm.title",
     ]
 

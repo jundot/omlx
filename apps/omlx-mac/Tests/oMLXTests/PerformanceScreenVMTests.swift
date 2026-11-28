@@ -233,3 +233,275 @@ final class PerformanceScreenVMTests: XCTestCase {
         XCTAssertEqual(balanced.binding, "dynamic")
     }
 }
+
+extension PerformanceScreenVMTests {
+    /// The privileged command is a fixed sysctl with a validated MiB integer.
+    /// Invalid values are rejected before any AppleScript or admin dialog.
+    func testPrivilegedWiredLimitValidation() throws {
+        XCTAssertEqual(try PrivilegedActions.validatedWiredLimitMB(1024), 1024)
+        for invalid in [0, -1, 1_048_577] {
+            XCTAssertThrowsError(try PrivilegedActions.validatedWiredLimitMB(invalid)) { error in
+                XCTAssertEqual(error as? PrivilegedActionError, .invalidValue)
+            }
+        }
+    }
+
+    /// SMJobBless answers "already installed, success" and never replaces the
+    /// tool, so the app decides from its own ledger whether to bless, reuse or
+    /// remove-and-bless. No admin prompt happens in this test.
+    func testHelperInstallStateDecidesBlessReuseReplace() {
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: false, recordedVersion: nil, bundledVersion: 1
+            ),
+            .bless
+        )
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: true, recordedVersion: 1, bundledVersion: 1
+            ),
+            .reuse
+        )
+        // A helper from an older build would otherwise stay installed forever.
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: true, recordedVersion: 0, bundledVersion: 1
+            ),
+            .replace
+        )
+        // A downgrade of the app also replaces: the ledger is authoritative.
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: true, recordedVersion: 2, bundledVersion: 1
+            ),
+            .replace
+        )
+        // Installed before the ledger existed: unknown version, so replace.
+        XCTAssertEqual(
+            PrivilegedHelper.installState(
+                helperOnDisk: true, recordedVersion: nil, bundledVersion: 1
+            ),
+            .replace
+        )
+    }
+
+    /// A cancelled prompt or a refused value must not open a second dialog.
+    func testOnlyInstallFailuresFallBackToAppleScript() {
+        XCTAssertFalse(
+            PrivilegedHelper.shouldFallBackToAppleScript(PrivilegedActionError.cancelled)
+        )
+        XCTAssertFalse(
+            PrivilegedHelper.shouldFallBackToAppleScript(PrivilegedActionError.invalidValue)
+        )
+        XCTAssertTrue(
+            PrivilegedHelper.shouldFallBackToAppleScript(
+                PrivilegedActionError.failed("SMJobBless refused to install the helper.")
+            )
+        )
+        XCTAssertTrue(
+            PrivilegedHelper.shouldFallBackToAppleScript(
+                CocoaError(.fileNoSuchFile)
+            )
+        )
+    }
+
+    /// The helper identity is duplicated in the plists and the build script;
+    /// the packaging test `test_privileged_helper_packaging.py` pins it there,
+    /// this pins the Swift side the XPC connection uses.
+    func testHelperIdentityMatchesTheInstalledLayout() {
+        XCTAssertEqual(PrivilegedHelper.helperID, "app.omlx.helper")
+        XCTAssertEqual(
+            PrivilegedHelper.installedPath,
+            "/Library/PrivilegedHelperTools/app.omlx.helper"
+        )
+        XCTAssertGreaterThanOrEqual(PrivilegedHelper.helperBundleVersion, 1)
+    }
+}
+
+// MARK: - D6: the helper is a capability (five status states)
+
+extension PerformanceScreenVMTests {
+    private func freshDefaults() -> UserDefaults {
+        let name = "omlx.helper.tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defaults.removePersistentDomain(forName: name)
+        return defaults
+    }
+
+    /// State 1 — not installed: Install is visible and enabling it blesses.
+    func testHelperNotInstalledOffersInstallAndBlesses() throws {
+        let status = PrivilegedHelper.status(
+            helperOnDisk: false, recordedVersion: nil,
+            wiredLimitCurrentMB: nil, wiredLimitRequestedMB: nil
+        )
+        XCTAssertFalse(status.installed)
+        XCTAssertNil(status.version)
+        let presentation = PrivilegedHelper.presentation(for: status)
+        XCTAssertEqual(presentation.installAction, .install)
+        XCTAssertTrue(presentation.willPrompt)
+
+        var blessed = 0
+        let defaults = freshDefaults()
+        let state = try PrivilegedHelper.ensureInstalled(
+            defaults: defaults, bundledVersion: 1, helperOnDisk: false,
+            bless: { blessed += 1 },
+            remove: { XCTFail("remove must not run on a fresh install") }
+        )
+        XCTAssertEqual(state, .bless)
+        XCTAssertEqual(blessed, 1)
+        XCTAssertEqual(defaults.object(forKey: PrivilegedHelper.installedVersionKey) as? Int, 1)
+    }
+
+    /// State 2 — installed, same version: state shown, no prompt (reuse).
+    func testHelperSameVersionReusesWithoutPrompt() throws {
+        let defaults = freshDefaults()
+        defaults.set(1, forKey: PrivilegedHelper.installedVersionKey)
+        let status = PrivilegedHelper.status(
+            helperOnDisk: true, recordedVersion: 1,
+            wiredLimitCurrentMB: nil, wiredLimitRequestedMB: nil
+        )
+        XCTAssertEqual(status.installState, .reuse)
+        let presentation = PrivilegedHelper.presentation(for: status)
+        XCTAssertEqual(presentation.installAction, .reinstall)
+        XCTAssertFalse(presentation.willPrompt)
+
+        var blessed = 0, removed = 0
+        let state = try PrivilegedHelper.ensureInstalled(
+            defaults: defaults, bundledVersion: 1, helperOnDisk: true,
+            bless: { blessed += 1 }, remove: { removed += 1 }
+        )
+        XCTAssertEqual(state, .reuse)
+        XCTAssertEqual(blessed, 0)
+        XCTAssertEqual(removed, 0)
+    }
+
+    /// State 3 — installed, other version: reinstall offered (remove, bless).
+    func testHelperOtherVersionReinstalls() throws {
+        let defaults = freshDefaults()
+        defaults.set(0, forKey: PrivilegedHelper.installedVersionKey)
+        let status = PrivilegedHelper.status(
+            helperOnDisk: true, recordedVersion: 0,
+            wiredLimitCurrentMB: nil, wiredLimitRequestedMB: nil
+        )
+        XCTAssertEqual(status.installState, .replace)
+        let presentation = PrivilegedHelper.presentation(for: status)
+        XCTAssertEqual(presentation.installAction, .reinstall)
+        XCTAssertTrue(presentation.willPrompt)
+
+        var order: [String] = []
+        let state = try PrivilegedHelper.ensureInstalled(
+            defaults: defaults, bundledVersion: 1, helperOnDisk: true,
+            bless: { order.append("bless") }, remove: { order.append("remove") }
+        )
+        XCTAssertEqual(state, .replace)
+        XCTAssertEqual(order, ["remove", "bless"])
+        XCTAssertEqual(defaults.object(forKey: PrivilegedHelper.installedVersionKey) as? Int, 1)
+    }
+
+    /// State 4 — limit == requested: Apply hidden, but Install still visible.
+    func testHelperWiredLimitEqualHidesApplyButKeepsInstall() {
+        let absent = PrivilegedHelper.status(
+            helperOnDisk: false, recordedVersion: nil,
+            wiredLimitCurrentMB: 122_880, wiredLimitRequestedMB: 122_880
+        )
+        XCTAssertFalse(absent.wiredLimitApplyVisible)
+        XCTAssertEqual(PrivilegedHelper.presentation(for: absent).installAction, .install)
+
+        let installed = PrivilegedHelper.status(
+            helperOnDisk: true, recordedVersion: 1,
+            wiredLimitCurrentMB: 122_880, wiredLimitRequestedMB: 122_880
+        )
+        XCTAssertFalse(installed.wiredLimitApplyVisible)
+        XCTAssertEqual(PrivilegedHelper.presentation(for: installed).installAction, .reinstall)
+    }
+
+    /// State 5 — limit < requested: both Apply and Install visible.
+    func testHelperWiredLimitBelowShowsBoth() {
+        let status = PrivilegedHelper.status(
+            helperOnDisk: true, recordedVersion: 1,
+            wiredLimitCurrentMB: 29_696, wiredLimitRequestedMB: 122_880
+        )
+        XCTAssertTrue(status.wiredLimitApplyVisible)
+        let presentation = PrivilegedHelper.presentation(for: status)
+        XCTAssertTrue(presentation.applyVisible)
+        XCTAssertEqual(presentation.installAction, .reinstall)
+    }
+
+    /// An absent tool never carries a stale ledger version.
+    func testHelperStatusAbsenceClearsStaleLedger() {
+        let status = PrivilegedHelper.status(
+            helperOnDisk: false, recordedVersion: 9,
+            wiredLimitCurrentMB: nil, wiredLimitRequestedMB: nil
+        )
+        XCTAssertFalse(status.installed)
+        XCTAssertNil(status.version)
+        XCTAssertEqual(status.installState, .bless)
+    }
+
+    /// The real reader converts the server's byte fields to MB and keeps the
+    /// installed/version pair local even without a server snapshot.
+    func testHelperCurrentStatusConvertsBytesToMB() {
+        let defaults = freshDefaults()
+        defaults.set(1, forKey: PrivilegedHelper.installedVersionKey)
+        let info = systemInfo(totalGB: 128, metalCapGB: 120, requestGB: 120)
+        let status = PrivilegedHelper.currentStatus(
+            defaults: defaults, systemInfo: info, helperOnDisk: true
+        )
+        XCTAssertTrue(status.installed)
+        XCTAssertEqual(status.version, 1)
+        XCTAssertEqual(status.wiredLimitCurrentMB, 122_880)
+        XCTAssertEqual(status.wiredLimitRequestedMB, 122_880)
+        XCTAssertFalse(status.wiredLimitApplyVisible)
+
+        let welcome = PrivilegedHelper.currentStatus(defaults: defaults, helperOnDisk: true)
+        XCTAssertTrue(welcome.installed)
+        XCTAssertNil(welcome.wiredLimitCurrentMB)
+        XCTAssertNil(welcome.wiredLimitRequestedMB)
+    }
+
+    /// The uninstall's one helper dialog reports removed / cancelled / failed;
+    /// a cancel or failure is never fatal and clears the ledger only on success.
+    func testHelperRemovalOutcomes() {
+        let defaults = freshDefaults()
+        defaults.set(1, forKey: PrivilegedHelper.installedVersionKey)
+        XCTAssertEqual(PrivilegedHelper.removeForUninstall(defaults: defaults, remove: {}), .removed)
+        XCTAssertNil(defaults.object(forKey: PrivilegedHelper.installedVersionKey))
+
+        XCTAssertEqual(
+            PrivilegedHelper.removeForUninstall(defaults: defaults, remove: { throw PrivilegedActionError.cancelled }),
+            .cancelled
+        )
+        let failed = PrivilegedHelper.removeForUninstall(
+            defaults: defaults, remove: { throw PrivilegedActionError.failed("boom") }
+        )
+        if case .failed(let message) = failed {
+            XCTAssertFalse(message.isEmpty)
+        } else {
+            XCTFail("expected .failed, got \(failed)")
+        }
+    }
+
+    /// The Performance VM renders the permanent row and the separate wired-limit
+    /// row from the injected status — independent of the memory-guard warning.
+    func testPerformanceHelperRowsRenderFromStatus() {
+        let vm = makeVM(tier: "balanced", guardOn: false, info: nil)
+        vm.helperStatus = PrivilegedHelper.status(
+            helperOnDisk: true, recordedVersion: 1,
+            wiredLimitCurrentMB: 29_696, wiredLimitRequestedMB: 122_880
+        )
+        XCTAssertEqual(vm.helperStatusLine, "Helper: installed (v1)")
+        XCTAssertEqual(vm.helperInstallTitle, "Reinstall…")
+        XCTAssertEqual(vm.wiredLimitStatusLine, "29696 MB of 122880 MB requested")
+        XCTAssertTrue(vm.wiredLimitApplyVisible)
+        // The guard is off and there is no warning, yet Apply is still offered.
+        XCTAssertNil(vm.wiredLimitWarningText)
+
+        vm.helperStatus = PrivilegedHelper.status(
+            helperOnDisk: false, recordedVersion: nil,
+            wiredLimitCurrentMB: 122_880, wiredLimitRequestedMB: 122_880
+        )
+        XCTAssertEqual(vm.helperStatusLine, "Helper: not installed")
+        XCTAssertEqual(vm.helperInstallTitle, "Install helper…")
+        XCTAssertFalse(vm.wiredLimitApplyVisible)
+    }
+}

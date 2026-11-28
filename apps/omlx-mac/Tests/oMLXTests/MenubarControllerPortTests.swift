@@ -670,6 +670,27 @@ final class MenubarControllerPortTests: XCTestCase {
         XCTAssertEqual(items.first { $0.name == "key" }?.value, "secret")
     }
 
+    func testWebAdminURLDeepLinksTheClusterTab() throws {
+        let url = try XCTUnwrap(
+            MenubarController.webAdminURL(
+                host: "127.0.0.1",
+                port: 8000,
+                apiKey: "secret",
+                redirect: MenubarController.clusterAssistantRedirect
+            )
+        )
+        let comps = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        XCTAssertEqual(comps.path, "/admin/auto-login")
+        XCTAssertEqual(
+            comps.queryItems?.first { $0.name == "redirect" }?.value,
+            "/admin/dashboard?tab=cluster"
+        )
+        XCTAssertEqual(
+            comps.queryItems?.first { $0.name == "key" }?.value,
+            "secret"
+        )
+    }
+
     func testWebAdminURLBuildsIPv6Host() throws {
         let url = try XCTUnwrap(
             MenubarController.webAdminURL(host: "[::1]", port: 8000, apiKey: nil)

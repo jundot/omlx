@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon plist shipped in Contents/Library/LaunchDaemons.
+
+  This file is for the SMAppService.daemon(plistName:) path (macOS 13+), which
+  reads it straight out of the bundle and therefore uses BundleProgram — the
+  executable never moves to /Library/PrivilegedHelperTools on that path.
+  SMJobBless does NOT read this file; it reads the Label from the helper's
+  __TEXT,__launchd_plist section (Helper/app.omlx.helper.bless.plist).
+
+  Today the app only uses SMJobBless, so this plist is inert. If SMAppService
+  is adopted later, registration replaces the one admin authorization dialog
+  with an approval in System Settings → Login Items & Extensions; that is a
+  product decision, not a drop-in swap.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.omlx.helper</string>
+    <key>BundleProgram</key>
+    <string>Contents/Library/LaunchServices/app.omlx.helper</string>
+    <key>MachServices</key>
+    <dict>
+        <key>app.omlx.helper</key>
+        <true/>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

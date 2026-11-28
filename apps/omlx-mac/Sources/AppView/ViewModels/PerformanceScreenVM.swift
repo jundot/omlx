@@ -1,3 +1,6 @@
+import AppKit
+import Security
+import ServiceManagement
 import SwiftUI
 
 @MainActor
@@ -57,6 +60,11 @@ final class PerformanceScreenVM {
     /// mirroring the web dashboard's breakdown (dashboard.js
     /// `memoryGuardBreakdownHTML` / `memoryGuardShowWiredLimitWarning`).
     var systemInfo: GlobalSettingsDTO.SystemInfo? = nil
+
+    /// D6: the one helper truth. Refreshed on load and after install/apply;
+    /// settable so tests can inject the five status states without a disk read.
+    var helperStatus: HelperStatus = PrivilegedHelper.currentStatus()
+    private(set) var helperInstalling = false
 
     var hasPendingChanges: Bool {
         parsedMaxConcurrent != loadedMaxConcurrent
@@ -223,10 +231,17 @@ final class PerformanceScreenVM {
                 self.loadedInitialCacheBlocks = cache.initialCacheBlocks
             }
             self.systemInfo = s.system
+            self.refreshHelperStatus()
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
         }
+    }
+
+    /// Re-read the helper truth from the local ledger plus the latest server
+    /// snapshot. Called on load and after any privileged action.
+    func refreshHelperStatus() {
+        helperStatus = PrivilegedHelper.currentStatus(systemInfo: systemInfo)
     }
 
     func save(client: OMLXClient) async {
@@ -514,9 +529,534 @@ final class PerformanceScreenVM {
 
     /// The sysctl command paired with `wiredLimitWarningText`.
     var wiredLimitCommand: String {
-        let requested = Double(systemInfo?.omlxWiredLimitRequestBytes ?? 0)
-        let mb = Int((requested / 1048576.0).rounded(.up))
+        guard let mb = wiredLimitMB else { return "" }
         return "sudo sysctl iogpu.wired_limit_mb=\(mb)"
     }
 
+    /// The requested Metal wired limit in MiB, or nil when the server did not
+    /// report a request (there is nothing to raise).
+    var wiredLimitMB: Int? {
+        let requested = Double(systemInfo?.omlxWiredLimitRequestBytes ?? 0)
+        guard requested > 0 else { return nil }
+        return Int((requested / 1048576.0).rounded(.up))
+    }
+
+    /// Raise the kernel Metal wired limit with one standard macOS admin dialog.
+    /// The helper is a fixed, validated command — never a shell string built
+    /// from UI text — and the app refreshes the settings after it succeeds.
+    func applyWiredLimit(client: OMLXClient) async {
+        guard let mb = wiredLimitMB else { return }
+        do {
+            // The persistent helper is installed with one admin prompt; the
+            // one-shot AppleScript remains the fallback if SMJobBless cannot
+            // install (ad-hoc build, older OS, refused authorization). A
+            // cancelled prompt never falls back: it would prompt a second time.
+            do {
+                try await PrivilegedHelper.setWiredLimit(mb: mb)
+            } catch {
+                guard PrivilegedHelper.shouldFallBackToAppleScript(error) else {
+                    throw error
+                }
+                try PrivilegedActions.setWiredLimit(mb: mb)
+            }
+            await load(client: client)
+            lastError = String(localized: "performance.memory.wired_limit_applied",
+                               defaultValue: "The wired limit was raised. Restart oMLX if it is already serving.",
+                               comment: "Confirmation after the admin dialog raised the Metal wired limit")
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    // MARK: Helper capability (D6)
+
+    var helperPresentation: HelperPresentation {
+        PrivilegedHelper.presentation(for: helperStatus)
+    }
+
+    /// "Helper: installed (vX)" / "Helper: not installed" — the permanent row.
+    var helperStatusLine: String {
+        if helperStatus.installed {
+            let version = helperStatus.version.map { "v\($0)" }
+                ?? String(localized: "performance.helper.unknown_version",
+                          defaultValue: "unknown version",
+                          comment: "Helper version label when the install ledger has no version")
+            return String(localized: "performance.helper.installed_line",
+                          defaultValue: "Helper: installed (\(version))",
+                          comment: "Permanent Performance row when the privileged helper is installed")
+        }
+        return String(localized: "performance.helper.not_installed_line",
+                      defaultValue: "Helper: not installed",
+                      comment: "Permanent Performance row when the privileged helper is absent")
+    }
+
+    var helperInstallTitle: String {
+        helperPresentation.installAction == .reinstall
+            ? String(localized: "performance.helper.reinstall",
+                     defaultValue: "Reinstall…",
+                     comment: "Button that re-blesses the privileged helper with one admin dialog")
+            : String(localized: "performance.helper.install",
+                     defaultValue: "Install helper…",
+                     comment: "Button that installs the privileged helper with one admin dialog")
+    }
+
+    /// "122880 MB of 122880 MB requested" — nil when the server reported no
+    /// request (nothing to apply). Independent of the memory-guard warning.
+    var wiredLimitStatusLine: String? {
+        guard let requested = helperStatus.wiredLimitRequestedMB, requested > 0 else { return nil }
+        // Plain digits (no locale grouping) so the English-only UI reads the
+        // same on every host: "29696 MB of 122880 MB requested".
+        let current = String(helperStatus.wiredLimitCurrentMB ?? 0)
+        let target = String(requested)
+        return String(localized: "performance.helper.wired_limit_line",
+                      defaultValue: "\(current) MB of \(target) MB requested",
+                      comment: "Wired-limit row showing the kernel cap against oMLX's request, in MB")
+    }
+
+    var wiredLimitApplyVisible: Bool { helperPresentation.applyVisible }
+
+    /// Install or reinstall the helper from the permanent Performance row.
+    /// Never conditional on the wired-limit warning. A same-build reinstall is
+    /// a no-prompt reuse and says so.
+    func installHelper(client: OMLXClient) async {
+        guard !helperInstalling else { return }
+        helperInstalling = true
+        defer { helperInstalling = false }
+        do {
+            let state = try PrivilegedHelper.ensureInstalled()
+            await load(client: client)
+            switch state {
+            case .reuse:
+                lastError = String(localized: "performance.helper.already_installed",
+                                   defaultValue: "The system helper is already installed.",
+                                   comment: "Confirmation when reinstalling the same helper build needs no prompt")
+            case .bless:
+                lastError = String(localized: "performance.helper.installed",
+                                   defaultValue: "The system helper was installed.",
+                                   comment: "Confirmation after the admin dialog installed the helper")
+            case .replace:
+                lastError = String(localized: "performance.helper.reinstalled",
+                                   defaultValue: "The system helper was reinstalled.",
+                                   comment: "Confirmation after the admin dialog replaced an older helper")
+            }
+        } catch {
+            lastError = error.localizedDescription
+            refreshHelperStatus()
+        }
+    }
+
+}
+
+// MARK: - Privileged actions
+
+enum PrivilegedActionError: LocalizedError, Equatable {
+    case invalidValue
+    case cancelled
+    case failed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidValue:
+            return String(localized: "performance.memory.wired_limit_invalid",
+                          defaultValue: "The wired-limit value is outside the supported range.",
+                          comment: "Error when the requested Metal wired limit is invalid")
+        case .cancelled:
+            return String(localized: "performance.memory.wired_limit_cancelled",
+                          defaultValue: "The administrator prompt was cancelled; the wired limit was not changed.",
+                          comment: "Error when the user cancels the admin dialog")
+        case .failed(let message):
+            let base = String(localized: "performance.memory.wired_limit_failed",
+                              defaultValue: "Could not set the wired limit.",
+                              comment: "Prefix for a failed privileged wired-limit action")
+            return message.isEmpty ? base : "\(base) \(message)"
+        }
+    }
+}
+
+enum PrivilegedActions {
+    /// The only command this slice runs. The value is validated as a positive
+    /// MiB integer, so the AppleScript shell string cannot be user-controlled.
+    static func setWiredLimit(mb: Int) throws {
+        let value = try validatedWiredLimitMB(mb)
+        let script = "do shell script \"sysctl iogpu.wired_limit_mb=\(value)\" with administrator privileges"
+        guard let appleScript = NSAppleScript(source: script) else {
+            throw PrivilegedActionError.failed("")
+        }
+        var error: NSDictionary?
+        _ = appleScript.executeAndReturnError(&error)
+        guard let error else { return }
+        let code = error[NSAppleScript.errorNumber] as? Int ?? 0
+        if code == -128 {
+            throw PrivilegedActionError.cancelled
+        }
+        let message = error[NSAppleScript.errorMessage] as? String ?? ""
+        throw PrivilegedActionError.failed(message)
+    }
+
+    static func validatedWiredLimitMB(_ mb: Int) throws -> Int {
+        guard mb > 0, mb <= 1_048_576 else {
+            throw PrivilegedActionError.invalidValue
+        }
+        return mb
+    }
+
+    /// The uninstall's one helper-removal command. Fixed strings only — never
+    /// built from UI text — mirroring the lab-proven cleanup script
+    /// (`scripts/cleanup-cluster-macs.sh`): SMJobRemove deregisters the
+    /// launchd job but leaves the root-owned tool files behind, so the removal
+    /// bootouts the job and deletes both files in the same admin dialog.
+    static func removeHelperTool() throws {
+        let script = "do shell script \"launchctl bootout system/app.omlx.helper 2>/dev/null; "
+            + "rm -f /Library/PrivilegedHelperTools/app.omlx.helper "
+            + "/Library/LaunchDaemons/app.omlx.helper.plist\" "
+            + "with administrator privileges"
+        guard let appleScript = NSAppleScript(source: script) else {
+            throw PrivilegedActionError.failed("")
+        }
+        var error: NSDictionary?
+        _ = appleScript.executeAndReturnError(&error)
+        guard let error else { return }
+        let code = error[NSAppleScript.errorNumber] as? Int ?? 0
+        if code == -128 {
+            throw PrivilegedActionError.cancelled
+        }
+        let message = error[NSAppleScript.errorMessage] as? String ?? ""
+        throw PrivilegedActionError.failed(message)
+    }
+}
+
+
+// MARK: - Helper capability (D6)
+
+/// The one observable truth about the privileged helper. `installed` and
+/// `version` come from the on-disk tool plus the app's install ledger; the
+/// wired-limit pair comes from the server's system snapshot. Welcome,
+/// Performance and the tests all read this same shape, so "is the helper
+/// there?" never needs a shell. The helper is a capability, not a side effect
+/// of a low wired limit: nothing here is conditional on the warning.
+struct HelperStatus: Equatable, Sendable {
+    let installed: Bool
+    /// The version the app recorded when it blessed the tool; `nil` when the
+    /// tool is absent or predates the ledger. The XPC tool exposes no version
+    /// query, so the ledger is the authoritative installed version.
+    let version: Int?
+    let wiredLimitCurrentMB: Int?
+    let wiredLimitRequestedMB: Int?
+
+    var installState: PrivilegedHelper.InstallState {
+        PrivilegedHelper.installState(
+            helperOnDisk: installed,
+            recordedVersion: version,
+            bundledVersion: PrivilegedHelper.helperBundleVersion
+        )
+    }
+
+    /// Apply is offered whenever a request exists and the kernel cap differs
+    /// from it — including "apply again" after a raise. Equal => hidden, but
+    /// the Install/Reinstall affordance stays visible regardless.
+    var wiredLimitApplyVisible: Bool {
+        guard let requested = wiredLimitRequestedMB, requested > 0 else { return false }
+        return wiredLimitCurrentMB != requested
+    }
+}
+
+/// The button the permanent Helper row shows. It is never hidden: a person
+/// must always be able to install or reinstall the capability (D6).
+enum HelperInstallAction: Equatable, Sendable {
+    case install
+    case reinstall
+}
+
+struct HelperPresentation: Equatable, Sendable {
+    let installAction: HelperInstallAction
+    let applyVisible: Bool
+    /// Whether invoking install will actually open an admin prompt (bless or
+    /// replace) or be a no-prompt reuse. Drives the confirmation text only.
+    let willPrompt: Bool
+}
+
+/// Outcome of the uninstall's single helper-removal dialog. A cancel or a
+/// failure leaves the rest of the uninstall done and is reported, not fatal.
+enum HelperRemovalOutcome: Equatable, Sendable {
+    case removed
+    case cancelled
+    case failed(String)
+}
+
+// MARK: - Persistent SMJobBless helper
+
+@objc(OMLXHelperProtocol)
+protocol OMLXHelperProtocol {
+    func setWiredLimit(_ mb: Int, withReply reply: @escaping (Bool, String) -> Void)
+}
+
+enum PrivilegedHelper {
+    static let helperID = "app.omlx.helper"
+    static let installedPath = "/Library/PrivilegedHelperTools/app.omlx.helper"
+
+    /// Must equal `CFBundleVersion` in `apps/omlx-mac/Helper/Info.plist`.
+    /// SMJobBless answers "already installed, success" and never replaces a
+    /// blessed tool, so the app records the version it installed and removes
+    /// the job when the bundled helper changes. The packaging test
+    /// `test_privileged_helper_packaging.py` pins this constant to the plist.
+    static let helperBundleVersion = 1
+    static let installedVersionKey = "omlx.helper.installedVersion"
+
+    enum InstallState: Equatable {
+        /// No helper on disk: one admin prompt via SMJobBless.
+        case bless
+        /// The recorded helper matches this build: no prompt.
+        case reuse
+        /// A helper from another build is installed: remove, then bless.
+        case replace
+    }
+
+    /// Pure decision so the upgrade path is testable without an admin prompt.
+    static func installState(
+        helperOnDisk: Bool,
+        recordedVersion: Int?,
+        bundledVersion: Int
+    ) -> InstallState {
+        guard helperOnDisk else { return .bless }
+        guard let recordedVersion, recordedVersion == bundledVersion else {
+            return .replace
+        }
+        return .reuse
+    }
+
+    /// Pure status builder so the five D6 states are testable without a disk
+    /// read or an admin prompt. An absent tool never carries a stale ledger
+    /// version.
+    static func status(
+        helperOnDisk: Bool,
+        recordedVersion: Int?,
+        wiredLimitCurrentMB: Int?,
+        wiredLimitRequestedMB: Int?
+    ) -> HelperStatus {
+        HelperStatus(
+            installed: helperOnDisk,
+            version: helperOnDisk ? recordedVersion : nil,
+            wiredLimitCurrentMB: wiredLimitCurrentMB,
+            wiredLimitRequestedMB: wiredLimitRequestedMB
+        )
+    }
+
+    /// The real-world reader both screens call. `systemInfo` is the server's
+    /// snapshot (nil in Welcome / before load => the wired-limit pair is nil,
+    /// the installed/version pair is still local truth).
+    static func currentStatus(
+        defaults: UserDefaults = .standard,
+        systemInfo: GlobalSettingsDTO.SystemInfo? = nil,
+        helperOnDisk: Bool? = nil
+    ) -> HelperStatus {
+        let exists = helperOnDisk
+            ?? FileManager.default.fileExists(atPath: installedPath)
+        return status(
+            helperOnDisk: exists,
+            recordedVersion: defaults.object(forKey: installedVersionKey) as? Int,
+            wiredLimitCurrentMB: mb(fromBytes: systemInfo?.iogpuWiredLimitBytes),
+            wiredLimitRequestedMB: mb(fromBytes: systemInfo?.omlxWiredLimitRequestBytes)
+        )
+    }
+
+    private static func mb(fromBytes bytes: Int64?) -> Int? {
+        guard let bytes, bytes > 0 else { return nil }
+        return Int((Double(bytes) / 1_048_576.0).rounded(.up))
+    }
+
+    /// The permanent row's decision: an install affordance is always present;
+    /// Apply appears only when the kernel cap differs from the request.
+    static func presentation(for status: HelperStatus) -> HelperPresentation {
+        HelperPresentation(
+            installAction: status.installed ? .reinstall : .install,
+            applyVisible: status.wiredLimitApplyVisible,
+            willPrompt: status.installState != .reuse
+        )
+    }
+
+    /// Install or reinstall the helper without touching the wired limit — the
+    /// Welcome step and the Performance "Install helper…/Reinstall…" button.
+    /// Idempotent and versioned: same build => `.reuse` (no prompt), another
+    /// build => remove then bless. The bless/remove effects are injectable so
+    /// the sequence is testable without an admin dialog. Returns the action
+    /// taken so the caller can report "already installed" vs "installed".
+    @discardableResult
+    static func ensureInstalled(
+        defaults: UserDefaults = .standard,
+        bundledVersion: Int = helperBundleVersion,
+        helperOnDisk: Bool? = nil,
+        bless: () throws -> Void = { try install() },
+        remove: () throws -> Void = { try uninstall() }
+    ) throws -> InstallState {
+        let exists = helperOnDisk
+            ?? FileManager.default.fileExists(atPath: installedPath)
+        let state = installState(
+            helperOnDisk: exists,
+            recordedVersion: defaults.object(forKey: installedVersionKey) as? Int,
+            bundledVersion: bundledVersion
+        )
+        switch state {
+        case .reuse:
+            break
+        case .bless:
+            try bless()
+            defaults.set(bundledVersion, forKey: installedVersionKey)
+        case .replace:
+            // A failed removal is not fatal: bless refuses to overwrite, so
+            // the call below then fails rather than silently keeping the old
+            // tool. The caller reports the failure.
+            try? remove()
+            try bless()
+            defaults.set(bundledVersion, forKey: installedVersionKey)
+        }
+        return state
+    }
+
+    /// The uninstall's one helper-removal dialog. One fixed admin command that
+    /// bootouts the launchd job AND removes both root-owned files (the
+    /// lab-proven cleanup-script path — SMJobRemove alone deregisters the job
+    /// and leaves the tool behind). A cancel or failure is reported and never
+    /// aborts the rest of the uninstall.
+    static func removeForUninstall(
+        defaults: UserDefaults = .standard,
+        remove: () throws -> Void = { try PrivilegedActions.removeHelperTool() }
+    ) -> HelperRemovalOutcome {
+        do {
+            try remove()
+            defaults.removeObject(forKey: installedVersionKey)
+            return .removed
+        } catch PrivilegedActionError.cancelled {
+            return .cancelled
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    /// A cancelled admin prompt or an out-of-range value must never open a
+    /// second prompt: the user already answered, and the AppleScript path
+    /// validates the same range. Only an installation or XPC failure falls
+    /// back to the one-shot AppleScript.
+    static func shouldFallBackToAppleScript(_ error: Error) -> Bool {
+        if let actionError = error as? PrivilegedActionError,
+           actionError == .cancelled || actionError == .invalidValue {
+            return false
+        }
+        return true
+    }
+
+    static func setWiredLimit(
+        mb: Int,
+        defaults: UserDefaults = .standard,
+        bundledVersion: Int = helperBundleVersion,
+        helperOnDisk: Bool? = nil
+    ) async throws {
+        let value = try PrivilegedActions.validatedWiredLimitMB(mb)
+        // One install path for both "Apply with Admin…" and the standalone
+        // Install/Reinstall button: bless/reuse/replace, then set the limit.
+        try ensureInstalled(
+            defaults: defaults,
+            bundledVersion: bundledVersion,
+            helperOnDisk: helperOnDisk
+        )
+        try await call(value)
+    }
+
+    private static func install() throws {
+        var authorization: AuthorizationRef?
+        let status = AuthorizationCreate(nil, nil, [], &authorization)
+        guard status == errAuthorizationSuccess, let authorization else {
+            throw PrivilegedActionError.failed(
+                "Could not create the administrator authorization (\(status))."
+            )
+        }
+        defer { AuthorizationFree(authorization, []) }
+        var error: Unmanaged<CFError>?
+        let installed = SMJobBless(
+            kSMDomainSystemLaunchd,
+            helperID as CFString,
+            authorization,
+            &error
+        )
+        if !installed {
+            let message = error?.takeRetainedValue().localizedDescription
+                ?? "SMJobBless refused to install the helper."
+            if message.localizedCaseInsensitiveContains("cancel") {
+                throw PrivilegedActionError.cancelled
+            }
+            throw PrivilegedActionError.failed(message)
+        }
+    }
+
+    private static func uninstall() throws {
+        var authorization: AuthorizationRef?
+        let status = AuthorizationCreate(nil, nil, [], &authorization)
+        guard status == errAuthorizationSuccess, let authorization else {
+            throw PrivilegedActionError.failed(
+                "Could not create the administrator authorization (\(status))."
+            )
+        }
+        defer { AuthorizationFree(authorization, []) }
+        var error: Unmanaged<CFError>?
+        let removed = SMJobRemove(
+            kSMDomainSystemLaunchd,
+            helperID as CFString,
+            authorization,
+            true,
+            &error
+        )
+        if !removed {
+            let message = error?.takeRetainedValue().localizedDescription
+                ?? "SMJobRemove could not remove the installed helper."
+            throw PrivilegedActionError.failed(message)
+        }
+    }
+
+    private static func call(_ mb: Int) async throws {
+        let connection = NSXPCConnection(
+            machServiceName: helperID,
+            options: .privileged
+        )
+        connection.remoteObjectInterface = NSXPCInterface(
+            with: OMLXHelperProtocol.self
+        )
+        connection.resume()
+        defer { connection.invalidate() }
+
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            let gate = HelperReplyGate(continuation)
+            guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
+                gate.finish(.failure(error))
+            }) as? OMLXHelperProtocol else {
+                gate.finish(.failure(PrivilegedActionError.failed(
+                    "The privileged helper did not expose its interface."
+                )))
+                return
+            }
+            proxy.setWiredLimit(mb) { ok, message in
+                if ok {
+                    gate.finish(.success(()))
+                } else {
+                    gate.finish(.failure(PrivilegedActionError.failed(message)))
+                }
+            }
+        }
+    }
+}
+
+private final class HelperReplyGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    init(_ continuation: CheckedContinuation<Void, Error>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ result: Result<Void, Error>) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(with: result)
+    }
 }
