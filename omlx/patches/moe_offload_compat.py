@@ -25,6 +25,9 @@ _SUPPORTED_TYPES = frozenset(
     }
 )
 
+# Families whose offload plan reads oQh routed experts.
+_OQH_TYPES = frozenset({"deepseek_v41"})
+
 
 def moe_offload_compatibility(model_path):
     """Return eligibility and a reason without loading any model tensors."""
@@ -34,8 +37,11 @@ def moe_offload_compatibility(model_path):
         raw = json.loads(config.read_text())
         if raw.get("model_type") not in _SUPPORTED_TYPES:
             return False, "MoE expert offload is not supported for this model type."
-        if is_oqh_config(raw):
-            return False, "MoE expert offload does not read oQh experts."
+        if is_oqh_config(raw) and raw.get("model_type") not in _OQH_TYPES:
+            return (
+                False,
+                "MoE expert offload does not read oQh experts of this model type.",
+            )
         files = [config, *path.glob("*.safetensors")]
         index = path / "model.safetensors.index.json"
         if index.exists():
@@ -55,8 +61,13 @@ def _inspect(path, signature):
     if kind == "deepseek_v41":
         from .deepseek_v41.moe_offload import estimate_expert_savings
 
-        if estimate_expert_savings(path, 0.125) > 0:
-            return True, ""
+        try:
+            if estimate_expert_savings(path, 0.125) > 0:
+                return True, ""
+        except KeyError as error:
+            return False, f"Could not read the expert layout: missing {error.args[0]}"
+        except ValueError as error:
+            return False, f"Could not read the expert layout: {error}"
         return False, "The checkpoint has no offloadable routed experts."
 
     from .moe_expert_offload import CheckpointExpertStore, _qwen35_checkpoint_prefix
