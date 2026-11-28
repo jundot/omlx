@@ -76,6 +76,10 @@ def _fields(cache):
     }
 
 
+def _states(cache):
+    return [c.state for c in cache] if isinstance(cache, list) else cache.state
+
+
 def _offset(cache):
     offset = cache.offset if cache is not None else 0
     return mx.array(offset) if isinstance(offset, mx.array) else offset
@@ -943,11 +947,14 @@ class ErnieModel(nn.Module):
             cache = [None] * len(self.layers)
         if len(cache) != len(self.layers):
             raise ValueError("Expected one cache per decoder layer")
+        submit = cache[0] is not None and h.shape[0] * h.shape[1] <= _DECODE_ROWS
         captured = []
         for i, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             h = layer(h, layer_cache)
             if i in taps:
                 captured.append(h[:, -(tap_rows or h.shape[1]) :].mean(axis=2))
+            if submit:
+                mx.async_eval(h, _states(layer_cache))
         if isinstance(cache[0], list):
             # mlx: an fp32 matmul over B rows rounds differently from B one-row calls.
             h = mx.concatenate([self.hc_head(row[None]) for row in h])
