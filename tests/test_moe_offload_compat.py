@@ -72,6 +72,44 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     return tensors
 
 
+@pytest.mark.parametrize("kind", ["mimo_v2", "mimo_v2_flash"])
+def test_mimo_stacked_experts_and_admission(tmp_path, kind):
+    from omlx.patches.moe_expert_offload import estimate_offload_admission_bytes
+
+    config = tmp_path / "config.json"
+    raw = {
+        "model_type": kind,
+        "num_hidden_layers": 2,
+        "n_routed_experts": 16,
+        "num_experts_per_tok": 8,
+        "hidden_size": 64,
+        "moe_intermediate_size": 64,
+        "moe_layer_freq": [0, 1],
+        "quantization": {"mode": "mxfp4", "group_size": 32, "bits": 4},
+    }
+    config.write_text(json.dumps(raw))
+    tensors = {}
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        weight, scales = mx.quantize(mx.ones((16, 64, 64)), 32, 4, mode="mxfp4")
+        name = f"model.layers.1.mlp.switch_mlp.{proj}"
+        tensors[name + ".weight"] = weight
+        tensors[name + ".scales"] = scales
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+
+    full = 1_000_000
+    expert_bytes = sum(t.nbytes for t in tensors.values())
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+    assert estimate_offload_admission_bytes(tmp_path, full, 0.5) == (
+        full - expert_bytes // 2
+    )
+
+    for mask in ([0], [0, 0], [0, 2], [1, 1]):
+        raw["moe_layer_freq"] = mask
+        config.write_text(json.dumps(raw))
+        assert not moe_offload_compatibility(tmp_path)[0]
+        assert estimate_offload_admission_bytes(tmp_path, full, 0.5) == full
+
+
 @pytest.mark.parametrize(
     "kind,per_expert",
     [

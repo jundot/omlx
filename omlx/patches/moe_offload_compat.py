@@ -17,6 +17,8 @@ _SUPPORTED_TYPES = frozenset(
         "qwen3_5_moe",
         "gemma4",
         "olmoe",
+        "mimo_v2",
+        "mimo_v2_flash",
         "glm_moe_dsa",
         "glm5_next",
         "minicpmv4_7",
@@ -70,6 +72,9 @@ def _inspect(path, signature):
         count = int(text.get("n_routed_experts") or 0)
         first_moe = int(text.get("first_k_dense_replace") or 0)
         moe_freq = int(text.get("moe_layer_freq") or 1)
+    elif kind in ("mimo_v2", "mimo_v2_flash"):
+        count = int(text.get("n_routed_experts") or 0)
+        first_moe, moe_freq = 0, 1
     else:
         count = int(text.get("num_experts") or 0)
         first_moe, moe_freq = 0, 1
@@ -87,7 +92,7 @@ def _inspect(path, signature):
         kind == "gemma4" and not text.get("enable_moe_block")
     ):
         return False, "The model does not have the supported MoE geometry."
-    # glm5_next picks sparse layers per layer, not by frequency.
+    # GLM5-Next and MiMo identify sparse layers individually.
     sparse_layers = None
     if kind == "glm5_next":
         types = text.get("mlp_layer_types")
@@ -96,6 +101,16 @@ def _inspect(path, signature):
         sparse_layers = {i for i, t in enumerate(types) if t == "sparse"}
         if not sparse_layers:
             return False, "The model does not have the supported MoE geometry."
+    elif kind in ("mimo_v2", "mimo_v2_flash"):
+        pattern = text.get("moe_layer_freq")
+        if (
+            not isinstance(pattern, list)
+            or len(pattern) != layers
+            or any(flag not in (0, 1) for flag in pattern)
+            or not any(pattern)
+        ):
+            return False, "Invalid MiMo routed-layer mask."
+        sparse_layers = {i for i, flag in enumerate(pattern) if flag}
     quant = raw.get("quantization", text.get("quantization"))
     if not isinstance(quant, dict):
         return False, "Expert offload requires an MLX quantized checkpoint."
@@ -106,8 +121,14 @@ def _inspect(path, signature):
         if layer < first_moe or layer % moe_freq:
             continue  # dense layer (GLM's first_k_dense_replace)
         if sparse_layers is not None and layer not in sparse_layers:
-            continue  # dense layer (glm5_next's mlp_layer_types)
-        if kind in ("olmoe", "glm_moe_dsa", "bailing_hybrid"):
+            continue  # dense layer in the per-layer mask
+        if kind in (
+            "olmoe",
+            "glm_moe_dsa",
+            "bailing_hybrid",
+            "mimo_v2",
+            "mimo_v2_flash",
+        ):
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         elif kind in ("qwen4_exp", "qwen3_5_moe", "minicpmv4_7"):
@@ -138,6 +159,8 @@ def _inspect(path, signature):
         )
         first = f"{prefix}.{projs[0][0]}.weight"
         if kind in (
+            "mimo_v2",
+            "mimo_v2_flash",
             "deepseek_v4",
             "glm5_next",
             "qwen3_5_moe",
