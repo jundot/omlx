@@ -1995,6 +1995,43 @@ class TestEnginePool:
         assert entry.engine is None
         assert pool._current_model_memory == 0
 
+    async def test_load_restarts_splash_when_its_plan_spills_the_context(
+        self, tmp_path, launchers, global_settings
+    ):
+        launchers("splash")
+        pool, entry = _pool(tmp_path)
+        manager = MagicMock()
+        manager.get_settings.return_value = ModelSettings(external_engine="splash")
+        pool._settings_manager = manager
+        budgets = []
+
+        async def fake_start(self):
+            self._tokenizer = MagicMock()
+            budgets.append(self._options.max_memory_bytes)
+            resident = 212977 if len(budgets) == 1 else 262144
+            self._status = {
+                "memory_plan": {
+                    "budget": {
+                        "hard_budget_bytes": self._options.max_memory_bytes,
+                        "kv_page_tokens": 32,
+                        "kv_extent_pages": 256,
+                        "kv_extent_bytes": 108527616,
+                        "kv_capacity_pages": (resident + 15) // 32,
+                        "context_bounds": {"window": 262144, "resident": resident},
+                    }
+                }
+            }
+
+        with (
+            patch.object(SplashEngine, "start", fake_start),
+            patch.object(SplashEngine, "stop", AsyncMock()) as stop,
+        ):
+            await pool._load_engine(entry.model_id)
+
+        stop.assert_awaited_once()
+        assert budgets[1:] == [budgets[0] + 7 * (108527616 + 8192 * 89)]
+        assert pool._current_model_memory == budgets[1]
+
     def test_runtime_signature_reloads_on_engine_change_only(self, tmp_path):
         pool, entry = _pool(tmp_path)
 
