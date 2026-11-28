@@ -558,6 +558,10 @@ class TestOpenAIAdapter:
 
         assert result.choices[0].finish_reason == "tool_calls"
         assert result.choices[0].message.tool_calls == tool_calls
+        assert result.choices[0].message.content == ""
+
+        payload = json.loads(result.model_dump_json(exclude_none=True))
+        assert "content" in payload["choices"][0]["message"]
 
     def test_format_response_empty_text(self, adapter):
         """Test formatting response with empty text."""
@@ -569,8 +573,9 @@ class TestOpenAIAdapter:
 
         result = adapter.format_response(response, request)
 
-        # Empty text should result in None content
-        assert result.choices[0].message.content is None
+        # Empty text is represented by an empty string so that the content key
+        # is always emitted, even with exclude_none serialization.
+        assert result.choices[0].message.content == ""
 
     def test_format_response_with_special_tokens(self, adapter):
         """Test formatting response cleans special tokens."""
@@ -663,6 +668,8 @@ class TestOpenAIAdapter:
 
         assert data["choices"][0]["finish_reason"] == "stop"
         # Note: ChatCompletionChunk may not have usage field in all implementations
+        assert "content" in data["choices"][0]["delta"]
+        assert data["choices"][0]["delta"]["content"] == ""
 
     def test_format_stream_chunk_with_tool_call_delta(self, adapter):
         """Test formatting stream chunk with tool call delta."""
